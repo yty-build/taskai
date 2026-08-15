@@ -17,6 +17,7 @@ import (
 	agentregistry "github.com/yty-build/acp-gateway/internal/agents"
 	"github.com/yty-build/acp-gateway/internal/buildinfo"
 	"github.com/yty-build/acp-gateway/internal/config"
+	"github.com/yty-build/acp-gateway/internal/console"
 	"github.com/yty-build/acp-gateway/internal/render"
 	appservice "github.com/yty-build/acp-gateway/internal/service"
 	"github.com/yty-build/acp-gateway/internal/sessionlog"
@@ -175,7 +176,7 @@ func runTasks(ctx context.Context, args []string, stdout io.Writer, service *tas
 
 func runTask(ctx context.Context, args []string, stdout io.Writer, service *task.Service, sessions *appservice.SessionService) error {
 	if len(args) == 0 {
-		return usagef("usage: agent task new|status|<task-id>")
+		return usagef("usage: agent task new|status|attach|logs|<task-id>")
 	}
 	switch args[0] {
 	case "new":
@@ -196,6 +197,11 @@ func runTask(ctx context.Context, args []string, stdout io.Writer, service *task
 		return nil
 	case "logs":
 		return runTaskLogs(ctx, args[1:], stdout, sessions)
+	case "attach":
+		if len(args) != 2 {
+			return usagef("usage: agent task attach <task-id>")
+		}
+		return console.AttachTask(ctx, console.Services{Tasks: service, Sessions: sessions}, args[1], os.Stdin, stdout)
 	default:
 		if len(args) != 1 {
 			return usagef("usage: agent task <task-id>")
@@ -285,7 +291,7 @@ func runStart(ctx context.Context, args []string, stdout io.Writer, tasks *task.
 
 func runSession(ctx context.Context, args []string, stdout io.Writer, service *appservice.SessionService) error {
 	if len(args) == 0 {
-		return usagef("usage: agent session start|prompt|cancel|resume|stop|logs|<session-id>")
+		return usagef("usage: agent session start|attach|prompt|cancel|resume|stop|logs|<session-id>")
 	}
 	switch args[0] {
 	case "start":
@@ -330,6 +336,11 @@ func runSession(ctx context.Context, args []string, stdout io.Writer, service *a
 		return nil
 	case "logs":
 		return runSessionLogs(ctx, args[1:], stdout, service)
+	case "attach":
+		if len(args) != 2 {
+			return usagef("usage: agent session attach <session-id>")
+		}
+		return console.AttachSession(ctx, console.Services{Sessions: service}, args[1], os.Stdin, stdout)
 	default:
 		if len(args) != 1 {
 			return usagef("usage: agent session <session-id>")
