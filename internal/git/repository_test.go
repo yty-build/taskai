@@ -30,6 +30,31 @@ func TestValidateRepositoryResolvesRootAndRejectsNonGit(t *testing.T) {
 	}
 }
 
+func TestPlanWorktreeCanonicalizesSymlinkedParent(t *testing.T) {
+	realParent := t.TempDir()
+	realRoot := filepath.Join(realParent, "agent-home", "worktrees")
+	if err := os.MkdirAll(realRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "tmp-alias")
+	if err := os.Symlink(realParent, alias); err != nil {
+		t.Fatal(err)
+	}
+
+	planned, err := PlanWorktree(filepath.Join(alias, "agent-home", "worktrees"), "/repo", "T-symlink", "S-canonical")
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalRoot, err := filepath.EvalSymlinks(realRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(canonicalRoot, "T-symlink-S-canonical")
+	if planned.Path != want {
+		t.Fatalf("planned worktree path = %q, want canonical path %q", planned.Path, want)
+	}
+}
+
 func TestCreateMultipleIsolatedWorktreesAndPreserveCollisions(t *testing.T) {
 	ctx := context.Background()
 	repository := initializeRepository(t)

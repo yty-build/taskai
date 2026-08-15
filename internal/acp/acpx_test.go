@@ -200,3 +200,45 @@ func TestCustomCommandIsPassedAsOneLiteralAgentArgument(t *testing.T) {
 		t.Fatalf("custom argument was unexpectedly evaluated; marker stat error = %v", err)
 	}
 }
+
+func TestCommandsCanonicalizeSymlinkedWorkingDirectory(t *testing.T) {
+	client, target := fixtureClient(t, "success")
+	realDirectory := t.TempDir()
+	alias := filepath.Join(t.TempDir(), "cwd-alias")
+	if err := os.Symlink(realDirectory, alias); err != nil {
+		t.Fatal(err)
+	}
+	target.WorkingDirectory = alias
+
+	argsFile := filepath.Join(t.TempDir(), "args")
+	cwdFile := filepath.Join(t.TempDir(), "cwd")
+	t.Setenv("FAKE_ACPX_ARGS_FILE", argsFile)
+	t.Setenv("FAKE_ACPX_CWD_FILE", cwdFile)
+	if _, err := client.Start(context.Background(), StartSpec{Target: target}); err != nil {
+		t.Fatal(err)
+	}
+
+	argsBody, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Split(strings.TrimSpace(string(argsBody)), "\n")
+	var passedCWD string
+	for index, arg := range args {
+		if arg == "--cwd" && index+1 < len(args) {
+			passedCWD = args[index+1]
+			break
+		}
+	}
+	commandCWD, err := os.ReadFile(cwdFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalDirectory, err := filepath.EvalSymlinks(realDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if passedCWD != canonicalDirectory || strings.TrimSpace(string(commandCWD)) != canonicalDirectory {
+		t.Fatalf("acpx cwd = argument %q, process %q; want canonical %q", passedCWD, strings.TrimSpace(string(commandCWD)), canonicalDirectory)
+	}
+}

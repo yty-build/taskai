@@ -202,7 +202,11 @@ func TestStartWorktreeFlagsPersistIsolatedCheckout(t *testing.T) {
 		t.Fatalf("start output = %q", stdout)
 	}
 	taskID, sessionID := fields[1], fields[3]
-	wantPath := filepath.Join(home, "worktrees", taskID+"-"+sessionID)
+	canonicalWorktrees, err := filepath.EvalSymlinks(filepath.Join(home, "worktrees"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPath := filepath.Join(canonicalWorktrees, taskID+"-"+sessionID)
 	wantBranch := "agent/" + taskID + "/" + sessionID
 	code, stdout, stderr = runForTest(t, "session", sessionID)
 	if code != ExitOK || stderr != "" || !strings.Contains(stdout, "Worktree: "+wantPath) || !strings.Contains(stdout, "Branch: "+wantBranch) {

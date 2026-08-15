@@ -135,7 +135,7 @@ func PlanWorktree(root, repository, taskID, sessionID string) (Worktree, error) 
 	if !idComponent.MatchString(sessionID) {
 		return Worktree{}, fmt.Errorf("Session ID %q is not safe for a Git branch", sessionID)
 	}
-	root, err := filepath.Abs(root)
+	root, err := CanonicalPath(root)
 	if err != nil {
 		return Worktree{}, fmt.Errorf("resolve worktree root: %w", err)
 	}
@@ -144,6 +144,39 @@ func PlanWorktree(root, repository, taskID, sessionID string) (Worktree, error) 
 		Path:       filepath.Join(filepath.Clean(root), taskID+"-"+sessionID),
 		Branch:     "agent/" + taskID + "/" + sessionID,
 	}, nil
+}
+
+// CanonicalPath resolves symlinks in the deepest existing parent while
+// preserving any not-yet-created suffix. This keeps planned checkout paths and
+// command working directories in the same physical namespace.
+func CanonicalPath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	candidate := filepath.Clean(abs)
+	var missing []string
+	for {
+		if _, err := os.Lstat(candidate); err == nil {
+			resolved, err := filepath.EvalSymlinks(candidate)
+			if err != nil {
+				return "", err
+			}
+			for index := len(missing) - 1; index >= 0; index-- {
+				resolved = filepath.Join(resolved, missing[index])
+			}
+			return filepath.Clean(resolved), nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+
+		parent := filepath.Dir(candidate)
+		if parent == candidate {
+			return "", fmt.Errorf("no existing parent for %q", path)
+		}
+		missing = append(missing, filepath.Base(candidate))
+		candidate = parent
+	}
 }
 
 // CheckAvailable rejects collisions without deleting or changing anything.
@@ -271,15 +304,14 @@ func commonDirectory(ctx context.Context, repository string) (string, error) {
 }
 
 func canonicalExisting(path string) (string, error) {
-	abs, err := filepath.Abs(path)
+	resolved, err := CanonicalPath(path)
 	if err != nil {
 		return "", err
 	}
-	resolved, err := filepath.EvalSymlinks(abs)
-	if err != nil {
+	if _, err := os.Stat(resolved); err != nil {
 		return "", err
 	}
-	return filepath.Clean(resolved), nil
+	return resolved, nil
 }
 
 func run(ctx context.Context, repository string, arguments ...string) (string, error) {

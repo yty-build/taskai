@@ -218,8 +218,12 @@ func TestStartCreatesDistinctPersistentWorktrees(t *testing.T) {
 	if started[0].WorktreePath == started[1].WorktreePath || started[0].Branch == started[1].Branch {
 		t.Fatalf("worktrees were not isolated: %#v", started)
 	}
+	canonicalWorktrees, err := filepath.EvalSymlinks(home.Worktrees)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, current := range started {
-		wantPath := filepath.Join(home.Worktrees, createdTask.ID+"-"+current.ID)
+		wantPath := filepath.Join(canonicalWorktrees, createdTask.ID+"-"+current.ID)
 		wantBranch := "agent/" + createdTask.ID + "/" + current.ID
 		if current.WorktreePath != wantPath || current.Branch != wantBranch {
 			t.Errorf("Session context = path %q branch %q, want %q %q", current.WorktreePath, current.Branch, wantPath, wantBranch)

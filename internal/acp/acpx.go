@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 
 	"github.com/yty-build/acp-gateway/internal/agents"
+	gitrepo "github.com/yty-build/acp-gateway/internal/git"
 	"github.com/yty-build/acp-gateway/internal/identity"
 )
 
@@ -177,9 +178,11 @@ func (c *Client) Probe(ctx context.Context) error {
 func NewRequestID() (string, error) { return identity.New("REQ") }
 
 func (c *Client) Start(ctx context.Context, spec StartSpec) (SessionInfo, error) {
-	if err := c.ready(spec.Target); err != nil {
+	target, err := c.ready(spec.Target)
+	if err != nil {
 		return SessionInfo{}, err
 	}
+	spec.Target = target
 	operation := []string{"sessions", "ensure", "--name", spec.ConsoleSessionID}
 	if spec.ResumeACPSessionID != "" {
 		operation = append(operation, "--resume-session", spec.ResumeACPSessionID)
@@ -199,7 +202,8 @@ func (c *Client) Resume(ctx context.Context, spec StartSpec) (SessionInfo, error
 }
 
 func (c *Client) Inspect(ctx context.Context, target Target) (SessionInfo, error) {
-	if err := c.ready(target); err != nil {
+	target, err := c.ready(target)
+	if err != nil {
 		return SessionInfo{}, err
 	}
 	raw, err := c.runControl(ctx, "session inspect", target, "sessions", "show", target.ConsoleSessionID)
@@ -210,7 +214,8 @@ func (c *Client) Inspect(ctx context.Context, target Target) (SessionInfo, error
 }
 
 func (c *Client) Status(ctx context.Context, target Target) (Status, error) {
-	if err := c.ready(target); err != nil {
+	target, err := c.ready(target)
+	if err != nil {
 		return Status{}, err
 	}
 	raw, err := c.runControl(ctx, "status", target, "status", "--session", target.ConsoleSessionID)
@@ -232,17 +237,20 @@ func (c *Client) Status(ctx context.Context, target Target) (Status, error) {
 }
 
 func (c *Client) Cancel(ctx context.Context, target Target) error {
-	if err := c.ready(target); err != nil {
+	target, err := c.ready(target)
+	if err != nil {
 		return err
 	}
-	_, err := c.runControl(ctx, "cancel", target, "cancel", "--session", target.ConsoleSessionID)
+	_, err = c.runControl(ctx, "cancel", target, "cancel", "--session", target.ConsoleSessionID)
 	return err
 }
 
 func (c *Client) Prompt(ctx context.Context, spec PromptSpec, emit func(Event) error) (PromptReceipt, error) {
-	if err := c.ready(spec.Target); err != nil {
+	target, err := c.ready(spec.Target)
+	if err != nil {
 		return PromptReceipt{}, err
 	}
+	spec.Target = target
 	if strings.TrimSpace(spec.Message) == "" {
 		return PromptReceipt{}, fmt.Errorf("prompt message is required")
 	}
@@ -325,11 +333,19 @@ func (c *Client) Prompt(ctx context.Context, spec PromptSpec, emit func(Event) e
 	return receipt, nil
 }
 
-func (c *Client) ready(target Target) error {
+func (c *Client) ready(target Target) (Target, error) {
 	if !c.verified.Load() {
-		return fmt.Errorf("acpx compatibility has not been probed")
+		return Target{}, fmt.Errorf("acpx compatibility has not been probed")
 	}
-	return target.validate()
+	if err := target.validate(); err != nil {
+		return Target{}, err
+	}
+	workingDirectory, err := gitrepo.CanonicalPath(target.WorkingDirectory)
+	if err != nil {
+		return Target{}, fmt.Errorf("resolve agent working directory %q: %w", target.WorkingDirectory, err)
+	}
+	target.WorkingDirectory = workingDirectory
+	return target, nil
 }
 
 func (c *Client) runControl(ctx context.Context, label string, target Target, operation ...string) (json.RawMessage, error) {

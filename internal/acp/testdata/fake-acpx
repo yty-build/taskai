@@ -20,6 +20,10 @@ if [ -n "${FAKE_ACPX_ARGS_LOG:-}" ]; then
   done
 fi
 
+if [ -n "${FAKE_ACPX_CWD_FILE:-}" ]; then
+  pwd -P > "${FAKE_ACPX_CWD_FILE}"
+fi
+
 scenario="${FAKE_ACPX_SCENARIO:-success}"
 command_line="$*"
 
