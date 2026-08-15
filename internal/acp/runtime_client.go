@@ -71,6 +71,44 @@ func (c *RuntimeClient) Resume(ctx context.Context, spec StartSpec) (SessionInfo
 	return info, nil
 }
 
+// Refresh closes the idle ACP provider process and resumes the exact same ACP
+// conversation. It is used after a provider-native harness exits so a later
+// ACP turn observes the provider's latest persisted transcript.
+func (c *RuntimeClient) Refresh(ctx context.Context, spec StartSpec) (SessionInfo, error) {
+	if strings.TrimSpace(spec.ResumeACPSessionID) == "" {
+		return SessionInfo{}, fmt.Errorf("ACP Session ID is required to refresh")
+	}
+	target, err := c.readyTarget(spec.Target)
+	if err != nil {
+		return SessionInfo{}, err
+	}
+	bridge, err := c.existingBridge(target)
+	if err != nil {
+		return SessionInfo{}, err
+	}
+	agentName, useBuiltin := runtimeAgentConfiguration(target.Profile)
+	var payload bridgeSession
+	err = bridge.call(ctx, bridgeCommand{
+		Type: "refresh", SessionKey: target.ConsoleSessionID, Agent: agentName, UseBuiltin: useBuiltin,
+		Argv: bridgeAgentArgv(target.Profile), Environment: cloneProfileEnvironment(target.Profile.Environment),
+		CWD: target.WorkingDirectory, PermissionMode: target.Permission, ResumeSessionID: spec.ResumeACPSessionID,
+	}, &payload)
+	if err != nil {
+		return SessionInfo{}, err
+	}
+	info, err := bridgeSessionInfo(target, payload)
+	if err != nil {
+		return SessionInfo{}, err
+	}
+	if info.ACPSessionID != spec.ResumeACPSessionID {
+		return SessionInfo{}, &ProtocolError{
+			Operation: "runtime refresh",
+			Message:   fmt.Sprintf("expected ACP Session ID %q, received %q", spec.ResumeACPSessionID, info.ACPSessionID),
+		}
+	}
+	return info, nil
+}
+
 func (c *RuntimeClient) ensure(ctx context.Context, spec StartSpec) (SessionInfo, error) {
 	target, err := c.readyTarget(spec.Target)
 	if err != nil {

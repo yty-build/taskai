@@ -31,6 +31,7 @@ type fakeACP struct {
 	resumeCount    int
 	resumeErr      error
 	resumeNativeID string
+	refreshCount   int
 }
 
 func newFakeACP() *fakeACP {
@@ -53,6 +54,16 @@ func (f *fakeACP) Resume(context.Context, acp.StartSpec) (acp.SessionInfo, error
 		nativeID = "native-start"
 	}
 	return acp.SessionInfo{ACPXRecordID: "acpx-resumed", ACPSessionID: "acp-resumed", NativeSessionID: nativeID}, nil
+}
+
+func (f *fakeACP) Refresh(_ context.Context, spec acp.StartSpec) (acp.SessionInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.refreshCount++
+	if f.resumeErr != nil {
+		return acp.SessionInfo{}, f.resumeErr
+	}
+	return acp.SessionInfo{ACPXRecordID: "acpx-refreshed", ACPSessionID: spec.ResumeACPSessionID, NativeSessionID: "native-start"}, nil
 }
 
 func (f *fakeACP) Prompt(ctx context.Context, spec acp.PromptSpec, emit func(acp.Event) error) (acp.PromptReceipt, error) {
@@ -377,7 +388,7 @@ func TestWorkerSerializesPromptsBroadcastsAndReplays(t *testing.T) {
 		t.Fatalf("status = %#v, %v", status, err)
 	}
 	if _, err := harness.client.Send(context.Background(), Command{Type: "native_acquire"}); err == nil {
-		t.Fatal("native lease acquired during active turn")
+		t.Fatal("removed native lease command was accepted")
 	}
 	if _, err := harness.client.Send(context.Background(), Command{Type: "cancel", RequestID: "req-1"}); err != nil {
 		t.Fatal(err)
@@ -614,49 +625,43 @@ func containsString(values []string, wanted string) bool {
 	return false
 }
 
-func TestNativeLeaseHoldsQueueUntilSuccessfulReconciliation(t *testing.T) {
+func TestNativeRefreshDefersUntilActiveAndQueuedPromptsFinish(t *testing.T) {
 	harness := startWorkerHarness(t)
-	if _, err := harness.client.Send(context.Background(), Command{Type: "native_acquire"}); err != nil {
-		t.Fatal(err)
+	first, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-active", Message: "active"})
+	if err != nil || first.State != "ready" {
+		t.Fatalf("active prompt = %#v, %v", first, err)
 	}
-	accepted, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-held", Message: "held"})
+	waitStarted(t, harness.acp.started, "req-active")
+	accepted, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-queued", Message: "queued"})
 	if err != nil || accepted.State != "queued" {
 		t.Fatalf("prompt = %#v, %v", accepted, err)
 	}
-	select {
-	case requestID := <-harness.acp.started:
-		t.Fatalf("queued prompt %s started during native lease", requestID)
-	case <-time.After(150 * time.Millisecond):
+	refresh, err := harness.client.Send(context.Background(), Command{Type: "refresh"})
+	if err != nil || refresh.Type != "refresh_scheduled" || refresh.State != "deferred" {
+		t.Fatalf("refresh = %#v, %v", refresh, err)
 	}
 	harness.acp.mu.Lock()
-	harness.acp.resumeErr = errors.New("cannot reconcile")
-	harness.acp.mu.Unlock()
-	if _, err := harness.client.Send(context.Background(), Command{Type: "native_release"}); err == nil {
-		t.Fatal("native release succeeded despite reconciliation failure")
+	if harness.acp.refreshCount != 0 {
+		harness.acp.mu.Unlock()
+		t.Fatal("refresh ran while an ACP turn was active")
 	}
+	harness.acp.mu.Unlock()
+	harness.acp.Complete("req-active")
+	waitStarted(t, harness.acp.started, "req-queued")
 	status, err := harness.client.Send(context.Background(), Command{Type: "status"})
-	if err != nil || !status.NativeLease || status.Queued != 1 {
-		t.Fatalf("status after failed reconcile = %#v, %v", status, err)
+	if err != nil || !status.RefreshPending || status.ActiveRequestID != "req-queued" {
+		t.Fatalf("status while refresh deferred = %#v, %v", status, err)
 	}
-	harness.acp.mu.Lock()
-	harness.acp.resumeErr = nil
-	harness.acp.resumeNativeID = "different-native-conversation"
-	harness.acp.mu.Unlock()
-	if _, err := harness.client.Send(context.Background(), Command{Type: "native_release"}); err == nil || !strings.Contains(err.Error(), "could not prove conversation identity") {
-		t.Fatalf("native identity mismatch error = %v", err)
-	}
-	status, err = harness.client.Send(context.Background(), Command{Type: "status"})
-	if err != nil || !status.NativeLease || status.Queued != 1 {
-		t.Fatalf("status after identity mismatch = %#v, %v", status, err)
-	}
-	harness.acp.mu.Lock()
-	harness.acp.resumeNativeID = "native-start"
-	harness.acp.mu.Unlock()
-	if _, err := harness.client.Send(context.Background(), Command{Type: "native_release"}); err != nil {
-		t.Fatal(err)
-	}
-	waitStarted(t, harness.acp.started, "req-held")
-	harness.acp.Complete("req-held")
+	harness.acp.Complete("req-queued")
+	waitFor(t, 2*time.Second, func() bool {
+		harness.acp.mu.Lock()
+		defer harness.acp.mu.Unlock()
+		return harness.acp.refreshCount == 1
+	})
+	waitFor(t, 2*time.Second, func() bool {
+		latest, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
+		return statusErr == nil && !latest.RefreshPending && !latest.Refreshing && latest.Queued == 0 && latest.ActiveRequestID == ""
+	})
 }
 
 func TestWorkerRejectsDuplicateAndUsesPrivateRuntimeFiles(t *testing.T) {

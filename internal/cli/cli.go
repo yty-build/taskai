@@ -18,6 +18,7 @@ import (
 	"github.com/yty-build/acp-gateway/internal/buildinfo"
 	"github.com/yty-build/acp-gateway/internal/config"
 	"github.com/yty-build/acp-gateway/internal/console"
+	"github.com/yty-build/acp-gateway/internal/native"
 	"github.com/yty-build/acp-gateway/internal/render"
 	appservice "github.com/yty-build/acp-gateway/internal/service"
 	"github.com/yty-build/acp-gateway/internal/sessionlog"
@@ -91,6 +92,14 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, info buil
 	switch args[0] {
 	case "_worker":
 		err = runHiddenWorker(ctx, args[1:], home, database)
+	case "_native":
+		registry, loadErr := agentregistry.Load(home.Agents)
+		if loadErr != nil {
+			err = loadErr
+			break
+		}
+		sessionService := appservice.NewSessionService(database, registry, home, runtime)
+		err = runHiddenNative(ctx, args[1:], stdout, stderr, sessionService)
 	case "tasks":
 		err = runTasks(ctx, args[1:], stdout, taskService)
 	case "task":
@@ -113,7 +122,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, info buil
 		err = runStart(ctx, args[1:], stdout, sessionService)
 	case "session":
 		var registry *agentregistry.Registry
-		if len(args) > 1 && (args[1] == "start" || args[1] == "review" || nativeAttachRequested(args[1:])) {
+		if len(args) > 1 && (args[1] == "start" || args[1] == "review" || args[1] == "attach") {
 			registry, err = agentregistry.Load(home.Agents)
 			if err != nil {
 				break
@@ -179,6 +188,16 @@ func runHiddenWorker(ctx context.Context, args []string, home config.Home, datab
 		return usagef("usage: acpctl _worker --session <session-id>")
 	}
 	return worker.RunSession(ctx, home, database, options.values["--session"])
+}
+
+func runHiddenNative(ctx context.Context, args []string, stdout, stderr io.Writer, service *appservice.SessionService) error {
+	options, err := parseOptions(args, map[string]optionKind{"--session": stringOption})
+	if err != nil || len(options.positionals) != 0 || options.values["--session"] == "" {
+		return usagef("usage: acpctl _native --session <session-id>")
+	}
+	return service.AttachNative(ctx, options.values["--session"], appservice.NativeAttachOptions{
+		Runner: native.ExecRunner{}, Input: os.Stdin, Output: stdout, ErrorOutput: stderr,
+	})
 }
 
 func fail(stderr io.Writer, code int, err error) int {
@@ -388,41 +407,23 @@ func runSession(ctx context.Context, args []string, stdout, stderr io.Writer, se
 		fmt.Fprintf(stdout, "Started reviewer %s for %s\nInitial request %s (%s)\n", launched.Session.ID, options.positionals[0], launched.RequestID, launched.State)
 		return nil
 	case "attach":
-		options, err := parseOptions(args[1:], map[string]optionKind{"--native": boolOption, "--cancel-active": boolOption, "--reconcile-only": boolOption})
+		options, err := parseOptions(args[1:], map[string]optionKind{"--acp": boolOption, "--native": boolOption})
 		if err != nil || len(options.positionals) != 1 {
-			return usagef("usage: acpctl session attach <session-id> [--native [--cancel-active|--reconcile-only]]")
+			return usagef("usage: acpctl session attach <session-id> [--acp]")
 		}
-		if options.booleans["--cancel-active"] && options.booleans["--reconcile-only"] {
-			return usagef("acpctl session attach: --cancel-active and --reconcile-only cannot be combined")
+		if options.booleans["--acp"] && options.booleans["--native"] {
+			return usagef("acpctl session attach: --acp and --native cannot be combined")
 		}
-		if options.booleans["--cancel-active"] || options.booleans["--reconcile-only"] {
-			options.booleans["--native"] = true
+		if options.booleans["--acp"] {
+			return console.AttachSession(ctx, console.Services{Sessions: service}, options.positionals[0], os.Stdin, stdout)
 		}
-		if options.booleans["--native"] {
-			return service.AttachNative(ctx, options.positionals[0], appservice.NativeAttachOptions{
-				Input: os.Stdin, Output: stdout, ErrorOutput: stderr,
-				CancelActive: options.booleans["--cancel-active"], ReconcileOnly: options.booleans["--reconcile-only"],
-			})
-		}
-		return console.AttachSession(ctx, console.Services{Sessions: service}, options.positionals[0], os.Stdin, stdout)
+		return service.AttachNative(ctx, options.positionals[0], appservice.NativeAttachOptions{Input: os.Stdin, Output: stdout, ErrorOutput: stderr})
 	default:
 		if len(args) != 1 {
 			return usagef("usage: acpctl session <session-id>")
 		}
 		return showSession(ctx, args[0], stdout, service)
 	}
-}
-
-func nativeAttachRequested(arguments []string) bool {
-	if len(arguments) == 0 || arguments[0] != "attach" {
-		return false
-	}
-	for _, argument := range arguments[1:] {
-		if argument == "--native" || argument == "--cancel-active" || argument == "--reconcile-only" {
-			return true
-		}
-	}
-	return false
 }
 
 func runSessionStart(ctx context.Context, args []string, stdout io.Writer, service *appservice.SessionService) error {
@@ -461,7 +462,7 @@ func showSession(ctx context.Context, id string, stdout io.Writer, service *apps
 	if current.Branch != "" {
 		fmt.Fprintf(stdout, "Branch: %s\n", current.Branch)
 	}
-	fmt.Fprintf(stdout, "Task Console ID: %s\nacpx record ID: %s\nACP Session ID: %s\nNative Session ID: %s\n", current.ID, valueOrDash(current.ACPXRecordID), valueOrDash(current.ACPSessionID), valueOrDash(current.NativeSessionID))
+	fmt.Fprintf(stdout, "Task Console ID: %s\nCanonical provider conversation: %s\nIdentity source: %s\nacpx record ID: %s\nACP Session ID: %s\nNative adapter ID: %s\n", current.ID, valueOrDash(current.ProviderConversationID), valueOrDash(string(current.ConversationIDSource)), valueOrDash(current.ACPXRecordID), valueOrDash(current.ACPSessionID), valueOrDash(current.NativeSessionID))
 	fmt.Fprintf(stdout, "Worker PID: %s\nWorker socket: %s\nLog: %s\n", intOrDash(current.WorkerPID), valueOrDash(current.WorkerSocket), valueOrDash(current.LogPath))
 	fmt.Fprintf(stdout, "Created: %s\nUpdated: %s\n", displayTime(current.CreatedAt), displayTime(current.UpdatedAt))
 	return nil

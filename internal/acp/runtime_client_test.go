@@ -457,6 +457,18 @@ func TestRuntimeResumeRequiresExactACPIdentity(t *testing.T) {
 	}
 }
 
+func TestRuntimeRefreshResumesExactACPIdentity(t *testing.T) {
+	client, target, _ := runtimeFixture(t, "success")
+	started, err := client.Resume(context.Background(), StartSpec{Target: target, ResumeACPSessionID: "acp-refresh"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshed, err := client.Refresh(context.Background(), StartSpec{Target: target, ResumeACPSessionID: started.ACPSessionID})
+	if err != nil || refreshed.ACPSessionID != started.ACPSessionID {
+		t.Fatalf("Refresh() = %#v, %v", refreshed, err)
+	}
+}
+
 func waitRuntimePermission(t *testing.T, events <-chan Event) string {
 	t.Helper()
 	timer := time.NewTimer(2 * time.Second)

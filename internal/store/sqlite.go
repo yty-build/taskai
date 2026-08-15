@@ -217,6 +217,7 @@ func (s *Store) UpdateTaskStatus(ctx context.Context, id string, status task.Sta
 }
 
 func (s *Store) CreateSession(ctx context.Context, params session.CreateParams) (session.Session, error) {
+	params = initializeConversationIdentity(params)
 	if err := params.Validate(); err != nil {
 		return session.Session{}, err
 	}
@@ -267,6 +268,7 @@ func (s *Store) CreateTaskWithSession(ctx context.Context, taskParams task.Creat
 		taskParams.ID = id
 	}
 	sessionParams.TaskID = taskParams.ID
+	sessionParams = initializeConversationIdentity(sessionParams)
 	if sessionParams.ID == "" {
 		id, err := identity.New("S")
 		if err != nil {
@@ -617,6 +619,20 @@ func cloneTime(value *time.Time) *time.Time {
 	}
 	cloned := value.UTC()
 	return &cloned
+}
+
+func initializeConversationIdentity(params session.CreateParams) session.CreateParams {
+	if strings.TrimSpace(params.ProviderConversationID) != "" {
+		return params
+	}
+	if value := strings.TrimSpace(params.NativeSessionID); value != "" {
+		params.ProviderConversationID = value
+		params.ConversationIDSource = session.ConversationSourceNative
+	} else if value := strings.TrimSpace(params.ACPSessionID); value != "" {
+		params.ProviderConversationID = value
+		params.ConversationIDSource = session.ConversationSourceACP
+	}
+	return params
 }
 
 func cloneJSON(value json.RawMessage) json.RawMessage {

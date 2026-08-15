@@ -13,7 +13,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/yty-build/acp-gateway/internal/acp"
 	"github.com/yty-build/acp-gateway/internal/agents"
@@ -398,53 +397,55 @@ func TestResumeAlsoProtectsSharedCheckout(t *testing.T) {
 	}
 }
 
-type nativeLeaseRuntime struct {
-	mu         sync.Mutex
-	active     string
-	lease      bool
-	calls      []string
-	releaseErr error
+type nativeTestRuntime struct {
+	mu           sync.Mutex
+	active       string
+	queued       int
+	calls        []string
+	refreshState string
+	refreshErr   error
 }
 
-func (r *nativeLeaseRuntime) Spawn(context.Context, string) (worker.SpawnResult, error) {
+func (r *nativeTestRuntime) Spawn(context.Context, string) (worker.SpawnResult, error) {
 	return worker.SpawnResult{}, nil
 }
 
-func (r *nativeLeaseRuntime) Send(_ context.Context, _ string, command worker.Command) (worker.Message, error) {
+func (r *nativeTestRuntime) Send(_ context.Context, _ string, command worker.Command) (worker.Message, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls = append(r.calls, command.Type)
 	switch command.Type {
 	case "status":
-		return worker.Message{Type: "status", ActiveRequestID: r.active, NativeLease: r.lease, Status: "waiting"}, nil
-	case "cancel":
-		if command.RequestID != r.active {
-			return worker.Message{}, errors.New("wrong active request")
+		return worker.Message{Type: "status", ActiveRequestID: r.active, Queued: r.queued, Status: "working"}, nil
+	case "refresh":
+		if r.refreshErr != nil {
+			return worker.Message{}, r.refreshErr
 		}
-		r.active = ""
-		return worker.Message{Type: "cancelled"}, nil
-	case "native_acquire":
-		if r.active != "" || r.lease {
-			return worker.Message{}, errors.New("lease unavailable")
+		state := r.refreshState
+		if state == "" {
+			state = "scheduled"
 		}
-		r.lease = true
-		return worker.Message{Type: "native_acquired"}, nil
-	case "native_release":
-		if r.releaseErr != nil {
-			return worker.Message{}, r.releaseErr
-		}
-		if !r.lease {
-			return worker.Message{}, errors.New("no lease")
-		}
-		r.lease = false
-		return worker.Message{Type: "native_released"}, nil
+		return worker.Message{Type: "refresh_scheduled", State: state}, nil
 	default:
 		return worker.Message{}, errors.New("unexpected worker command " + command.Type)
 	}
 }
 
-func (r *nativeLeaseRuntime) Subscribe(context.Context, string, uint64, func(worker.Message) error) error {
+func (r *nativeTestRuntime) Subscribe(context.Context, string, uint64, func(worker.Message) error) error {
 	return nil
+}
+
+type acceptingNativeVerifier struct {
+	err   error
+	calls []string
+}
+
+func (v *acceptingNativeVerifier) Verify(_ context.Context, _ agents.Profile, conversationID, workingDirectory string) (native.Verification, error) {
+	v.calls = append(v.calls, conversationID+"@"+workingDirectory)
+	if v.err != nil {
+		return native.Verification{}, v.err
+	}
+	return native.Verification{ConversationID: conversationID, StorePath: "/provider/store"}, nil
 }
 
 type recordingNativeRunner struct {
@@ -457,13 +458,16 @@ func (r *recordingNativeRunner) Run(_ context.Context, invocation native.Invocat
 	return r.err
 }
 
-func TestNativeAttachCancelsExplicitlyRunsCorrectConversationAndReleases(t *testing.T) {
+func TestNativeAttachRunsVerifiedCanonicalConversationWithoutPausingACP(t *testing.T) {
 	service, runtime, current := nativeServiceHarness(t, "codex", "native-exact")
 	runtime.active = "req-active"
+	runtime.queued = 2
+	runtime.refreshState = "deferred"
 	runner := &recordingNativeRunner{}
+	verifier := &acceptingNativeVerifier{}
 	var notices bytes.Buffer
 	if err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{
-		Runner: runner, Input: strings.NewReader(""), Output: io.Discard, ErrorOutput: &notices, CancelActive: true,
+		Runner: runner, Verifier: verifier, Input: strings.NewReader(""), Output: io.Discard, ErrorOutput: &notices,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -471,95 +475,86 @@ func TestNativeAttachCancelsExplicitlyRunsCorrectConversationAndReleases(t *test
 		t.Fatalf("native invocation = %#v", runner.invocation)
 	}
 	runtime.mu.Lock()
-	calls, leased := append([]string(nil), runtime.calls...), runtime.lease
+	calls, active, queued := append([]string(nil), runtime.calls...), runtime.active, runtime.queued
 	runtime.mu.Unlock()
-	if !reflect.DeepEqual(calls, []string{"status", "cancel", "status", "native_acquire", "native_release"}) || leased {
-		t.Fatalf("native worker calls=%v lease=%v", calls, leased)
+	if !reflect.DeepEqual(calls, []string{"status", "refresh"}) || active != "req-active" || queued != 2 {
+		t.Fatalf("native worker calls=%v active=%q queued=%d", calls, active, queued)
 	}
-	for _, expected := range []string{"cancelling active ACP turn req-active", "native lease acquired", "reconciled"} {
+	for _, expected := range []string{"ACP activity is also live", "refresh is deferred"} {
 		if !strings.Contains(notices.String(), expected) {
 			t.Errorf("notices missing %q: %s", expected, notices.String())
 		}
 	}
+	verified, err := service.Get(context.Background(), current.ID)
+	if err != nil || verified.ProviderConversationID != "native-exact" || verified.ConversationIDSource != session.ConversationSourceProviderStore || verified.ConversationIDVerifiedAt == nil {
+		t.Fatalf("verified Session = %#v, %v", verified, err)
+	}
+	if len(verifier.calls) != 1 || !strings.HasPrefix(verifier.calls[0], "native-exact@") {
+		t.Fatalf("verification calls = %v", verifier.calls)
+	}
 }
 
-func TestNativeAttachWaitsForActiveTurnWithoutImplicitCancellation(t *testing.T) {
+func TestNativeAttachRequiresCanonicalIDWithoutTouchingWorker(t *testing.T) {
+	service, runtime, current := nativeServiceHarness(t, "codex", "")
+	err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{Runner: &recordingNativeRunner{}, Verifier: &acceptingNativeVerifier{}})
+	if err == nil || !strings.Contains(err.Error(), "no canonical provider conversation ID") {
+		t.Fatalf("missing canonical ID error = %v", err)
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if len(runtime.calls) != 0 {
+		t.Fatalf("missing ID touched worker: calls=%v", runtime.calls)
+	}
+}
+
+func TestNativeAttachRejectsUnverifiedConversationBeforeRunner(t *testing.T) {
 	service, runtime, current := nativeServiceHarness(t, "codex", "native-exact")
-	runtime.active = "req-finish-naturally"
-	go func() {
-		time.Sleep(40 * time.Millisecond)
-		runtime.mu.Lock()
-		runtime.active = ""
-		runtime.mu.Unlock()
-	}()
-	var notices bytes.Buffer
-	if err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{Runner: &recordingNativeRunner{}, ErrorOutput: &notices}); err != nil {
-		t.Fatal(err)
+	runner := &recordingNativeRunner{}
+	err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{
+		Runner: runner, Verifier: &acceptingNativeVerifier{err: errors.New("exact transcript missing")},
+	})
+	if err == nil || !strings.Contains(err.Error(), "exact transcript missing") {
+		t.Fatalf("verification error = %v", err)
 	}
 	runtime.mu.Lock()
 	calls := append([]string(nil), runtime.calls...)
 	runtime.mu.Unlock()
-	for _, call := range calls {
-		if call == "cancel" {
-			t.Fatalf("native attachment cancelled implicitly: calls=%v", calls)
-		}
-	}
-	if !strings.Contains(notices.String(), "waiting for active ACP turn req-finish-naturally") {
-		t.Fatalf("wait notice = %q", notices.String())
+	if len(calls) != 0 || runner.invocation.Command != "" {
+		t.Fatalf("unverified attach touched runtime or runner: calls=%v invocation=%#v", calls, runner.invocation)
 	}
 }
 
-func TestNativeAttachRequiresIDBeforeLease(t *testing.T) {
-	service, runtime, current := nativeServiceHarness(t, "codex", "")
-	err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{Runner: &recordingNativeRunner{}})
-	if err == nil || !strings.Contains(err.Error(), "no provider-native Session ID") {
-		t.Fatalf("missing native ID error = %v", err)
-	}
-	runtime.mu.Lock()
-	defer runtime.mu.Unlock()
-	if len(runtime.calls) != 0 || runtime.lease {
-		t.Fatalf("missing ID touched worker: calls=%v lease=%v", runtime.calls, runtime.lease)
-	}
-}
-
-func TestFailedNativeReconciliationHoldsLeaseUntilExplicitRetry(t *testing.T) {
+func TestNativeProcessFailureStillSchedulesNonBlockingRefresh(t *testing.T) {
 	service, runtime, current := nativeServiceHarness(t, "codex", "native-exact")
-	runtime.releaseErr = errors.New("acpx offline")
-	err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{Runner: &recordingNativeRunner{}})
-	if err == nil || !strings.Contains(err.Error(), "--reconcile-only") || !strings.Contains(err.Error(), "queued prompts remain paused") {
-		t.Fatalf("reconciliation error = %v", err)
-	}
-	runtime.mu.Lock()
-	if !runtime.lease {
-		runtime.mu.Unlock()
-		t.Fatal("failed reconciliation released native lease")
-	}
-	runtime.releaseErr = nil
-	runtime.mu.Unlock()
-	if err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{ReconcileOnly: true}); err != nil {
-		t.Fatalf("explicit reconciliation retry: %v", err)
-	}
-	runtime.mu.Lock()
-	defer runtime.mu.Unlock()
-	if runtime.lease {
-		t.Fatal("successful reconciliation retry retained lease")
-	}
-}
-
-func TestNativeProcessFailureStillReconcilesBeforeReturning(t *testing.T) {
-	service, runtime, current := nativeServiceHarness(t, "codex", "native-exact")
-	err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{Runner: &recordingNativeRunner{err: errors.New("exit 7")}})
-	if err == nil || !strings.Contains(err.Error(), "safely reconciled") {
+	err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{Runner: &recordingNativeRunner{err: errors.New("exit 7")}, Verifier: &acceptingNativeVerifier{}})
+	if err == nil || !strings.Contains(err.Error(), "exit 7") {
 		t.Fatalf("native process error = %v", err)
 	}
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
-	if runtime.lease || runtime.calls[len(runtime.calls)-1] != "native_release" {
-		t.Fatalf("process failure did not reconcile: calls=%v lease=%v", runtime.calls, runtime.lease)
+	if !reflect.DeepEqual(runtime.calls, []string{"status", "refresh"}) {
+		t.Fatalf("process failure refresh calls=%v", runtime.calls)
 	}
 }
 
-func nativeServiceHarness(t *testing.T, agentName, nativeID string) (*SessionService, *nativeLeaseRuntime, session.Session) {
+type continuingNativeRunner struct{ recordingNativeRunner }
+
+func (*continuingNativeRunner) ProcessMayContinue() bool { return true }
+
+func TestDetachedTmuxViewerLeavesRefreshToNativeProcessOwner(t *testing.T) {
+	service, runtime, current := nativeServiceHarness(t, "codex", "native-exact")
+	runner := &continuingNativeRunner{}
+	if err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{Runner: runner, Verifier: &acceptingNativeVerifier{}}); err != nil {
+		t.Fatal(err)
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if !reflect.DeepEqual(runtime.calls, []string{"status"}) {
+		t.Fatalf("viewer detach scheduled premature refresh: %v", runtime.calls)
+	}
+}
+
+func nativeServiceHarness(t *testing.T, agentName, nativeID string) (*SessionService, *nativeTestRuntime, session.Session) {
 	t.Helper()
 	ctx := context.Background()
 	root := t.TempDir()
@@ -585,9 +580,13 @@ func nativeServiceHarness(t *testing.T, agentName, nativeID string) (*SessionSer
 	if err != nil {
 		t.Fatal(err)
 	}
+	acpID := ""
+	if nativeID != "" {
+		acpID = "acp-exact"
+	}
 	current, err := repository.CreateSession(ctx, session.CreateParams{
 		ID: "S-native", TaskID: createdTask.ID, Agent: agentName, Provider: "openai", RepoPath: canonicalRepo,
-		NativeSessionID: nativeID, ACPSessionID: "acp-exact", WorkerSocket: filepath.Join(root, "worker.sock"), Status: session.StatusWaiting,
+		NativeSessionID: nativeID, ACPSessionID: acpID, WorkerSocket: filepath.Join(root, "worker.sock"), Status: session.StatusWaiting,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -596,6 +595,6 @@ func nativeServiceHarness(t *testing.T, agentName, nativeID string) (*SessionSer
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtime := &nativeLeaseRuntime{}
+	runtime := &nativeTestRuntime{}
 	return NewSessionService(repository, registry, home, runtime), runtime, current
 }

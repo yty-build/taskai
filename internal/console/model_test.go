@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -31,6 +32,7 @@ type fakeBackend struct {
 	starts      []appservice.StartSessionParams
 	profiles    []agents.Profile
 	promptState string
+	native      []string
 }
 
 type promptCall struct {
@@ -141,6 +143,13 @@ func (f *fakeBackend) StartSession(_ context.Context, params appservice.StartSes
 	return appservice.LaunchResult{Session: created, RequestID: "REQ-3", State: "ready"}, nil
 }
 
+func (f *fakeBackend) AttachNative(_ context.Context, id string, _ io.Reader, _, _ io.Writer) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.native = append(f.native, id)
+	return nil
+}
+
 func TestTaskConsoleShowsEverySessionAndDetachesOnlyViewer(t *testing.T) {
 	backend := newConsoleBackend()
 	model, cancel, err := newTaskModel(context.Background(), backend, "T-1")
@@ -209,10 +218,10 @@ func TestTaskConsoleKeyboardMouseAndExplicitPromptTarget(t *testing.T) {
 
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
 	model = updated.(Model)
-	updated, _ = model.Update(tea.MouseMsg(tea.MouseEvent{X: 2, Y: 5, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft}))
+	updated, nativeCommand := model.Update(tea.MouseMsg(tea.MouseEvent{X: 2, Y: 5, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft}))
 	model = updated.(Model)
-	if model.mode != sessionView || model.current.ID != "S-1" {
-		t.Fatalf("mouse drill opened %s in mode %d", model.current.ID, model.mode)
+	if model.mode != taskView || model.selected != 0 || nativeCommand == nil {
+		t.Fatalf("mouse native attach: selected=%d mode=%d command=%v", model.selected, model.mode, nativeCommand)
 	}
 }
 

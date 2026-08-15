@@ -45,7 +45,8 @@ type Message struct {
 	Timestamp       time.Time           `json:"timestamp,omitempty"`
 	LineType        string              `json:"line_type,omitempty"`
 	Queued          int                 `json:"queued,omitempty"`
-	NativeLease     bool                `json:"native_lease,omitempty"`
+	RefreshPending  bool                `json:"refresh_pending,omitempty"`
+	Refreshing      bool                `json:"refreshing,omitempty"`
 	Permissions     []PendingPermission `json:"permissions,omitempty"`
 	Data            json.RawMessage     `json:"data,omitempty"`
 	Message         string              `json:"message,omitempty"`

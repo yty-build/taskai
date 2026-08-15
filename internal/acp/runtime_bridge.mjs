@@ -396,6 +396,19 @@ async function ensure(command) {
   emit({ type: "response", commandId: command.commandId, data: { handle, status } });
 }
 
+async function refresh(command) {
+  if (!runtime || !handle) {
+    throw new Error("acpx runtime Session is not ensured");
+  }
+  if (activeTurn) {
+    throw new Error("cannot refresh while an acpx runtime turn is active");
+  }
+  cancelPendingPermissions("Session refreshed after native activity");
+  await runtime.close({ handle, reason: "refresh after provider-native activity" });
+  handle = undefined;
+  await ensure(command);
+}
+
 async function runTurn(command) {
   if (!runtime || !handle) {
     throw new Error("acpx runtime Session is not ensured");
@@ -514,6 +527,9 @@ async function handleCommand(command) {
     switch (command.type) {
       case "ensure":
         await ensure(command);
+        break;
+      case "refresh":
+        await refresh(command);
         break;
       case "turn":
         await runTurn(command);

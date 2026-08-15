@@ -56,7 +56,8 @@ func TestSessionLifecycleThroughBuiltCLIAndDetachedWorker(t *testing.T) {
 		t.Fatal(err)
 	}
 	nativeRecord := filepath.Join(root, "native-record")
-	profile := fmt.Sprintf("name: codex\nprovider: openai\ncommand: %q\nenvironment:\n  FAKE_NATIVE_RECORD: %q\n  FAKE_NATIVE_MARKER: lifecycle\n", nativeFixture, nativeRecord)
+	codexHome := filepath.Join(root, "codex-home")
+	profile := fmt.Sprintf("name: codex\nprovider: openai\ncommand: %q\nenvironment:\n  CODEX_HOME: %q\n  FAKE_NATIVE_RECORD: %q\n  FAKE_NATIVE_MARKER: lifecycle\n", nativeFixture, codexHome, nativeRecord)
 	if err := os.WriteFile(filepath.Join(root, "agents", "codex.yaml"), []byte(profile), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -77,14 +78,22 @@ func TestSessionLifecycleThroughBuiltCLIAndDetachedWorker(t *testing.T) {
 		code, detail, _ = runBinary(root, binary, "session", sessionID)
 		return code == 0 && strings.Contains(detail, "Status: waiting") && strings.Contains(detail, "ACP Session ID: acp-reconnected")
 	})
-	for _, expected := range []string{"Task: " + taskID, "Role: researcher", "Permission: approve-all", "acpx record ID: acpx-record", "Native Session ID: native-reconnected", "Worker PID:"} {
+	for _, expected := range []string{"Task: " + taskID, "Role: researcher", "Permission: approve-all", "acpx record ID: acpx-record", "Canonical provider conversation: native-reconnected", "Native adapter ID: native-reconnected", "Worker PID:"} {
 		if !strings.Contains(detail, expected) {
 			t.Errorf("Session detail does not contain %q:\n%s", expected, detail)
 		}
 	}
 
-	code, output, stderr = runBinary(root, binary, "session", "attach", sessionID, "--native")
-	if code != 0 || !strings.Contains(output, "fake native attached") || !strings.Contains(stderr, "native lease acquired") || !strings.Contains(stderr, "reconciled") {
+	conversationPath := filepath.Join(codexHome, "sessions", "2026", "08", "15", "rollout-native-reconnected.jsonl")
+	if err := os.MkdirAll(filepath.Dir(conversationPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	conversation := fmt.Sprintf("{\"type\":\"session_meta\",\"payload\":{\"id\":\"native-reconnected\",\"cwd\":%q}}\n", canonicalRepo)
+	if err := os.WriteFile(conversationPath, []byte(conversation), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, output, stderr = runBinary(root, binary, "session", "attach", sessionID)
+	if code != 0 || !strings.Contains(output, "fake native attached") || !strings.Contains(stderr, "ACP refresh scheduled") {
 		t.Fatalf("native attach: code=%d output=%q stderr=%q", code, output, stderr)
 	}
 	nativeInvocation, err := os.ReadFile(nativeRecord)
@@ -97,8 +106,8 @@ func TestSessionLifecycleThroughBuiltCLIAndDetachedWorker(t *testing.T) {
 		}
 	}
 	code, output, stderr = runBinary(root, binary, "session", "logs", sessionID)
-	if code != 0 || stderr != "" || !strings.Contains(output, "native acquired") || !strings.Contains(output, "native released") {
-		t.Fatalf("native lease history: code=%d output=%q stderr=%q", code, output, stderr)
+	if code != 0 || stderr != "" || !strings.Contains(output, "native refresh") {
+		t.Fatalf("native refresh history: code=%d output=%q stderr=%q", code, output, stderr)
 	}
 
 	argsLog, err := os.ReadFile(filepath.Join(root, "acpx-args.log"))

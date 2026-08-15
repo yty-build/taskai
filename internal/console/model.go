@@ -281,6 +281,8 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 				m.selected++
 			}
 		case "enter":
+			return m.attachSelectedNative()
+		case "a":
 			return m.openSelected(false)
 		case "p":
 			return m.openSelected(true)
@@ -450,7 +452,20 @@ func (m Model) handleMouse(event tea.MouseEvent) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.selected = index
-	return m.openSelected(false)
+	return m.attachSelectedNative()
+}
+
+func (m Model) attachSelectedNative() (tea.Model, tea.Cmd) {
+	if len(m.task.Sessions) == 0 {
+		m.notice = "This Task has no Sessions. Press n to add one."
+		return m, nil
+	}
+	current := m.task.Sessions[m.selected]
+	m.notice = "Opening the native " + valueOr(current.Agent, "provider") + " harness for " + current.ID + "…"
+	command := &nativeAttachCommand{ctx: m.ctx, backend: m.backend, sessionID: current.ID}
+	return m, tea.Exec(command, func(err error) tea.Msg {
+		return actionMsg{kind: "native", sessionID: current.ID, err: err}
+	})
 }
 
 func (m Model) openSelected(prompt bool) (tea.Model, tea.Cmd) {
@@ -621,6 +636,8 @@ func (m Model) handleAction(message actionMsg) (tea.Model, tea.Cmd) {
 		m.notice = "Session worker stopped; the conversation remains resumable."
 	case "permission":
 		m.notice = "Permission decision accepted. The agent turn continues in this Session."
+	case "native":
+		m.notice = "Returned from the native harness. The provider conversation remains the same."
 	}
 	return m, m.refreshCmd()
 }

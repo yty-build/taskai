@@ -28,6 +28,7 @@ type Backend interface {
 	Stop(context.Context, string) error
 	AvailableAgents(context.Context) ([]agents.Profile, error)
 	StartSession(context.Context, appservice.StartSessionParams) (appservice.LaunchResult, error)
+	AttachNative(context.Context, string, io.Reader, io.Writer, io.Writer) error
 }
 
 type Services struct {
@@ -77,6 +78,27 @@ func (s Services) AvailableAgents(context.Context) ([]agents.Profile, error) {
 
 func (s Services) StartSession(ctx context.Context, params appservice.StartSessionParams) (appservice.LaunchResult, error) {
 	return s.Sessions.Start(ctx, params)
+}
+
+func (s Services) AttachNative(ctx context.Context, sessionID string, input io.Reader, output, errorOutput io.Writer) error {
+	return s.Sessions.AttachNative(ctx, sessionID, appservice.NativeAttachOptions{Input: input, Output: output, ErrorOutput: errorOutput})
+}
+
+type nativeAttachCommand struct {
+	ctx       context.Context
+	backend   Backend
+	sessionID string
+	input     io.Reader
+	output    io.Writer
+	stderr    io.Writer
+}
+
+func (c *nativeAttachCommand) SetStdin(input io.Reader)   { c.input = input }
+func (c *nativeAttachCommand) SetStdout(output io.Writer) { c.output = output }
+func (c *nativeAttachCommand) SetStderr(output io.Writer) { c.stderr = output }
+
+func (c *nativeAttachCommand) Run() error {
+	return c.backend.AttachNative(c.ctx, c.sessionID, c.input, c.output, c.stderr)
 }
 
 func AttachTask(ctx context.Context, backend Backend, taskID string, input io.Reader, output io.Writer) error {
