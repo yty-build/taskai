@@ -9,7 +9,8 @@ The product contract is defined by `agent_task_console_spec.md`; the ordered bui
 - Do not add Run, Event, Artifact, workflow, broker, or daemon domain models.
 - Keep all `acpx` behavior behind `internal/acp`.
 - Treat attachment as a disposable viewer connection. Detaching must never stop a worker or cancel a turn.
-- Treat provider-native attachment as exclusive; ACP and a native CLI must never write concurrently.
+- Persist one canonical provider conversation identity per Session and use it on every native or ACP continuation.
+- Treat ACP/native concurrency as advisory presence only. Never pause, cancel, or block one surface because the other may be open; the user owns cross-surface coordination.
 - Keep HTTP, CLI, and terminal UIs as transports over shared application services.
 
 ## Development commands

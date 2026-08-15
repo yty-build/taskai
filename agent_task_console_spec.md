@@ -37,8 +37,8 @@ It manages only:
 4. Agent invocation through ACP.
 5. Repo/worktree association.
 6. Live session visibility.
-7. Interactive Task and Session attachment through ACP.
-8. Optional exclusive access through a provider's native CLI.
+7. A polished Task navigator plus structured ACP views for terminal, web, and mobile clients.
+8. The real provider-native harness as the default terminal Session experience.
 
 Everything else remains owned by the systems already good at it:
 
@@ -58,7 +58,7 @@ Everything else remains owned by the systems already good at it:
 > **ACP = how we control that agent.**<br>
 > **Worker = what keeps that session alive.**<br>
 > **Repo/worktree = where the work lives.**<br>
-> **Attach = how a human observes and steers through ACP.**<br>
+> **Attach = how a human returns to the same provider conversation.**<br>
 > **CLI/web/mobile = views and controls over the same state.**
 
 ## 2.2 What the product should feel like
@@ -285,8 +285,12 @@ repo_path
 worktree_path
 branch
 
-acp_session_id
-native_session_id
+acpx_record_id
+acp_session_id                 # adapter evidence / resume transport
+native_session_id              # optional adapter evidence / compatibility
+provider_conversation_id       # canonical provider identity used by native attach
+conversation_id_source         # acp, native, or verified-provider-store
+conversation_id_verified_at
 
 status
 
@@ -595,7 +599,7 @@ Example worker metadata:
   "pid": 1044,
   "socket": "/home/user/.agent/workers/S102.sock",
   "acp_session_id": "abc123",
-  "native_session_id": "abc123"
+  "provider_conversation_id": "abc123"
 }
 ```
 
@@ -616,8 +620,7 @@ Commands:
 {"type":"cancel","request_id":"req-42"}
 {"type":"status"}
 {"type":"tail","from":100}
-{"type":"native_acquire"}
-{"type":"native_release"}
+{"type":"refresh"}
 ```
 
 Responses:
@@ -631,7 +634,7 @@ Responses:
 
 Closing a subscriber connection only detaches that viewer. It must not cancel a turn, stop the worker, or close the ACP Session.
 
-The worker may grant an exclusive native lease only when the active ACP turn has completed or been cancelled. While that lease exists, the worker stays alive and may retain queued prompts, but it must not issue prompts to the same provider-native Session.
+Provider-native attachment does not acquire a worker lease. It must not pause or cancel an ACP turn, change Session state, or hold the prompt queue. A `refresh` request made after native activity is best effort: reconnect immediately when the worker is idle, or defer it until the active turn and queued prompts complete. Cross-surface concurrency warnings are advisory because the user owns coordination.
 
 Use newline-delimited JSON over Unix sockets.
 
@@ -842,10 +845,16 @@ Prompt:
 acpctl session prompt S102 "Check the one-hour horizon too"
 ```
 
-Attach to the interactive ACP console:
+Attach to the provider's native harness for the same conversation:
 
 ```bash
 acpctl session attach S102
+```
+
+Open the structured ACP console explicitly:
+
+```bash
+acpctl session attach S102 --acp
 ```
 
 Follow logs without an interactive console:
@@ -879,15 +888,9 @@ Stop worker:
 acpctl session stop S102
 ```
 
-Open the provider-native CLI as an explicit exclusive mode:
-
-```bash
-acpctl session attach S102 --native
-```
-
 ---
 
-# 14. Interactive Attachment and Native Mode
+# 14. Interactive Attachment and Native/ACP Views
 
 Attachment is the primary way a human observes and steers work. It is a client connection to existing Task/Session state; it is not a new persistent entity and it does not own worker lifetime.
 
@@ -899,15 +902,17 @@ Attachment is the primary way a human observes and steers work. It is a client c
 2. shows agent, role, repo/worktree, status, and latest activity,
 3. updates when Sessions are added or change state,
 4. accepts keyboard and mouse selection,
-5. drills into a selected Session without launching another process,
-6. provides controls for prompt, cancel, resume, stop, review, and native mode,
+5. opens the selected Session in its real provider-native harness on Enter,
+6. provides an explicit ACP view plus controls for prompt, cancel, resume, stop, and review,
 7. returns from Session detail to the Task overview.
+
+The terminal Task console uses a two-pane Session navigator and selected-Session preview at normal widths, with a stacked layout for narrow terminals. A single action registry drives keyboard shortcuts, contextual footer hints, help, and command-palette entries. Filtering and a command palette make larger Tasks quick to navigate. Returning from a native harness restores the Task console.
 
 A Task is not itself an agent. A message entered at Task scope must target an explicitly selected Session. V1 must not silently broadcast a prompt to every Session.
 
 ## 14.2 Session attachment
 
-`acpctl session attach <session-id>` opens the same Session detail console directly.
+`acpctl session attach <session-id> --acp` opens the structured ACP Session console directly. Web and mobile Session selection always opens this same structured ACP view because those clients cannot embed a local provider terminal.
 
 The console first replays stored ACP-visible history and then subscribes to live output. It should render agent messages, tool calls, command results, diffs, permission requests, errors, and reasoning information when the provider exposes them through ACP. A raw/debug gateway-envelope view is available as an advanced toggle; with the public runtime bridge it is not an exact JSON-RPC packet capture.
 
@@ -932,43 +937,52 @@ This behavior applies equally to terminal, web, mobile, automation, and agent-to
 
 ## 14.4 Provider-native mode
 
-`acpctl session attach <session-id> --native` is an escape hatch for interacting through the provider's native CLI rather than through ACP.
-
-Native mode is exclusive because an ACP worker and a provider-native CLI must not both write to the same native Session concurrently.
+`acpctl session attach <session-id>` opens the provider's real native CLI and resumes the Session's canonical provider conversation. `--native` is accepted as a compatibility alias. This is the default terminal experience; the gateway does not attempt to reproduce Codex, Claude, Grok, or OpenCode's native harness.
 
 Examples:
 
 Codex:
 
 ```bash
-codex resume <native_session_id>
+codex resume <provider_conversation_id>
 ```
 
 Claude:
 
 ```bash
-claude --resume <native_session_id>
+claude --resume <provider_conversation_id>
 ```
 
 Gemini:
 
 ```bash
-gemini --resume <native_session_id>
+gemini --resume <provider_conversation_id>
+```
+
+Grok:
+
+```bash
+grok --resume <provider_conversation_id>
+```
+
+OpenCode:
+
+```bash
+opencode --session <provider_conversation_id>
 ```
 
 Behavior:
 
-1. let the active ACP turn finish or allow the human to cancel it with `Esc`,
-2. acquire an exclusive native lease from the worker,
-3. mark the Session `waiting`, keep the worker alive, and prevent it from issuing ACP prompts,
-4. hold queued ACP prompts without running them,
-5. launch the native CLI in the repo/worktree,
-6. when the human exits, reconcile/resume the same native Session through the adapter,
-7. release the native lease and continue queued ACP prompts only after reconciliation succeeds.
+1. resolve the canonical provider conversation ID persisted for the Session,
+2. verify the exact ID exists in the provider's local store and belongs to the same repo/worktree,
+3. launch the documented native resume command in that repo/worktree,
+4. preferably host it in a tmux session derived from the Task Console Session ID so terminal detach/reattach preserves the native process,
+5. leave any active ACP turn and queued prompts untouched,
+6. after native exit, request a best-effort ACP refresh at the next idle boundary.
 
-If the provider does not expose a resumable native Session ID or reconciliation fails, leave the Session in `waiting` with an actionable explanation. Never guess that two different provider conversations are the same Session.
+If the canonical ID is missing, cannot be verified, or the provider cannot resume it, fail with an actionable explanation. Never choose the newest provider transcript, guess that two IDs represent the same conversation, or silently open a replacement conversation.
 
-Do not allow the automated worker and human CLI to actively write to the same native Session at the same time.
+The gateway may display that ACP and native clients could both be active, but it does not enforce a lock. Concurrent writes are a provider/user concern: the user is responsible for avoiding conflicting conversations when the provider does not serialize them safely.
 
 ---
 
@@ -1237,14 +1251,19 @@ CREATE TABLE sessions (
     worktree_path TEXT,
     branch TEXT,
 
+    acpx_record_id TEXT,
     acp_session_id TEXT,
     native_session_id TEXT,
+    provider_conversation_id TEXT,
+    conversation_id_source TEXT,
+    conversation_id_verified_at TEXT,
 
     status TEXT NOT NULL,
 
     worker_pid INTEGER,
     worker_socket TEXT,
     log_path TEXT,
+    metadata_json TEXT,
 
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -1329,7 +1348,7 @@ acpctl _worker --session S201
 worker starts acpx / ACP agent
        │
        ▼
-persist ACP/native session IDs
+persist acpx/ACP evidence and canonical provider conversation ID
        │
        ▼
 status = working
@@ -1459,15 +1478,17 @@ Implementation may use ULIDs internally while exposing short prefixes.
 
 Avoid making provider-native session IDs the product IDs.
 
-Persist both:
+Persist these identities:
 
 ```text
 our Session ID
+acpx record ID
 ACP session ID
-native runtime session ID
+canonical provider conversation ID
+identity source and last verified time
 ```
 
-because they are different concepts even when values happen to match.
+The canonical provider conversation ID is the only ID used for subsequent provider-native continuation. ACP/native adapter IDs remain evidence and migration fields because they are different protocol concepts even when their values happen to match. Once a Session has a canonical identity, no attach path may replace it implicitly.
 
 ---
 
@@ -1478,8 +1499,8 @@ because they are different concepts even when values happen to match.
 3. Do not expose implementation vocabulary unless useful.
 4. Raw ACP details should live under an advanced/debug view.
 5. Repo/worktree should always be visible on Session details.
-6. `attach` always means an interactive Task or Session console through the gateway and ACP.
-7. Provider-native access is an explicit `acpctl session attach <id> --native` mode.
+6. Task attachment is a gateway navigator; selecting a Session opens the provider-native harness by default.
+7. Direct terminal Session attachment is native by default; `acpctl session attach <id> --acp` opens the structured ACP console used by web/mobile.
 8. Detaching a viewer must never stop a worker or active turn.
 9. Reviewer Sessions should be visually distinct from producer Sessions.
 10. A user should be able to understand the current state without reading raw logs.
@@ -1712,7 +1733,8 @@ V1 is complete when all of these work.
 - [ ] Cancel/stop/bridge failure abandons pending permission safely and executes no denied write.
 - [ ] Attach to a Task and see all of its Sessions update live.
 - [ ] Select a Session from the Task console with keyboard or mouse.
-- [ ] Attach directly to a Session and see stored history followed by live ACP output.
+- [ ] Attach directly to a Session and resume the exact provider conversation in its native harness.
+- [ ] Use `session attach --acp` and see stored history followed by live ACP output.
 - [ ] Queue a steering prompt while a turn is active.
 - [ ] Cancel an active turn with `Esc` and continue in the same Session.
 - [ ] Detach without interrupting the active turn.
@@ -1722,12 +1744,13 @@ V1 is complete when all of these work.
 - [ ] Follow aggregate Task logs without an interactive console.
 - [ ] Cancel a Session.
 - [ ] Resume a stopped Session.
-- [ ] Persist ACP/native session IDs.
+- [ ] Persist a canonical provider conversation ID plus ACP/acpx identity evidence.
 - [ ] Associate Session with Git worktree.
 - [ ] Create isolated worktrees on request.
-- [ ] Human can enter exclusive provider-native mode with `acpctl session attach <id> --native`.
-- [ ] ACP and native clients never write to the same native Session concurrently.
-- [ ] Exiting native mode reconciles ACP state before queued prompts continue.
+- [ ] Enter on a Task Session and `session attach <id>` both open the real provider-native harness.
+- [ ] Codex, Claude, Grok, and OpenCode resume the exact verified conversation ID; no recency fallback is used.
+- [ ] Native attach never pauses/cancels ACP or holds queued prompts, and any concurrency warning is advisory.
+- [ ] Exiting native mode requests a nonblocking ACP refresh at the next idle boundary.
 
 ## Review
 
@@ -1778,7 +1801,7 @@ Build in this order.
 7. pinned `acpx` adapter and compatibility fixtures.
 8. Start ACP Session.
 9. Prompt queue, cancel, and resume.
-10. request correlation and native/ACP IDs.
+10. request correlation and canonical provider conversation identity.
 
 ## Phase 3 — durable workers
 
@@ -1791,7 +1814,7 @@ Build in this order.
 ## Phase 4 — interactive attachment
 
 16. `acpctl task attach` Task console.
-17. `acpctl session attach` Session console.
+17. `acpctl session attach --acp` structured Session console.
 18. keyboard/mouse Session selection.
 19. history replay followed by live stream.
 20. prompt/cancel/resume/stop controls.
@@ -1802,7 +1825,7 @@ Build in this order.
 22. repo validation.
 23. optional worktree creation.
 24. branch naming.
-25. `acpctl session attach --native` exclusive lease and reconciliation.
+25. canonical provider identity verification and native-by-default attachment.
 
 ## Phase 6 — review helper
 
@@ -1856,24 +1879,22 @@ S101  researcher  Gemini  done
 S102  analyst     Codex   working
 ```
 
-Select `S102` from the Task console or attach directly:
+Select `S102` from the Task console or attach directly to its real provider harness:
 
 ```bash
 acpctl session attach S102
 ```
 
-Observe the stored ACP-visible history, continue receiving live work, submit a steering prompt, and detach without stopping the Session.
+To observe stored ACP-visible history, continue receiving live ACP work, or submit an ACP steering prompt explicitly:
+
+```bash
+acpctl session attach S102 --acp
+```
 
 Start review:
 
 ```bash
 acpctl session review S102 --agent claude
-```
-
-Open the native provider CLI only if needed:
-
-```bash
-acpctl session attach S102 --native
 ```
 
 And optionally:

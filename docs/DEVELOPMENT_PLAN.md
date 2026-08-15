@@ -53,7 +53,7 @@ Commit: `feat: add task management commands`
 
 - Load embedded default YAML profiles and overlay `~/.agent/agents/*.yaml`.
 - Support only name, provider, command, args, and environment in V1.
-- Provide profiles for Codex, Claude, Gemini, Grok (`grok-build`), and OpenCode.
+- Provide profiles for Codex, Claude, Gemini, Grok (`grok`, with `grok-build` compatibility), and OpenCode.
 - Support raw custom ACP-compatible commands.
 - Validate names and commands and never use shell interpolation.
 - Provide a small list/diagnostic command.
@@ -67,7 +67,7 @@ Commit: `feat: add declarative agent registry`
 - Run one long-lived Node bridge per Session worker through the public `acpx/runtime` export; do not use the detached `acpx prompt` queue owner or a PTY.
 - Implement session create/ensure, prompt, status, cancel, reconnect/resume, metadata inspection, and interactive `session/request_permission` decisions.
 - Stream normalized runtime events and preserve the complete gateway event payload. Document that the public runtime does not expose an exact raw JSON-RPC packet stream.
-- Persist Task Console, acpx, ACP, and provider-native IDs distinctly.
+- Persist Task Console and acpx record IDs distinctly from one canonical provider conversation ID. Retain ACP/native source IDs only as adapter evidence and migration compatibility.
 - Assign a request ID to every prompt and preserve it through streamed output.
 - Keep runtime state/bridge source private, keep provider auth out of persisted options, bound bridge frames and diagnostics, and fail closed on malformed permission options.
 - Build a deterministic fake-`acpx/runtime` fixture for success, cancellation, exact resume, permissions, duplicate option kinds, and reconnection. Retain CLI-adapter fixtures for the legacy compatibility unit tests.
@@ -86,7 +86,7 @@ Commit: `feat: add the acpx execution adapter`
 - Broadcast request-correlated activity to all viewers.
 - Append monotonically positioned JSONL history.
 - Handle signals, stale PID/socket state, duplicate workers, and crash recovery.
-- Implement an exclusive native lease: worker stays alive but issues no prompts while leased.
+- Keep ACP work independent of disposable viewers. Native attachment must not acquire a worker lease, pause ACP work, cancel a turn, or hold queued prompts.
 
 Commit: `feat: add durable session workers`
 
@@ -105,7 +105,8 @@ Commit: `feat: add session lifecycle controls`
 
 - Implement `acpctl task attach <task-id>` and `acpctl session attach <session-id>`.
 - Use one focused Go terminal UI dependency for keyboard, mouse, streaming, and text input.
-- Task attachment shows every Session, agent, role, repo/worktree, state, latest activity, and aggregate activity.
+- Task attachment uses a polished two-pane developer console: Session navigator, selected-Session preview, contextual footer, help, filter, and command palette, with a stacked narrow-terminal layout.
+- Pressing Enter on a Session opens the real provider-native harness for that canonical conversation. An explicit ACP action opens the gateway transcript/permission console.
 - New Sessions must appear without restarting the console.
 - Keyboard and mouse selection drill into a Session and allow return to the Task view.
 - Session detail replays complete stored ACP-visible history, then continues live without duplication.
@@ -129,17 +130,17 @@ Commit: `feat: add interactive task and session consoles`
 
 Commit: `feat: add isolated git worktrees`
 
-## D10 — Provider-native attachment mode
+## D10 — Canonical provider-native attachment
 
-- Implement `acpctl session attach <id> --native`.
-- Let an active turn finish or allow explicit cancellation before acquiring the native lease.
-- Mark the Session waiting, keep the worker alive, and hold queued prompts.
-- Launch the native CLI in the correct repo/worktree using the native ID when supported.
-- On exit, reconcile/resume the same provider conversation before releasing the lease.
-- If reconciliation or native resume is unsupported, remain waiting with an actionable explanation; never conflate two conversations.
-- Test with fake native CLIs and add at least a real Codex smoke procedure.
+- Make `acpctl session attach <id>` open the real provider-native harness by default; use `--acp` for the structured gateway console and keep `--native` only as a compatibility alias.
+- Resolve the exact canonical provider conversation ID from the Session. Never select a conversation by recency or create a replacement conversation as an attach fallback.
+- Verify that ID against the provider's local conversation store and the Session repo/worktree before launching Codex, Claude, Grok, or OpenCode.
+- Launch the documented provider resume command in the correct repo/worktree, preferably in a tmux-backed native harness so a terminal detach does not end the provider process.
+- Do not acquire a lock or lease, cancel/pause ACP, change Session status, or hold queued ACP prompts. Show an advisory warning when both surfaces may be active; the user owns concurrency.
+- After native exit, request a best-effort ACP refresh at the next idle boundary. Refresh failure must be visible but must not strand or replace the canonical conversation.
+- Test exact provider argv, provider-store verification, native detach/reattach, and ACP → native → ACP continuity for Codex, Claude, Grok, and OpenCode.
 
-Commit: `feat: add exclusive native attachment mode`
+Commit: `feat: make native harness the default session attachment`
 
 ## D11 — Independent review Sessions
 
