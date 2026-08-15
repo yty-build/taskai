@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/yty-build/acp-gateway/internal/session"
 	"github.com/yty-build/acp-gateway/internal/task"
@@ -104,7 +105,7 @@ func TestMigrationFromVersionOneAddsDistinctACPXRecordID(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer rows.Close()
-	var found bool
+	found := make(map[string]bool)
 	for rows.Next() {
 		var cid int
 		var name, columnType string
@@ -113,10 +114,59 @@ func TestMigrationFromVersionOneAddsDistinctACPXRecordID(t *testing.T) {
 		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
 			t.Fatal(err)
 		}
-		found = found || name == "acpx_record_id"
+		found[name] = true
 	}
-	if !found {
-		t.Fatal("sessions.acpx_record_id was not added")
+	for _, name := range []string{"acpx_record_id", "provider_conversation_id", "conversation_id_source", "conversation_id_verified_at"} {
+		if !found[name] {
+			t.Fatalf("sessions.%s was not added", name)
+		}
+	}
+}
+
+func TestMigrationBackfillsCanonicalProviderConversation(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "agent.db")
+	database, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"001_init.sql", "002_acpx_record_id.sql"} {
+		body, readErr := migrationFiles.ReadFile("migrations/" + name)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if _, err := database.ExecContext(ctx, string(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO tasks (id, title, status, created_at, updated_at) VALUES ('T-migrate', 'migrate', 'open', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO sessions (id, task_id, agent, acp_session_id, status, created_at, updated_at) VALUES ('S-acp', 'T-migrate', 'codex', 'acp-exact', 'waiting', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO sessions (id, task_id, agent, acp_session_id, native_session_id, status, created_at, updated_at) VALUES ('S-native', 'T-migrate', 'claude', 'acp-other', 'native-exact', 'waiting', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, "PRAGMA user_version = 2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	upgraded, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upgraded.Close()
+	acpOnly, err := upgraded.GetSession(ctx, "S-acp")
+	if err != nil || acpOnly.ProviderConversationID != "acp-exact" || acpOnly.ConversationIDSource != session.ConversationSourceACP {
+		t.Fatalf("ACP backfill = %#v, %v", acpOnly, err)
+	}
+	native, err := upgraded.GetSession(ctx, "S-native")
+	if err != nil || native.ProviderConversationID != "native-exact" || native.ConversationIDSource != session.ConversationSourceNative {
+		t.Fatalf("native backfill = %#v, %v", native, err)
 	}
 }
 
@@ -157,8 +207,16 @@ func TestRepositoriesValidateAndRoundTrip(t *testing.T) {
 		t.Fatalf("UpdateSessionStatus() = %#v, %v", updated, err)
 	}
 	withIDs, err := store.UpdateSessionRuntimeIDs(ctx, loaded.ID, "acpx-record", "acp-session", "native-session")
-	if err != nil || withIDs.ID != loaded.ID || withIDs.ACPXRecordID != "acpx-record" || withIDs.ACPSessionID != "acp-session" || withIDs.NativeSessionID != "native-session" {
+	if err != nil || withIDs.ID != loaded.ID || withIDs.ACPXRecordID != "acpx-record" || withIDs.ACPSessionID != "acp-session" || withIDs.NativeSessionID != "native-session" || withIDs.ProviderConversationID != "native-session" || withIDs.ConversationIDSource != session.ConversationSourceNative {
 		t.Fatalf("UpdateSessionRuntimeIDs() = %#v, %v", withIDs, err)
+	}
+	verifiedAt := time.Date(2026, time.August, 15, 12, 0, 0, 0, time.UTC)
+	verified, err := store.UpdateSessionConversation(ctx, loaded.ID, "native-session", session.ConversationSourceProviderStore, &verifiedAt)
+	if err != nil || verified.ConversationIDVerifiedAt == nil || !verified.ConversationIDVerifiedAt.Equal(verifiedAt) || verified.ConversationIDSource != session.ConversationSourceProviderStore {
+		t.Fatalf("UpdateSessionConversation() = %#v, %v", verified, err)
+	}
+	if _, err := store.UpdateSessionConversation(ctx, loaded.ID, "different-session", session.ConversationSourceProviderStore, &verifiedAt); err == nil {
+		t.Fatal("canonical provider conversation replacement was accepted")
 	}
 	if _, err := store.GetTask(ctx, "T-nope"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("GetTask missing error = %v", err)

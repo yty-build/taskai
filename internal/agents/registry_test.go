@@ -17,7 +17,7 @@ func TestLoadEmbeddedProfiles(t *testing.T) {
 	for _, profile := range registry.List() {
 		names = append(names, profile.Name)
 	}
-	want := []string{"claude", "codex", "gemini", "grok-build", "opencode"}
+	want := []string{"claude", "codex", "gemini", "grok", "grok-build", "opencode"}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("profiles = %v, want %v", names, want)
 	}
