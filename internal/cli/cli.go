@@ -18,6 +18,7 @@ import (
 	"github.com/yty-build/acp-gateway/internal/session"
 	"github.com/yty-build/acp-gateway/internal/store"
 	"github.com/yty-build/acp-gateway/internal/task"
+	"github.com/yty-build/acp-gateway/internal/worker"
 )
 
 const (
@@ -68,6 +69,8 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, info buil
 
 	taskService := task.NewService(database)
 	switch args[0] {
+	case "_worker":
+		err = runHiddenWorker(ctx, args[1:], home, database)
 	case "tasks":
 		err = runTasks(ctx, args[1:], stdout, taskService)
 	case "task":
@@ -97,6 +100,14 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, info buil
 		return fail(stderr, ExitUsage, usageErr)
 	}
 	return fail(stderr, ExitFailure, err)
+}
+
+func runHiddenWorker(ctx context.Context, args []string, home config.Home, database *store.Store) error {
+	options, err := parseOptions(args, map[string]optionKind{"--session": stringOption})
+	if err != nil || len(options.positionals) != 0 || options.values["--session"] == "" {
+		return usagef("usage: agent _worker --session <session-id>")
+	}
+	return worker.RunSession(ctx, home, database, options.values["--session"])
 }
 
 func fail(stderr io.Writer, code int, err error) int {

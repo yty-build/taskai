@@ -104,4 +104,6 @@ type Repository interface {
 	ListSessionsByTask(context.Context, string) ([]Session, error)
 	UpdateSessionStatus(context.Context, string, Status) (Session, error)
 	UpdateSessionRuntimeIDs(context.Context, string, string, string, string) (Session, error)
+	UpdateSessionWorker(context.Context, string, int, string, string, Status) (Session, error)
+	ClearSessionWorker(context.Context, string, Status) (Session, error)
 }

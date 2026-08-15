@@ -350,6 +350,26 @@ func (s *Store) ListSessionsByTask(ctx context.Context, taskID string) ([]sessio
 	return results, nil
 }
 
+func (s *Store) ListSessions(ctx context.Context) ([]session.Session, error) {
+	rows, err := s.db.QueryContext(ctx, sessionSelect+` ORDER BY created_at, id`)
+	if err != nil {
+		return nil, fmt.Errorf("list Sessions: %w", err)
+	}
+	defer rows.Close()
+	var results []session.Session
+	for rows.Next() {
+		result, err := scanSession(rows)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, result)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list Sessions: %w", err)
+	}
+	return results, nil
+}
+
 func (s *Store) UpdateSessionStatus(ctx context.Context, id string, status session.Status) (session.Session, error) {
 	if err := status.Validate(); err != nil {
 		return session.Session{}, err
@@ -379,6 +399,48 @@ func (s *Store) UpdateSessionRuntimeIDs(ctx context.Context, id, acpxRecordID, a
 	}
 	if count, err := result.RowsAffected(); err != nil {
 		return session.Session{}, fmt.Errorf("update Session %s runtime IDs: %w", id, err)
+	} else if count == 0 {
+		return session.Session{}, fmt.Errorf("Session %s: %w", id, ErrNotFound)
+	}
+	return s.GetSession(ctx, id)
+}
+
+func (s *Store) UpdateSessionWorker(ctx context.Context, id string, pid int, socket, logPath string, status session.Status) (session.Session, error) {
+	if pid <= 0 {
+		return session.Session{}, fmt.Errorf("worker PID must be positive")
+	}
+	if strings.TrimSpace(socket) == "" || strings.TrimSpace(logPath) == "" {
+		return session.Session{}, fmt.Errorf("worker socket and log path are required")
+	}
+	if err := status.Validate(); err != nil {
+		return session.Session{}, err
+	}
+	now := s.now().UTC()
+	result, err := s.db.ExecContext(ctx, `UPDATE sessions SET worker_pid = ?, worker_socket = ?, log_path = ?, status = ?, updated_at = ?, last_activity_at = ? WHERE id = ?`,
+		pid, socket, logPath, string(status), formatTime(now), formatTime(now), id)
+	if err != nil {
+		return session.Session{}, fmt.Errorf("update Session %s worker: %w", id, err)
+	}
+	if count, err := result.RowsAffected(); err != nil {
+		return session.Session{}, fmt.Errorf("update Session %s worker: %w", id, err)
+	} else if count == 0 {
+		return session.Session{}, fmt.Errorf("Session %s: %w", id, ErrNotFound)
+	}
+	return s.GetSession(ctx, id)
+}
+
+func (s *Store) ClearSessionWorker(ctx context.Context, id string, status session.Status) (session.Session, error) {
+	if err := status.Validate(); err != nil {
+		return session.Session{}, err
+	}
+	now := s.now().UTC()
+	result, err := s.db.ExecContext(ctx, `UPDATE sessions SET worker_pid = NULL, worker_socket = NULL, status = ?, updated_at = ?, last_activity_at = ? WHERE id = ?`,
+		string(status), formatTime(now), formatTime(now), id)
+	if err != nil {
+		return session.Session{}, fmt.Errorf("clear Session %s worker: %w", id, err)
+	}
+	if count, err := result.RowsAffected(); err != nil {
+		return session.Session{}, fmt.Errorf("clear Session %s worker: %w", id, err)
 	} else if count == 0 {
 		return session.Session{}, fmt.Errorf("Session %s: %w", id, ErrNotFound)
 	}
