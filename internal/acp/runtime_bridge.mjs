@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import fs from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -24,6 +25,14 @@ const automaticallyResolvedReadKinds = new Set(["read", "search", "fetch", "thin
 const require = createRequire(path.join(packageRoot, "package.json"));
 const runtimeURL = pathToFileURL(require.resolve("acpx/runtime")).href;
 const { createAcpRuntime, createAgentRegistry, createRuntimeStore } = await import(runtimeURL);
+
+// Adapter-backed agents are launched through npx. Keep its cache under the
+// gateway's private runtime root so an unrelated or incorrectly owned global
+// npm cache cannot prevent a Session from starting.
+const npmCacheDir = path.join(path.dirname(stateDir), "npm-cache");
+fs.mkdirSync(npmCacheDir, { recursive: true, mode: 0o700 });
+fs.chmodSync(npmCacheDir, 0o700);
+process.env.npm_config_cache = npmCacheDir;
 
 let runtime;
 let handle;
@@ -184,10 +193,13 @@ function configure(command) {
   }
   applyEnvironment(command.environment);
   configuredPermissionMode = command.permissionMode === "approve-all" ? "approve-all" : "approve-reads";
+  const agentRegistry = command.useBuiltin
+    ? createAgentRegistry()
+    : createAgentRegistry({ overrides: { [command.agent]: command.argv } });
   runtime = createAcpRuntime({
     cwd: command.cwd,
     sessionStore: createRuntimeStore({ stateDir }),
-    agentRegistry: createAgentRegistry({ overrides: { [command.agent]: command.argv } }),
+    agentRegistry,
     permissionMode: configuredPermissionMode,
     nonInteractivePermissions: "fail",
     onPermissionRequest: permissionRequest,

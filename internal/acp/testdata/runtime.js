@@ -25,7 +25,7 @@ function appendPermissionDecision(value) {
 }
 
 export function createAgentRegistry(options = {}) {
-  return options;
+  return { ...options, registryKind: options.overrides ? "override" : "builtin" };
 }
 
 export function createRuntimeStore(options = {}) {
@@ -40,6 +40,14 @@ export function createAcpRuntime(options = {}) {
     async ensureSession(session) {
       if (process.env.FAKE_ACPX_SCENARIO === "nonzero") {
         throw new Error("fixture ensure failed");
+      }
+      if (
+        process.env.FAKE_ACPX_EXPECT_REGISTRY &&
+        options.agentRegistry?.registryKind !== process.env.FAKE_ACPX_EXPECT_REGISTRY
+      ) {
+        throw new Error(
+          `fixture registry was ${options.agentRegistry?.registryKind}, expected ${process.env.FAKE_ACPX_EXPECT_REGISTRY}`,
+        );
       }
       const ids = identifiers(session.resumeSessionId);
       handle = {

@@ -64,6 +64,56 @@ func TestRuntimeClientUsesPublicRuntimeAndPrivateState(t *testing.T) {
 	if err != nil || scriptInfo.Mode().Perm() != 0o600 {
 		t.Fatalf("runtime bridge mode = %v, %v", scriptInfo, err)
 	}
+	cacheInfo, err := os.Stat(filepath.Join(filepath.Dir(client.stateDirectory), "npm-cache"))
+	if err != nil || cacheInfo.Mode().Perm() != 0o700 {
+		t.Fatalf("private npm cache mode = %v, %v", cacheInfo, err)
+	}
+}
+
+func TestRuntimeAgentConfigurationExpandsFriendlyBuiltinsOnly(t *testing.T) {
+	tests := []struct {
+		name        string
+		profile     agents.Profile
+		wantAgent   string
+		wantBuiltin bool
+	}{
+		{name: "friendly codex", profile: agents.Profile{Name: "codex", Command: "codex"}, wantAgent: "codex", wantBuiltin: true},
+		{name: "friendly alias", profile: agents.Profile{Name: "team-codex", Command: "codex"}, wantAgent: "codex", wantBuiltin: true},
+		{name: "raw custom", profile: agents.Profile{Name: "custom", Command: "/opt/acp/custom", Args: []string{"--stdio"}}, wantAgent: "custom"},
+		{name: "built-in name with raw args", profile: agents.Profile{Name: "codex", Command: "codex", Args: []string{"--stdio"}}, wantAgent: "codex"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			gotAgent, gotBuiltin := runtimeAgentConfiguration(test.profile)
+			if gotAgent != test.wantAgent || gotBuiltin != test.wantBuiltin {
+				t.Fatalf("runtimeAgentConfiguration() = (%q, %t), want (%q, %t)", gotAgent, gotBuiltin, test.wantAgent, test.wantBuiltin)
+			}
+		})
+	}
+}
+
+func TestRuntimeBridgeUsesBuiltinRegistryOnlyForFriendlyProfiles(t *testing.T) {
+	tests := []struct {
+		name     string
+		profile  agents.Profile
+		expected string
+	}{
+		{name: "friendly built-in", profile: agents.Profile{Name: "codex", Provider: "test", Command: "codex"}, expected: "builtin"},
+		{name: "raw override", profile: agents.Profile{Name: "custom", Provider: "test", Command: "/opt/acp/custom", Args: []string{"--stdio"}}, expected: "override"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, target, _ := runtimeFixture(t, "success")
+			test.profile.Environment = map[string]string{
+				"FAKE_ACPX_SCENARIO":        "success",
+				"FAKE_ACPX_EXPECT_REGISTRY": test.expected,
+			}
+			target.Profile = test.profile
+			if _, err := client.Start(context.Background(), StartSpec{Target: target}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
 }
 
 func TestRuntimePermissionStaysPendingAndFirstDecisionWins(t *testing.T) {

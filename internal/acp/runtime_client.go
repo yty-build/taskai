@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/yty-build/acp-gateway/internal/agents"
 	gitrepo "github.com/yty-build/acp-gateway/internal/git"
 )
 
@@ -79,9 +80,10 @@ func (c *RuntimeClient) ensure(ctx context.Context, spec StartSpec) (SessionInfo
 	if err != nil {
 		return SessionInfo{}, err
 	}
+	agentName, useBuiltin := runtimeAgentConfiguration(target.Profile)
 	var payload bridgeSession
 	err = bridge.call(ctx, bridgeCommand{
-		Type: "ensure", SessionKey: target.ConsoleSessionID, Agent: target.Profile.Name,
+		Type: "ensure", SessionKey: target.ConsoleSessionID, Agent: agentName, UseBuiltin: useBuiltin,
 		Argv: bridgeAgentArgv(target.Profile), Environment: cloneProfileEnvironment(target.Profile.Environment),
 		CWD: target.WorkingDirectory, PermissionMode: target.Permission, ResumeSessionID: spec.ResumeACPSessionID,
 	}, &payload)
@@ -89,6 +91,17 @@ func (c *RuntimeClient) ensure(ctx context.Context, spec StartSpec) (SessionInfo
 		return SessionInfo{}, err
 	}
 	return bridgeSessionInfo(target, payload)
+}
+
+// runtimeAgentConfiguration distinguishes the friendly acpx built-in names in
+// embedded profiles from user-supplied raw ACP server commands. The public
+// runtime registry, rather than a native provider CLI, must expand a friendly
+// name such as "codex" into its pinned ACP adapter command.
+func runtimeAgentConfiguration(profile agents.Profile) (string, bool) {
+	if isBuiltIn(profile) {
+		return strings.TrimSpace(profile.Command), true
+	}
+	return profile.Name, false
 }
 
 func (c *RuntimeClient) Prompt(ctx context.Context, spec PromptSpec, emit func(Event) error) (PromptReceipt, error) {

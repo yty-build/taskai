@@ -29,6 +29,13 @@ func TestLoadEmbeddedProfiles(t *testing.T) {
 	if got := opencode.Argv(); !reflect.DeepEqual(got, wantOpenCodeArgv) {
 		t.Fatalf("opencode Argv() = %q, want %q", got, wantOpenCodeArgv)
 	}
+	gemini, err := registry.Get("gemini")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := gemini.Argv(), []string{"gemini"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("gemini Argv() = %q, want friendly profile %q", got, want)
+	}
 }
 
 func TestUserProfilesOverlayDefaultsAndAddCustomCommands(t *testing.T) {

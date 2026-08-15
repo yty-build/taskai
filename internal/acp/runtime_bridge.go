@@ -64,6 +64,7 @@ type bridgeCommand struct {
 	SessionKey      string            `json:"sessionKey,omitempty"`
 	Agent           string            `json:"agent,omitempty"`
 	Argv            []string          `json:"argv,omitempty"`
+	UseBuiltin      bool              `json:"useBuiltin,omitempty"`
 	Environment     map[string]string `json:"environment,omitempty"`
 	CWD             string            `json:"cwd,omitempty"`
 	PermissionMode  PermissionMode    `json:"permissionMode,omitempty"`

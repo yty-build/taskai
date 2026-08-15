@@ -59,7 +59,7 @@ Embedded profiles:
 | `claude` | `anthropic` | `claude` |
 | `gemini` | `google` | `gemini` |
 | `grok-build` | `xai` | `grok-build` |
-| `opencode` | `opencode` | `opencode` |
+| `opencode` | `opencode` | `npx -y opencode-ai@1.18.18 acp` |
 
 Place overrides or custom profiles in `$AGENT_HOME/agents/*.yaml`:
 
