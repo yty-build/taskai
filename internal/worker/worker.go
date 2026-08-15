@@ -49,8 +49,9 @@ type Config struct {
 }
 
 type queuedPrompt struct {
-	RequestID string
-	Message   string
+	RequestID      string
+	Message        string
+	DisplayMessage string
 }
 
 type Worker struct {
@@ -270,7 +271,7 @@ func (w *Worker) handleConnection(ctx context.Context, connection net.Conn) {
 	case "status":
 		writeMessage(connection, w.statusMessage())
 	case "prompt":
-		state, err := w.enqueue(command.RequestID, command.Message)
+		state, err := w.enqueue(command.RequestID, command.Message, command.DisplayMessage)
 		if err != nil {
 			writeMessage(connection, Message{Type: "error", Message: err.Error()})
 			return
@@ -306,7 +307,7 @@ func (w *Worker) handleConnection(ctx context.Context, connection net.Conn) {
 	}
 }
 
-func (w *Worker) enqueue(requestID, message string) (string, error) {
+func (w *Worker) enqueue(requestID, message, displayMessage string) (string, error) {
 	if strings.TrimSpace(requestID) == "" {
 		return "", fmt.Errorf("prompt request_id is required")
 	}
@@ -322,9 +323,15 @@ func (w *Worker) enqueue(requestID, message string) (string, error) {
 	if w.active != nil || w.nativeLease || len(w.queue) > 0 {
 		state = "queued"
 	}
-	w.queue = append(w.queue, queuedPrompt{RequestID: requestID, Message: message})
+	if strings.TrimSpace(displayMessage) == "" {
+		displayMessage = message
+	}
+	w.queue = append(w.queue, queuedPrompt{RequestID: requestID, Message: message, DisplayMessage: displayMessage})
 	w.seenRequestIDs[requestID] = struct{}{}
 	w.mu.Unlock()
+	if _, err := w.publish(requestID, "prompt_submitted", map[string]string{"display_message": displayMessage}); err != nil {
+		return "", err
+	}
 	_, err := w.publish(requestID, "prompt_queued", map[string]string{"state": state})
 	w.signalWake()
 	return state, err

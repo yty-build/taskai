@@ -94,7 +94,14 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, info buil
 	case "tasks":
 		err = runTasks(ctx, args[1:], stdout, taskService)
 	case "task":
-		sessionService := appservice.NewSessionService(database, nil, home, runtime)
+		var registry *agentregistry.Registry
+		if len(args) > 1 && args[1] == "attach" {
+			registry, err = agentregistry.Load(home.Agents)
+			if err != nil {
+				break
+			}
+		}
+		sessionService := appservice.NewSessionService(database, registry, home, runtime)
 		err = runTask(ctx, args[1:], stdout, taskService, sessionService)
 	case "start":
 		registry, loadErr := agentregistry.Load(home.Agents)

@@ -8,6 +8,7 @@ import (
 	"io"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/yty-build/acp-gateway/internal/agents"
 	appservice "github.com/yty-build/acp-gateway/internal/service"
 	"github.com/yty-build/acp-gateway/internal/session"
 	"github.com/yty-build/acp-gateway/internal/sessionlog"
@@ -24,6 +25,8 @@ type Backend interface {
 	Cancel(context.Context, string) error
 	Resume(context.Context, string) (session.Session, error)
 	Stop(context.Context, string) error
+	AvailableAgents(context.Context) ([]agents.Profile, error)
+	StartSession(context.Context, appservice.StartSessionParams) (appservice.LaunchResult, error)
 }
 
 type Services struct {
@@ -61,6 +64,14 @@ func (s Services) Resume(ctx context.Context, id string) (session.Session, error
 
 func (s Services) Stop(ctx context.Context, id string) error {
 	return s.Sessions.Stop(ctx, id)
+}
+
+func (s Services) AvailableAgents(context.Context) ([]agents.Profile, error) {
+	return s.Sessions.AgentProfiles()
+}
+
+func (s Services) StartSession(ctx context.Context, params appservice.StartSessionParams) (appservice.LaunchResult, error) {
+	return s.Sessions.Start(ctx, params)
 }
 
 func AttachTask(ctx context.Context, backend Backend, taskID string, input io.Reader, output io.Writer) error {

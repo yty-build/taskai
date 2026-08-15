@@ -101,6 +101,16 @@ func NewSessionService(repository SessionRepository, registry *agents.Registry, 
 	return &SessionService{repository: repository, registry: registry, home: home, runtime: runtime}
 }
 
+// AgentProfiles exposes the declarative registry through the shared service
+// boundary so terminal, web, and future clients do not read registry files or
+// duplicate provider knowledge.
+func (s *SessionService) AgentProfiles() ([]agents.Profile, error) {
+	if s.registry == nil {
+		return nil, fmt.Errorf("agent registry is unavailable")
+	}
+	return s.registry.List(), nil
+}
+
 func (s *SessionService) Prepare(params StartSessionParams) (session.CreateParams, error) {
 	return s.PrepareContext(context.Background(), params)
 }
@@ -316,7 +326,10 @@ func (s *SessionService) Launch(ctx context.Context, sessionID, extraPrompt stri
 		return LaunchResult{Session: current}, err
 	}
 	message := BuildInitialPrompt(taskItem, current, extraPrompt)
-	accepted, err := s.runtime.Send(ctx, spawned.Socket, worker.Command{Type: "prompt", RequestID: requestID, Message: message})
+	displayMessage := BuildInitialDisplayMessage(taskItem, current, extraPrompt)
+	accepted, err := s.runtime.Send(ctx, spawned.Socket, worker.Command{
+		Type: "prompt", RequestID: requestID, Message: message, DisplayMessage: displayMessage,
+	})
 	if err != nil {
 		_, _ = s.repository.UpdateSessionStatus(context.Background(), current.ID, session.StatusFailed)
 		return LaunchResult{Session: current, RequestID: requestID}, fmt.Errorf("submit initial Session prompt: %w", err)
@@ -351,6 +364,29 @@ func BuildInitialPrompt(taskItem task.Task, current session.Session, extra strin
 		fmt.Fprintf(&builder, "\nSession-specific instructions:\n%s\n", strings.TrimSpace(extra))
 	}
 	return builder.String()
+}
+
+// BuildInitialDisplayMessage is the clean human-facing USER block for the
+// injected initial turn. The complete ACP prompt still carries IDs and checkout
+// context, but the transcript does not scrape or pretend that transport text
+// was typed by the user.
+func BuildInitialDisplayMessage(taskItem task.Task, current session.Session, extra string) string {
+	var builder strings.Builder
+	fmt.Fprintf(&builder, "Start work on %q as %s.", taskItem.Title, valueOrRole(current.Role))
+	if strings.TrimSpace(taskItem.Description) != "" {
+		fmt.Fprintf(&builder, "\n\n%s", strings.TrimSpace(taskItem.Description))
+	}
+	if strings.TrimSpace(extra) != "" {
+		fmt.Fprintf(&builder, "\n\n%s", strings.TrimSpace(extra))
+	}
+	return builder.String()
+}
+
+func valueOrRole(role string) string {
+	if strings.TrimSpace(role) == "" {
+		return "worker"
+	}
+	return strings.TrimSpace(role)
 }
 
 func PermissionMetadata(approveAll bool) (json.RawMessage, error) {
@@ -395,7 +431,9 @@ func (s *SessionService) Prompt(ctx context.Context, id, message string) (worker
 	if err != nil {
 		return worker.Message{}, err
 	}
-	return s.runtime.Send(ctx, current.WorkerSocket, worker.Command{Type: "prompt", RequestID: requestID, Message: message})
+	return s.runtime.Send(ctx, current.WorkerSocket, worker.Command{
+		Type: "prompt", RequestID: requestID, Message: message, DisplayMessage: message,
+	})
 }
 
 func (s *SessionService) Cancel(ctx context.Context, id string) error {

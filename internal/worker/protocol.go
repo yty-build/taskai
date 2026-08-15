@@ -10,10 +10,11 @@ import (
 )
 
 type Command struct {
-	Type      string `json:"type"`
-	From      uint64 `json:"from,omitempty"`
-	RequestID string `json:"request_id,omitempty"`
-	Message   string `json:"message,omitempty"`
+	Type           string `json:"type"`
+	From           uint64 `json:"from,omitempty"`
+	RequestID      string `json:"request_id,omitempty"`
+	Message        string `json:"message,omitempty"`
+	DisplayMessage string `json:"display_message,omitempty"`
 }
 
 type Message struct {

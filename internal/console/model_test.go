@@ -10,6 +10,8 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/yty-build/acp-gateway/internal/agents"
+	appservice "github.com/yty-build/acp-gateway/internal/service"
 	"github.com/yty-build/acp-gateway/internal/session"
 	"github.com/yty-build/acp-gateway/internal/sessionlog"
 	"github.com/yty-build/acp-gateway/internal/task"
@@ -25,6 +27,8 @@ type fakeBackend struct {
 	cancelled   []string
 	resumed     []string
 	stopped     []string
+	starts      []appservice.StartSessionParams
+	profiles    []agents.Profile
 	promptState string
 }
 
@@ -100,6 +104,26 @@ func (f *fakeBackend) Stop(_ context.Context, id string) error {
 	return nil
 }
 
+func (f *fakeBackend) AvailableAgents(context.Context) ([]agents.Profile, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]agents.Profile(nil), f.profiles...), nil
+}
+
+func (f *fakeBackend) StartSession(_ context.Context, params appservice.StartSessionParams) (appservice.LaunchResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.starts = append(f.starts, params)
+	created := session.Session{
+		ID: "S-3", TaskID: params.TaskID, Role: params.Role, Agent: params.Agent, Provider: "test",
+		RepoPath: params.RepoPath, WorktreePath: "/worktrees/three", Branch: "agent/S-3",
+		Status: session.StatusWorking, WorkerSocket: "/tmp/S-3.sock",
+	}
+	f.sessions[created.ID] = created
+	f.detail.Sessions = append(f.detail.Sessions, created)
+	return appservice.LaunchResult{Session: created, RequestID: "REQ-3", State: "ready"}, nil
+}
+
 func TestTaskConsoleShowsEverySessionAndDetachesOnlyViewer(t *testing.T) {
 	backend := newConsoleBackend()
 	model, cancel, err := newTaskModel(context.Background(), backend, "T-1")
@@ -109,10 +133,13 @@ func TestTaskConsoleShowsEverySessionAndDetachesOnlyViewer(t *testing.T) {
 	defer cancel()
 
 	view := model.View()
-	for _, want := range []string{"Task T-1", "S-1", "researcher", "gemini", "/repo/one", "S-2", "implementer", "codex", "/worktrees/two", "waiting", "Aggregate activity"} {
+	for _, want := range []string{"TASK T-1", "S-1", "researcher", "GEMINI", "one", "S-2", "implementer", "CODEX", "two", "waiting", "No conversation yet"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("Task view missing %q:\n%s", want, view)
 		}
+	}
+	if strings.Contains(view, "Aggregate activity") || strings.Contains(view, "worker ready") {
+		t.Fatalf("Task view leaked the old aggregate event feed:\n%s", view)
 	}
 
 	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
@@ -143,8 +170,8 @@ func TestTaskConsoleKeyboardMouseAndExplicitPromptTarget(t *testing.T) {
 	}
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
 	model = updated.(Model)
-	if model.mode != sessionView || model.current.ID != "S-2" || !model.inputMode {
-		t.Fatalf("prompt drill = mode %d, Session %s, input %v", model.mode, model.current.ID, model.inputMode)
+	if model.mode != sessionView || model.current.ID != "S-2" || !model.composer.focused {
+		t.Fatalf("prompt drill = mode %d, Session %s, input %v", model.mode, model.current.ID, model.composer.focused)
 	}
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("steer only this")})
 	model = updated.(Model)
@@ -153,7 +180,7 @@ func TestTaskConsoleKeyboardMouseAndExplicitPromptTarget(t *testing.T) {
 	result := command()
 	updated, _ = model.Update(result)
 	model = updated.(Model)
-	if !strings.Contains(model.notice, "queued for S-2") {
+	if !strings.Contains(model.notice, "Message queued") {
 		t.Fatalf("queued notice = %q", model.notice)
 	}
 	backend.mu.Lock()
@@ -165,7 +192,7 @@ func TestTaskConsoleKeyboardMouseAndExplicitPromptTarget(t *testing.T) {
 
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
 	model = updated.(Model)
-	updated, _ = model.Update(tea.MouseMsg(tea.MouseEvent{X: 2, Y: 4, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft}))
+	updated, _ = model.Update(tea.MouseMsg(tea.MouseEvent{X: 2, Y: 5, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft}))
 	model = updated.(Model)
 	if model.mode != sessionView || model.current.ID != "S-1" {
 		t.Fatalf("mouse drill opened %s in mode %d", model.current.ID, model.mode)
@@ -222,8 +249,8 @@ func TestInteractivePromptPreservesSpaceKeyInput(t *testing.T) {
 			if len(prompts) != 1 || prompts[0] != want {
 				t.Fatalf("prompt calls = %#v, want %#v", prompts, []promptCall{want})
 			}
-			if model.inputMode || len(model.input) != 0 || !strings.Contains(model.notice, "accepted") {
-				t.Fatalf("submitted input state: mode=%v input=%q notice=%q", model.inputMode, model.input, model.notice)
+			if model.composer.focused || len(model.composer.value) != 0 || !strings.Contains(model.notice, "accepted") {
+				t.Fatalf("submitted input state: mode=%v input=%q notice=%q", model.composer.focused, model.composer.value, model.notice)
 			}
 		})
 	}
@@ -246,7 +273,7 @@ func TestSessionConsoleReplaysThenDeduplicatesLiveAndTogglesRaw(t *testing.T) {
 	if command == nil {
 		t.Fatal("live update did not continue subscription")
 	}
-	live := logLine(2, "agent_message", "live output")
+	live := projectionACPLine(2, "REQ-LIVE", "agent_message_chunk", sessionUpdate(messageUpdate("agent_message_chunk", "live output", "message-live")))
 	updated, _ = model.Update(activityMsg{sessionID: "S-1", line: live})
 	model = updated.(Model)
 	if got := len(model.histories["S-1"]); got != 2 {
@@ -262,7 +289,7 @@ func TestSessionConsoleReplaysThenDeduplicatesLiveAndTogglesRaw(t *testing.T) {
 	}
 }
 
-func TestEscapeCancelsActiveTurnAndPreservesTypedSteering(t *testing.T) {
+func TestEscapeLeavesComposerWithoutCancellingAndExplicitCancelPreservesDraft(t *testing.T) {
 	backend := newConsoleBackend()
 	current := backend.sessions["S-1"]
 	current.Status = session.StatusWorking
@@ -279,18 +306,38 @@ func TestEscapeCancelsActiveTurnAndPreservesTypedSteering(t *testing.T) {
 	model = updated.(Model)
 	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	model = updated.(Model)
-	updated, _ = model.Update(command())
-	model = updated.(Model)
+	if command != nil {
+		t.Fatal("Esc inside the composer unexpectedly started an action")
+	}
 	backend.mu.Lock()
 	cancelled := append([]string(nil), backend.cancelled...)
 	backend.mu.Unlock()
+	if len(cancelled) != 0 {
+		t.Fatalf("Esc inside the composer cancelled the turn: %v", cancelled)
+	}
+	if model.composer.focused || model.composer.text() != "continue differently" {
+		t.Fatalf("draft was not preserved: mode=%v input=%q", model.composer.focused, model.composer.text())
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	model = updated.(Model)
+	if model.confirm == nil || !strings.Contains(model.View(), "CONFIRM") {
+		t.Fatalf("cancel did not require confirmation: %#v", model.confirm)
+	}
+	updated, command = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	model = updated.(Model)
+	updated, _ = model.Update(command())
+	model = updated.(Model)
+	backend.mu.Lock()
+	cancelled = append([]string(nil), backend.cancelled...)
+	backend.mu.Unlock()
 	if len(cancelled) != 1 || cancelled[0] != "S-1" {
-		t.Fatalf("Esc cancellation = %v", cancelled)
+		t.Fatalf("explicit cancellation = %v", cancelled)
 	}
-	if !model.inputMode || string(model.input) != "continue differently" {
-		t.Fatalf("steering was not preserved: mode=%v input=%q", model.inputMode, model.input)
+	if model.composer.text() != "continue differently" {
+		t.Fatalf("explicit cancellation discarded draft: %q", model.composer.text())
 	}
-	if !strings.Contains(model.notice, "not suspension") {
+	if !strings.Contains(model.notice, "does not pause") {
 		t.Fatalf("cancellation notice = %q", model.notice)
 	}
 }
@@ -314,6 +361,48 @@ func TestRefreshAddsNewTaskSessionWithoutRestart(t *testing.T) {
 	model = updated.(Model)
 	if len(model.task.Sessions) != 2 || !strings.Contains(model.View(), "S-2") {
 		t.Fatalf("new Session did not appear:\n%s", model.View())
+	}
+}
+
+func TestTaskConsoleCreatesAndOpensSessionThroughWizard(t *testing.T) {
+	backend := newConsoleBackend()
+	model, cancel, err := newTaskModel(context.Background(), backend, "T-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	model = updated.(Model)
+	if command == nil {
+		t.Fatal("n did not load the new Session wizard")
+	}
+	updated, _ = model.Update(command())
+	model = updated.(Model)
+	if model.wizard == nil || !strings.Contains(model.View(), "NEW SESSION") {
+		t.Fatalf("wizard did not open:\n%s", model.View())
+	}
+	// Move to the final field and submit. Defaults intentionally prove isolated
+	// worktree + read approval without requiring shell commands or copied IDs.
+	for range 5 {
+		updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyTab})
+		model = updated.(Model)
+	}
+	updated, command = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if command == nil || model.wizard == nil || !model.wizard.submitting {
+		t.Fatal("wizard did not submit from its final field")
+	}
+	updated, command = model.Update(command())
+	model = updated.(Model)
+	if model.wizard != nil || model.mode != sessionView || model.current.ID != "S-3" {
+		t.Fatalf("created Session did not open: wizard=%v mode=%d current=%s", model.wizard != nil, model.mode, model.current.ID)
+	}
+	backend.mu.Lock()
+	starts := append([]appservice.StartSessionParams(nil), backend.starts...)
+	backend.mu.Unlock()
+	if len(starts) != 1 || starts[0].TaskID != "T-1" || starts[0].Agent != "codex" || !starts[0].Worktree || starts[0].ApproveAll {
+		t.Fatalf("wizard start params = %#v", starts)
 	}
 }
 
@@ -354,6 +443,7 @@ func newConsoleBackend() *fakeBackend {
 			"S-1": {logLine(1, "worker_ready", "ready one")},
 			"S-2": {logLine(1, "prompt_queued", "queued two")},
 		},
+		profiles: []agents.Profile{{Name: "claude", Provider: "anthropic", Command: "claude"}, {Name: "codex", Provider: "openai", Command: "codex"}},
 	}
 }
 

@@ -107,6 +107,9 @@ func TestStartPersistsPermissionAndSendsCompleteInitialPrompt(t *testing.T) {
 			t.Errorf("initial prompt does not contain %q:\n%s", expected, commands[0].Message)
 		}
 	}
+	if commands[0].DisplayMessage != "Start work on \"Investigate edge\" as analyst.\n\nCompare one-hour results\n\nCheck the one-hour horizon too" {
+		t.Fatalf("initial display message = %q", commands[0].DisplayMessage)
+	}
 }
 
 func TestPrepareDefaultsToReadApprovalAndValidatesProfileAndDirectory(t *testing.T) {
