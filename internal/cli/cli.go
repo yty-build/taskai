@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"text/tabwriter"
 	"time"
 
@@ -462,11 +461,6 @@ func runSessionLogs(ctx context.Context, args []string, stdout io.Writer, servic
 	return nil
 }
 
-type taskLogLine struct {
-	SessionID string
-	Line      sessionlog.Line
-}
-
 func runTaskLogs(ctx context.Context, args []string, stdout io.Writer, service *appservice.SessionService) error {
 	options, err := parseOptions(args, map[string]optionKind{"--follow": boolOption, "--raw": boolOption})
 	if err != nil {
@@ -476,110 +470,26 @@ func runTaskLogs(ctx context.Context, args []string, stdout io.Writer, service *
 		return usagef("usage: agent task logs <task-id> [--follow] [--raw]")
 	}
 	taskID := options.positionals[0]
-	sessions, err := service.ListByTask(ctx, taskID)
+	stored, err := service.TaskHistory(ctx, taskID, nil)
 	if err != nil {
 		return err
 	}
 	cursors := make(map[string]uint64)
-	var stored []taskLogLine
-	for _, current := range sessions {
-		lines, err := service.History(ctx, current.ID, 0)
-		if err != nil {
-			return err
-		}
-		for _, line := range lines {
-			stored = append(stored, taskLogLine{SessionID: current.ID, Line: line})
-			if line.Seq > cursors[current.ID] {
-				cursors[current.ID] = line.Seq
-			}
-		}
-	}
-	sort.SliceStable(stored, func(i, j int) bool {
-		if stored[i].Line.Timestamp.Equal(stored[j].Line.Timestamp) {
-			if stored[i].SessionID == stored[j].SessionID {
-				return stored[i].Line.Seq < stored[j].Line.Seq
-			}
-			return stored[i].SessionID < stored[j].SessionID
-		}
-		return stored[i].Line.Timestamp.Before(stored[j].Line.Timestamp)
-	})
 	for _, item := range stored {
+		cursors[item.SessionID] = item.Line.Seq
 		fmt.Fprintf(stdout, "%s  %s\n", item.SessionID, render.Activity(item.Line, options.booleans["--raw"]))
 	}
 	if !options.booleans["--follow"] {
 		return nil
 	}
-	return followTaskLogs(ctx, taskID, stdout, options.booleans["--raw"], service, cursors)
-}
-
-func followTaskLogs(ctx context.Context, taskID string, stdout io.Writer, raw bool, service *appservice.SessionService, cursors map[string]uint64) error {
-	followContext, cancel := context.WithCancel(ctx)
-	updates := make(chan taskLogLine, 256)
-	errorsChannel := make(chan error, 16)
-	trackedSockets := make(map[string]string)
-	var followers sync.WaitGroup
-	startFollowers := func() error {
-		currentSessions, err := service.ListByTask(followContext, taskID)
-		if err != nil {
-			return err
-		}
-		for _, current := range currentSessions {
-			if current.WorkerSocket == "" || trackedSockets[current.ID] == current.WorkerSocket {
-				continue
-			}
-			trackedSockets[current.ID] = current.WorkerSocket
-			current := current
-			cursor := cursors[current.ID]
-			followers.Add(1)
-			go func() {
-				defer followers.Done()
-				err := service.Follow(followContext, current.ID, cursor, func(line sessionlog.Line) error {
-					select {
-					case updates <- taskLogLine{SessionID: current.ID, Line: line}:
-						return nil
-					case <-followContext.Done():
-						return followContext.Err()
-					}
-				})
-				if err != nil && !errors.Is(err, context.Canceled) {
-					select {
-					case errorsChannel <- err:
-					case <-followContext.Done():
-					}
-				}
-			}()
-		}
+	err = service.FollowTask(ctx, taskID, cursors, func(item appservice.TaskActivity) error {
+		fmt.Fprintf(stdout, "%s  %s\n", item.SessionID, render.Activity(item.Line, options.booleans["--raw"]))
+		return nil
+	})
+	if errors.Is(err, context.Canceled) {
 		return nil
 	}
-	if err := startFollowers(); err != nil {
-		cancel()
-		followers.Wait()
-		return err
-	}
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-	defer func() {
-		cancel()
-		followers.Wait()
-	}()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case err := <-errorsChannel:
-			return err
-		case item := <-updates:
-			if item.Line.Seq <= cursors[item.SessionID] {
-				continue
-			}
-			cursors[item.SessionID] = item.Line.Seq
-			fmt.Fprintf(stdout, "%s  %s\n", item.SessionID, render.Activity(item.Line, raw))
-		case <-ticker.C:
-			if err := startFollowers(); err != nil {
-				return err
-			}
-		}
-	}
+	return err
 }
 
 func parseCursor(value string) (uint64, error) {
