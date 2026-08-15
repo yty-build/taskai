@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -107,6 +108,40 @@ func TestStartValidationIsAtomic(t *testing.T) {
 	t.Setenv("AGENT_HOME", filepath.Join(t.TempDir(), "state"))
 	code, _, stderr := runForTest(t, "start", "Invalid", "--agent", "", "--repo", ".")
 	if code != ExitUsage || !strings.Contains(stderr, "usage: agent start") {
+		t.Fatalf("start: code=%d stderr=%q", code, stderr)
+	}
+	code, stdout, stderr := runForTest(t, "tasks")
+	if code != ExitOK || stdout != "No Tasks.\n" || stderr != "" {
+		t.Fatalf("tasks: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
+func TestAgentsListsDefaultsAndHidesEnvironmentValues(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "state")
+	t.Setenv("AGENT_HOME", home)
+	code, stdout, stderr := runForTest(t, "agents")
+	if code != ExitOK || stderr != "" {
+		t.Fatalf("agents: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	for _, name := range []string{"claude", "codex", "gemini", "grok-build", "opencode"} {
+		if !strings.Contains(stdout, name) {
+			t.Errorf("agents output %q does not contain %q", stdout, name)
+		}
+	}
+	profile := "name: private-agent\nprovider: custom\ncommand: custom-acp\nenvironment:\n  API_TOKEN: top-secret\n"
+	if err := os.WriteFile(filepath.Join(home, "agents", "private-agent.yaml"), []byte(profile), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, stderr = runForTest(t, "agents", "private-agent")
+	if code != ExitOK || stderr != "" || !strings.Contains(stdout, "API_TOKEN (values hidden)") || strings.Contains(stdout, "top-secret") {
+		t.Fatalf("agents private-agent: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
+func TestStartRejectsUnknownAgentProfileWithoutCreatingTask(t *testing.T) {
+	t.Setenv("AGENT_HOME", filepath.Join(t.TempDir(), "state"))
+	code, _, stderr := runForTest(t, "start", "Unknown", "--agent", "missing", "--repo", ".")
+	if code != ExitFailure || !strings.Contains(stderr, `agent profile "missing" was not found`) {
 		t.Fatalf("start: code=%d stderr=%q", code, stderr)
 	}
 	code, stdout, stderr := runForTest(t, "tasks")

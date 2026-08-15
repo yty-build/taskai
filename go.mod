@@ -2,7 +2,10 @@ module github.com/yty-build/acp-gateway
 
 go 1.23.0
 
-require modernc.org/sqlite v1.38.2
+require (
+	go.yaml.in/yaml/v3 v3.0.4
+	modernc.org/sqlite v1.38.2
+)
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect

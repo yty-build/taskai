@@ -1,0 +1,3 @@
+name: claude
+provider: anthropic
+command: claude

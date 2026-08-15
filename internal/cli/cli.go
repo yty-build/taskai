@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
 
+	agentregistry "github.com/yty-build/acp-gateway/internal/agents"
 	"github.com/yty-build/acp-gateway/internal/buildinfo"
 	"github.com/yty-build/acp-gateway/internal/config"
 	"github.com/yty-build/acp-gateway/internal/session"
@@ -71,7 +73,19 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, info buil
 	case "task":
 		err = runTask(ctx, args[1:], stdout, taskService)
 	case "start":
-		err = runStart(ctx, args[1:], stdout, taskService)
+		registry, loadErr := agentregistry.Load(home.Agents)
+		if loadErr != nil {
+			err = loadErr
+			break
+		}
+		err = runStart(ctx, args[1:], stdout, taskService, registry)
+	case "agents":
+		registry, loadErr := agentregistry.Load(home.Agents)
+		if loadErr != nil {
+			err = loadErr
+			break
+		}
+		err = runAgents(args[1:], stdout, registry)
 	default:
 		err = usagef("unknown command %q; run 'agent help' for usage", strings.Join(args, " "))
 	}
@@ -194,7 +208,7 @@ func showTask(ctx context.Context, id string, stdout io.Writer, service *task.Se
 	return w.Flush()
 }
 
-func runStart(ctx context.Context, args []string, stdout io.Writer, service *task.Service) error {
+func runStart(ctx context.Context, args []string, stdout io.Writer, service *task.Service, registry *agentregistry.Registry) error {
 	options, err := parseOptions(args, map[string]optionKind{
 		"--agent": stringOption, "--repo": stringOption, "--role": stringOption, "--description": stringOption,
 		"--external-ref": stringOption, "--metadata-json": stringOption,
@@ -204,6 +218,10 @@ func runStart(ctx context.Context, args []string, stdout io.Writer, service *tas
 	}
 	if len(options.positionals) != 1 || strings.TrimSpace(options.values["--agent"]) == "" || strings.TrimSpace(options.values["--repo"]) == "" {
 		return usagef("usage: agent start <title> --agent <name> --repo <path> [--role <role>]")
+	}
+	profile, err := registry.Get(options.values["--agent"])
+	if err != nil {
+		return err
 	}
 	repoPath, err := filepath.Abs(options.values["--repo"])
 	if err != nil {
@@ -215,13 +233,43 @@ func runStart(ctx context.Context, args []string, stdout io.Writer, service *tas
 	}
 	createdTask, createdSession, err := service.Start(ctx,
 		task.CreateParams{Title: options.positionals[0], Description: options.values["--description"], ExternalRef: options.values["--external-ref"], MetadataJSON: rawJSON(options.values["--metadata-json"]), Status: task.StatusWorking},
-		session.CreateParams{Role: role, Agent: options.values["--agent"], RepoPath: filepath.Clean(repoPath), Status: session.StatusStarting},
+		session.CreateParams{Role: role, Agent: profile.Name, Provider: profile.Provider, RepoPath: filepath.Clean(repoPath), Status: session.StatusStarting},
 	)
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(stdout, "Created %s\nStarted %s\n", createdTask.ID, createdSession.ID)
 	return nil
+}
+
+func runAgents(args []string, stdout io.Writer, registry *agentregistry.Registry) error {
+	if len(args) > 1 {
+		return usagef("usage: agent agents [name]")
+	}
+	if len(args) == 1 {
+		profile, err := registry.Get(args[0])
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "Name: %s\nProvider: %s\nCommand: %s\n", profile.Name, profile.Provider, strings.Join(profile.Argv(), " "))
+		if len(profile.Environment) == 0 {
+			fmt.Fprintln(stdout, "Environment: -")
+			return nil
+		}
+		keys := make([]string, 0, len(profile.Environment))
+		for name := range profile.Environment {
+			keys = append(keys, name)
+		}
+		sort.Strings(keys)
+		fmt.Fprintf(stdout, "Environment: %s (values hidden)\n", strings.Join(keys, ", "))
+		return nil
+	}
+	w := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "NAME\tPROVIDER\tCOMMAND")
+	for _, profile := range registry.List() {
+		fmt.Fprintf(w, "%s\t%s\t%s\n", profile.Name, profile.Provider, profile.Command)
+	}
+	return w.Flush()
 }
 
 func rawJSON(value string) json.RawMessage {
