@@ -17,11 +17,13 @@ Do not begin until the orchestrator gives you the developer's final pushed SHA. 
 Run independently:
 
 ```bash
+make acceptance
 gofmt -l .
 go test ./...
 go test -race ./...
 go vet ./...
 go build ./cmd/agent
+make security-check
 ```
 
 Inspect the quality and failure sensitivity of tests rather than accepting green output alone.

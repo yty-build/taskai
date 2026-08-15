@@ -4,6 +4,10 @@
 *.test
 *.out
 coverage.*
+*.log
+*.jsonl
+*.sqlite
+*.sqlite3
 
 # Local configuration and secrets
 .env
@@ -12,10 +16,17 @@ coverage.*
 
 # Agent Task Console runtime state
 /.agent/
+/worktrees/
 agent.db
 agent.db-*
 *.sock
 *.pid
+
+# Provider authentication state must remain in the user's home directory
+/.codex/
+/.claude/
+/.gemini/
+/.opencode/
 
 # Editor and operating-system files
 .DS_Store

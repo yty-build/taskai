@@ -22,6 +22,8 @@ make test
 make race
 make vet
 make build
+make security-check
+make acceptance
 ```
 
 Never commit credentials, provider authentication state, SQLite databases, sockets, logs, binaries, coverage files, or live worktrees.
