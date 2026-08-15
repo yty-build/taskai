@@ -1,0 +1,25 @@
+# Build outputs
+/bin/
+/agent
+*.test
+*.out
+coverage.*
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Agent Task Console runtime state
+/.agent/
+agent.db
+agent.db-*
+*.sock
+*.pid
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
