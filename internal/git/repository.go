@@ -14,14 +14,25 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 var idComponent = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+const MaxReviewDiffBytes = 64 << 10
 
 type Worktree struct {
 	Repository string
 	Path       string
 	Branch     string
+}
+
+type ReviewSnapshot struct {
+	Branch       string
+	Status       string
+	StagedDiff   string
+	UnstagedDiff string
+	Truncated    bool
 }
 
 // ValidateRepository resolves path to the root of a non-bare Git worktree.
@@ -69,6 +80,49 @@ func CurrentBranch(ctx context.Context, repository string) (string, error) {
 		return "", fmt.Errorf("read current Git branch: %w", err)
 	}
 	return strings.TrimSpace(branch), nil
+}
+
+// CaptureReviewSnapshot records the current checkout evidence without changing
+// the index or working tree. Untracked paths appear in Status; reviewers are
+// instructed to inspect their contents directly.
+func CaptureReviewSnapshot(ctx context.Context, checkout string) (ReviewSnapshot, error) {
+	branch, err := CurrentBranch(ctx, checkout)
+	if err != nil {
+		return ReviewSnapshot{}, err
+	}
+	status, err := run(ctx, checkout, "status", "--short", "--untracked-files=all")
+	if err != nil {
+		return ReviewSnapshot{}, fmt.Errorf("capture Git status: %w", err)
+	}
+	staged, err := run(ctx, checkout, "diff", "--cached", "--no-ext-diff", "--no-color", "--")
+	if err != nil {
+		return ReviewSnapshot{}, fmt.Errorf("capture staged Git diff: %w", err)
+	}
+	unstaged, err := run(ctx, checkout, "diff", "--no-ext-diff", "--no-color", "--")
+	if err != nil {
+		return ReviewSnapshot{}, fmt.Errorf("capture unstaged Git diff: %w", err)
+	}
+	remaining := MaxReviewDiffBytes
+	staged, stagedTruncated := truncateBytes(staged, remaining)
+	remaining -= len(staged)
+	unstaged, unstagedTruncated := truncateBytes(unstaged, remaining)
+	return ReviewSnapshot{
+		Branch: branch, Status: strings.TrimSpace(status), StagedDiff: strings.TrimSpace(staged),
+		UnstagedDiff: strings.TrimSpace(unstaged), Truncated: stagedTruncated || unstagedTruncated,
+	}, nil
+}
+
+func truncateBytes(value string, limit int) (string, bool) {
+	if limit < 0 {
+		limit = 0
+	}
+	if len(value) <= limit {
+		return value, false
+	}
+	for limit > 0 && !utf8.ValidString(value[:limit]) {
+		limit--
+	}
+	return value[:limit], true
 }
 
 func PlanWorktree(root, repository, taskID, sessionID string) (Worktree, error) {

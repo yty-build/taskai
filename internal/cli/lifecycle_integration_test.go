@@ -181,6 +181,44 @@ func TestSessionLifecycleThroughBuiltCLIAndDetachedWorker(t *testing.T) {
 		t.Fatalf("stopped JSONL fallback is incomplete: code=%d stderr=%q\nprior=%q\ngot=%q", code, stderr, rawOutput, fallback)
 	}
 
+	code, output, stderr = runBinary(root, binary, "session", "review", sessionID, "--agent", "claude")
+	if code != 0 || stderr != "" {
+		t.Fatalf("session review: code=%d output=%q stderr=%q", code, output, stderr)
+	}
+	fields = strings.Fields(output)
+	if len(fields) < 6 || fields[0] != "Started" || fields[1] != "reviewer" || fields[3] != "for" || fields[4] != sessionID {
+		t.Fatalf("review output = %q", output)
+	}
+	reviewerID := fields[2]
+	sessionsToStop = append(sessionsToStop, reviewerID)
+	waitForCLI(t, 4*time.Second, func() bool {
+		code, detail, _ = runBinary(root, binary, "session", reviewerID)
+		return code == 0 && strings.Contains(detail, "Role: reviewer") && strings.Contains(detail, "Status: waiting")
+	})
+	if !strings.Contains(detail, "Task: "+taskID) || !strings.Contains(detail, "Repo: "+canonicalRepo) {
+		t.Fatalf("reviewer detail = %q", detail)
+	}
+	argsLog, err = os.ReadFile(filepath.Join(root, "acpx-args.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"Producer Session ID: " + sessionID, "Producer JSONL log (read-only evidence): " + filepath.Join(root, "logs", sessionID+".jsonl"),
+		"independent, skeptical review", "ignored test failures", "selective tests presented as complete tests", "security regressions",
+	} {
+		if !strings.Contains(string(argsLog), expected) {
+			t.Errorf("review prompt argv missing %q", expected)
+		}
+	}
+	code, output, stderr = runBinary(root, binary, "task", taskID)
+	if code != 0 || stderr != "" || !strings.Contains(output, reviewerID) || !strings.Contains(output, "reviewer") {
+		t.Fatalf("Task reviewer aggregate: code=%d output=%q stderr=%q", code, output, stderr)
+	}
+	code, _, stderr = runBinary(root, binary, "session", "stop", reviewerID)
+	if code != 0 || stderr != "" {
+		t.Fatalf("stop reviewer: code=%d stderr=%q", code, stderr)
+	}
+
 	code, output, stderr = runBinary(root, binary, "session", "resume", sessionID)
 	if code != 0 || stderr != "" || output != "Resumed "+sessionID+"\n" {
 		t.Fatalf("session resume: code=%d output=%q stderr=%q", code, output, stderr)

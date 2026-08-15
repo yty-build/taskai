@@ -105,7 +105,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, info buil
 		err = runStart(ctx, args[1:], stdout, sessionService)
 	case "session":
 		var registry *agentregistry.Registry
-		if len(args) > 1 && (args[1] == "start" || nativeAttachRequested(args[1:])) {
+		if len(args) > 1 && (args[1] == "start" || args[1] == "review" || nativeAttachRequested(args[1:])) {
 			registry, err = agentregistry.Load(home.Agents)
 			if err != nil {
 				break
@@ -288,7 +288,7 @@ func runStart(ctx context.Context, args []string, stdout io.Writer, sessions *ap
 
 func runSession(ctx context.Context, args []string, stdout, stderr io.Writer, service *appservice.SessionService) error {
 	if len(args) == 0 {
-		return usagef("usage: agent session start|attach|prompt|cancel|resume|stop|logs|<session-id>")
+		return usagef("usage: agent session start|review|attach|prompt|cancel|resume|stop|logs|<session-id>")
 	}
 	switch args[0] {
 	case "start":
@@ -334,6 +334,19 @@ func runSession(ctx context.Context, args []string, stdout, stderr io.Writer, se
 		return nil
 	case "logs":
 		return runSessionLogs(ctx, args[1:], stdout, service)
+	case "review":
+		options, err := parseOptions(args[1:], map[string]optionKind{"--agent": stringOption, "--allow-active-producer": boolOption})
+		if err != nil || len(options.positionals) != 1 || strings.TrimSpace(options.values["--agent"]) == "" {
+			return usagef("usage: agent session review <producer-session-id> --agent <reviewer> [--allow-active-producer]")
+		}
+		launched, err := service.Review(ctx, appservice.ReviewSessionParams{
+			ProducerID: options.positionals[0], Agent: options.values["--agent"], AllowActiveProducer: options.booleans["--allow-active-producer"],
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "Started reviewer %s for %s\nInitial request %s (%s)\n", launched.Session.ID, options.positionals[0], launched.RequestID, launched.State)
+		return nil
 	case "attach":
 		options, err := parseOptions(args[1:], map[string]optionKind{"--native": boolOption, "--cancel-active": boolOption, "--reconcile-only": boolOption})
 		if err != nil || len(options.positionals) != 1 {

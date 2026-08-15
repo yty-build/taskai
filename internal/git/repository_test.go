@@ -125,6 +125,35 @@ func TestRepositoryLockHonorsContextAndReleases(t *testing.T) {
 	}
 }
 
+func TestCaptureReviewSnapshotIncludesBranchStatusAndDiffs(t *testing.T) {
+	repository := initializeRepository(t)
+	if err := os.WriteFile(filepath.Join(repository, "README.md"), []byte("changed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repository, "staged.txt"), []byte("staged evidence\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitOutput(t, repository, "add", "staged.txt")
+	if err := os.WriteFile(filepath.Join(repository, "untracked.txt"), []byte("untracked evidence\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := CaptureReviewSnapshot(context.Background(), repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Branch != "main" || snapshot.Truncated {
+		t.Fatalf("snapshot metadata = %#v", snapshot)
+	}
+	for _, expected := range []string{"README.md", "staged.txt", "untracked.txt"} {
+		if !strings.Contains(snapshot.Status, expected) {
+			t.Errorf("status missing %q: %s", expected, snapshot.Status)
+		}
+	}
+	if !strings.Contains(snapshot.StagedDiff, "staged evidence") || !strings.Contains(snapshot.UnstagedDiff, "-fixture") || !strings.Contains(snapshot.UnstagedDiff, "+changed") {
+		t.Fatalf("snapshot diffs = staged %q, unstaged %q", snapshot.StagedDiff, snapshot.UnstagedDiff)
+	}
+}
+
 func initializeRepository(t *testing.T) string {
 	t.Helper()
 	repository := filepath.Join(t.TempDir(), "repo")
