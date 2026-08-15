@@ -1,8 +1,6 @@
-# Agent Task Console V1 — Independent Test Plan
+# Agent Task Console V1 — Verification Plan
 
-You are the independent verification agent in tmux window `acp-gateway-build:tester`.
-
-Do not begin until the orchestrator gives you the developer's final pushed SHA. Read `agent_task_console_spec.md` and `docs/DEVELOPMENT_PLAN.md`. Test independently and do not silently repair implementation code. Report defects to the developer with exact evidence; the developer owns fixes and commits.
+The primary Codex session runs this as a distinct verification pass after implementation. No tmux developer/tester workflow is required. Read `agent_task_console_spec.md` and `docs/DEVELOPMENT_PLAN.md`, record exact evidence for every defect, fix it in a focused commit, then rerun the affected checks and the complete final suite.
 
 ## T01 — Source, history, and privacy
 
@@ -22,7 +20,7 @@ gofmt -l .
 go test ./...
 go test -race ./...
 go vet ./...
-go build ./cmd/agent
+go build ./cmd/acpctl
 make security-check
 ```
 
@@ -34,7 +32,7 @@ With an isolated `AGENT_HOME`:
 
 - Create/list/show/update Tasks.
 - Create a Task with zero Sessions.
-- Use `agent start` for a one-Session Task.
+- Use `acpctl start` for a one-Session Task.
 - Start multiple Sessions under one Task.
 - Verify invalid IDs, statuses, profiles, and metadata.
 - Restart CLI processes and verify persistence.
@@ -53,10 +51,11 @@ Using the fake ACP/acpx fixtures:
 - Exercise malformed/partial adapter output and missing native IDs.
 - Verify socket, state, and log permissions.
 - Start a custom ACP-compatible command.
+- With the public runtime fixture, prove pending permission, exact offered decision, malformed duplicate-kind fail-closed behavior, cancellation, and exact resume identity.
 
 ## T05 — Interactive attachment
 
-For `agent task attach`:
+For `acpctl task attach`:
 
 - Every Task Session appears with correct state and activity.
 - A new Session appears without restarting.
@@ -65,7 +64,7 @@ For `agent task attach`:
 - Task-level input cannot silently broadcast.
 - Detaching does not affect workers.
 
-For `agent session attach`:
+For `acpctl session attach`:
 
 - Stored history loads before live output and does not duplicate.
 - Prompts reach the correct Session.
@@ -76,6 +75,9 @@ For `agent session attach`:
 - A disconnected caller recovers missed output from its cursor.
 - Two viewers can observe safely.
 - Raw and normalized views are faithful.
+- A permission remains pending across detach; a reattached viewer can decide it.
+- Two viewers racing a permission yield one accepted decision and one deterministic conflict.
+- `allow_always`/`reject_always` are visibly persistent and require confirmation.
 
 ## T06 — Git, review, and native mode
 
@@ -110,13 +112,15 @@ For every provider:
 - Detach the UI while work continues.
 - Send a short follow-up prompt.
 - Stop and resume the same Session.
-- Verify it appears and drills down correctly in `agent task attach`.
+- Verify it appears and drills down correctly in `acpctl task attach`.
+- Exercise one harmless write permission in `read-approval`: the file must not exist before allow, must appear after allow, and must remain absent after reject.
+- Record whether each provider uses `session/request_permission` or a public-runtime host callback that currently fails closed.
 
 Do not edit authentication configuration. Report an unexpected login prompt as a blocker for that provider.
 
 ## T09 — Defect loop and sign-off
 
-For each failure, send the developer the exact command, expected result, actual result, and relevant log. Require a regression test and a separate pushed fix commit. Rerun the affected tests and the complete final suite.
+For each failure, record the exact command, expected result, actual result, and relevant log. Add a regression test and a focused pushed fix commit. Rerun the affected tests and the complete final suite.
 
 Sign off only with:
 

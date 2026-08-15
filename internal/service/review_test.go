@@ -154,7 +154,7 @@ func TestReviewRejectsChangingProducerUnlessExplicit(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := NewSessionService(repository, registry, home, &recordingRuntime{})
-	if _, err := service.Review(ctx, ReviewSessionParams{ProducerID: producer.ID, Agent: "claude"}); err == nil || !strings.Contains(err.Error(), "agent session stop") || !strings.Contains(err.Error(), "--allow-active-producer") {
+	if _, err := service.Review(ctx, ReviewSessionParams{ProducerID: producer.ID, Agent: "claude"}); err == nil || !strings.Contains(err.Error(), "acpctl session stop") || !strings.Contains(err.Error(), "--allow-active-producer") {
 		t.Fatalf("active producer review error = %v", err)
 	}
 	sessions, err := repository.ListSessions(ctx)

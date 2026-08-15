@@ -10,8 +10,8 @@ export PATH="$HOME/.local/bin:$PATH"
 
 make verify
 make build VERSION=1.0.0
-install -m 0755 bin/agent "$HOME/.local/bin/agent"
-agent version
+install -m 0755 bin/acpctl "$HOME/.local/bin/acpctl"
+acpctl version
 ```
 
 Build metadata is injected through `VERSION`, `COMMIT`, and `BUILD_DATE`. `make version-check` builds with deterministic values and verifies the exact output.
@@ -22,8 +22,8 @@ Before upgrading:
 2. stop active Sessions when practical;
 3. copy the private `AGENT_HOME` if rollback is required;
 4. build and run `make acceptance` at the target SHA;
-5. replace only the `agent` binary;
-6. run `agent tasks` to reopen/migrate SQLite and reconcile stale workers.
+5. replace only the `acpctl` binary;
+6. run `acpctl tasks` to reopen/migrate SQLite and reconcile stale workers.
 
 Migrations are embedded, transactional, and idempotent. Downgrade migration is not supported; restore the matching binary and backup together.
 
@@ -88,8 +88,8 @@ Schema rules:
 Inspect resolution without exposing environment values:
 
 ```bash
-agent agents
-agent agents custom-acp
+acpctl agents
+acpctl agents custom-acp
 ```
 
 Prefer provider-native credential stores or the launching process environment over literal secrets in YAML. If an environment value is necessary, keep the profile user-readable only and never commit it.
@@ -100,40 +100,44 @@ Prefer provider-native credential stores or the launching process environment ov
 
 | Command | Purpose / options |
 | --- | --- |
-| `agent version` | Print injected version, commit, and build date |
-| `agent agents [name]` | List profiles or diagnose one profile |
-| `agent task new <title>` | Create zero-Session Task; optional `--description`, `--external-ref`, `--metadata-json` |
-| `agent tasks` | List Tasks |
-| `agent task <id>` | Show Task and child Session summaries |
-| `agent task status <id> <status>` | Set `open`, `working`, `review`, `done`, `failed`, or `cancelled` |
-| `agent start <title>` | Atomically create Task + first Session; requires `--agent`, `--repo`; supports `--role`, Task description/reference/metadata, `--prompt`, `--approve-all`, `--worktree`, and shared-checkout override |
-| `agent session start <task-id>` | Add Session; requires `--agent`, `--repo`; supports `--role`, `--prompt`, `--approve-all`, `--worktree`, and shared-checkout override |
-| `agent session <id>` | Show full local Session/runtime detail |
-| `agent session prompt <id> <message>` | Submit/queue a correlated prompt |
-| `agent session cancel <id>` | Request cancellation of active turn |
-| `agent session stop <id>` | Stop worker without deleting history/worktree |
-| `agent session resume <id>` | Resume persisted ACP conversation; optional shared-checkout override |
-| `agent session logs <id>` | Replay/follow; supports `--follow`, `--raw`, `--from <position>` |
-| `agent task logs <id>` | Aggregate child histories; supports `--follow`, `--raw` |
-| `agent task attach <id>` | Interactive aggregate Task viewer/controller |
-| `agent session attach <id>` | Interactive Session viewer/controller |
-| `agent session attach <id> --native` | Exclusive exact provider-native resume; optional `--cancel-active` or `--reconcile-only` |
-| `agent session review <producer-id>` | Requires `--agent`; optional `--allow-active-producer` |
-| `agent serve` | Local HTML/JSON/SSE server; optional `--listen <explicit-loopback-ip:port>` |
+| `acpctl version` | Print injected version, commit, and build date |
+| `acpctl agents [name]` | List profiles or diagnose one profile |
+| `acpctl task new <title>` | Create zero-Session Task; optional `--description`, `--external-ref`, `--metadata-json` |
+| `acpctl tasks` | List Tasks |
+| `acpctl task <id>` | Show Task and child Session summaries |
+| `acpctl task status <id> <status>` | Set `open`, `working`, `review`, `done`, `failed`, or `cancelled` |
+| `acpctl start <title>` | Atomically create Task + first Session; requires `--agent`, `--repo`; supports `--role`, Task description/reference/metadata, `--prompt`, `--approve-all`, `--worktree`, and shared-checkout override |
+| `acpctl session start <task-id>` | Add Session; requires `--agent`, `--repo`; supports `--role`, `--prompt`, `--approve-all`, `--worktree`, and shared-checkout override |
+| `acpctl session <id>` | Show full local Session/runtime detail |
+| `acpctl session prompt <id> <message>` | Submit/queue a correlated prompt |
+| `acpctl session cancel <id>` | Request cancellation of active turn |
+| `acpctl session stop <id>` | Stop worker without deleting history/worktree |
+| `acpctl session resume <id>` | Resume persisted ACP conversation; optional shared-checkout override |
+| `acpctl session logs <id>` | Replay/follow; supports `--follow`, `--raw`, `--from <position>` |
+| `acpctl task logs <id>` | Aggregate child histories; supports `--follow`, `--raw` |
+| `acpctl task attach <id>` | Interactive aggregate Task viewer/controller |
+| `acpctl session attach <id>` | Interactive Session viewer/controller |
+| `acpctl session attach <id> --native` | Exclusive exact provider-native resume; optional `--cancel-active` or `--reconcile-only` |
+| `acpctl session review <producer-id>` | Requires `--agent`; optional `--allow-active-producer` |
+| `acpctl serve` | Local HTML/JSON/SSE server; optional `--listen <explicit-loopback-ip:port>` |
 
-Options accept either `--name value` or `--name=value`. Boolean options take no value. Duplicate and unknown options fail with exit code 2. General failures use exit code 1 and stable `agent: <message>` stderr output.
+Options accept either `--name value` or `--name=value`. Boolean options take no value. Duplicate and unknown options fail with exit code 2. General failures use exit code 1 and stable `acpctl: <message>` stderr output.
 
 ## Permissions
 
-The default permission is `read-approval`: agent write/tool requests remain subject to ACP/provider approval behavior.
+The default permission is `read-approval`: read-like work may be resolved automatically, while ACP write/execute/unknown `session/request_permission` calls appear as actionable cards in an attached Session console.
 
 Use `--approve-all` only for an explicitly trusted unattended Session:
 
 ```bash
-agent session start <task-id> --agent codex --repo /repo --role implementer --approve-all
+acpctl session start <task-id> --agent codex --repo /repo --role implementer --approve-all
 ```
 
 The choice is persisted in Session `metadata_json` and surfaced as `Permission` in CLI, terminal, API, and web detail. Noninteractive execution never implicitly enables writes.
+
+When an approval card appears, press its displayed number and confirm the exact provider-offered choice. `allow_always` and `reject_always` are marked `PERSISTENT`. Pressing `q`, closing the terminal, or losing the viewer connection leaves the request pending; attach again to decide it. If two viewers decide concurrently, exactly one wins. Cancelling the turn or stopping the worker cancels the pending request.
+
+The public `acpx/runtime` hook covers ACP `session/request_permission`. Some providers may instead request client-side host operations such as `fs/write_text_file` or `terminal/create`, whose interactive callbacks are not exposed by this pinned runtime. Those operations fail closed. Consult provider capability-test results before relying on interactive approval for a specific adapter.
 
 Agent Task Console does not replace provider sandboxing. Provider command behavior and local OS permissions still apply.
 
@@ -144,7 +148,7 @@ Every Session records a validated Git repository root, optional worktree, and br
 Preferred isolation:
 
 ```bash
-agent session start <task-id> --agent codex --repo /repo --role implementer --worktree
+acpctl session start <task-id> --agent codex --repo /repo --role implementer --worktree
 ```
 
 This creates:
@@ -163,11 +167,11 @@ Stopping/completing a Session never removes its worktree or branch. Inspect and 
 Useful commands:
 
 ```bash
-agent session <id>
-agent session logs <id> --follow
-agent session cancel <id>
-agent session stop <id>
-agent session resume <id>
+acpctl session <id>
+acpctl session logs <id> --follow
+acpctl session cancel <id>
+acpctl session stop <id>
+acpctl session resume <id>
 ```
 
 - `cancel` affects the active ACP turn and leaves the conversation resumable.
@@ -179,18 +183,22 @@ agent session resume <id>
 
 Every normal CLI command checks persisted active Sessions. If a PID is dead or its private socket is unreachable, it clears stale ownership, marks the Session stopped, and removes stale runtime files. It does not auto-resume work.
 
+New Sessions record `acp_transport=acpx-runtime-v1` in `metadata_json`. A Session with an existing ACP ID but no runtime marker is treated as a legacy CLI-backed conversation and is not blindly resumed: its old detached queue owner may still be alive. Stored history remains readable. Create a fresh Session for normal use; do not run both transports against the same provider conversation.
+
 ## Terminal attachment
 
 Normal attach is through ACP:
 
 ```bash
-agent task attach <task-id>
-agent session attach <session-id>
+acpctl task attach <task-id>
+acpctl session attach <session-id>
 ```
 
 Use `q`/`Ctrl-C` to detach. This cancels only viewer subscriptions. Do not use `stop` merely to close a UI.
 
 Task attach targets one selected Session for every prompt or control action; there is no broadcast. Stored history appears before live output, and positions prevent duplicate replay.
+
+Session attach renders a native conversation harness by default: user/assistant turns, collapsed reasoning, merged tool cards, plans, errors, and permission cards. Press `r` for the bounded gateway raw/debug envelope view; the public runtime does not provide an exact JSON-RPC packet capture.
 
 ## Provider-native mode
 
@@ -205,16 +213,16 @@ Supported exact resume mappings:
 
 `grok-build` and custom profiles have no V1 native mapping. They remain usable through ACP.
 
-Before native attach, `agent session <id>` must show both ACP and Native Session IDs. If either is absent, native mode fails without starting another conversation.
+Before native attach, `acpctl session <id>` must show both ACP and Native Session IDs. If either is absent, native mode fails without starting another conversation.
 
 ```bash
-agent session attach <id> --native
+acpctl session attach <id> --native
 ```
 
 Default behavior waits for an active turn. To request cancellation explicitly:
 
 ```bash
-agent session attach <id> --native --cancel-active
+acpctl session attach <id> --native --cancel-active
 ```
 
 While leased:
@@ -227,7 +235,7 @@ While leased:
 On native exit the worker reconciles the exact ACP/provider conversation. It releases the lease only after successful reconciliation. If reconciliation fails, confirm the native process is closed, fix the external problem, then run:
 
 ```bash
-agent session attach <id> --native --reconcile-only
+acpctl session attach <id> --native --reconcile-only
 ```
 
 Never run reconciliation while a native CLI still owns the Session.
@@ -237,8 +245,8 @@ Never run reconciliation while a native CLI still owns the Session.
 Stop or complete the producer, then create an independent reviewer:
 
 ```bash
-agent session stop <producer-id>
-agent session review <producer-id> --agent claude
+acpctl session stop <producer-id>
+acpctl session review <producer-id> --agent claude
 ```
 
 `--allow-active-producer` is an explicit unsafe-state override when concurrent review is intentional. It also permits the shared checkout needed for that case. The review snapshot may become stale immediately, so the reviewer prompt tells the agent to rerun Git inspection.
@@ -248,11 +256,11 @@ Review evidence includes the producer's JSONL path. Treat it as read-only; repai
 ## Local web server
 
 ```bash
-agent serve
-agent serve --listen 127.0.0.1:0
+acpctl serve
+acpctl serve --listen 127.0.0.1:0
 ```
 
-Use the exact URL printed. The handler rejects arbitrary Host headers; `localhost` may therefore be rejected even though it resolves locally. Browser mutations must be same-origin. Closing the browser or sending SIGINT/SIGTERM to `agent serve` has no worker lifecycle effect.
+Use the exact URL printed. The handler rejects arbitrary Host headers; `localhost` may therefore be rejected even though it resolves locally. Browser mutations must be same-origin. Closing the browser or sending SIGINT/SIGTERM to `acpctl serve` has no worker lifecycle effect.
 
 The browser's “Show raw execution” option shows the sanitized API Activity DTO, including kind/request/position. It intentionally does not reveal ACP JSON-RPC, worker sockets, native identifiers, or JSONL paths. Use the local terminal `--raw` log view for trusted-user forensic inspection.
 
@@ -277,7 +285,7 @@ Those controls may wrap the versioned Task/Session API later. They are intention
 
 ## Backup and cleanup
 
-For a coherent cold backup, stop active Sessions and `agent serve`, then copy the entire private `AGENT_HOME`. Worktrees may contain uncommitted user work and must be backed up or committed separately.
+For a coherent cold backup, stop active Sessions and `acpctl serve`, then copy the entire private `AGENT_HOME`. Worktrees may contain uncommitted user work and must be backed up or committed separately.
 
 To remove disposable state, first verify the exact `AGENT_HOME`, stop its Sessions, preserve required repositories/worktrees/logs, and then use normal user-controlled filesystem cleanup. Agent Task Console never auto-deletes that data.
 
@@ -295,7 +303,7 @@ To remove disposable state, first verify the exact `AGENT_HOME`, stop its Sessio
 
 ### Sessions and workers
 
-**No live worker:** `agent session resume <id>` after confirming its checkout is safe.
+**No live worker:** `acpctl session resume <id>` after confirming its checkout is safe.
 
 **Already running:** another healthy worker owns the Session. Attach to it; do not start a duplicate.
 

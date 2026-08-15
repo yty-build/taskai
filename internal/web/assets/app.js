@@ -147,7 +147,58 @@ async function refreshTask(taskID) {
   for (const item of result.sessions) list.append(makeSessionCard(item));
 }
 
-const activityState = { entries: [], seen: new Set() };
+const activityState = { entries: [], seen: new Set(), permissions: new Map() };
+
+function rememberPermission(activity) {
+  const permission = activity.permission;
+  if (!permission || !permission.id) return false;
+  activityState.permissions.set(permission.id, permission);
+  return true;
+}
+
+async function submitPermission(sessionID, permission, option, card) {
+  const persistent = option.kind === "allow_always" || option.kind === "reject_always";
+  const warning = persistent ? " This is a persistent provider choice." : "";
+  if (!window.confirm(`${option.name || option.kind} for ${permission.title || "this tool request"}?${warning}`)) return;
+  for (const button of card.querySelectorAll("button")) button.disabled = true;
+  const notice = document.querySelector("#action-notice");
+  setNotice(notice, "Sending exact permission decision…");
+  try {
+    await apiRequest(`/api/v1/sessions/${encodeURIComponent(sessionID)}/permissions/decision`, "POST", {
+      permission_id: permission.id,
+      option_id: option.id,
+      cancelled: false
+    });
+    activityState.permissions.set(permission.id, { ...permission, state: "resolved", decision: option.kind });
+    renderActivities();
+    setNotice(notice, "Permission decision accepted; the agent turn continues.");
+  } catch (error) {
+    for (const button of card.querySelectorAll("button")) button.disabled = false;
+    setNotice(notice, error.message, true);
+  }
+}
+
+function makePermissionCard(permission, sessionID) {
+  const card = document.createElement("section");
+  card.className = "permission-card";
+  const title = document.createElement("strong");
+  title.textContent = `Approval required · ${permission.title || "Tool request"}`;
+  const detail = document.createElement("p");
+  detail.textContent = "The agent remains waiting if this browser detaches.";
+  const options = document.createElement("div");
+  options.className = "permission-options";
+  for (const option of permission.options || []) {
+    const button = document.createElement("button");
+    const persistent = option.kind === "allow_always" || option.kind === "reject_always";
+    button.type = "button";
+    button.textContent = `${option.name || option.kind}${persistent ? " · PERSISTENT" : ""}`;
+    if (option.kind.startsWith("reject")) button.classList.add("permission-reject");
+    button.addEventListener("click", () => submitPermission(sessionID, permission, option, card));
+    options.append(button);
+  }
+  card.append(title, detail, options);
+  return card;
+}
 
 function makeActivityElement(activity, showRaw) {
   const row = document.createElement("article");
@@ -166,6 +217,10 @@ function makeActivityElement(activity, showRaw) {
   // ACP wire payloads, worker sockets, or JSONL storage fields.
   message.textContent = showRaw ? JSON.stringify(activity, null, 2) : activity.activity;
   row.append(label, message);
+  if (page === "session" && activity.permission?.state === "waiting") {
+    const current = activityState.permissions.get(activity.permission.id);
+    if (current?.state === "waiting") row.append(makePermissionCard(current, activity.session_id));
+  }
   return row;
 }
 
@@ -206,10 +261,15 @@ function attachActivityStream(path) {
       if (activityState.seen.has(key)) return;
       activityState.seen.add(key);
       activityState.entries.push(activity);
+      const permissionChanged = rememberPermission(activity);
       const placeholder = feed.querySelector(".activity-placeholder");
       if (placeholder) placeholder.remove();
-      const showRaw = Boolean(document.querySelector("#raw-toggle")?.checked);
-      feed.append(makeActivityElement(activity, showRaw));
+      if (permissionChanged) {
+        renderActivities();
+      } else {
+        const showRaw = Boolean(document.querySelector("#raw-toggle")?.checked);
+        feed.append(makeActivityElement(activity, showRaw));
+      }
       feed.scrollTop = feed.scrollHeight;
     } catch (_) {
       if (state) state.textContent = "Invalid activity";

@@ -40,6 +40,8 @@ func New(tasks *task.Service, sessions *appservice.SessionService) *Server {
 	mux.HandleFunc("GET /api/v1/tasks/{taskID}/stream", server.streamTask)
 	mux.HandleFunc("GET /api/v1/sessions/{sessionID}", server.getSession)
 	mux.HandleFunc("POST /api/v1/sessions/{sessionID}/prompt", server.prompt)
+	mux.HandleFunc("GET /api/v1/sessions/{sessionID}/permissions", server.permissions)
+	mux.HandleFunc("POST /api/v1/sessions/{sessionID}/permissions/decision", server.decidePermission)
 	mux.HandleFunc("POST /api/v1/sessions/{sessionID}/cancel", server.cancel)
 	mux.HandleFunc("POST /api/v1/sessions/{sessionID}/resume", server.resume)
 	mux.HandleFunc("POST /api/v1/sessions/{sessionID}/stop", server.stop)
@@ -192,6 +194,45 @@ func (s *Server) prompt(writer http.ResponseWriter, request *http.Request) {
 	writeJSON(writer, http.StatusAccepted, map[string]string{"request_id": accepted.RequestID, "state": accepted.State})
 }
 
+func (s *Server) permissions(writer http.ResponseWriter, request *http.Request) {
+	pending, err := s.sessions.PendingPermissions(request.Context(), request.PathValue("sessionID"))
+	if err != nil {
+		writeActionError(writer, err)
+		return
+	}
+	result := make([]PermissionDTO, 0, len(pending))
+	for _, permission := range pending {
+		result = append(result, makePendingPermissionDTO(permission))
+	}
+	writeJSON(writer, http.StatusOK, map[string]any{"permissions": result})
+}
+
+type permissionDecisionRequest struct {
+	PermissionID string `json:"permission_id"`
+	OptionID     string `json:"option_id"`
+	Cancelled    bool   `json:"cancelled"`
+}
+
+func (s *Server) decidePermission(writer http.ResponseWriter, request *http.Request) {
+	var body permissionDecisionRequest
+	if err := decodeJSON(writer, request, &body, false); err != nil {
+		writeBadRequest(writer, err)
+		return
+	}
+	if strings.TrimSpace(body.PermissionID) == "" || (!body.Cancelled && strings.TrimSpace(body.OptionID) == "") {
+		writeBadRequest(writer, fmt.Errorf("permission_id and an option_id or cancelled=true are required"))
+		return
+	}
+	id := request.PathValue("sessionID")
+	if err := s.sessions.DecidePermission(request.Context(), id, body.PermissionID, body.OptionID, body.Cancelled); err != nil {
+		writeActionError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusAccepted, map[string]any{
+		"session_id": id, "permission_id": body.PermissionID, "option_id": body.OptionID, "status": "decision_accepted",
+	})
+}
+
 func (s *Server) cancel(writer http.ResponseWriter, request *http.Request) {
 	if err := requireEmptyBody(request); err != nil {
 		writeBadRequest(writer, err)
@@ -320,6 +361,7 @@ func makeActivityDTO(sessionID string, line sessionlog.Line, cursor string) Acti
 	return ActivityDTO{
 		SessionID: sessionID, Position: line.Seq, RequestID: line.RequestID, Kind: line.Type,
 		Timestamp: formatTime(line.Timestamp), Activity: render.Activity(line, false), Cursor: cursor,
+		Permission: makeActivityPermissionDTO(line),
 	}
 }
 
@@ -411,7 +453,10 @@ func writeActionError(writer http.ResponseWriter, err error) {
 		return
 	}
 	message := err.Error()
-	for _, expected := range []string{"has no live worker", "worker is already running", "already used by active Session", "no active turn"} {
+	for _, expected := range []string{
+		"has no live worker", "worker is already running", "already used by active Session", "no active turn",
+		"no longer pending", "was not offered", "no longer belongs",
+	} {
 		if strings.Contains(message, expected) {
 			writeJSONError(writer, http.StatusConflict, "session_conflict", message)
 			return

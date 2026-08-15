@@ -13,10 +13,10 @@ The command:
 1. runs every Go test uncached;
 2. reruns every test under the race detector;
 3. checks formatting and `go vet`;
-4. builds the real `cmd/agent` binary with fixed version/commit/date values and verifies exact `agent version` output;
+4. builds the real `cmd/acpctl` binary with fixed version/commit/date values and verifies exact `acpctl version` output;
 5. runs tracked-file, credential-pattern, ignore-rule, fixture-mode, and two-table entity-boundary checks.
 
-The black-box lifecycle test builds `agent`, uses an isolated temporary `AGENT_HOME` and Git repository, launches a genuinely detached hidden worker against deterministic fake `acpx`, prompts/follows/stops/resumes it, uses fake provider-native resume, creates an independent review, and validates persisted/logged behavior. No network or provider credential is required.
+The black-box lifecycle test builds `acpctl`, uses an isolated temporary `AGENT_HOME` and Git repository, launches a genuinely detached hidden worker against deterministic fake `acpx`, prompts/follows/stops/resumes it, uses fake provider-native resume, creates an independent review, and validates persisted/logged behavior. No network or provider credential is required.
 
 Primary end-to-end evidence:
 
@@ -75,7 +75,7 @@ Primary end-to-end evidence:
 
 | Specification criterion | Deterministic evidence | Manual evidence |
 | --- | --- | --- |
-| `agent serve` starts local UI | `TestServeUsesLoopbackAndStopsOnlyTheViewer` | Open printed URL |
+| `acpctl serve` starts local UI | `TestServeUsesLoopbackAndStopsOnlyTheViewer` | Open printed URL |
 | Web lists Tasks and shows Task Sessions | `TestServerRenderedPagesAndVersionedBrowserBoundary` | Visual smoke |
 | Clickable Session detail | server-render test asserts links/control page | Click smoke |
 | Stored and live Session history | embedded EventSource client plus versioned API SSE replay test | Provider browser smoke |
@@ -137,7 +137,7 @@ gofmt -l . result:
 go test ./... result:
 go test -race ./... result:
 go vet ./... result:
-go build ./cmd/agent result:
+go build ./cmd/acpctl result:
 provider matrix:
 native smoke:
 git status --short:

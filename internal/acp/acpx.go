@@ -23,6 +23,7 @@ import (
 
 const (
 	SupportedACPXVersion = "0.13.0"
+	RuntimeTransport     = "acpx-runtime-v1"
 	maxStructuredLine    = 16 << 20
 )
 

@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"github.com/yty-build/acp-gateway/internal/acp"
 	"github.com/yty-build/acp-gateway/internal/sessionlog"
+	"github.com/yty-build/acp-gateway/internal/worker"
 )
 
 const (
@@ -186,6 +187,21 @@ func (t *transcript) apply(line sessionlog.Line) bool {
 	case "permission_resolved":
 		if request != nil {
 			request.resolvePermission(jsonString(line.Data, "permission_id"), jsonString(line.Data, "decision"))
+		}
+	case "permission_requested":
+		if request != nil {
+			var pending worker.PendingPermission
+			if json.Unmarshal(line.Data, &pending) == nil {
+				request.upsertWorkerPermission(pending)
+			}
+		}
+	case "permission_abandoned":
+		if request != nil {
+			decision := "cancelled"
+			if message := jsonString(line.Data, "message"); message != "" {
+				decision = "cancelled · " + message
+			}
+			request.resolvePermission(jsonString(line.Data, "permission_id"), decision)
 		}
 	case "acp":
 		t.applyACP(request, line)
@@ -403,6 +419,26 @@ func (r *transcriptRequest) upsertPermission(raw map[string]any) {
 			})
 		}
 		card.options = options
+	}
+}
+
+func (r *transcriptRequest) upsertWorkerPermission(pending worker.PendingPermission) {
+	if pending.ID == "" {
+		return
+	}
+	card := r.permission[pending.ID]
+	if card == nil {
+		card = &permissionCard{id: pending.ID, toolCallID: pending.ToolCallID, state: "waiting"}
+		r.permission[pending.ID] = card
+		r.blocks = append(r.blocks, &transcriptBlock{kind: blockPermission, id: pending.ID, permission: card})
+	}
+	card.title = mergeField(card.title, pending.Title)
+	card.kind = mergeField(card.kind, pending.Kind)
+	if len(pending.Options) > 0 {
+		card.options = card.options[:0]
+		for _, option := range pending.Options {
+			card.options = append(card.options, permissionOption{id: option.ID, name: sanitizeInline(option.Name), kind: option.Kind})
+		}
 	}
 }
 

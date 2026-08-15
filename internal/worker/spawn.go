@@ -31,7 +31,7 @@ const (
 // answers ping. The worker is not tied to the caller's terminal lifetime.
 func Spawn(ctx context.Context, executable string, home config.Home, sessionID string) (SpawnResult, error) {
 	if executable == "" {
-		return SpawnResult{}, fmt.Errorf("agent executable path is required")
+		return SpawnResult{}, fmt.Errorf("acpctl executable path is required")
 	}
 	socket := filepath.Join(home.Workers, sessionID+".sock")
 	probeContext, probeCancel := context.WithTimeout(ctx, 200*time.Millisecond)

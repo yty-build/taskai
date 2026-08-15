@@ -9,10 +9,12 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/yty-build/acp-gateway/internal/acp"
 	"github.com/yty-build/acp-gateway/internal/agents"
@@ -54,6 +56,12 @@ type queuedPrompt struct {
 	DisplayMessage string
 }
 
+type pendingPermission struct {
+	PendingPermission
+	bridgeID string
+	byID     map[string]PermissionOption
+}
+
 type Worker struct {
 	config Config
 	target acp.Target
@@ -67,6 +75,7 @@ type Worker struct {
 	activeCancel    context.CancelFunc
 	nativeLease     bool
 	seenRequestIDs  map[string]struct{}
+	permissions     map[string]*pendingPermission
 	wake            chan struct{}
 	stop            context.CancelFunc
 
@@ -108,7 +117,7 @@ func New(config Config) (*Worker, error) {
 	}
 	return &Worker{
 		config: config, target: target, status: config.Session.Status, acpSessionID: config.Session.ACPSessionID, nativeSessionID: config.Session.NativeSessionID,
-		seenRequestIDs: make(map[string]struct{}), wake: make(chan struct{}, 1),
+		seenRequestIDs: make(map[string]struct{}), permissions: make(map[string]*pendingPermission), wake: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -219,6 +228,12 @@ func (w *Worker) Run(ctx context.Context) error {
 	_ = listener.Close()
 	w.cancelActiveTurn()
 	<-processorDone
+	w.abandonPermissions("Session worker stopped")
+	if closer, ok := w.config.ACP.(interface{ Close() error }); ok {
+		if err := closer.Close(); err != nil && runErr == nil {
+			runErr = fmt.Errorf("close ACP runtime: %w", err)
+		}
+	}
 	w.hub.close()
 	w.handlers.Wait()
 	if _, err := w.config.Repository.ClearSessionWorker(context.Background(), w.config.Session.ID, session.StatusStopped); err != nil && runErr == nil {
@@ -283,6 +298,12 @@ func (w *Worker) handleConnection(ctx context.Context, connection net.Conn) {
 			return
 		}
 		writeMessage(connection, Message{Type: "cancelled", RequestID: command.RequestID})
+	case "permission_decision":
+		if err := w.decidePermission(ctx, command.PermissionID, command.OptionID, command.Cancelled); err != nil {
+			writeMessage(connection, Message{Type: "error", Message: err.Error()})
+			return
+		}
+		writeMessage(connection, Message{Type: "permission_decided", RequestID: command.RequestID})
 	case "subscribe":
 		w.subscribe(ctx, connection, command.From)
 	case "tail":
@@ -375,6 +396,19 @@ func (w *Worker) executePrompt(ctx context.Context, prompt queuedPrompt) {
 	_ = w.updateStatus(session.StatusWorking)
 	_, _ = w.publish(prompt.RequestID, "turn_started", map[string]string{"request_id": prompt.RequestID})
 	receipt, err := w.config.ACP.Prompt(ctx, acp.PromptSpec{Target: w.target, RequestID: prompt.RequestID, Message: prompt.Message}, func(event acp.Event) error {
+		if event.Type == "session_request_permission" {
+			pending, permissionErr := parsePendingPermission(prompt.RequestID, event)
+			if permissionErr != nil {
+				return permissionErr
+			}
+			if permissionErr := w.registerPermission(pending); permissionErr != nil {
+				return permissionErr
+			}
+			if _, permissionErr := w.publish(prompt.RequestID, "permission_requested", pending.PendingPermission); permissionErr != nil {
+				w.removePermission(pending.ID)
+				return permissionErr
+			}
+		}
 		_, publishErr := w.publish(prompt.RequestID, "acp", event)
 		return publishErr
 	})
@@ -409,6 +443,7 @@ func (w *Worker) finishPrompt(requestID string) {
 	delete(w.seenRequestIDs, requestID)
 	hasNext := len(w.queue) > 0 && !w.nativeLease
 	w.mu.Unlock()
+	w.abandonRequestPermissions(requestID, "turn ended")
 	if hasNext {
 		w.signalWake()
 	}
@@ -428,6 +463,7 @@ func (w *Worker) cancel(ctx context.Context, requestID string) error {
 		return err
 	}
 	_, err := w.publish(active.RequestID, "cancel_requested", map[string]string{"request_id": active.RequestID})
+	w.abandonRequestPermissions(active.RequestID, "turn cancelled")
 	return err
 }
 
@@ -570,6 +606,12 @@ func (w *Worker) statusMessage() Message {
 	if w.active != nil {
 		message.ActiveRequestID = w.active.RequestID
 	}
+	for _, pending := range w.permissions {
+		copyPermission := pending.PendingPermission
+		copyPermission.Options = append([]PermissionOption(nil), pending.Options...)
+		message.Permissions = append(message.Permissions, copyPermission)
+	}
+	sort.Slice(message.Permissions, func(i, j int) bool { return message.Permissions[i].ID < message.Permissions[j].ID })
 	return message
 }
 
@@ -658,6 +700,180 @@ func (w *Worker) cancelActiveTurn() {
 	w.mu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+}
+
+func parsePendingPermission(requestID string, event acp.Event) (*pendingPermission, error) {
+	var envelope struct {
+		ID     json.RawMessage `json:"id"`
+		Params struct {
+			ToolCall struct {
+				ID    string `json:"toolCallId"`
+				Title string `json:"title"`
+				Kind  string `json:"kind"`
+			} `json:"toolCall"`
+			Options []struct {
+				ID   string `json:"optionId"`
+				Name string `json:"name"`
+				Kind string `json:"kind"`
+			} `json:"options"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(event.Raw, &envelope); err != nil {
+		return nil, fmt.Errorf("decode ACP permission request: %w", err)
+	}
+	bridgeID := permissionRPCID(envelope.ID)
+	if bridgeID == "" || len(bridgeID) > 256 {
+		return nil, fmt.Errorf("ACP permission request has an invalid ID")
+	}
+	if envelope.Params.ToolCall.ID == "" || len(envelope.Params.ToolCall.ID) > 512 || len(envelope.Params.ToolCall.Title) > 4096 || len(envelope.Params.ToolCall.Kind) > 64 {
+		return nil, fmt.Errorf("ACP permission request contains invalid tool metadata")
+	}
+	if len(envelope.Params.Options) == 0 || len(envelope.Params.Options) > 16 {
+		return nil, fmt.Errorf("ACP permission request has an invalid option count")
+	}
+	consoleID := bridgeID
+	if envelope.Params.ToolCall.ID != "" {
+		consoleID += ":" + envelope.Params.ToolCall.ID
+	}
+	pending := &pendingPermission{
+		PendingPermission: PendingPermission{
+			ID: consoleID, RequestID: requestID, ToolCallID: envelope.Params.ToolCall.ID,
+			Title: envelope.Params.ToolCall.Title, Kind: envelope.Params.ToolCall.Kind,
+		},
+		bridgeID: bridgeID, byID: make(map[string]PermissionOption),
+	}
+	kinds := make(map[string]struct{})
+	for _, rawOption := range envelope.Params.Options {
+		if rawOption.ID == "" || len(rawOption.ID) > 256 || rawOption.Name == "" || len(rawOption.Name) > 1024 || !validPermissionKind(rawOption.Kind) {
+			return nil, fmt.Errorf("ACP permission request contains an invalid option")
+		}
+		if _, duplicate := pending.byID[rawOption.ID]; duplicate {
+			return nil, fmt.Errorf("ACP permission request repeats option ID %q", rawOption.ID)
+		}
+		if _, duplicate := kinds[rawOption.Kind]; duplicate {
+			return nil, fmt.Errorf("ACP permission request repeats option kind %q", rawOption.Kind)
+		}
+		option := PermissionOption{ID: rawOption.ID, Name: rawOption.Name, Kind: rawOption.Kind}
+		pending.byID[option.ID] = option
+		pending.Options = append(pending.Options, option)
+		kinds[option.Kind] = struct{}{}
+	}
+	return pending, nil
+}
+
+func permissionRPCID(raw json.RawMessage) string {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return strings.TrimSpace(text)
+	}
+	var number json.Number
+	if json.Unmarshal(raw, &number) == nil {
+		return number.String()
+	}
+	return ""
+}
+
+func validPermissionKind(kind string) bool {
+	switch kind {
+	case "allow_once", "allow_always", "reject_once", "reject_always":
+		return true
+	default:
+		return false
+	}
+}
+
+func (w *Worker) registerPermission(pending *pendingPermission) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.active == nil || w.active.RequestID != pending.RequestID {
+		return fmt.Errorf("permission %s does not belong to the active request", pending.ID)
+	}
+	if _, exists := w.permissions[pending.ID]; exists {
+		return fmt.Errorf("permission %s is already pending", pending.ID)
+	}
+	w.permissions[pending.ID] = pending
+	return nil
+}
+
+func (w *Worker) removePermission(permissionID string) {
+	w.mu.Lock()
+	delete(w.permissions, permissionID)
+	w.mu.Unlock()
+}
+
+func (w *Worker) decidePermission(ctx context.Context, permissionID, optionID string, cancelled bool) error {
+	responder, ok := w.config.ACP.(acp.PermissionResponder)
+	if !ok {
+		return fmt.Errorf("ACP transport does not support interactive permission decisions")
+	}
+	w.mu.Lock()
+	pending := w.permissions[permissionID]
+	if pending == nil {
+		w.mu.Unlock()
+		return fmt.Errorf("permission %s is no longer pending", permissionID)
+	}
+	if w.active == nil || w.active.RequestID != pending.RequestID {
+		delete(w.permissions, permissionID)
+		w.mu.Unlock()
+		return fmt.Errorf("permission %s no longer belongs to the active request", permissionID)
+	}
+	decision := "cancel"
+	if !cancelled {
+		option, offered := pending.byID[optionID]
+		if !offered {
+			w.mu.Unlock()
+			return fmt.Errorf("permission option %q was not offered", optionID)
+		}
+		decision = option.Kind
+	}
+	delete(w.permissions, permissionID) // first valid viewer wins before I/O
+	w.mu.Unlock()
+
+	if err := responder.DecidePermission(ctx, pending.bridgeID, optionID, cancelled); err != nil {
+		cancelContext, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = responder.DecidePermission(cancelContext, pending.bridgeID, "", true)
+		cancel()
+		_, _ = w.publish(pending.RequestID, "permission_abandoned", map[string]string{
+			"permission_id": pending.ID, "message": err.Error(),
+		})
+		return err
+	}
+	_, err := w.publish(pending.RequestID, "permission_resolved", map[string]string{
+		"permission_id": pending.ID, "option_id": optionID, "decision": decision,
+	})
+	return err
+}
+
+func (w *Worker) abandonRequestPermissions(requestID, reason string) {
+	w.mu.Lock()
+	var abandoned []*pendingPermission
+	for id, pending := range w.permissions {
+		if pending.RequestID == requestID {
+			abandoned = append(abandoned, pending)
+			delete(w.permissions, id)
+		}
+	}
+	w.mu.Unlock()
+	for _, pending := range abandoned {
+		_, _ = w.publish(requestID, "permission_abandoned", map[string]string{
+			"permission_id": pending.ID, "message": reason,
+		})
+	}
+}
+
+func (w *Worker) abandonPermissions(reason string) {
+	w.mu.Lock()
+	var abandoned []*pendingPermission
+	for id, pending := range w.permissions {
+		abandoned = append(abandoned, pending)
+		delete(w.permissions, id)
+	}
+	w.mu.Unlock()
+	for _, pending := range abandoned {
+		_, _ = w.publish(pending.RequestID, "permission_abandoned", map[string]string{
+			"permission_id": pending.ID, "message": reason,
+		})
 	}
 }
 

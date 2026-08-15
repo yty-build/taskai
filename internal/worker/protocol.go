@@ -15,21 +15,40 @@ type Command struct {
 	RequestID      string `json:"request_id,omitempty"`
 	Message        string `json:"message,omitempty"`
 	DisplayMessage string `json:"display_message,omitempty"`
+	PermissionID   string `json:"permission_id,omitempty"`
+	OptionID       string `json:"option_id,omitempty"`
+	Cancelled      bool   `json:"cancelled,omitempty"`
+}
+
+type PermissionOption struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Kind string `json:"kind"`
+}
+
+type PendingPermission struct {
+	ID         string             `json:"id"`
+	RequestID  string             `json:"request_id"`
+	ToolCallID string             `json:"tool_call_id,omitempty"`
+	Title      string             `json:"title,omitempty"`
+	Kind       string             `json:"kind,omitempty"`
+	Options    []PermissionOption `json:"options"`
 }
 
 type Message struct {
-	Type            string          `json:"type"`
-	State           string          `json:"state,omitempty"`
-	Status          string          `json:"status,omitempty"`
-	RequestID       string          `json:"request_id,omitempty"`
-	ActiveRequestID string          `json:"active_request_id,omitempty"`
-	Seq             uint64          `json:"seq,omitempty"`
-	Timestamp       time.Time       `json:"timestamp,omitempty"`
-	LineType        string          `json:"line_type,omitempty"`
-	Queued          int             `json:"queued,omitempty"`
-	NativeLease     bool            `json:"native_lease,omitempty"`
-	Data            json.RawMessage `json:"data,omitempty"`
-	Message         string          `json:"message,omitempty"`
+	Type            string              `json:"type"`
+	State           string              `json:"state,omitempty"`
+	Status          string              `json:"status,omitempty"`
+	RequestID       string              `json:"request_id,omitempty"`
+	ActiveRequestID string              `json:"active_request_id,omitempty"`
+	Seq             uint64              `json:"seq,omitempty"`
+	Timestamp       time.Time           `json:"timestamp,omitempty"`
+	LineType        string              `json:"line_type,omitempty"`
+	Queued          int                 `json:"queued,omitempty"`
+	NativeLease     bool                `json:"native_lease,omitempty"`
+	Permissions     []PendingPermission `json:"permissions,omitempty"`
+	Data            json.RawMessage     `json:"data,omitempty"`
+	Message         string              `json:"message,omitempty"`
 }
 
 func lineMessage(line sessionlog.Line) Message {

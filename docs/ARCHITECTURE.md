@@ -52,7 +52,7 @@ Transport handlers do not reimplement Task or Session behavior:
 - `internal/native` is the only provider-native resume mapping;
 - `internal/console`, `internal/api`, and `internal/web` are transports/views.
 
-The HTTP API emits stable DTOs, not database rows. Worker PID/socket/log paths and raw ACP JSON-RPC remain below that boundary.
+The HTTP API emits stable DTOs, not database rows. Worker PID/socket/log paths and gateway-level raw/debug payloads remain below that boundary.
 
 ## Session creation
 
@@ -61,9 +61,9 @@ The HTTP API emits stable DTOs, not database rows. Worker PID/socket/log paths a
 3. Create a readable collision-resistant Session ID.
 4. Acquire a per-repository filesystem lock.
 5. Reject an active writer in the same checkout unless isolation or an explicit override was requested.
-6. Persist the Session under an existing Task. `agent start` atomically persists the Task and first Session together.
+6. Persist the Session under an existing Task. `acpctl start` atomically persists the Task and first Session together.
 7. Create an optional worktree at `$AGENT_HOME/worktrees/<task>-<session>` on branch `agent/<task>/<session>`.
-8. Spawn a detached hidden `agent _worker --session <id>` process.
+8. Spawn a detached hidden `acpctl _worker --session <id>` process.
 9. Submit a request-correlated initial prompt containing Task title/description, Session role, repository, worktree/branch, and optional Session instructions.
 
 If atomic Task/Session persistence fails, neither row survives. If later provisioning fails, the persisted state is marked failed rather than silently disappearing. User worktrees and branches are never automatically deleted.
@@ -75,14 +75,17 @@ One worker owns one active Session. It opens a user-only Unix socket and append-
 The worker:
 
 - probes `acpx` 0.13.0 before operations;
+- owns one long-lived, private Node child using the public `acpx/runtime` API;
 - creates or resumes the same ACP Session;
 - allows at most one active ACP turn;
 - serializes later prompts in a visible queue;
 - gives every prompt a request ID;
 - appends every visible transition/output with a monotonic position;
 - broadcasts the same correlated lines to multiple subscribers;
-- supports prompt, status/ping, cancel, stop, subscribe, and native-lease commands;
+- supports prompt, status/ping, exact permission decision, cancel, stop, subscribe, and native-lease commands;
 - clears worker ownership on orderly stop.
+
+Pending permissions are runtime state plus append-only Session history, not another entity or table. A viewer detach has no permission or turn side effect. The first valid viewer decision wins; cancel/stop/bridge failure abandons the request safely.
 
 The spawning CLI is not the worker's parent lifecycle owner. Terminal and web connections may exit without affecting it. Every normal CLI invocation reconciles stale persisted PID/socket state and removes stale runtime files.
 
@@ -116,8 +119,10 @@ Attachment always means a viewer/controller connection unless `--native` is expl
 - Session attachment replays that Session, then subscribes from its last position.
 - Multiple viewers may subscribe safely.
 - A Task prompt is never broadcast; the user must select its target Session.
-- `q`, `Ctrl-C`, browser close, network loss, or `agent serve` exit detaches only the viewer.
+- `q`, `Ctrl-C`, browser close, network loss, or `acpctl serve` exit detaches only the viewer.
 - `Esc` requests cancellation of the current ACP turn. It does not suspend an exact token/tool state.
+- numbered permission choices select the exact option offered by the provider; persistent choices require confirmation;
+- detaching while permission is pending leaves the agent waiting so another attachment can decide it.
 
 ## Provider-native ownership
 
@@ -156,7 +161,7 @@ The producer transcript is evidence, not imported conversational context. Review
 
 ## HTTP and web process
 
-`agent serve` opens a disposable `net/http` server on an explicit loopback IP. Server-rendered HTML and embedded CSS/vanilla JavaScript use the same `/api/v1` handlers for mutations and SSE.
+`acpctl serve` opens a disposable `net/http` server on an explicit loopback IP. Server-rendered HTML and embedded CSS/vanilla JavaScript use the same `/api/v1` handlers for mutations and SSE.
 
 The process has no worker shutdown hook. Its context cancellation gracefully closes HTTP connections and the database handle opened by that CLI process; detached workers retain their own processes and database connections.
 

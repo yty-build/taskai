@@ -16,6 +16,7 @@ import (
 	"github.com/yty-build/acp-gateway/internal/agents"
 	"github.com/yty-build/acp-gateway/internal/config"
 	"github.com/yty-build/acp-gateway/internal/session"
+	"github.com/yty-build/acp-gateway/internal/sessionlog"
 	"github.com/yty-build/acp-gateway/internal/store"
 	"github.com/yty-build/acp-gateway/internal/task"
 )
@@ -130,6 +131,155 @@ type workerHarness struct {
 	acp        *fakeACP
 	cancel     context.CancelFunc
 	done       chan error
+}
+
+type permissionDecision struct {
+	permissionID string
+	optionID     string
+	cancelled    bool
+}
+
+type permissionACP struct {
+	mu         sync.Mutex
+	emitted    chan struct{}
+	decisions  chan permissionDecision
+	recorded   []permissionDecision
+	cancelled  chan struct{}
+	promptDone chan struct{}
+	cancelOnce sync.Once
+}
+
+func newPermissionACP() *permissionACP {
+	return &permissionACP{
+		emitted: make(chan struct{}), decisions: make(chan permissionDecision, 2),
+		cancelled: make(chan struct{}), promptDone: make(chan struct{}),
+	}
+}
+
+func (f *permissionACP) Start(context.Context, acp.StartSpec) (acp.SessionInfo, error) {
+	return acp.SessionInfo{ACPXRecordID: "acpx-permission", ACPSessionID: "acp-permission", NativeSessionID: "native-permission"}, nil
+}
+
+func (f *permissionACP) Resume(context.Context, acp.StartSpec) (acp.SessionInfo, error) {
+	return f.Start(context.Background(), acp.StartSpec{})
+}
+
+func (f *permissionACP) Prompt(ctx context.Context, spec acp.PromptSpec, emit func(acp.Event) error) (acp.PromptReceipt, error) {
+	defer close(f.promptDone)
+	raw := json.RawMessage(`{"jsonrpc":"2.0","id":"bridge-permission","method":"session/request_permission","params":{"sessionId":"acp-permission","toolCall":{"toolCallId":"tool-write","title":"Write marker","kind":"edit"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"},{"optionId":"allow-always","name":"Always allow","kind":"allow_always"},{"optionId":"reject-once","name":"Reject once","kind":"reject_once"}]}}`)
+	if err := emit(acp.Event{
+		EventVersion: 1, SessionID: spec.ConsoleSessionID, RequestID: spec.RequestID,
+		Seq: 1, Stream: "prompt", Type: "session_request_permission", Raw: raw,
+	}); err != nil {
+		return acp.PromptReceipt{}, err
+	}
+	close(f.emitted)
+	select {
+	case <-ctx.Done():
+		return acp.PromptReceipt{RequestID: spec.RequestID, LastSeq: 1}, ctx.Err()
+	case <-f.cancelled:
+		return acp.PromptReceipt{RequestID: spec.RequestID, LastSeq: 1, StopReason: "cancelled"}, nil
+	case decision := <-f.decisions:
+		if decision.cancelled {
+			return acp.PromptReceipt{RequestID: spec.RequestID, LastSeq: 1, StopReason: "cancelled"}, nil
+		}
+		return acp.PromptReceipt{RequestID: spec.RequestID, LastSeq: 1, StopReason: "end_turn"}, nil
+	}
+}
+
+func (f *permissionACP) DecidePermission(ctx context.Context, permissionID, optionID string, cancelled bool) error {
+	decision := permissionDecision{permissionID: permissionID, optionID: optionID, cancelled: cancelled}
+	f.mu.Lock()
+	f.recorded = append(f.recorded, decision)
+	f.mu.Unlock()
+	select {
+	case f.decisions <- decision:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (f *permissionACP) recordedDecisions() []permissionDecision {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]permissionDecision(nil), f.recorded...)
+}
+
+func (f *permissionACP) Cancel(context.Context, acp.Target) error {
+	f.cancelOnce.Do(func() { close(f.cancelled) })
+	return nil
+}
+
+func (f *permissionACP) Inspect(context.Context, acp.Target) (acp.SessionInfo, error) {
+	return acp.SessionInfo{ACPXRecordID: "acpx-permission", ACPSessionID: "acp-permission", NativeSessionID: "native-permission"}, nil
+}
+
+type permissionWorkerHarness struct {
+	runtime *Worker
+	client  *SocketClient
+	acp     *permissionACP
+	cancel  context.CancelFunc
+	done    chan error
+}
+
+func startPermissionWorkerHarness(t *testing.T) *permissionWorkerHarness {
+	t.Helper()
+	root, err := os.MkdirTemp("/tmp", "atc-permission-worker-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	repo := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repo, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	repository, err := store.Open(context.Background(), filepath.Join(root, "agent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repository.Close() })
+	createdTask, err := repository.CreateTask(context.Background(), task.CreateParams{ID: "T-permission", Title: "Permission test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdSession, err := repository.CreateSession(context.Background(), session.CreateParams{
+		ID: "S-permission", TaskID: createdTask.ID, Agent: "codex", Provider: "openai", RepoPath: repo,
+		Status: session.StatusStarting, MetadataJSON: json.RawMessage(`{"permission":"read-approval"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := newPermissionACP()
+	runtime, err := New(Config{
+		Session: createdSession, Profile: agents.Profile{Name: "codex", Provider: "openai", Command: "codex"},
+		Repository: repository, ACP: fake, WorkersDirectory: filepath.Join(root, "workers"), LogsDirectory: filepath.Join(root, "logs"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runtime.Run(ctx) }()
+	client := NewSocketClient(runtime.SocketPath())
+	waitFor(t, 3*time.Second, func() bool {
+		probe, stop := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer stop()
+		return client.Ping(probe) == nil
+	})
+	harness := &permissionWorkerHarness{runtime: runtime, client: client, acp: fake, cancel: cancel, done: done}
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("Worker.Run() error = %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Error("permission worker did not stop")
+		}
+	})
+	return harness
 }
 
 func startWorkerHarness(t *testing.T) *workerHarness {
@@ -280,6 +430,190 @@ func TestWorkerSerializesPromptsBroadcastsAndReplays(t *testing.T) {
 	}
 }
 
+func TestPermissionSurvivesDetachAndConcurrentViewerDecisionIsFirstWins(t *testing.T) {
+	harness := startPermissionWorkerHarness(t)
+	viewerContext, detachViewer := context.WithCancel(context.Background())
+	viewerLines := make(chan Message, 32)
+	go func() {
+		_ = harness.client.Subscribe(viewerContext, 0, func(message Message) error {
+			viewerLines <- message
+			return nil
+		})
+	}()
+	waitFor(t, time.Second, func() bool { return len(viewerLines) > 0 })
+
+	accepted, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "REQ-permission", Message: "write marker"})
+	if err != nil || accepted.State != "ready" {
+		t.Fatalf("prompt = %#v, %v", accepted, err)
+	}
+	select {
+	case <-harness.acp.emitted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("permission was not emitted")
+	}
+	waitFor(t, time.Second, func() bool {
+		status, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
+		return statusErr == nil && len(status.Permissions) == 1
+	})
+	status, err := harness.client.Send(context.Background(), Command{Type: "status"})
+	if err != nil || len(status.Permissions) != 1 {
+		t.Fatalf("pending status = %#v, %v", status, err)
+	}
+	pending := status.Permissions[0]
+	if pending.ID != "bridge-permission:tool-write" || pending.RequestID != "REQ-permission" || len(pending.Options) != 3 {
+		t.Fatalf("pending permission = %#v", pending)
+	}
+
+	// A disposable viewer disconnect is not a turn or permission lifecycle
+	// action. A later viewer can still inspect and resolve the same request.
+	detachViewer()
+	time.Sleep(50 * time.Millisecond)
+	status, err = harness.client.Send(context.Background(), Command{Type: "status"})
+	if err != nil || status.ActiveRequestID != "REQ-permission" || len(status.Permissions) != 1 {
+		t.Fatalf("status after detach = %#v, %v", status, err)
+	}
+	if _, err := harness.client.Send(context.Background(), Command{
+		Type: "permission_decision", PermissionID: pending.ID, OptionID: "not-offered",
+	}); err == nil || !strings.Contains(err.Error(), "was not offered") {
+		t.Fatalf("invalid option error = %v", err)
+	}
+	status, err = harness.client.Send(context.Background(), Command{Type: "status"})
+	if err != nil || len(status.Permissions) != 1 {
+		t.Fatalf("invalid option consumed pending request: %#v, %v", status, err)
+	}
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for _, optionID := range []string{"allow-once", "reject-once"} {
+		optionID := optionID
+		go func() {
+			<-start
+			_, decisionErr := harness.client.Send(context.Background(), Command{
+				Type: "permission_decision", PermissionID: pending.ID, OptionID: optionID,
+			})
+			results <- decisionErr
+		}()
+	}
+	close(start)
+	var successes, conflicts int
+	for range 2 {
+		decisionErr := <-results
+		if decisionErr == nil {
+			successes++
+		} else if strings.Contains(decisionErr.Error(), "no longer pending") {
+			conflicts++
+		} else {
+			t.Fatalf("unexpected viewer race result: %v", decisionErr)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("viewer race = %d success, %d conflict", successes, conflicts)
+	}
+	select {
+	case <-harness.acp.promptDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("turn did not continue after permission decision")
+	}
+	decisions := harness.acp.recordedDecisions()
+	if len(decisions) != 1 || decisions[0].permissionID != "bridge-permission" || (decisions[0].optionID != "allow-once" && decisions[0].optionID != "reject-once") {
+		t.Fatalf("provider decisions = %#v", decisions)
+	}
+	waitFor(t, time.Second, func() bool {
+		current, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
+		return statusErr == nil && current.ActiveRequestID == "" && len(current.Permissions) == 0
+	})
+
+	var types []string
+	if err := harness.client.Tail(context.Background(), 0, func(message Message) error {
+		types = append(types, message.LineType)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"permission_requested", "acp", "permission_resolved", "turn_completed"} {
+		if !containsString(types, required) {
+			t.Errorf("durable replay is missing %s: %v", required, types)
+		}
+	}
+}
+
+func TestCancelAndStopAbandonPendingPermission(t *testing.T) {
+	t.Run("cancel turn", func(t *testing.T) {
+		harness := startPermissionWorkerHarness(t)
+		if _, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "REQ-cancel-permission", Message: "write"}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-harness.acp.emitted:
+		case <-time.After(2 * time.Second):
+			t.Fatal("permission was not emitted")
+		}
+		if _, err := harness.client.Send(context.Background(), Command{Type: "cancel", RequestID: "REQ-cancel-permission"}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-harness.acp.promptDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("cancel did not release pending prompt")
+		}
+		waitFor(t, time.Second, func() bool {
+			status, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
+			return statusErr == nil && len(status.Permissions) == 0
+		})
+		var abandoned bool
+		if err := harness.client.Tail(context.Background(), 0, func(message Message) error {
+			abandoned = abandoned || message.LineType == "permission_abandoned"
+			return nil
+		}); err != nil || !abandoned {
+			t.Fatalf("permission abandonment was not durable: %v", err)
+		}
+	})
+
+	t.Run("stop worker", func(t *testing.T) {
+		harness := startPermissionWorkerHarness(t)
+		if _, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "REQ-stop-permission", Message: "write"}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-harness.acp.emitted:
+		case <-time.After(2 * time.Second):
+			t.Fatal("permission was not emitted")
+		}
+		if _, err := harness.client.Send(context.Background(), Command{Type: "stop"}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-harness.acp.promptDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("stop did not release pending prompt")
+		}
+		waitFor(t, 2*time.Second, func() bool {
+			_, statErr := os.Stat(harness.runtime.SocketPath())
+			return os.IsNotExist(statErr)
+		})
+		lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var abandoned bool
+		for _, line := range lines {
+			abandoned = abandoned || line.Type == "permission_abandoned"
+		}
+		if !abandoned {
+			t.Fatalf("stop history lacks permission_abandoned: %#v", lines)
+		}
+	})
+}
+
+func containsString(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
+}
+
 func TestNativeLeaseHoldsQueueUntilSuccessfulReconciliation(t *testing.T) {
 	harness := startWorkerHarness(t)
 	if _, err := harness.client.Send(context.Background(), Command{Type: "native_acquire"}); err != nil {
@@ -361,6 +695,16 @@ func TestPermissionMetadataDefaultsReadAndRequiresExplicitApproveAll(t *testing.
 		if (err == nil) != test.ok || got != test.want {
 			t.Errorf("permissionFromMetadata(%q) = %q, %v", test.metadata, got, err)
 		}
+	}
+}
+
+func TestRuntimeTransportMarkerPreventsBlindLegacyCutover(t *testing.T) {
+	if usesRuntimeTransport(nil) || usesRuntimeTransport(json.RawMessage(`{"permission":"read-approval"}`)) {
+		t.Fatal("legacy Session metadata was treated as runtime-backed")
+	}
+	metadata := json.RawMessage(`{"permission":"read-approval","acp_transport":"acpx-runtime-v1"}`)
+	if !usesRuntimeTransport(metadata) {
+		t.Fatal("runtime-backed Session metadata was not recognized")
 	}
 }
 
@@ -446,11 +790,11 @@ func TestDetachedHiddenWorkerStartupLifecycleAndDiagnostics(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	executable := filepath.Join(root, "agent")
-	build := exec.Command("go", "build", "-o", executable, "./cmd/agent")
+	executable := filepath.Join(root, "acpctl")
+	build := exec.Command("go", "build", "-o", executable, "./cmd/acpctl")
 	build.Dir = filepath.Join("..", "..")
 	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build agent: %v\n%s", err, output)
+		t.Fatalf("build acpctl: %v\n%s", err, output)
 	}
 	fixture, err := filepath.Abs(filepath.Join("..", "acp", "testdata", "fake-acpx"))
 	if err != nil {

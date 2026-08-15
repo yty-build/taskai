@@ -43,7 +43,7 @@ for ignored_path in \
   .agent/agent.db \
   .codex/auth.json \
   .claude/auth.json \
-  bin/agent \
+  bin/acpctl \
   coverage.out \
   session.jsonl \
   worker.log \

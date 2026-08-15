@@ -22,7 +22,7 @@ func TestSessionLifecycleThroughBuiltCLIAndDetachedWorker(t *testing.T) {
 	var sessionsToStop []string
 	t.Cleanup(func() {
 		for _, sessionID := range sessionsToStop {
-			_, _, _ = runBinary(root, filepath.Join(root, "agent"), "session", "stop", sessionID)
+			_, _, _ = runBinary(root, filepath.Join(root, "acpctl"), "session", "stop", sessionID)
 		}
 		_ = os.RemoveAll(root)
 	})
@@ -35,11 +35,11 @@ func TestSessionLifecycleThroughBuiltCLIAndDetachedWorker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	binary := filepath.Join(root, "agent")
-	build := exec.Command("go", "build", "-o", binary, "./cmd/agent")
+	binary := filepath.Join(root, "acpctl")
+	build := exec.Command("go", "build", "-o", binary, "./cmd/acpctl")
 	build.Dir = filepath.Join("..", "..")
 	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build agent: %v\n%s", err, output)
+		t.Fatalf("build acpctl: %v\n%s", err, output)
 	}
 
 	code, output, stderr := runBinary(root, binary, "task", "new", "Investigate BTC edge", "--description", "Compare horizons")
@@ -136,7 +136,7 @@ func TestSessionLifecycleThroughBuiltCLIAndDetachedWorker(t *testing.T) {
 	}
 	waitForCLI(t, 4*time.Second, func() bool {
 		code, output, _ = runBinary(root, binary, "session", "logs", sessionID)
-		return code == 0 && strings.Contains(output, "turn ended: end_turn") && strings.Contains(output, "Follow") == false
+		return code == 0 && strings.Contains(output, "turn completed") && strings.Contains(output, "ok")
 	})
 	waitForCLI(t, 2*time.Second, func() bool {
 		for len(followLines) > 0 {
@@ -168,7 +168,7 @@ func TestSessionLifecycleThroughBuiltCLIAndDetachedWorker(t *testing.T) {
 	}
 
 	code, output, stderr = runBinary(root, binary, "task", "logs", taskID)
-	if code != 0 || stderr != "" || !strings.Contains(output, sessionID) || !strings.Contains(output, "turn ended: end_turn") {
+	if code != 0 || stderr != "" || !strings.Contains(output, sessionID) || !strings.Contains(output, "turn completed") {
 		t.Fatalf("task logs: code=%d output=%q stderr=%q", code, output, stderr)
 	}
 

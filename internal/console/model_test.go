@@ -24,6 +24,7 @@ type fakeBackend struct {
 	sessions    map[string]session.Session
 	histories   map[string][]sessionlog.Line
 	prompts     []promptCall
+	permissions []permissionCall
 	cancelled   []string
 	resumed     []string
 	stopped     []string
@@ -35,6 +36,13 @@ type fakeBackend struct {
 type promptCall struct {
 	sessionID string
 	message   string
+}
+
+type permissionCall struct {
+	sessionID    string
+	permissionID string
+	optionID     string
+	cancelled    bool
 }
 
 func (f *fakeBackend) Task(context.Context, string) (task.Detail, error) {
@@ -77,6 +85,15 @@ func (f *fakeBackend) Prompt(_ context.Context, id, message string) (worker.Mess
 		state = "ready"
 	}
 	return worker.Message{Type: "accepted", RequestID: "req-test", State: state}, nil
+}
+
+func (f *fakeBackend) DecidePermission(_ context.Context, sessionID, permissionID, optionID string, cancelled bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.permissions = append(f.permissions, permissionCall{
+		sessionID: sessionID, permissionID: permissionID, optionID: optionID, cancelled: cancelled,
+	})
+	return nil
 }
 
 func (f *fakeBackend) Cancel(_ context.Context, id string) error {
@@ -339,6 +356,56 @@ func TestEscapeLeavesComposerWithoutCancellingAndExplicitCancelPreservesDraft(t 
 	}
 	if !strings.Contains(model.notice, "does not pause") {
 		t.Fatalf("cancellation notice = %q", model.notice)
+	}
+}
+
+func TestSessionHarnessChoosesExactOfferedPermissionAndHighlightsAlways(t *testing.T) {
+	backend := newConsoleBackend()
+	requestID := "REQ-APPROVAL"
+	backend.histories["S-1"] = []sessionlog.Line{
+		projectionLine(1, requestID, "prompt_submitted", map[string]any{"display_message": "Make a safe change."}),
+		projectionLine(2, requestID, "turn_started", map[string]any{}),
+		projectionACPLine(3, requestID, "session_request_permission", map[string]any{
+			"jsonrpc": "2.0", "id": "permission-7", "method": "session/request_permission", "params": map[string]any{
+				"sessionId": "native", "toolCall": map[string]any{"toolCallId": "tool-write", "title": "Write marker", "kind": "edit"},
+				"options": []any{
+					map[string]any{"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"},
+					map[string]any{"optionId": "allow-always", "name": "Always allow", "kind": "allow_always"},
+					map[string]any{"optionId": "reject-once", "name": "Reject", "kind": "reject_once"},
+				},
+			},
+		}),
+	}
+	model, cancel, err := newSessionModel(context.Background(), backend, "S-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	view := model.View()
+	if !strings.Contains(view, "APPROVAL REQUIRED") || !strings.Contains(view, "[2] Always allow · PERSISTENT") || !strings.Contains(view, "1-3 choose approval") {
+		t.Fatalf("permission prompt is not actionable:\n%s", view)
+	}
+
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("2")})
+	model = updated.(Model)
+	if command != nil || model.confirm == nil || !strings.Contains(model.View(), "ALLOW ALWAYS") {
+		t.Fatalf("persistent permission did not require explicit confirmation:\n%s", model.View())
+	}
+	updated, command = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	model = updated.(Model)
+	if command == nil {
+		t.Fatal("confirmed permission did not produce a command")
+	}
+	updated, _ = model.Update(command())
+	model = updated.(Model)
+	backend.mu.Lock()
+	decisions := append([]permissionCall(nil), backend.permissions...)
+	backend.mu.Unlock()
+	if len(decisions) != 1 || decisions[0].sessionID != "S-1" || decisions[0].permissionID != "permission-7:tool-write" || decisions[0].optionID != "allow-always" || decisions[0].cancelled {
+		t.Fatalf("permission decision = %#v", decisions)
+	}
+	if !strings.Contains(model.notice, "turn continues") {
+		t.Fatalf("permission notice = %q", model.notice)
 	}
 }
 

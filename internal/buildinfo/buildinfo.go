@@ -22,5 +22,5 @@ func Current() Info {
 }
 
 func (i Info) String() string {
-	return fmt.Sprintf("agent %s (commit %s, built %s)", i.Version, i.Commit, i.Date)
+	return fmt.Sprintf("acpctl %s (commit %s, built %s)", i.Version, i.Commit, i.Date)
 }

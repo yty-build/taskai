@@ -1,4 +1,4 @@
-BINARY := bin/agent
+BINARY := bin/acpctl
 VERSION ?= dev
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || printf unknown)
 BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -13,7 +13,7 @@ all: test build
 
 build:
 	@mkdir -p bin
-	go build -trimpath -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/agent
+	go build -trimpath -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/acpctl
 
 test:
 	go test ./...
@@ -35,7 +35,7 @@ security-check:
 
 version-check:
 	@$(MAKE) --no-print-directory build VERSION=acceptance COMMIT=acceptance-sha BUILD_DATE=2000-01-01T00:00:00Z
-	@test "$$($(BINARY) version)" = "agent acceptance (commit acceptance-sha, built 2000-01-01T00:00:00Z)"
+	@test "$$($(BINARY) version)" = "acpctl acceptance (commit acceptance-sha, built 2000-01-01T00:00:00Z)"
 
 acceptance:
 	./scripts/acceptance.sh

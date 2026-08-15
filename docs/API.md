@@ -1,6 +1,6 @@
 # Local API and SSE contract
 
-`agent serve` exposes a versioned Task/Session API for the local web UI and future clients. It is a transport over the same application services as the CLI and terminal console.
+`acpctl serve` exposes a versioned Task/Session API for the local web UI and future clients. It is a transport over the same application services as the CLI and terminal console.
 
 ## Boundary
 
@@ -68,6 +68,27 @@ Activity:
 }
 ```
 
+For `permission_requested`, Activity may additionally include a sanitized actionable permission object:
+
+```json
+{
+  "permission": {
+    "id": "permission-…:tool-…",
+    "request_id": "REQ-…",
+    "tool_call_id": "tool-…",
+    "title": "Write marker",
+    "kind": "edit",
+    "state": "waiting",
+    "options": [
+      {"id":"allow-once","name":"Allow once","kind":"allow_once"},
+      {"id":"reject-once","name":"Reject","kind":"reject_once"}
+    ]
+  }
+}
+```
+
+Only safe labels and exact opaque IDs needed to decide are exposed. Raw tool input, provider environment/auth, ACP wire data, and worker paths remain private.
+
 Database/runtime-only fields are intentionally absent: worker PID, Unix socket, JSONL path, metadata JSON storage representation, acpx record ID, ACP Session ID, provider-native Session ID, and raw ACP data.
 
 ## Routes
@@ -83,6 +104,8 @@ Database/runtime-only fields are intentionally absent: worker PID, Unix socket, 
 | `GET` | `/api/v1/tasks/{id}/stream` | Aggregate Task SSE |
 | `GET` | `/api/v1/sessions/{id}` | Session DTO |
 | `POST` | `/api/v1/sessions/{id}/prompt` | Queue prompt; return request ID |
+| `GET` | `/api/v1/sessions/{id}/permissions` | Current actionable permission list |
+| `POST` | `/api/v1/sessions/{id}/permissions/decision` | Select an exact offered option |
 | `POST` | `/api/v1/sessions/{id}/cancel` | Request active-turn cancellation |
 | `POST` | `/api/v1/sessions/{id}/resume` | Resume worker |
 | `POST` | `/api/v1/sessions/{id}/stop` | Stop worker |
@@ -124,6 +147,14 @@ curl -sS http://127.0.0.1:8080/api/v1/sessions/S-…/prompt \
 ```
 
 Successful submission is `202 Accepted` with a new `request_id` and `state`. If another turn is active, the worker queues this request; the API does not inject it into the active turn.
+
+Permission decision:
+
+```json
+{"permission_id":"permission-…:tool-…","option_id":"allow-once","cancelled":false}
+```
+
+IDs are opaque and must come from the current permission list or stream event. The worker revalidates Session, active request, permission, and offered option; concurrent callers receive one accepted decision and a `409` conflict for later attempts. Detaching or closing the client leaves an undecided permission pending.
 
 Cancel and stop require an empty request body. Resume accepts an empty body or:
 
@@ -212,4 +243,5 @@ Common statuses:
 - Route Task-scoped input only after a user/client selects a Session.
 - A disconnected prompt client must reconnect using its cursor to receive completed correlated output.
 - Do not infer permission from noninteractive use; set `approve_all` explicitly.
+- Never invent a permission option ID; display only the exact current `options`, distinguish persistent `*_always` choices, and handle `409` as another viewer winning the race.
 - Do not present the local API as an authenticated remote endpoint.

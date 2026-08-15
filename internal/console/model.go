@@ -65,9 +65,11 @@ func (c *composerState) deleteWord() {
 }
 
 type confirmation struct {
-	kind      string
-	sessionID string
-	message   string
+	kind         string
+	sessionID    string
+	permissionID string
+	optionID     string
+	message      string
 }
 
 // Model is the Bubble Tea model shared by Task and direct Session attachment.
@@ -347,6 +349,10 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 		}
 	case "end", "G":
 		m.scroll, m.unread = 0, 0
+	default:
+		if len(name) == 1 && name[0] >= '1' && name[0] <= '9' {
+			return m.confirmPermission(int(name[0] - '1'))
+		}
 	}
 	return m, nil
 }
@@ -406,11 +412,19 @@ func (m Model) handleConfirmation(name string) (tea.Model, tea.Cmd) {
 	switch name {
 	case "y", "Y":
 		m.confirm = nil
+		if confirm.kind == "permission" {
+			m.notice = "Sending the selected permission decision…"
+			return m, permissionDecisionCmd(m.ctx, m.backend, confirm.sessionID, confirm.permissionID, confirm.optionID)
+		}
 		m.notice = actionProgress(confirm.kind, confirm.sessionID)
 		return m, sessionActionCmd(m.ctx, m.backend, confirm.kind, confirm.sessionID)
 	case "n", "N", "esc", "enter":
 		m.confirm = nil
-		m.notice = actionLabel(confirm.kind) + " dismissed; the Session is unchanged."
+		if confirm.kind == "permission" {
+			m.notice = "Permission choice dismissed; the agent is still waiting."
+		} else {
+			m.notice = actionLabel(confirm.kind) + " dismissed; the Session is unchanged."
+		}
 	}
 	return m, nil
 }
@@ -488,6 +502,30 @@ func (m Model) withConfirmation(kind string, current session.Session) (tea.Model
 		message = "Stop this Session worker? The conversation remains resumable."
 	}
 	m.confirm = &confirmation{kind: kind, sessionID: current.ID, message: message}
+	return m, nil
+}
+
+func (m Model) confirmPermission(index int) (tea.Model, tea.Cmd) {
+	projection := m.projections[m.current.ID]
+	if projection == nil {
+		return m, nil
+	}
+	_, card := projection.pendingPermission()
+	if card == nil || index < 0 || index >= len(card.options) {
+		return m, nil
+	}
+	option := card.options[index]
+	label := valueOr(option.name, strings.ReplaceAll(option.kind, "_", " "))
+	message := fmt.Sprintf("Choose %q for %s?", label, valueOr(card.title, "this tool request"))
+	if option.kind == "allow_always" {
+		message = fmt.Sprintf("ALLOW ALWAYS for %s? Future matching requests may be approved automatically.", valueOr(card.title, "this tool request"))
+	} else if option.kind == "reject_always" {
+		message = fmt.Sprintf("REJECT ALWAYS for %s? Future matching requests may be rejected automatically.", valueOr(card.title, "this tool request"))
+	}
+	m.confirm = &confirmation{
+		kind: "permission", sessionID: m.current.ID, permissionID: card.id,
+		optionID: option.id, message: message,
+	}
 	return m, nil
 }
 
@@ -581,6 +619,8 @@ func (m Model) handleAction(message actionMsg) (tea.Model, tea.Cmd) {
 		m.manager.ensure(message.current, m.cursors[message.current.ID])
 	case "stop":
 		m.notice = "Session worker stopped; the conversation remains resumable."
+	case "permission":
+		m.notice = "Permission decision accepted. The agent turn continues in this Session."
 	}
 	return m, m.refreshCmd()
 }
@@ -589,6 +629,13 @@ func promptCmd(ctx context.Context, backend Backend, sessionID, message string) 
 	return func() tea.Msg {
 		accepted, err := backend.Prompt(ctx, sessionID, message)
 		return actionMsg{kind: "prompt", sessionID: sessionID, accepted: accepted, err: err}
+	}
+}
+
+func permissionDecisionCmd(ctx context.Context, backend Backend, sessionID, permissionID, optionID string) tea.Cmd {
+	return func() tea.Msg {
+		err := backend.DecidePermission(ctx, sessionID, permissionID, optionID, false)
+		return actionMsg{kind: "permission", sessionID: sessionID, err: err}
 	}
 }
 

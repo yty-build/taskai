@@ -26,7 +26,7 @@ func (s *SessionService) Review(ctx context.Context, params ReviewSessionParams)
 		return LaunchResult{}, fmt.Errorf("reviewer agent is required")
 	}
 	if !params.AllowActiveProducer && !safeReviewProducer(producer) {
-		return LaunchResult{}, fmt.Errorf("producer Session %s checkout may still change (status %s, worker PID %d); stop it with 'agent session stop %s' before review, or pass --allow-active-producer only when concurrent review is intentional", producer.ID, producer.Status, producer.WorkerPID, producer.ID)
+		return LaunchResult{}, fmt.Errorf("producer Session %s checkout may still change (status %s, worker PID %d); stop it with 'acpctl session stop %s' before review, or pass --allow-active-producer only when concurrent review is intentional", producer.ID, producer.Status, producer.WorkerPID, producer.ID)
 	}
 	taskItem, err := s.repository.GetTask(ctx, producer.TaskID)
 	if err != nil {

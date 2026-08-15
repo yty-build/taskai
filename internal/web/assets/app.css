@@ -207,6 +207,12 @@ button.full { width: 100%; margin-top: 12px; }
 .activity-label strong { display: block; overflow: hidden; color: var(--blue); text-overflow: ellipsis; }
 .activity-message { min-width: 0; margin: 0; color: #d7dce3; font: 12px/1.55 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
 .activity-message.raw { overflow-x: auto; color: #b4bdc9; white-space: pre; }
+.permission-card { grid-column: 2; padding: 13px; border: 1px solid rgba(245, 201, 107, .35); border-radius: 10px; background: rgba(245, 201, 107, .06); }
+.permission-card strong { color: var(--amber); font-size: .82rem; }
+.permission-card p { margin: 4px 0 10px; color: var(--muted); font-size: .72rem; }
+.permission-options { display: flex; flex-wrap: wrap; gap: 7px; }
+.permission-options button { padding: 7px 10px; border-color: rgba(157, 242, 196, .3); color: var(--accent); font-size: .72rem; }
+.permission-options button.permission-reject { border-color: rgba(255, 143, 143, .32); color: var(--red); }
 
 .control-panel { display: grid; gap: 14px; position: sticky; top: 84px; }
 .control-row { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
@@ -243,6 +249,7 @@ footer { display: flex; justify-content: space-between; width: min(1380px, 92vw)
   .wide { grid-column: auto; }
   .task-card { min-height: 205px; }
   .activity-item { grid-template-columns: 1fr; gap: 4px; }
+  .permission-card { grid-column: 1; }
   .activity-label strong { display: inline; margin-right: 7px; }
   footer { width: calc(100% - 28px); }
 }

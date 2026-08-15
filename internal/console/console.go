@@ -22,6 +22,7 @@ type Backend interface {
 	History(context.Context, string, uint64) ([]sessionlog.Line, error)
 	Follow(context.Context, string, uint64, func(sessionlog.Line) error) error
 	Prompt(context.Context, string, string) (worker.Message, error)
+	DecidePermission(context.Context, string, string, string, bool) error
 	Cancel(context.Context, string) error
 	Resume(context.Context, string) (session.Session, error)
 	Stop(context.Context, string) error
@@ -52,6 +53,10 @@ func (s Services) Follow(ctx context.Context, id string, cursor uint64, consume 
 
 func (s Services) Prompt(ctx context.Context, id, message string) (worker.Message, error) {
 	return s.Sessions.Prompt(ctx, id, message)
+}
+
+func (s Services) DecidePermission(ctx context.Context, id, permissionID, optionID string, cancelled bool) error {
+	return s.Sessions.DecidePermission(ctx, id, permissionID, optionID, cancelled)
 }
 
 func (s Services) Cancel(ctx context.Context, id string) error {

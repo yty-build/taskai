@@ -34,6 +34,7 @@ type apiRuntime struct {
 	nextPID    int
 	sockets    map[string]string
 	commands   []worker.Command
+	pending    map[string][]worker.PendingPermission
 }
 
 func (r *apiRuntime) Spawn(ctx context.Context, sessionID string) (worker.SpawnResult, error) {
@@ -65,6 +66,18 @@ func (r *apiRuntime) Send(ctx context.Context, socket string, command worker.Com
 		r.mu.Lock()
 		delete(r.sockets, socket)
 		r.mu.Unlock()
+	}
+	if command.Type == "status" {
+		r.mu.Lock()
+		permissions := append([]worker.PendingPermission(nil), r.pending[sessionID]...)
+		r.mu.Unlock()
+		return worker.Message{Type: "status", Permissions: permissions}, nil
+	}
+	if command.Type == "permission_decision" {
+		r.mu.Lock()
+		delete(r.pending, sessionID)
+		r.mu.Unlock()
+		return worker.Message{Type: "permission_decided"}, nil
 	}
 	return worker.Message{Type: "accepted", State: "ready", RequestID: command.RequestID}, nil
 }
@@ -129,7 +142,7 @@ func newAPIFixture(t *testing.T) *apiFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtime := &apiRuntime{repository: repository, home: home, sockets: make(map[string]string)}
+	runtime := &apiRuntime{repository: repository, home: home, sockets: make(map[string]string), pending: make(map[string][]worker.PendingPermission)}
 	sessions := appservice.NewSessionService(repository, registry, home, runtime)
 	server := New(task.NewService(repository), sessions)
 	return &apiFixture{handler: server.Handler(), repository: repository, runtime: runtime, home: home, repo: repo}
@@ -209,6 +222,38 @@ func TestVersionedTaskAndSessionAPI(t *testing.T) {
 	decodeResponse(t, prompt, &promptResult)
 	if promptResult["request_id"] == "" || promptResult["request_id"] == started.RequestID {
 		t.Fatalf("prompt request ID = %q", promptResult["request_id"])
+	}
+	fixture.runtime.mu.Lock()
+	fixture.runtime.pending[sessionID] = []worker.PendingPermission{{
+		ID: "permission-1:tool-write", RequestID: "request-permission", ToolCallID: "tool-write",
+		Title: "Write marker\x1b]52;c;hidden\a", Kind: "edit",
+		Options: []worker.PermissionOption{
+			{ID: "allow-once", Name: "Allow once", Kind: "allow_once"},
+			{ID: "reject-once", Name: "Reject", Kind: "reject_once"},
+		},
+	}}
+	fixture.runtime.mu.Unlock()
+	permissions := performRequest(t, fixture.handler, http.MethodGet, "/api/v1/sessions/"+sessionID+"/permissions", nil, nil)
+	assertStatus(t, permissions, http.StatusOK)
+	var permissionResult struct {
+		Permissions []PermissionDTO `json:"permissions"`
+	}
+	decodeResponse(t, permissions, &permissionResult)
+	if len(permissionResult.Permissions) != 1 || permissionResult.Permissions[0].ID != "permission-1:tool-write" || len(permissionResult.Permissions[0].Options) != 2 {
+		t.Fatalf("permissions response = %#v", permissionResult)
+	}
+	if strings.Contains(permissionResult.Permissions[0].Title, "\x1b") {
+		t.Fatalf("permission title retained terminal controls: %q", permissionResult.Permissions[0].Title)
+	}
+	decision := performJSON(t, fixture.handler, http.MethodPost, "/api/v1/sessions/"+sessionID+"/permissions/decision", map[string]any{
+		"permission_id": "permission-1:tool-write", "option_id": "allow-once",
+	})
+	assertStatus(t, decision, http.StatusAccepted)
+	fixture.runtime.mu.Lock()
+	lastCommand := fixture.runtime.commands[len(fixture.runtime.commands)-1]
+	fixture.runtime.mu.Unlock()
+	if lastCommand.Type != "permission_decision" || lastCommand.PermissionID != "permission-1:tool-write" || lastCommand.OptionID != "allow-once" {
+		t.Fatalf("permission transport command = %#v", lastCommand)
 	}
 	cancel := performRequest(t, fixture.handler, http.MethodPost, "/api/v1/sessions/"+sessionID+"/cancel", nil, nil)
 	assertStatus(t, cancel, http.StatusAccepted)
@@ -312,6 +357,26 @@ func TestVersionedTaskAndSessionAPI(t *testing.T) {
 	}
 	assertStatus(t, performRequest(t, fixture.handler, http.MethodPost, "/api/v1/sessions/"+reviewStarted.Session.ID+"/stop", nil, nil), http.StatusOK)
 	assertDTOIsRedacted(t, getSession.Body.String(), fixture.home, sessionID)
+}
+
+func TestActivityPermissionDTOExposesOnlyActionableSafeFields(t *testing.T) {
+	line := sessionlog.Line{
+		Seq: 4, RequestID: "REQ", Type: "permission_requested",
+		Data: json.RawMessage(`{"id":"permission-4:tool","request_id":"REQ","tool_call_id":"tool","title":"Write marker","kind":"edit","options":[{"id":"allow","name":"Allow once","kind":"allow_once"}]}`),
+	}
+	dto := makeActivityDTO("S-one", line, "")
+	if dto.Permission == nil || dto.Permission.ID != "permission-4:tool" || dto.Permission.State != "waiting" || len(dto.Permission.Options) != 1 {
+		t.Fatalf("permission activity DTO = %#v", dto.Permission)
+	}
+	encoded, err := json.Marshal(dto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"worker_socket", "log_path", "rawInput", "environment"} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Fatalf("permission DTO leaked %q: %s", forbidden, encoded)
+		}
+	}
 }
 
 func TestLoopbackListenerAndGracefulServe(t *testing.T) {

@@ -2,7 +2,7 @@
 
 **Status:** V1 implementation spec, revised interaction model<br>
 **Primary interface:** CLI with interactive Task and Session attachment<br>
-**Optional runtime interface:** lightweight local web UI via `agent serve`<br>
+**Optional runtime interface:** lightweight local web UI via `acpctl serve`<br>
 **Core model:** Task → many Sessions<br>
 **Core execution protocol:** ACP<br>
 **Primary design goal:** the smallest reliable control layer over Codex, Claude, Gemini, Grok, OpenCode, and custom ACP-compatible agents without rebuilding capabilities those runtimes already provide.
@@ -357,7 +357,7 @@ Each Session belongs to exactly one Task. Do not share one Session across multip
 A convenience command may create a Task and its first Session atomically, but this does not change the underlying relationship:
 
 ```text
-agent start "Fix login regression" --agent codex --repo ./product
+acpctl start "Fix login regression" --agent codex --repo ./product
     │
     └── creates Task
             └── creates one Session
@@ -462,11 +462,11 @@ For built-in `acpx` profiles, `command` may be the friendly profile name such as
 
 Do not implement ACP protocol plumbing directly.
 
-Use a thin wrapper around `acpx`.
+Use one long-lived bridge process per Session worker around the public `acpx/runtime` API. The bridge is an implementation detail inside `internal/acp`; it is not another product entity or a shared daemon. Do not drive `acpx prompt` through a PTY: `acpx` delegates persistent prompts to a detached queue owner whose permission input is not attached to the foreground terminal.
 
 Pin the supported `acpx` version for V1 and verify it at startup. `acpx` is pre-1.0, so its command grammar and output contract must be covered by adapter-level fixtures and integration tests.
 
-The product calls `acpx` to:
+The product uses the public runtime to:
 
 - start ACP sessions,
 - prompt sessions,
@@ -475,7 +475,11 @@ The product calls `acpx` to:
 - cancel sessions,
 - invoke custom ACP-compatible agents.
 
+Resolve `acpx/runtime` from the installed, pinned package associated with the configured `acpx` binary. Runtime state and the materialized bridge script live under private `AGENT_HOME` state with `0700`/`0600` permissions. Provider authentication remains provider-managed and is never copied into Session options, SQLite, or logs.
+
 The product must hide `acpx` behind one internal package so the rest of the code does not depend on its CLI syntax.
+
+The public runtime emits rich normalized messages, reasoning, tool, status, usage, and permission activity. It does not promise the exact underlying JSON-RPC wire object. The advanced raw/debug view therefore preserves the complete gateway event envelope and normalized runtime payload available to this integration; it must not be described as an exact packet capture. Exact wire access requires a future stable upstream hook or a direct ACP implementation.
 
 Suggested internal interface:
 
@@ -500,6 +504,14 @@ A Session has at most one active ACP turn. If a human or another client submits 
 Pressing `Esc` in an attached console requests ACP cancellation of the active turn. This is cancellation, not suspension at an exact token or tool-execution position. The Session and its conversation remain resumable, and the steering instruction begins as a new turn.
 
 If the submitting client remains connected, it receives the correlated response live. If it disconnects, work continues, the result is persisted, and the client can replay it from its last stream position after reconnecting.
+
+### Permission semantics
+
+Under `read-approval`, read/search/fetch/thought work may be resolved automatically by the pinned runtime. Write, execute, and unknown ACP `session/request_permission` calls remain pending until a viewer selects one of the exact options offered by the provider. The worker exposes pending choices in status, records requested/resolved/abandoned transitions in Session JSONL, validates Session/request/option identity, and applies first-valid-decision-wins when viewers race.
+
+Detaching a viewer does not resolve, cancel, or time out a permission request. A later viewer sees the same pending card and can decide it. Cancelling the turn, stopping the worker, bridge failure, or stdin/process shutdown cancels pending callbacks and fails closed. `allow_always` and `reject_always` must be visibly persistent choices and are selectable only when the provider offered them.
+
+The public runtime callback covers ACP `session/request_permission`. Client-side host callbacks such as `fs/write_text_file` or `terminal/create` are not yet exposed interactively by `acpx/runtime`; those paths must remain fail-closed and must be called out in provider capability tests rather than silently treated as supported.
 
 ---
 
@@ -645,9 +657,9 @@ Store the raw structured output received from ACP/acpx with minimal normalizatio
 
 Purposes:
 
-- `agent task attach`
-- `agent session attach`
-- `agent session logs --follow`
+- `acpctl task attach`
+- `acpctl session attach`
+- `acpctl session logs --follow`
 - reviewer inspection
 - debugging
 - finding suspicious behavior
@@ -682,7 +694,7 @@ Recommended behavior:
 If `--worktree` is requested:
 
 ```bash
-agent session start APP-91 \
+acpctl session start APP-91 \
   --agent codex \
   --repo ~/repos/product \
   --role implementer \
@@ -722,7 +734,7 @@ The CLI is the primary V1 interface.
 Create:
 
 ```bash
-agent task new "Research Polymarket BTC edge"
+acpctl task new "Research Polymarket BTC edge"
 ```
 
 Output:
@@ -734,7 +746,7 @@ Created PM-42
 List:
 
 ```bash
-agent tasks
+acpctl tasks
 ```
 
 Output:
@@ -749,7 +761,7 @@ VID-17   done      Create property walkthrough
 Show:
 
 ```bash
-agent task PM-42
+acpctl task PM-42
 ```
 
 Output:
@@ -767,13 +779,13 @@ S103      reviewer     claude   waiting
 Set status:
 
 ```bash
-agent task status PM-42 review
+acpctl task status PM-42 review
 ```
 
 Attach to the live Task console:
 
 ```bash
-agent task attach PM-42
+acpctl task attach PM-42
 ```
 
 The Task console shows every Session, current status, latest activity, and an aggregate activity stream. A user may select a Session with the keyboard or mouse and drill into its complete ACP-visible history and live output.
@@ -781,13 +793,13 @@ The Task console shows every Session, current status, latest activity, and an ag
 Follow Task activity without an interactive terminal UI:
 
 ```bash
-agent task logs PM-42 --follow
+acpctl task logs PM-42 --follow
 ```
 
 Convenience creation for a one-Session Task:
 
 ```bash
-agent start "Fix login regression" \
+acpctl start "Fix login regression" \
   --agent codex \
   --repo ~/repos/product \
   --role implementer
@@ -802,7 +814,7 @@ This is shorthand for creating a Task and then its first Session. The persisted 
 Start:
 
 ```bash
-agent session start PM-42 \
+acpctl session start PM-42 \
   --agent gemini \
   --repo ~/repos/polymarket \
   --role researcher
@@ -815,7 +827,7 @@ ACP permissions default to read approval. A write-capable unattended Session mus
 Start with worktree:
 
 ```bash
-agent session start APP-91 \
+acpctl session start APP-91 \
   --agent codex \
   --repo ~/repos/product \
   --role implementer \
@@ -825,50 +837,50 @@ agent session start APP-91 \
 Prompt:
 
 ```bash
-agent session prompt S102 "Check the one-hour horizon too"
+acpctl session prompt S102 "Check the one-hour horizon too"
 ```
 
 Attach to the interactive ACP console:
 
 ```bash
-agent session attach S102
+acpctl session attach S102
 ```
 
 Follow logs without an interactive console:
 
 ```bash
-agent session logs S102 --follow
-agent session logs S102 --follow --raw
+acpctl session logs S102 --follow
+acpctl session logs S102 --follow --raw
 ```
 
 Status:
 
 ```bash
-agent session S102
+acpctl session S102
 ```
 
 Cancel:
 
 ```bash
-agent session cancel S102
+acpctl session cancel S102
 ```
 
 Resume:
 
 ```bash
-agent session resume S102
+acpctl session resume S102
 ```
 
 Stop worker:
 
 ```bash
-agent session stop S102
+acpctl session stop S102
 ```
 
 Open the provider-native CLI as an explicit exclusive mode:
 
 ```bash
-agent session attach S102 --native
+acpctl session attach S102 --native
 ```
 
 ---
@@ -879,7 +891,7 @@ Attachment is the primary way a human observes and steers work. It is a client c
 
 ## 14.1 Task attachment
 
-`agent task attach <task-id>` opens an interactive terminal console that:
+`acpctl task attach <task-id>` opens an interactive terminal console that:
 
 1. shows all Sessions belonging to the Task,
 2. shows agent, role, repo/worktree, status, and latest activity,
@@ -893,9 +905,9 @@ A Task is not itself an agent. A message entered at Task scope must target an ex
 
 ## 14.2 Session attachment
 
-`agent session attach <session-id>` opens the same Session detail console directly.
+`acpctl session attach <session-id>` opens the same Session detail console directly.
 
-The console first replays stored ACP-visible history and then subscribes to live output. It should render agent messages, tool calls, command results, diffs, permission requests, errors, and reasoning information when the provider exposes them through ACP. Raw ACP is available as an advanced toggle.
+The console first replays stored ACP-visible history and then subscribes to live output. It should render agent messages, tool calls, command results, diffs, permission requests, errors, and reasoning information when the provider exposes them through ACP. A raw/debug gateway-envelope view is available as an advanced toggle; with the public runtime bridge it is not an exact JSON-RPC packet capture.
 
 While an ACP turn is active:
 
@@ -903,6 +915,8 @@ While an ACP turn is active:
 - `Esc` requests cancellation of the active turn,
 - after cancellation, steering starts a new turn in the same Session,
 - detaching does not cancel or stop anything.
+
+When a permission card is pending, numbered choices map directly to the exact offered option IDs. Persistent `allow_always`/`reject_always` choices are visually distinct and require confirmation. Closing the console leaves the agent waiting; attaching again restores the actionable card.
 
 The complete ACP-visible history is not necessarily the provider's complete hidden internal state. The native runtime transcript remains authoritative for provider-specific details that ACP does not emit.
 
@@ -916,7 +930,7 @@ This behavior applies equally to terminal, web, mobile, automation, and agent-to
 
 ## 14.4 Provider-native mode
 
-`agent session attach <session-id> --native` is an escape hatch for interacting through the provider's native CLI rather than through ACP.
+`acpctl session attach <session-id> --native` is an escape hatch for interacting through the provider's native CLI rather than through ACP.
 
 Native mode is exclusive because an ACP worker and a provider-native CLI must not both write to the same native Session concurrently.
 
@@ -965,7 +979,7 @@ A review is simply another Session under the same Task.
 Convenience command:
 
 ```bash
-agent session review S201 --agent claude
+acpctl session review S201 --agent claude
 ```
 
 Equivalent to creating a new Session:
@@ -1015,7 +1029,7 @@ Web is optional and should not change the architecture.
 Command:
 
 ```bash
-agent serve
+acpctl serve
 ```
 
 This starts a disposable local web server.
@@ -1029,7 +1043,7 @@ The server:
 
 Web handlers must not contain a second implementation of Task or Session behavior and must not expose Unix socket or raw ACP internals as the client contract.
 
-If `agent serve` exits, Sessions keep running.
+If `acpctl serve` exits, Sessions keep running.
 
 ---
 
@@ -1104,7 +1118,7 @@ No separate chat ontology.
 
 # 17. Local HTTP API and Future Client Boundary
 
-`agent serve` exposes a small, versioned JSON API used by the local web UI.
+`acpctl serve` exposes a small, versioned JSON API used by the local web UI.
 
 Do not create a separate API service.
 
@@ -1123,6 +1137,8 @@ GET    /api/v1/sessions/{id}
 POST   /api/v1/tasks/{id}/sessions
 
 POST   /api/v1/sessions/{id}/prompt
+GET    /api/v1/sessions/{id}/permissions
+POST   /api/v1/sessions/{id}/permissions/decision
 POST   /api/v1/sessions/{id}/cancel
 POST   /api/v1/sessions/{id}/resume
 POST   /api/v1/sessions/{id}/stop
@@ -1142,7 +1158,7 @@ This allows future:
 
 The product contract is Task/Session.
 
-Raw ACP should remain below this boundary.
+Raw ACP and worker transport details should remain below this boundary. A permission DTO may expose only the sanitized title/kind plus exact opaque permission and option IDs required for an authorized decision.
 
 V1 binds this API to loopback and does not claim to be safe for public exposure. A future public gateway may expose the same versioned contract over authenticated HTTPS without changing the Task/Session model.
 
@@ -1162,7 +1178,7 @@ Reasons:
 - easy SQLite,
 - easy optional HTTP server,
 - easy cross-platform distribution,
-- no long-lived Python or Node runtime required,
+- no shared application daemon; each worker may own the pinned Node runtime bridge required by `acpx`,
 - good fit for local systems tooling.
 
 ---
@@ -1295,7 +1311,7 @@ Do not split into microservices.
 ## Start
 
 ```text
-agent session start
+acpctl session start
        │
        ▼
 create Session row
@@ -1305,7 +1321,7 @@ create worktree if requested
        │
        ▼
 spawn detached:
-agent _worker --session S201
+acpctl _worker --session S201
        │
        ▼
 worker starts acpx / ACP agent
@@ -1336,7 +1352,7 @@ session continues
 ## Attach
 
 ```text
-agent task attach APP-91
+acpctl task attach APP-91
        │
        ▼
 load Task and every Session
@@ -1356,7 +1372,7 @@ If worker is not available:
 ```text
 show stored JSONL history
 +
-offer agent session resume S201
+offer acpctl session resume S201
 ```
 
 If the user detaches while work is active:
@@ -1378,7 +1394,7 @@ reconnecting viewer resumes from its last stream position
 If worker is stopped:
 
 ```text
-agent session resume S201
+acpctl session resume S201
        │
        ▼
 spawn new detached worker
@@ -1397,7 +1413,7 @@ No new Run entity.
 
 No permanent daemon is required.
 
-When any `agent` command starts:
+When any `acpctl` command starts:
 
 1. open SQLite,
 2. inspect Sessions marked active,
@@ -1409,13 +1425,13 @@ Do not automatically restart every agent on boot in V1.
 User may run:
 
 ```bash
-agent session resume S201
+acpctl session resume S201
 ```
 
 Later an optional recovery command may be added:
 
 ```bash
-agent resume --all
+acpctl resume --all
 ```
 
 ---
@@ -1461,7 +1477,7 @@ because they are different concepts even when values happen to match.
 4. Raw ACP details should live under an advanced/debug view.
 5. Repo/worktree should always be visible on Session details.
 6. `attach` always means an interactive Task or Session console through the gateway and ACP.
-7. Provider-native access is an explicit `agent session attach <id> --native` mode.
+7. Provider-native access is an explicit `acpctl session attach <id> --native` mode.
 8. Detaching a viewer must never stop a worker or active turn.
 9. Reviewer Sessions should be visually distinct from producer Sessions.
 10. A user should be able to understand the current state without reading raw logs.
@@ -1485,7 +1501,9 @@ Default assumptions:
 
 ACP permissions should default to read approval. Unattended write-capable execution requires an explicit user choice such as `--approve-all`. Permission choices must be visible on Session details and must never be inferred merely because the UI is noninteractive.
 
-`agent serve` should bind to:
+Interactive permission decisions must be authorized against the current Session, active request, pending permission ID, and exact offered option. Multiple viewers use first-valid-decision-wins semantics. Raw tool input is escaped and bounded in terminal views; provider environment and authentication values are never logged.
+
+`acpctl serve` should bind to:
 
 ```text
 127.0.0.1
@@ -1566,7 +1584,7 @@ ACP agents
 
 Customers may receive simplified visibility while developers retain raw trace/terminal access.
 
-A public gateway is a later deployment profile. It requires authentication, TLS, authorization, tenant isolation, secret management, worker isolation, rate limiting, and operational recovery. The local `agent serve` process must not be presented as that production boundary.
+A public gateway is a later deployment profile. It requires authentication, TLS, authorization, tenant isolation, secret management, worker isolation, rate limiting, and operational recovery. The local `acpctl serve` process must not be presented as that production boundary.
 
 ---
 
@@ -1687,6 +1705,9 @@ V1 is complete when all of these work.
 - [ ] Prompt an existing Session.
 - [ ] Starting a Session sends Task, role, and repo/worktree context as its initial prompt.
 - [ ] Unattended write access requires an explicit permission choice.
+- [ ] A write/execute permission remains pending across viewer detach and can be decided after reattach.
+- [ ] Concurrent permission decisions produce exactly one accepted provider response.
+- [ ] Cancel/stop/bridge failure abandons pending permission safely and executes no denied write.
 - [ ] Attach to a Task and see all of its Sessions update live.
 - [ ] Select a Session from the Task console with keyboard or mouse.
 - [ ] Attach directly to a Session and see stored history followed by live ACP output.
@@ -1702,7 +1723,7 @@ V1 is complete when all of these work.
 - [ ] Persist ACP/native session IDs.
 - [ ] Associate Session with Git worktree.
 - [ ] Create isolated worktrees on request.
-- [ ] Human can enter exclusive provider-native mode with `agent session attach <id> --native`.
+- [ ] Human can enter exclusive provider-native mode with `acpctl session attach <id> --native`.
 - [ ] ACP and native clients never write to the same native Session concurrently.
 - [ ] Exiting native mode reconciles ACP state before queued prompts continue.
 
@@ -1716,7 +1737,7 @@ V1 is complete when all of these work.
 
 ## Web
 
-- [ ] `agent serve` starts local web UI.
+- [ ] `acpctl serve` starts local web UI.
 - [ ] Web lists Tasks.
 - [ ] Web shows Task Sessions.
 - [ ] Selecting a web Session shows the same stored and live history as terminal attachment.
@@ -1767,8 +1788,8 @@ Build in this order.
 
 ## Phase 4 — interactive attachment
 
-16. `agent task attach` Task console.
-17. `agent session attach` Session console.
+16. `acpctl task attach` Task console.
+17. `acpctl session attach` Session console.
 18. keyboard/mouse Session selection.
 19. history replay followed by live stream.
 20. prompt/cancel/resume/stop controls.
@@ -1779,11 +1800,11 @@ Build in this order.
 22. repo validation.
 23. optional worktree creation.
 24. branch naming.
-25. `agent session attach --native` exclusive lease and reconciliation.
+25. `acpctl session attach --native` exclusive lease and reconciliation.
 
 ## Phase 6 — review helper
 
-26. `agent session review`.
+26. `acpctl session review`.
 27. transcript + repo evidence prompt.
 
 ## Phase 7 — versioned API and optional local web
@@ -1791,7 +1812,7 @@ Build in this order.
 28. shared Task/Session/SessionStream service boundary.
 29. `/api/v1` Task and Session endpoints.
 30. reconnectable Task and Session event streams.
-31. `agent serve`.
+31. `acpctl serve`.
 32. Tasks page.
 33. Task detail and clickable Session drill-down.
 34. stored history plus live Session stream.
@@ -1806,14 +1827,14 @@ Do not start Phase 7 before the CLI and terminal attachment flow is pleasant.
 The product succeeds if one developer can do this:
 
 ```bash
-agent task new "Investigate BTC Polymarket edge"
+acpctl task new "Investigate BTC Polymarket edge"
 ```
 
 Then:
 
 ```bash
-agent session start PM-42 --agent gemini --repo ~/repos/polymarket --role researcher
-agent session start PM-42 --agent codex  --repo ~/repos/polymarket --role analyst
+acpctl session start PM-42 --agent gemini --repo ~/repos/polymarket --role researcher
+acpctl session start PM-42 --agent codex  --repo ~/repos/polymarket --role analyst
 ```
 
 Close the terminal.
@@ -1821,7 +1842,7 @@ Close the terminal.
 Come back later and attach to the Task:
 
 ```bash
-agent task attach PM-42
+acpctl task attach PM-42
 ```
 
 See:
@@ -1836,7 +1857,7 @@ S102  analyst     Codex   working
 Select `S102` from the Task console or attach directly:
 
 ```bash
-agent session attach S102
+acpctl session attach S102
 ```
 
 Observe the stored ACP-visible history, continue receiving live work, submit a steering prompt, and detach without stopping the Session.
@@ -1844,19 +1865,19 @@ Observe the stored ACP-visible history, continue receiving live work, submit a s
 Start review:
 
 ```bash
-agent session review S102 --agent claude
+acpctl session review S102 --agent claude
 ```
 
 Open the native provider CLI only if needed:
 
 ```bash
-agent session attach S102 --native
+acpctl session attach S102 --native
 ```
 
 And optionally:
 
 ```bash
-agent serve
+acpctl serve
 ```
 
 to inspect/control the same Tasks and Sessions through the versioned local API in a browser.

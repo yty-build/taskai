@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yty-build/acp-gateway/internal/acp"
 	"github.com/yty-build/acp-gateway/internal/agents"
 	"github.com/yty-build/acp-gateway/internal/config"
 	gitrepo "github.com/yty-build/acp-gateway/internal/git"
@@ -110,6 +111,19 @@ func TestStartPersistsPermissionAndSendsCompleteInitialPrompt(t *testing.T) {
 	if commands[0].DisplayMessage != "Start work on \"Investigate edge\" as analyst.\n\nCompare one-hour results\n\nCheck the one-hour horizon too" {
 		t.Fatalf("initial display message = %q", commands[0].DisplayMessage)
 	}
+	if _, err := repository.UpdateSessionWorker(ctx, current.ID, 42, "recording.sock", current.LogPath, session.StatusWorking); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.DecidePermission(ctx, current.ID, "permission-1:tool-write", "allow-once", false); err != nil {
+		t.Fatal(err)
+	}
+	runtime.mu.Lock()
+	commands = append([]worker.Command(nil), runtime.commands...)
+	runtime.mu.Unlock()
+	decision := commands[len(commands)-1]
+	if decision.Type != "permission_decision" || decision.PermissionID != "permission-1:tool-write" || decision.OptionID != "allow-once" || decision.Cancelled {
+		t.Fatalf("permission command = %#v", decision)
+	}
 }
 
 func TestPrepareDefaultsToReadApprovalAndValidatesProfileAndDirectory(t *testing.T) {
@@ -133,7 +147,7 @@ func TestPrepareDefaultsToReadApprovalAndValidatesProfileAndDirectory(t *testing
 		t.Fatal(err)
 	}
 	var metadata map[string]string
-	if err := json.Unmarshal(prepared.MetadataJSON, &metadata); err != nil || metadata["permission"] != "read-approval" || prepared.Role != "worker" {
+	if err := json.Unmarshal(prepared.MetadataJSON, &metadata); err != nil || metadata["permission"] != "read-approval" || metadata["acp_transport"] != acp.RuntimeTransport || prepared.Role != "worker" {
 		t.Fatalf("prepared = %#v, metadata=%v, err=%v", prepared, metadata, err)
 	}
 	if _, err := service.Prepare(StartSessionParams{Agent: "missing", RepoPath: repo}); err == nil {

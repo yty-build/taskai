@@ -232,7 +232,13 @@ func (m Model) sessionFooter(width int) string {
 	if m.raw {
 		mode = "r conversation"
 	}
-	return fitLine("p message · ↑/↓ scroll · End follow · d tool · o reasoning · Esc cancel · x stop · "+mode+back+" · q detach", width)
+	approval := ""
+	if projection := m.projections[m.current.ID]; projection != nil {
+		if _, card := projection.pendingPermission(); card != nil && len(card.options) > 0 {
+			approval = fmt.Sprintf("1-%d choose approval · ", min(9, len(card.options)))
+		}
+	}
+	return fitLine(approval+"p message · ↑/↓ scroll · End follow · d tool · o reasoning · Esc cancel · x stop · "+mode+back+" · q detach", width)
 }
 
 type conversationOptions struct {
@@ -374,6 +380,9 @@ func renderPermission(card *permissionCard, width int) []string {
 	}
 	for index, option := range card.options {
 		label := valueOr(option.name, strings.ReplaceAll(option.kind, "_", " "))
+		if option.kind == "allow_always" || option.kind == "reject_always" {
+			label += " · PERSISTENT"
+		}
 		lines = append(lines, fmt.Sprintf("│  [%d] %s", index+1, label))
 	}
 	lines = append(lines, "╰─ choose an offered option")

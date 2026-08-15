@@ -189,6 +189,31 @@ func TestTranscriptUpdatesPlanPermissionErrorsAndCancellation(t *testing.T) {
 	}
 }
 
+func TestTranscriptRestoresWorkerPermissionBeforeACPEventAndAbandonsIt(t *testing.T) {
+	projection := newTranscript()
+	projection.apply(projectionLine(1, "REQ-PENDING", "prompt_submitted", map[string]any{"display_message": "Write safely."}))
+	projection.apply(projectionLine(2, "REQ-PENDING", "permission_requested", map[string]any{
+		"id": "permission-2:tool-write", "request_id": "REQ-PENDING", "tool_call_id": "tool-write",
+		"title": "Write marker", "kind": "edit", "options": []any{
+			map[string]any{"id": "allow", "name": "Allow once", "kind": "allow_once"},
+			map[string]any{"id": "reject", "name": "Reject", "kind": "reject_once"},
+		},
+	}))
+	_, pending := projection.pendingPermission()
+	if pending == nil || pending.id != "permission-2:tool-write" || len(pending.options) != 2 {
+		t.Fatalf("worker permission was not restored: %#v", pending)
+	}
+	projection.apply(projectionLine(3, "REQ-PENDING", "permission_abandoned", map[string]any{
+		"permission_id": "permission-2:tool-write", "message": "worker stopped",
+	}))
+	if _, stillPending := projection.pendingPermission(); stillPending != nil {
+		t.Fatalf("abandoned permission remained actionable: %#v", stillPending)
+	}
+	if pending.state != "resolved" || !strings.Contains(pending.decision, "worker stopped") {
+		t.Fatalf("abandoned permission state = %#v", pending)
+	}
+}
+
 func TestTranscriptSanitizesHostileTerminalSequences(t *testing.T) {
 	projection := newTranscript()
 	projection.apply(projectionLine(1, "REQ", "prompt_submitted", map[string]any{

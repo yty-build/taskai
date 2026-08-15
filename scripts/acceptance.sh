@@ -16,8 +16,8 @@ go vet ./...
 
 printf 'Verifying injected build metadata\n'
 make --no-print-directory build VERSION=acceptance COMMIT=acceptance-sha BUILD_DATE=2000-01-01T00:00:00Z
-actual_version=$(bin/agent version)
-expected_version='agent acceptance (commit acceptance-sha, built 2000-01-01T00:00:00Z)'
+actual_version=$(bin/acpctl version)
+expected_version='acpctl acceptance (commit acceptance-sha, built 2000-01-01T00:00:00Z)'
 if [ "$actual_version" != "$expected_version" ]; then
   printf 'version output mismatch: %s\n' "$actual_version" >&2
   exit 1

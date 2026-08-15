@@ -40,7 +40,7 @@ const (
 const usage = `Agent Task Console controls persistent agent Sessions grouped under Tasks.
 
 Usage:
-  agent <command> [arguments]
+  acpctl <command> [arguments]
 
 Commands:
   start       Create a Task and its first Session
@@ -83,7 +83,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, info buil
 	}
 	executable, executableErr := os.Executable()
 	if executableErr != nil {
-		return fail(stderr, ExitFailure, fmt.Errorf("resolve agent executable: %w", executableErr))
+		return fail(stderr, ExitFailure, fmt.Errorf("resolve acpctl executable: %w", executableErr))
 	}
 	runtime := sessionRuntimeFactory(home, executable)
 
@@ -137,7 +137,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, info buil
 		sessionService := appservice.NewSessionService(database, registry, home, runtime)
 		err = runServe(ctx, args[1:], stdout, taskService, sessionService, registry)
 	default:
-		err = usagef("unknown command %q; run 'agent help' for usage", strings.Join(args, " "))
+		err = usagef("unknown command %q; run 'acpctl help' for usage", strings.Join(args, " "))
 	}
 	if err == nil {
 		return ExitOK
@@ -152,7 +152,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, info buil
 func runServe(ctx context.Context, args []string, stdout io.Writer, tasks *task.Service, sessions *appservice.SessionService, registry *agentregistry.Registry) error {
 	options, err := parseOptions(args, map[string]optionKind{"--listen": stringOption})
 	if err != nil || len(options.positionals) != 0 {
-		return usagef("usage: agent serve [--listen 127.0.0.1:8080]")
+		return usagef("usage: acpctl serve [--listen 127.0.0.1:8080]")
 	}
 	address := options.values["--listen"]
 	if strings.TrimSpace(address) == "" {
@@ -176,13 +176,13 @@ func runServe(ctx context.Context, args []string, stdout io.Writer, tasks *task.
 func runHiddenWorker(ctx context.Context, args []string, home config.Home, database *store.Store) error {
 	options, err := parseOptions(args, map[string]optionKind{"--session": stringOption})
 	if err != nil || len(options.positionals) != 0 || options.values["--session"] == "" {
-		return usagef("usage: agent _worker --session <session-id>")
+		return usagef("usage: acpctl _worker --session <session-id>")
 	}
 	return worker.RunSession(ctx, home, database, options.values["--session"])
 }
 
 func fail(stderr io.Writer, code int, err error) int {
-	fmt.Fprintf(stderr, "agent: %s\n", err)
+	fmt.Fprintf(stderr, "acpctl: %s\n", err)
 	return code
 }
 
@@ -196,7 +196,7 @@ func usagef(format string, args ...any) error {
 
 func runTasks(ctx context.Context, args []string, stdout io.Writer, service *task.Service) error {
 	if len(args) != 0 {
-		return usagef("usage: agent tasks")
+		return usagef("usage: acpctl tasks")
 	}
 	tasks, err := service.List(ctx)
 	if err != nil {
@@ -216,14 +216,14 @@ func runTasks(ctx context.Context, args []string, stdout io.Writer, service *tas
 
 func runTask(ctx context.Context, args []string, stdout io.Writer, service *task.Service, sessions *appservice.SessionService) error {
 	if len(args) == 0 {
-		return usagef("usage: agent task new|status|attach|logs|<task-id>")
+		return usagef("usage: acpctl task new|status|attach|logs|<task-id>")
 	}
 	switch args[0] {
 	case "new":
 		return runTaskNew(ctx, args[1:], stdout, service)
 	case "status":
 		if len(args) != 3 {
-			return usagef("usage: agent task status <task-id> <status>")
+			return usagef("usage: acpctl task status <task-id> <status>")
 		}
 		status, err := task.ParseStatus(args[2])
 		if err != nil {
@@ -239,12 +239,12 @@ func runTask(ctx context.Context, args []string, stdout io.Writer, service *task
 		return runTaskLogs(ctx, args[1:], stdout, sessions)
 	case "attach":
 		if len(args) != 2 {
-			return usagef("usage: agent task attach <task-id>")
+			return usagef("usage: acpctl task attach <task-id>")
 		}
 		return console.AttachTask(ctx, console.Services{Tasks: service, Sessions: sessions}, args[1], os.Stdin, stdout)
 	default:
 		if len(args) != 1 {
-			return usagef("usage: agent task <task-id>")
+			return usagef("usage: acpctl task <task-id>")
 		}
 		return showTask(ctx, args[0], stdout, service)
 	}
@@ -255,10 +255,10 @@ func runTaskNew(ctx context.Context, args []string, stdout io.Writer, service *t
 		"--description": stringOption, "--external-ref": stringOption, "--metadata-json": stringOption,
 	})
 	if err != nil {
-		return usagef("agent task new: %s", err)
+		return usagef("acpctl task new: %s", err)
 	}
 	if len(options.positionals) != 1 {
-		return usagef("usage: agent task new <title> [--description <text>] [--external-ref <ref>] [--metadata-json <json>]")
+		return usagef("usage: acpctl task new <title> [--description <text>] [--external-ref <ref>] [--metadata-json <json>]")
 	}
 	created, err := service.Create(ctx, task.CreateParams{
 		Title: options.positionals[0], Description: options.values["--description"], ExternalRef: options.values["--external-ref"],
@@ -304,10 +304,10 @@ func runStart(ctx context.Context, args []string, stdout io.Writer, sessions *ap
 		"--worktree": boolOption, "--allow-shared-checkout": boolOption,
 	})
 	if err != nil {
-		return usagef("agent start: %s", err)
+		return usagef("acpctl start: %s", err)
 	}
 	if len(options.positionals) != 1 || strings.TrimSpace(options.values["--agent"]) == "" || strings.TrimSpace(options.values["--repo"]) == "" {
-		return usagef("usage: agent start <title> --agent <name> --repo <path> [--role <role>] [--worktree] [--allow-shared-checkout]")
+		return usagef("usage: acpctl start <title> --agent <name> --repo <path> [--role <role>] [--worktree] [--allow-shared-checkout]")
 	}
 	started, err := sessions.StartTask(ctx,
 		task.CreateParams{Title: options.positionals[0], Description: options.values["--description"], ExternalRef: options.values["--external-ref"], MetadataJSON: rawJSON(options.values["--metadata-json"]), Status: task.StatusWorking},
@@ -328,14 +328,14 @@ func runStart(ctx context.Context, args []string, stdout io.Writer, sessions *ap
 
 func runSession(ctx context.Context, args []string, stdout, stderr io.Writer, service *appservice.SessionService) error {
 	if len(args) == 0 {
-		return usagef("usage: agent session start|review|attach|prompt|cancel|resume|stop|logs|<session-id>")
+		return usagef("usage: acpctl session start|review|attach|prompt|cancel|resume|stop|logs|<session-id>")
 	}
 	switch args[0] {
 	case "start":
 		return runSessionStart(ctx, args[1:], stdout, service)
 	case "prompt":
 		if len(args) != 3 {
-			return usagef("usage: agent session prompt <session-id> <message>")
+			return usagef("usage: acpctl session prompt <session-id> <message>")
 		}
 		accepted, err := service.Prompt(ctx, args[1], args[2])
 		if err != nil {
@@ -345,7 +345,7 @@ func runSession(ctx context.Context, args []string, stdout, stderr io.Writer, se
 		return nil
 	case "cancel":
 		if len(args) != 2 {
-			return usagef("usage: agent session cancel <session-id>")
+			return usagef("usage: acpctl session cancel <session-id>")
 		}
 		if err := service.Cancel(ctx, args[1]); err != nil {
 			return err
@@ -355,7 +355,7 @@ func runSession(ctx context.Context, args []string, stdout, stderr io.Writer, se
 	case "resume":
 		options, err := parseOptions(args[1:], map[string]optionKind{"--allow-shared-checkout": boolOption})
 		if err != nil || len(options.positionals) != 1 {
-			return usagef("usage: agent session resume <session-id> [--allow-shared-checkout]")
+			return usagef("usage: acpctl session resume <session-id> [--allow-shared-checkout]")
 		}
 		resumed, err := service.ResumeWithOptions(ctx, options.positionals[0], options.booleans["--allow-shared-checkout"])
 		if err != nil {
@@ -365,7 +365,7 @@ func runSession(ctx context.Context, args []string, stdout, stderr io.Writer, se
 		return nil
 	case "stop":
 		if len(args) != 2 {
-			return usagef("usage: agent session stop <session-id>")
+			return usagef("usage: acpctl session stop <session-id>")
 		}
 		if err := service.Stop(ctx, args[1]); err != nil {
 			return err
@@ -377,7 +377,7 @@ func runSession(ctx context.Context, args []string, stdout, stderr io.Writer, se
 	case "review":
 		options, err := parseOptions(args[1:], map[string]optionKind{"--agent": stringOption, "--allow-active-producer": boolOption})
 		if err != nil || len(options.positionals) != 1 || strings.TrimSpace(options.values["--agent"]) == "" {
-			return usagef("usage: agent session review <producer-session-id> --agent <reviewer> [--allow-active-producer]")
+			return usagef("usage: acpctl session review <producer-session-id> --agent <reviewer> [--allow-active-producer]")
 		}
 		launched, err := service.Review(ctx, appservice.ReviewSessionParams{
 			ProducerID: options.positionals[0], Agent: options.values["--agent"], AllowActiveProducer: options.booleans["--allow-active-producer"],
@@ -390,10 +390,10 @@ func runSession(ctx context.Context, args []string, stdout, stderr io.Writer, se
 	case "attach":
 		options, err := parseOptions(args[1:], map[string]optionKind{"--native": boolOption, "--cancel-active": boolOption, "--reconcile-only": boolOption})
 		if err != nil || len(options.positionals) != 1 {
-			return usagef("usage: agent session attach <session-id> [--native [--cancel-active|--reconcile-only]]")
+			return usagef("usage: acpctl session attach <session-id> [--native [--cancel-active|--reconcile-only]]")
 		}
 		if options.booleans["--cancel-active"] && options.booleans["--reconcile-only"] {
-			return usagef("agent session attach: --cancel-active and --reconcile-only cannot be combined")
+			return usagef("acpctl session attach: --cancel-active and --reconcile-only cannot be combined")
 		}
 		if options.booleans["--cancel-active"] || options.booleans["--reconcile-only"] {
 			options.booleans["--native"] = true
@@ -407,7 +407,7 @@ func runSession(ctx context.Context, args []string, stdout, stderr io.Writer, se
 		return console.AttachSession(ctx, console.Services{Sessions: service}, options.positionals[0], os.Stdin, stdout)
 	default:
 		if len(args) != 1 {
-			return usagef("usage: agent session <session-id>")
+			return usagef("usage: acpctl session <session-id>")
 		}
 		return showSession(ctx, args[0], stdout, service)
 	}
@@ -431,10 +431,10 @@ func runSessionStart(ctx context.Context, args []string, stdout io.Writer, servi
 		"--prompt": stringOption, "--approve-all": boolOption, "--worktree": boolOption, "--allow-shared-checkout": boolOption,
 	})
 	if err != nil {
-		return usagef("agent session start: %s", err)
+		return usagef("acpctl session start: %s", err)
 	}
 	if len(options.positionals) != 1 || options.values["--agent"] == "" || options.values["--repo"] == "" {
-		return usagef("usage: agent session start <task-id> --agent <name> --repo <path> --role <role> [--worktree] [--allow-shared-checkout] [--prompt <text>] [--approve-all]")
+		return usagef("usage: acpctl session start <task-id> --agent <name> --repo <path> --role <role> [--worktree] [--allow-shared-checkout] [--prompt <text>] [--approve-all]")
 	}
 	launched, err := service.Start(ctx, appservice.StartSessionParams{
 		TaskID: options.positionals[0], Agent: options.values["--agent"], RepoPath: options.values["--repo"],
@@ -470,14 +470,14 @@ func showSession(ctx context.Context, id string, stdout io.Writer, service *apps
 func runSessionLogs(ctx context.Context, args []string, stdout io.Writer, service *appservice.SessionService) error {
 	options, err := parseOptions(args, map[string]optionKind{"--follow": boolOption, "--raw": boolOption, "--from": stringOption})
 	if err != nil {
-		return usagef("agent session logs: %s", err)
+		return usagef("acpctl session logs: %s", err)
 	}
 	if len(options.positionals) != 1 {
-		return usagef("usage: agent session logs <session-id> [--follow] [--raw] [--from <position>]")
+		return usagef("usage: acpctl session logs <session-id> [--follow] [--raw] [--from <position>]")
 	}
 	cursor, err := parseCursor(options.values["--from"])
 	if err != nil {
-		return usagef("agent session logs: %s", err)
+		return usagef("acpctl session logs: %s", err)
 	}
 	printLine := func(line sessionlog.Line) error {
 		fmt.Fprintln(stdout, render.Activity(line, options.booleans["--raw"]))
@@ -505,10 +505,10 @@ func runSessionLogs(ctx context.Context, args []string, stdout io.Writer, servic
 func runTaskLogs(ctx context.Context, args []string, stdout io.Writer, service *appservice.SessionService) error {
 	options, err := parseOptions(args, map[string]optionKind{"--follow": boolOption, "--raw": boolOption})
 	if err != nil {
-		return usagef("agent task logs: %s", err)
+		return usagef("acpctl task logs: %s", err)
 	}
 	if len(options.positionals) != 1 {
-		return usagef("usage: agent task logs <task-id> [--follow] [--raw]")
+		return usagef("usage: acpctl task logs <task-id> [--follow] [--raw]")
 	}
 	taskID := options.positionals[0]
 	stored, err := service.TaskHistory(ctx, taskID, nil)
@@ -553,7 +553,7 @@ func intOrDash(value int) string {
 
 func runAgents(args []string, stdout io.Writer, registry *agentregistry.Registry) error {
 	if len(args) > 1 {
-		return usagef("usage: agent agents [name]")
+		return usagef("usage: acpctl agents [name]")
 	}
 	if len(args) == 1 {
 		profile, err := registry.Get(args[0])

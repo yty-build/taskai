@@ -394,7 +394,7 @@ func PermissionMetadata(approveAll bool) (json.RawMessage, error) {
 	if approveAll {
 		permission = string(acp.PermissionApproveAll)
 	}
-	encoded, err := json.Marshal(map[string]string{"permission": permission})
+	encoded, err := json.Marshal(map[string]string{"permission": permission, "acp_transport": acp.RuntimeTransport})
 	return json.RawMessage(encoded), err
 }
 
@@ -425,7 +425,7 @@ func (s *SessionService) Prompt(ctx context.Context, id, message string) (worker
 		return worker.Message{}, err
 	}
 	if current.WorkerSocket == "" {
-		return worker.Message{}, fmt.Errorf("Session %s has no live worker; run 'agent session resume %s'", id, id)
+		return worker.Message{}, fmt.Errorf("Session %s has no live worker; run 'acpctl session resume %s'", id, id)
 	}
 	requestID, err := acp.NewRequestID()
 	if err != nil {
@@ -446,6 +446,47 @@ func (s *SessionService) Cancel(ctx context.Context, id string) error {
 	}
 	_, err = s.runtime.Send(ctx, current.WorkerSocket, worker.Command{Type: "cancel"})
 	return err
+}
+
+// DecidePermission resolves one currently pending ACP permission request using
+// an exact option offered by that provider. The Session worker validates both
+// the request and option and makes concurrent viewer decisions first-wins.
+func (s *SessionService) DecidePermission(ctx context.Context, id, permissionID, optionID string, cancelled bool) error {
+	current, err := s.repository.GetSession(ctx, id)
+	if err != nil {
+		return err
+	}
+	if current.WorkerSocket == "" {
+		return fmt.Errorf("Session %s has no live worker", id)
+	}
+	if strings.TrimSpace(permissionID) == "" {
+		return fmt.Errorf("permission ID is required")
+	}
+	if !cancelled && strings.TrimSpace(optionID) == "" {
+		return fmt.Errorf("permission option ID is required")
+	}
+	_, err = s.runtime.Send(ctx, current.WorkerSocket, worker.Command{
+		Type: "permission_decision", PermissionID: permissionID, OptionID: optionID, Cancelled: cancelled,
+	})
+	return err
+}
+
+// PendingPermissions returns the worker's current actionable permission state.
+// A stopped Session has no in-memory pending callback, so it returns an empty
+// slice while durable history remains available through History/Follow.
+func (s *SessionService) PendingPermissions(ctx context.Context, id string) ([]worker.PendingPermission, error) {
+	current, err := s.repository.GetSession(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if current.WorkerSocket == "" {
+		return []worker.PendingPermission{}, nil
+	}
+	status, err := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{Type: "status"})
+	if err != nil {
+		return nil, err
+	}
+	return append([]worker.PendingPermission(nil), status.Permissions...), nil
 }
 
 func (s *SessionService) Resume(ctx context.Context, id string) (session.Session, error) {
@@ -586,7 +627,7 @@ func (s *SessionService) acquireNative(ctx context.Context, current session.Sess
 			return fmt.Errorf("read Session %s worker status before native attachment: %w", current.ID, err)
 		}
 		if status.NativeLease {
-			return fmt.Errorf("Session %s already has an exclusive native lease; do not start another native CLI. If the prior CLI has exited, run 'agent session attach %s --native --reconcile-only'", current.ID, current.ID)
+			return fmt.Errorf("Session %s already has an exclusive native lease; do not start another native CLI. If the prior CLI has exited, run 'acpctl session attach %s --native --reconcile-only'", current.ID, current.ID)
 		}
 		if status.ActiveRequestID != "" {
 			if cancelActive && !cancelled[status.ActiveRequestID] {
@@ -635,7 +676,7 @@ func (s *SessionService) reconcileNative(ctx context.Context, current session.Se
 
 func (s *SessionService) releaseNative(ctx context.Context, current session.Session) error {
 	if _, err := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{Type: "native_release"}); err != nil {
-		return fmt.Errorf("native reconciliation failed for Session %s; the exclusive lease remains held and queued prompts remain paused. Resolve the provider/acpx issue, ensure the native CLI has exited, then run 'agent session attach %s --native --reconcile-only': %w", current.ID, current.ID, err)
+		return fmt.Errorf("native reconciliation failed for Session %s; the exclusive lease remains held and queued prompts remain paused. Resolve the provider/acpx issue, ensure the native CLI has exited, then run 'acpctl session attach %s --native --reconcile-only': %w", current.ID, current.ID, err)
 	}
 	return nil
 }

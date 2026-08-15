@@ -35,7 +35,7 @@ func TestRunVersion(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	info := buildinfo.Info{Version: "1.2.3", Commit: "abc", Date: "today"}
 	code := Run(context.Background(), []string{"version"}, &stdout, &stderr, info)
-	if code != ExitOK || stdout.String() != "agent 1.2.3 (commit abc, built today)\n" {
+	if code != ExitOK || stdout.String() != "acpctl 1.2.3 (commit abc, built today)\n" {
 		t.Fatalf("code = %d, stdout = %q", code, stdout.String())
 	}
 }
@@ -47,7 +47,7 @@ func TestRunUnknownCommandHasStableError(t *testing.T) {
 	if code != ExitUsage {
 		t.Fatalf("exit code = %d, want %d", code, ExitUsage)
 	}
-	if got, want := stderr.String(), "agent: unknown command \"wat\"; run 'agent help' for usage\n"; got != want {
+	if got, want := stderr.String(), "acpctl: unknown command \"wat\"; run 'acpctl help' for usage\n"; got != want {
 		t.Fatalf("stderr = %q, want %q", got, want)
 	}
 }
@@ -65,7 +65,7 @@ func TestServeUsesLoopbackAndStopsOnlyTheViewer(t *testing.T) {
 	case <-stdout.ready:
 	case <-time.After(4 * time.Second):
 		cancel()
-		t.Fatal("agent serve did not start")
+		t.Fatal("acpctl serve did not start")
 	}
 	cancel()
 	select {
@@ -74,7 +74,7 @@ func TestServeUsesLoopbackAndStopsOnlyTheViewer(t *testing.T) {
 			t.Fatalf("serve: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 		}
 	case <-time.After(4 * time.Second):
-		t.Fatal("agent serve did not stop after context cancellation")
+		t.Fatal("acpctl serve did not stop after context cancellation")
 	}
 	for _, expected := range []string{"http://127.0.0.1:", "Session workers will continue"} {
 		if !strings.Contains(stdout.String(), expected) {
@@ -234,7 +234,7 @@ func (fakeSessionRuntime) Subscribe(context.Context, string, uint64, func(worker
 func TestStartValidationIsAtomic(t *testing.T) {
 	t.Setenv("AGENT_HOME", filepath.Join(t.TempDir(), "state"))
 	code, _, stderr := runForTest(t, "start", "Invalid", "--agent", "", "--repo", ".")
-	if code != ExitUsage || !strings.Contains(stderr, "usage: agent start") {
+	if code != ExitUsage || !strings.Contains(stderr, "usage: acpctl start") {
 		t.Fatalf("start: code=%d stderr=%q", code, stderr)
 	}
 	code, stdout, stderr := runForTest(t, "tasks")
