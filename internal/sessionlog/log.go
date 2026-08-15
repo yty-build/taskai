@@ -30,6 +30,19 @@ type Log struct {
 	now  func() time.Time
 }
 
+// ReadFile reads existing history without creating or opening an append writer.
+func ReadFile(path string, cursor uint64) ([]Line, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("open Session log for replay: %w", err)
+	}
+	defer file.Close()
+	return scanFile(file, cursor, 0)
+}
+
 func Open(path string) (*Log, error) {
 	if path == "" {
 		return nil, fmt.Errorf("Session log path is required")

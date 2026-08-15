@@ -13,6 +13,13 @@ if [ -n "${FAKE_ACPX_ARGS_FILE:-}" ]; then
   done
 fi
 
+if [ -n "${FAKE_ACPX_ARGS_LOG:-}" ]; then
+  printf '%s\n' '---' >> "${FAKE_ACPX_ARGS_LOG}"
+  for argument in "$@"; do
+    printf '%s\n' "$argument" >> "${FAKE_ACPX_ARGS_LOG}"
+  done
+fi
+
 scenario="${FAKE_ACPX_SCENARIO:-success}"
 command_line="$*"
 

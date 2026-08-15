@@ -9,6 +9,9 @@ import (
 	"testing"
 
 	"github.com/yty-build/acp-gateway/internal/buildinfo"
+	"github.com/yty-build/acp-gateway/internal/config"
+	appservice "github.com/yty-build/acp-gateway/internal/service"
+	"github.com/yty-build/acp-gateway/internal/worker"
 )
 
 func TestRunHelp(t *testing.T) {
@@ -89,12 +92,18 @@ func TestTaskCommandLifecycle(t *testing.T) {
 func TestStartCreatesTaskAndSession(t *testing.T) {
 	t.Setenv("AGENT_HOME", filepath.Join(t.TempDir(), "state"))
 	repo := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(repo, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	originalFactory := sessionRuntimeFactory
+	sessionRuntimeFactory = func(config.Home, string) appservice.Runtime { return fakeSessionRuntime{} }
+	t.Cleanup(func() { sessionRuntimeFactory = originalFactory })
 	code, stdout, stderr := runForTest(t, "start", "Fix login", "--agent", "codex", "--repo", repo, "--role", "implementer", "--description", "Production regression")
 	if code != ExitOK || stderr != "" {
 		t.Fatalf("start: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
 	fields := strings.Fields(stdout)
-	if len(fields) != 4 || fields[0] != "Created" || fields[2] != "Started" {
+	if len(fields) < 7 || fields[0] != "Created" || fields[2] != "Started" || fields[4] != "Initial" {
 		t.Fatalf("start output = %q", stdout)
 	}
 	taskID, sessionID := fields[1], fields[3]
@@ -102,6 +111,20 @@ func TestStartCreatesTaskAndSession(t *testing.T) {
 	if code != ExitOK || stderr != "" || !strings.Contains(stdout, sessionID) || !strings.Contains(stdout, "implementer") || !strings.Contains(stdout, "codex") || !strings.Contains(stdout, "starting") {
 		t.Fatalf("task show: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
+}
+
+type fakeSessionRuntime struct{}
+
+func (fakeSessionRuntime) Spawn(context.Context, string) (worker.SpawnResult, error) {
+	return worker.SpawnResult{PID: 123, Socket: "fake.sock"}, nil
+}
+
+func (fakeSessionRuntime) Send(_ context.Context, _ string, command worker.Command) (worker.Message, error) {
+	return worker.Message{Type: "accepted", RequestID: command.RequestID, State: "ready"}, nil
+}
+
+func (fakeSessionRuntime) Subscribe(context.Context, string, uint64, func(worker.Message) error) error {
+	return nil
 }
 
 func TestStartValidationIsAtomic(t *testing.T) {

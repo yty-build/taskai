@@ -6,20 +6,28 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"path/filepath"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
 
 	agentregistry "github.com/yty-build/acp-gateway/internal/agents"
 	"github.com/yty-build/acp-gateway/internal/buildinfo"
 	"github.com/yty-build/acp-gateway/internal/config"
-	"github.com/yty-build/acp-gateway/internal/session"
+	"github.com/yty-build/acp-gateway/internal/render"
+	appservice "github.com/yty-build/acp-gateway/internal/service"
+	"github.com/yty-build/acp-gateway/internal/sessionlog"
 	"github.com/yty-build/acp-gateway/internal/store"
 	"github.com/yty-build/acp-gateway/internal/task"
 	"github.com/yty-build/acp-gateway/internal/worker"
 )
+
+var sessionRuntimeFactory = func(home config.Home, executable string) appservice.Runtime {
+	return appservice.LocalRuntime{Executable: executable, Home: home}
+}
 
 const (
 	ExitOK      = 0
@@ -66,6 +74,16 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, info buil
 		return fail(stderr, ExitFailure, err)
 	}
 	defer database.Close()
+	if args[0] != "_worker" {
+		if _, err := worker.ReconcileStale(ctx, home, database); err != nil {
+			return fail(stderr, ExitFailure, err)
+		}
+	}
+	executable, executableErr := os.Executable()
+	if executableErr != nil {
+		return fail(stderr, ExitFailure, fmt.Errorf("resolve agent executable: %w", executableErr))
+	}
+	runtime := sessionRuntimeFactory(home, executable)
 
 	taskService := task.NewService(database)
 	switch args[0] {
@@ -74,14 +92,26 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, info buil
 	case "tasks":
 		err = runTasks(ctx, args[1:], stdout, taskService)
 	case "task":
-		err = runTask(ctx, args[1:], stdout, taskService)
+		sessionService := appservice.NewSessionService(database, nil, home, runtime)
+		err = runTask(ctx, args[1:], stdout, taskService, sessionService)
 	case "start":
 		registry, loadErr := agentregistry.Load(home.Agents)
 		if loadErr != nil {
 			err = loadErr
 			break
 		}
-		err = runStart(ctx, args[1:], stdout, taskService, registry)
+		sessionService := appservice.NewSessionService(database, registry, home, runtime)
+		err = runStart(ctx, args[1:], stdout, taskService, sessionService)
+	case "session":
+		var registry *agentregistry.Registry
+		if len(args) > 1 && args[1] == "start" {
+			registry, err = agentregistry.Load(home.Agents)
+			if err != nil {
+				break
+			}
+		}
+		sessionService := appservice.NewSessionService(database, registry, home, runtime)
+		err = runSession(ctx, args[1:], stdout, sessionService)
 	case "agents":
 		registry, loadErr := agentregistry.Load(home.Agents)
 		if loadErr != nil {
@@ -143,7 +173,7 @@ func runTasks(ctx context.Context, args []string, stdout io.Writer, service *tas
 	return w.Flush()
 }
 
-func runTask(ctx context.Context, args []string, stdout io.Writer, service *task.Service) error {
+func runTask(ctx context.Context, args []string, stdout io.Writer, service *task.Service, sessions *appservice.SessionService) error {
 	if len(args) == 0 {
 		return usagef("usage: agent task new|status|<task-id>")
 	}
@@ -164,6 +194,8 @@ func runTask(ctx context.Context, args []string, stdout io.Writer, service *task
 		}
 		fmt.Fprintf(stdout, "Updated %s to %s\n", updated.ID, updated.Status)
 		return nil
+	case "logs":
+		return runTaskLogs(ctx, args[1:], stdout, sessions)
 	default:
 		if len(args) != 1 {
 			return usagef("usage: agent task <task-id>")
@@ -219,10 +251,10 @@ func showTask(ctx context.Context, id string, stdout io.Writer, service *task.Se
 	return w.Flush()
 }
 
-func runStart(ctx context.Context, args []string, stdout io.Writer, service *task.Service, registry *agentregistry.Registry) error {
+func runStart(ctx context.Context, args []string, stdout io.Writer, tasks *task.Service, sessions *appservice.SessionService) error {
 	options, err := parseOptions(args, map[string]optionKind{
 		"--agent": stringOption, "--repo": stringOption, "--role": stringOption, "--description": stringOption,
-		"--external-ref": stringOption, "--metadata-json": stringOption,
+		"--external-ref": stringOption, "--metadata-json": stringOption, "--prompt": stringOption, "--approve-all": boolOption,
 	})
 	if err != nil {
 		return usagef("agent start: %s", err)
@@ -230,27 +262,294 @@ func runStart(ctx context.Context, args []string, stdout io.Writer, service *tas
 	if len(options.positionals) != 1 || strings.TrimSpace(options.values["--agent"]) == "" || strings.TrimSpace(options.values["--repo"]) == "" {
 		return usagef("usage: agent start <title> --agent <name> --repo <path> [--role <role>]")
 	}
-	profile, err := registry.Get(options.values["--agent"])
+	prepared, err := sessions.Prepare(appservice.StartSessionParams{
+		Agent: options.values["--agent"], RepoPath: options.values["--repo"], Role: options.values["--role"], ApproveAll: options.booleans["--approve-all"],
+	})
 	if err != nil {
 		return err
 	}
-	repoPath, err := filepath.Abs(options.values["--repo"])
-	if err != nil {
-		return fmt.Errorf("resolve repo path: %w", err)
-	}
-	role := strings.TrimSpace(options.values["--role"])
-	if role == "" {
-		role = "worker"
-	}
-	createdTask, createdSession, err := service.Start(ctx,
+	createdTask, createdSession, err := tasks.Start(ctx,
 		task.CreateParams{Title: options.positionals[0], Description: options.values["--description"], ExternalRef: options.values["--external-ref"], MetadataJSON: rawJSON(options.values["--metadata-json"]), Status: task.StatusWorking},
-		session.CreateParams{Role: role, Agent: profile.Name, Provider: profile.Provider, RepoPath: filepath.Clean(repoPath), Status: session.StatusStarting},
+		prepared,
 	)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "Created %s\nStarted %s\n", createdTask.ID, createdSession.ID)
+	launched, err := sessions.Launch(ctx, createdSession.ID, options.values["--prompt"])
+	if err != nil {
+		return fmt.Errorf("created Task %s and Session %s, but launch failed: %w", createdTask.ID, createdSession.ID, err)
+	}
+	fmt.Fprintf(stdout, "Created %s\nStarted %s\nInitial request %s (%s)\n", createdTask.ID, createdSession.ID, launched.RequestID, launched.State)
 	return nil
+}
+
+func runSession(ctx context.Context, args []string, stdout io.Writer, service *appservice.SessionService) error {
+	if len(args) == 0 {
+		return usagef("usage: agent session start|prompt|cancel|resume|stop|logs|<session-id>")
+	}
+	switch args[0] {
+	case "start":
+		return runSessionStart(ctx, args[1:], stdout, service)
+	case "prompt":
+		if len(args) != 3 {
+			return usagef("usage: agent session prompt <session-id> <message>")
+		}
+		accepted, err := service.Prompt(ctx, args[1], args[2])
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "Accepted %s (%s)\n", accepted.RequestID, accepted.State)
+		return nil
+	case "cancel":
+		if len(args) != 2 {
+			return usagef("usage: agent session cancel <session-id>")
+		}
+		if err := service.Cancel(ctx, args[1]); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "Cancellation requested for %s\n", args[1])
+		return nil
+	case "resume":
+		if len(args) != 2 {
+			return usagef("usage: agent session resume <session-id>")
+		}
+		resumed, err := service.Resume(ctx, args[1])
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "Resumed %s\n", resumed.ID)
+		return nil
+	case "stop":
+		if len(args) != 2 {
+			return usagef("usage: agent session stop <session-id>")
+		}
+		if err := service.Stop(ctx, args[1]); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "Stopped %s\n", args[1])
+		return nil
+	case "logs":
+		return runSessionLogs(ctx, args[1:], stdout, service)
+	default:
+		if len(args) != 1 {
+			return usagef("usage: agent session <session-id>")
+		}
+		return showSession(ctx, args[0], stdout, service)
+	}
+}
+
+func runSessionStart(ctx context.Context, args []string, stdout io.Writer, service *appservice.SessionService) error {
+	options, err := parseOptions(args, map[string]optionKind{
+		"--agent": stringOption, "--repo": stringOption, "--role": stringOption,
+		"--prompt": stringOption, "--approve-all": boolOption,
+	})
+	if err != nil {
+		return usagef("agent session start: %s", err)
+	}
+	if len(options.positionals) != 1 || options.values["--agent"] == "" || options.values["--repo"] == "" {
+		return usagef("usage: agent session start <task-id> --agent <name> --repo <path> --role <role> [--prompt <text>] [--approve-all]")
+	}
+	launched, err := service.Start(ctx, appservice.StartSessionParams{
+		TaskID: options.positionals[0], Agent: options.values["--agent"], RepoPath: options.values["--repo"],
+		Role: options.values["--role"], Prompt: options.values["--prompt"], ApproveAll: options.booleans["--approve-all"],
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "Started %s\nInitial request %s (%s)\n", launched.Session.ID, launched.RequestID, launched.State)
+	return nil
+}
+
+func showSession(ctx context.Context, id string, stdout io.Writer, service *appservice.SessionService) error {
+	current, err := service.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "%s\nTask: %s\nRole: %s\nAgent: %s\nProvider: %s\nStatus: %s\n", current.ID, current.TaskID, valueOrDash(current.Role), current.Agent, valueOrDash(current.Provider), current.Status)
+	fmt.Fprintf(stdout, "Permission: %s\nRepo: %s\n", appservice.PermissionLabel(current), valueOrDash(current.RepoPath))
+	if current.WorktreePath != "" {
+		fmt.Fprintf(stdout, "Worktree: %s\n", current.WorktreePath)
+	}
+	if current.Branch != "" {
+		fmt.Fprintf(stdout, "Branch: %s\n", current.Branch)
+	}
+	fmt.Fprintf(stdout, "Task Console ID: %s\nacpx record ID: %s\nACP Session ID: %s\nNative Session ID: %s\n", current.ID, valueOrDash(current.ACPXRecordID), valueOrDash(current.ACPSessionID), valueOrDash(current.NativeSessionID))
+	fmt.Fprintf(stdout, "Worker PID: %s\nWorker socket: %s\nLog: %s\n", intOrDash(current.WorkerPID), valueOrDash(current.WorkerSocket), valueOrDash(current.LogPath))
+	fmt.Fprintf(stdout, "Created: %s\nUpdated: %s\n", displayTime(current.CreatedAt), displayTime(current.UpdatedAt))
+	return nil
+}
+
+func runSessionLogs(ctx context.Context, args []string, stdout io.Writer, service *appservice.SessionService) error {
+	options, err := parseOptions(args, map[string]optionKind{"--follow": boolOption, "--raw": boolOption, "--from": stringOption})
+	if err != nil {
+		return usagef("agent session logs: %s", err)
+	}
+	if len(options.positionals) != 1 {
+		return usagef("usage: agent session logs <session-id> [--follow] [--raw] [--from <position>]")
+	}
+	cursor, err := parseCursor(options.values["--from"])
+	if err != nil {
+		return usagef("agent session logs: %s", err)
+	}
+	printLine := func(line sessionlog.Line) error {
+		fmt.Fprintln(stdout, render.Activity(line, options.booleans["--raw"]))
+		return nil
+	}
+	if options.booleans["--follow"] {
+		err := service.Follow(ctx, options.positionals[0], cursor, printLine)
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
+		return err
+	}
+	lines, err := service.History(ctx, options.positionals[0], cursor)
+	if err != nil {
+		return err
+	}
+	for _, line := range lines {
+		if err := printLine(line); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type taskLogLine struct {
+	SessionID string
+	Line      sessionlog.Line
+}
+
+func runTaskLogs(ctx context.Context, args []string, stdout io.Writer, service *appservice.SessionService) error {
+	options, err := parseOptions(args, map[string]optionKind{"--follow": boolOption, "--raw": boolOption})
+	if err != nil {
+		return usagef("agent task logs: %s", err)
+	}
+	if len(options.positionals) != 1 {
+		return usagef("usage: agent task logs <task-id> [--follow] [--raw]")
+	}
+	taskID := options.positionals[0]
+	sessions, err := service.ListByTask(ctx, taskID)
+	if err != nil {
+		return err
+	}
+	cursors := make(map[string]uint64)
+	var stored []taskLogLine
+	for _, current := range sessions {
+		lines, err := service.History(ctx, current.ID, 0)
+		if err != nil {
+			return err
+		}
+		for _, line := range lines {
+			stored = append(stored, taskLogLine{SessionID: current.ID, Line: line})
+			if line.Seq > cursors[current.ID] {
+				cursors[current.ID] = line.Seq
+			}
+		}
+	}
+	sort.SliceStable(stored, func(i, j int) bool {
+		if stored[i].Line.Timestamp.Equal(stored[j].Line.Timestamp) {
+			if stored[i].SessionID == stored[j].SessionID {
+				return stored[i].Line.Seq < stored[j].Line.Seq
+			}
+			return stored[i].SessionID < stored[j].SessionID
+		}
+		return stored[i].Line.Timestamp.Before(stored[j].Line.Timestamp)
+	})
+	for _, item := range stored {
+		fmt.Fprintf(stdout, "%s  %s\n", item.SessionID, render.Activity(item.Line, options.booleans["--raw"]))
+	}
+	if !options.booleans["--follow"] {
+		return nil
+	}
+	return followTaskLogs(ctx, taskID, stdout, options.booleans["--raw"], service, cursors)
+}
+
+func followTaskLogs(ctx context.Context, taskID string, stdout io.Writer, raw bool, service *appservice.SessionService, cursors map[string]uint64) error {
+	followContext, cancel := context.WithCancel(ctx)
+	updates := make(chan taskLogLine, 256)
+	errorsChannel := make(chan error, 16)
+	trackedSockets := make(map[string]string)
+	var followers sync.WaitGroup
+	startFollowers := func() error {
+		currentSessions, err := service.ListByTask(followContext, taskID)
+		if err != nil {
+			return err
+		}
+		for _, current := range currentSessions {
+			if current.WorkerSocket == "" || trackedSockets[current.ID] == current.WorkerSocket {
+				continue
+			}
+			trackedSockets[current.ID] = current.WorkerSocket
+			current := current
+			cursor := cursors[current.ID]
+			followers.Add(1)
+			go func() {
+				defer followers.Done()
+				err := service.Follow(followContext, current.ID, cursor, func(line sessionlog.Line) error {
+					select {
+					case updates <- taskLogLine{SessionID: current.ID, Line: line}:
+						return nil
+					case <-followContext.Done():
+						return followContext.Err()
+					}
+				})
+				if err != nil && !errors.Is(err, context.Canceled) {
+					select {
+					case errorsChannel <- err:
+					case <-followContext.Done():
+					}
+				}
+			}()
+		}
+		return nil
+	}
+	if err := startFollowers(); err != nil {
+		cancel()
+		followers.Wait()
+		return err
+	}
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	defer func() {
+		cancel()
+		followers.Wait()
+	}()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case err := <-errorsChannel:
+			return err
+		case item := <-updates:
+			if item.Line.Seq <= cursors[item.SessionID] {
+				continue
+			}
+			cursors[item.SessionID] = item.Line.Seq
+			fmt.Fprintf(stdout, "%s  %s\n", item.SessionID, render.Activity(item.Line, raw))
+		case <-ticker.C:
+			if err := startFollowers(); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func parseCursor(value string) (uint64, error) {
+	if value == "" {
+		return 0, nil
+	}
+	cursor, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid stream position %q", value)
+	}
+	return cursor, nil
+}
+
+func intOrDash(value int) string {
+	if value == 0 {
+		return "-"
+	}
+	return strconv.Itoa(value)
 }
 
 func runAgents(args []string, stdout io.Writer, registry *agentregistry.Registry) error {
