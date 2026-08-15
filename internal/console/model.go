@@ -24,6 +24,15 @@ const (
 	sessionView
 )
 
+type overlayMode uint8
+
+const (
+	noOverlay overlayMode = iota
+	helpOverlay
+	paletteOverlay
+	filterOverlay
+)
+
 type composerState struct {
 	focused bool
 	value   []rune
@@ -98,6 +107,10 @@ type Model struct {
 	composer      composerState
 	confirm       *confirmation
 	wizard        *sessionWizard
+	overlay       overlayMode
+	overlayEditor composerState
+	filter        string
+	paletteIndex  int
 	notice        string
 	scroll        int
 	unread        int
@@ -218,6 +231,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 			if m.mode == sessionView && !m.direct {
 				m.syncCurrentFromTask()
 			}
+			m.ensureVisibleSelection()
 			m.watchSessions(m.task.Sessions)
 		}
 		if message.current != nil {
@@ -266,37 +280,39 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 	if m.composer.focused {
 		return m.handleComposer(key)
 	}
-	if name == "q" {
-		return m, tea.Quit
+	if m.overlay != noOverlay {
+		return m.handleOverlayKey(key)
+	}
+	if name == "?" {
+		m.overlay = helpOverlay
+		return m, nil
 	}
 
 	if m.mode == taskView {
 		switch name {
 		case "up", "k":
-			if m.selected > 0 {
-				m.selected--
-			}
+			m.moveTaskSelection(-1)
+			return m, nil
 		case "down", "j":
-			if m.selected+1 < len(m.task.Sessions) {
-				m.selected++
+			m.moveTaskSelection(1)
+			return m, nil
+		case "s":
+			return m.dispatchTaskAction(actionStop)
+		case "esc":
+			if m.filter != "" {
+				m.filter = ""
+				m.ensureVisibleSelection()
+				m.notice = "Session filter cleared."
 			}
-		case "enter":
-			return m.attachSelectedNative()
-		case "a":
-			return m.openSelected(false)
-		case "p":
-			return m.openSelected(true)
-		case "c", "esc":
-			return m.confirmSelected("cancel")
-		case "u":
-			return m.selectedAction("resume")
-		case "x", "s":
-			return m.confirmSelected("stop")
-		case "n":
-			m.notice = "Loading agent profiles…"
-			return m, loadWizardCmd(m.ctx, m.backend, m.defaultSessionRepo())
+			return m, nil
+		}
+		if action, ok := taskActionForKey(name); ok {
+			return m.dispatchTaskAction(action.ID)
 		}
 		return m, nil
+	}
+	if name == "q" {
+		return m, tea.Quit
 	}
 
 	switch name {
@@ -357,6 +373,159 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 		}
 	}
 	return m, nil
+}
+
+func (m Model) dispatchTaskAction(id actionID) (tea.Model, tea.Cmd) {
+	m.overlay = noOverlay
+	m.overlayEditor = composerState{}
+	switch id {
+	case actionNative:
+		return m.attachSelectedNative()
+	case actionACP:
+		return m.openSelected(false)
+	case actionMessage:
+		return m.openSelected(true)
+	case actionNew:
+		m.notice = "Loading agent profiles…"
+		return m, loadWizardCmd(m.ctx, m.backend, m.defaultSessionRepo())
+	case actionCancel:
+		return m.confirmSelected("cancel")
+	case actionResume:
+		return m.selectedAction("resume")
+	case actionStop:
+		return m.confirmSelected("stop")
+	case actionFilter:
+		m.overlay = filterOverlay
+		m.overlayEditor.value = []rune(m.filter)
+		m.overlayEditor.cursor = len(m.overlayEditor.value)
+		return m, nil
+	case actionPalette:
+		m.overlay = paletteOverlay
+		m.paletteIndex = 0
+		return m, nil
+	case actionHelp:
+		m.overlay = helpOverlay
+		return m, nil
+	case actionDetach:
+		return m, tea.Quit
+	default:
+		m.notice = "Unknown console action."
+		return m, nil
+	}
+}
+
+func (m Model) handleOverlayKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	name := key.String()
+	if m.overlay == helpOverlay {
+		if name == "?" || name == "esc" || name == "q" || name == "enter" {
+			m.overlay = noOverlay
+		}
+		return m, nil
+	}
+	if name == "esc" {
+		m.overlay = noOverlay
+		m.overlayEditor = composerState{}
+		return m, nil
+	}
+	if m.overlay == paletteOverlay {
+		actions := filteredTaskActions(m.overlayEditor.text())
+		switch name {
+		case "up", "ctrl+p":
+			m.paletteIndex = max(0, m.paletteIndex-1)
+		case "down", "ctrl+n":
+			m.paletteIndex = min(max(0, len(actions)-1), m.paletteIndex+1)
+		case "enter":
+			if len(actions) > 0 {
+				return m.dispatchTaskAction(actions[m.paletteIndex].ID)
+			}
+		case "backspace", "ctrl+h":
+			m.overlayEditor.backspace()
+			m.paletteIndex = 0
+		case "ctrl+w":
+			m.overlayEditor.deleteWord()
+			m.paletteIndex = 0
+		default:
+			if key.Type == tea.KeySpace {
+				m.overlayEditor.insert(' ')
+				m.paletteIndex = 0
+			} else if key.Type == tea.KeyRunes {
+				m.overlayEditor.insert(key.Runes...)
+				m.paletteIndex = 0
+			}
+		}
+		return m, nil
+	}
+	if m.overlay == filterOverlay {
+		switch name {
+		case "enter":
+			m.overlay = noOverlay
+			m.notice = fmt.Sprintf("Showing %d of %d Sessions.", len(m.filteredSessionIndices()), len(m.task.Sessions))
+			return m, nil
+		case "backspace", "ctrl+h":
+			m.overlayEditor.backspace()
+		case "ctrl+w":
+			m.overlayEditor.deleteWord()
+		case "ctrl+u":
+			m.overlayEditor = composerState{}
+		default:
+			if key.Type == tea.KeySpace {
+				m.overlayEditor.insert(' ')
+			} else if key.Type == tea.KeyRunes {
+				m.overlayEditor.insert(key.Runes...)
+			}
+		}
+		m.filter = m.overlayEditor.text()
+		m.ensureVisibleSelection()
+	}
+	return m, nil
+}
+
+func (m Model) filteredSessionIndices() []int {
+	query := strings.ToLower(strings.TrimSpace(m.filter))
+	result := make([]int, 0, len(m.task.Sessions))
+	for index, current := range m.task.Sessions {
+		if query == "" {
+			result = append(result, index)
+			continue
+		}
+		haystack := strings.ToLower(strings.Join([]string{
+			current.ID, current.Agent, current.Role, current.Provider, string(current.Status), current.RepoPath,
+			current.WorktreePath, current.Branch, m.sessionSummary(current.ID),
+		}, " "))
+		if strings.Contains(haystack, query) {
+			result = append(result, index)
+		}
+	}
+	return result
+}
+
+func (m *Model) ensureVisibleSelection() {
+	indices := m.filteredSessionIndices()
+	if len(indices) == 0 {
+		return
+	}
+	for _, index := range indices {
+		if index == m.selected {
+			return
+		}
+	}
+	m.selected = indices[0]
+}
+
+func (m *Model) moveTaskSelection(delta int) {
+	indices := m.filteredSessionIndices()
+	if len(indices) == 0 {
+		return
+	}
+	position := 0
+	for index, actual := range indices {
+		if actual == m.selected {
+			position = index
+			break
+		}
+	}
+	position = min(max(0, position+delta), len(indices)-1)
+	m.selected = indices[position]
 }
 
 func (m Model) defaultSessionRepo() string {
@@ -447,11 +616,15 @@ func (m Model) handleMouse(event tea.MouseEvent) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	const firstSessionRow = 5
-	index := (event.Y - firstSessionRow) / 3
-	if event.Y < firstSessionRow || index < 0 || index >= len(m.task.Sessions) {
+	if m.width >= 92 && event.X >= taskNavigatorWidth(m.width) {
 		return m, nil
 	}
-	m.selected = index
+	position := (event.Y - firstSessionRow) / 2
+	indices := m.filteredSessionIndices()
+	if event.Y < firstSessionRow || position < 0 || position >= len(indices) {
+		return m, nil
+	}
+	m.selected = indices[position]
 	return m.attachSelectedNative()
 }
 

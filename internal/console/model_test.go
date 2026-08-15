@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -222,6 +223,64 @@ func TestTaskConsoleKeyboardMouseAndExplicitPromptTarget(t *testing.T) {
 	model = updated.(Model)
 	if model.mode != taskView || model.selected != 0 || nativeCommand == nil {
 		t.Fatalf("mouse native attach: selected=%d mode=%d command=%v", model.selected, model.mode, nativeCommand)
+	}
+}
+
+func TestTaskConsoleNativeDefaultACPActionFilterHelpAndPalette(t *testing.T) {
+	backend := newConsoleBackend()
+	model, cancel, err := newTaskModel(context.Background(), backend, "T-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+
+	updated, nativeCommand := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if model.mode != taskView || nativeCommand == nil || !strings.Contains(model.notice, "native gemini harness") {
+		t.Fatalf("Enter did not choose native harness: mode=%d command=%v notice=%q", model.mode, nativeCommand, model.notice)
+	}
+	direct := &nativeAttachCommand{ctx: context.Background(), backend: backend, sessionID: "S-1", input: strings.NewReader(""), output: io.Discard, stderr: io.Discard}
+	if err := direct.Run(); err != nil {
+		t.Fatal(err)
+	}
+	backend.mu.Lock()
+	if !reflect.DeepEqual(backend.native, []string{"S-1"}) {
+		backend.mu.Unlock()
+		t.Fatalf("native calls = %v", backend.native)
+	}
+	backend.mu.Unlock()
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	model = updated.(Model)
+	if model.mode != sessionView || model.current.ID != "S-1" || model.composer.focused {
+		t.Fatalf("ACP action = mode %d Session %s composer=%v", model.mode, model.current.ID, model.composer.focused)
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
+	model = updated.(Model)
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	model = updated.(Model)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("codex")})
+	model = updated.(Model)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if model.overlay != noOverlay || model.filter != "codex" || model.selected != 1 || len(model.filteredSessionIndices()) != 1 {
+		t.Fatalf("filter state: overlay=%d filter=%q selected=%d matches=%v", model.overlay, model.filter, model.selected, model.filteredSessionIndices())
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("?")})
+	model = updated.(Model)
+	if model.overlay != helpOverlay || !strings.Contains(model.View(), "KEYBOARD HELP") || !strings.Contains(model.View(), "Native harness") {
+		t.Fatalf("help overlay:\n%s", model.View())
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(Model)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(":")})
+	model = updated.(Model)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("new")})
+	model = updated.(Model)
+	if model.overlay != paletteOverlay || !strings.Contains(model.View(), "New Session") || strings.Contains(model.View(), "Cancel turn") {
+		t.Fatalf("filtered command palette:\n%s", model.View())
 	}
 }
 

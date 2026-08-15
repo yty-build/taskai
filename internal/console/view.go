@@ -32,6 +32,9 @@ func (m Model) View() string {
 	if m.wizard != nil {
 		return m.renderSessionWizard(width, height)
 	}
+	if m.overlay != noOverlay {
+		return m.renderOverlay(width, height)
+	}
 	if m.mode == sessionView {
 		return m.renderSession(width, height)
 	}
@@ -113,63 +116,196 @@ func compactSizeWarning(width, height int) string {
 func (m Model) renderTask(width, height int) string {
 	item := m.task.Task
 	header := []string{
-		frameTop("TASK "+safeText(item.ID), statusBadge(string(item.Status)), width),
+		frameTop("AGENT TASK CONSOLE · TASK "+safeText(item.ID), statusBadge(string(item.Status)), width),
 		frameLine(safeText(item.Title), width),
 		frameLine(taskSubtitle(item.Description, len(m.task.Sessions)), width),
 		frameBottom(width),
 	}
 
 	bodyHeight := max(1, height-len(header)-2)
-	body := m.renderTaskSessions(width, bodyHeight)
+	var body []string
+	if width >= 92 {
+		navigatorWidth := taskNavigatorWidth(width)
+		previewWidth := width - navigatorWidth - 1
+		navigator := m.renderTaskNavigator(navigatorWidth, bodyHeight)
+		preview := m.renderTaskPreview(previewWidth, bodyHeight)
+		body = joinColumns(navigator, preview, navigatorWidth, previewWidth)
+	} else {
+		navigatorHeight := max(7, bodyHeight/2)
+		previewHeight := max(1, bodyHeight-navigatorHeight)
+		body = append(m.renderTaskNavigator(width, navigatorHeight), m.renderTaskPreview(width, previewHeight)...)
+	}
 	notice := noticeLine(m.notice, width)
-	footer := fitLine("↑/↓ select · Enter/click open · p message · n new Session · c cancel · u resume · x stop · q detach", width)
+	footer := m.taskFooter(width)
 	return renderScreen(append(append(append(header, body...), notice), footer), width, height)
 }
 
-func (m Model) renderTaskSessions(width, height int) []string {
+func taskNavigatorWidth(width int) int {
+	navigator := width * 42 / 100
+	navigator = min(52, max(36, navigator))
+	return min(navigator, max(1, width-37))
+}
+
+func (m Model) renderTaskNavigator(width, height int) []string {
+	indices := m.filteredSessionIndices()
+	filterLabel := fmt.Sprintf("%d/%d", len(indices), len(m.task.Sessions))
+	lines := []string{frameTop("SESSIONS", filterLabel, width)}
+	innerHeight := max(1, height-2)
 	if len(m.task.Sessions) == 0 {
-		return padLines([]string{
-			"",
-			centerLine("No Sessions yet", width),
-			centerLine("Press n to add the first agent Session to this Task.", width),
-		}, height, width)
+		lines = append(lines, padLines([]string{"", centerLine("No Sessions yet", width), centerLine("Press n to add one", width)}, innerHeight, width)...)
+		return append(lines, frameBottom(width))
 	}
-
-	blocks := make([][]string, 0, len(m.task.Sessions))
-	for index, current := range m.task.Sessions {
-		selected := "  "
-		if index == m.selected {
-			selected = "› "
+	if len(indices) == 0 {
+		lines = append(lines, padLines([]string{"", centerLine("No Sessions match /"+safeText(m.filter), width), centerLine("Esc clears the filter", width)}, innerHeight, width)...)
+		return append(lines, frameBottom(width))
+	}
+	visible := max(1, innerHeight/2)
+	selectedPosition := 0
+	for position, actual := range indices {
+		if actual == m.selected {
+			selectedPosition = position
+			break
 		}
-		roleAgent := strings.ToUpper(valueOr(current.Agent, "agent")) + " · " + valueOr(current.Role, "worker")
-		state := statusBadge(string(current.Status))
-		first := selected + roleAgent
-		first = fitWithRight(first, state, width)
-		context := "    " + current.ID + " · " + appservice.PermissionLabel(current) + " · " + compactSessionPath(current)
-		summary := "    " + m.sessionSummary(current.ID)
-		blocks = append(blocks, []string{fitLine(first, width), fitLine(context, width), fitLine(summary, width)})
 	}
+	start := max(0, selectedPosition-visible+1)
+	start = min(start, max(0, len(indices)-visible))
+	var entries []string
+	for position := start; position < len(indices) && position < start+visible; position++ {
+		actual := indices[position]
+		current := m.task.Sessions[actual]
+		marker := "  "
+		if actual == m.selected {
+			marker = "› "
+		}
+		name := marker + strings.ToUpper(valueOr(current.Agent, "agent")) + " · " + valueOr(current.Role, "worker")
+		entries = append(entries, fitWithRight(name, statusBadge(string(current.Status)), width))
+		entries = append(entries, fitLine("  "+current.ID+" · "+compactSessionPath(current)+" · "+m.sessionSummary(current.ID), width))
+	}
+	if start > 0 && len(entries) > 0 {
+		entries[0] = fitLine(fmt.Sprintf("  ↑ %d earlier · ", start)+entries[0], width)
+	}
+	remaining := len(indices) - (start + visible)
+	if remaining > 0 && len(entries) > 0 {
+		entries[len(entries)-1] = fitLine(entries[len(entries)-1]+fmt.Sprintf(" · %d more ↓", remaining), width)
+	}
+	lines = append(lines, padLines(entries, innerHeight, width)...)
+	return append(lines, frameBottom(width))
+}
 
-	visibleBlocks := max(1, height/3)
-	start := 0
-	if m.selected >= visibleBlocks {
-		start = m.selected - visibleBlocks + 1
+func (m Model) renderTaskPreview(width, height int) []string {
+	if len(m.task.Sessions) == 0 || len(m.filteredSessionIndices()) == 0 {
+		lines := []string{frameTop("SESSION PREVIEW", "", width)}
+		lines = append(lines, padLines([]string{"", centerLine("Select or create a Session", width)}, max(1, height-2), width)...)
+		return append(lines, frameBottom(width))
 	}
-	if start+visibleBlocks > len(blocks) {
-		start = max(0, len(blocks)-visibleBlocks)
+	current := m.task.Sessions[m.selected]
+	lines := []string{frameTop("SESSION PREVIEW", statusBadge(string(current.Status)), width)}
+	identity := "conversation identity pending"
+	if current.ProviderConversationID != "" {
+		identity = "conversation " + current.ProviderConversationID
+		if current.ConversationIDVerifiedAt != nil {
+			identity += " · verified"
+		}
 	}
-	var lines []string
-	for index := start; index < len(blocks) && index < start+visibleBlocks; index++ {
-		lines = append(lines, blocks[index]...)
+	content := []string{
+		strings.ToUpper(valueOr(current.Agent, "agent")) + " · " + valueOr(current.Role, "worker") + " · " + appservice.PermissionLabel(current),
+		current.ID,
+		"Checkout  " + sessionPath(current),
+		"Identity  " + identity,
+		"",
+		"LATEST ACTIVITY",
 	}
-	if start > 0 && len(lines) > 0 {
-		lines[0] = fitLine(fmt.Sprintf("  ↑ %d more Session(s)", start), width)
+	content = append(content, indentWrapped(m.sessionSummary(current.ID), max(10, width-4), "  ")...)
+	content = append(content,
+		"",
+		"Enter  Open real "+valueOr(current.Agent, "provider")+" harness",
+		"a      Open structured ACP console",
+		"p      Message through ACP",
+	)
+	innerHeight := max(1, height-2)
+	lines = append(lines, padLines(content, innerHeight, width)...)
+	return append(lines, frameBottom(width))
+}
+
+func joinColumns(left, right []string, leftWidth, rightWidth int) []string {
+	count := max(len(left), len(right))
+	result := make([]string, 0, count)
+	for index := 0; index < count; index++ {
+		leftLine, rightLine := "", ""
+		if index < len(left) {
+			leftLine = left[index]
+		}
+		if index < len(right) {
+			rightLine = right[index]
+		}
+		result = append(result, padRight(fitLine(leftLine, leftWidth), leftWidth)+" "+fitLine(rightLine, rightWidth))
 	}
-	remaining := len(blocks) - (start + visibleBlocks)
-	if remaining > 0 && len(lines) > 0 {
-		lines[len(lines)-1] = fitLine(fmt.Sprintf("  ↓ %d more Session(s)", remaining), width)
+	return result
+}
+
+func (m Model) taskFooter(width int) string {
+	footer := "↑/↓ select · Enter native · a ACP · / filter · : commands · ? help · q detach"
+	if strings.TrimSpace(m.filter) != "" {
+		footer = "FILTER /" + safeText(m.filter) + " · " + footer
 	}
-	return padLines(lines, height, width)
+	return fitLine(footer, width)
+}
+
+func (m Model) renderOverlay(width, height int) string {
+	var title, subtitle, footer string
+	var body []string
+	switch m.overlay {
+	case helpOverlay:
+		title, subtitle, footer = "KEYBOARD HELP", "Actions are contextual; native and ACP always continue the same Session.", "Esc/?/Enter closes help"
+		if m.mode == taskView {
+			body = append(body, "NAVIGATION", "  ↑/↓ or j/k    Select a Session", "")
+			for _, action := range taskActions {
+				body = append(body, fmt.Sprintf("  %-8s %-22s %s", displayActionKey(action.Key), action.Label, action.Description))
+			}
+		} else {
+			body = []string{
+				"SESSION ACP CONSOLE", "  p / i / Enter  Compose a message", "  ↑/↓ PgUp/PgDn Scroll history", "  End            Follow live output",
+				"  1-9            Choose an offered permission", "  d              Expand selected tool", "  [ / ]          Select tool", "  o              Toggle reasoning",
+				"  r              Toggle raw ACP events", "  Esc / c        Cancel active turn", "  b              Back to Task", "  q              Detach viewer",
+			}
+		}
+	case paletteOverlay:
+		title, subtitle, footer = "COMMAND PALETTE", "> "+editorDisplay(m.overlayEditor), "Type to filter · ↑/↓ choose · Enter run · Esc close"
+		actions := filteredTaskActions(m.overlayEditor.text())
+		for index, action := range actions {
+			marker := "  "
+			if index == m.paletteIndex {
+				marker = "› "
+			}
+			body = append(body, fmt.Sprintf("%s%-8s %s", marker, displayActionKey(action.Key), action.Label), "    "+action.Description)
+		}
+		if len(actions) == 0 {
+			body = []string{"", "  No matching commands"}
+		}
+	case filterOverlay:
+		title, subtitle, footer = "FILTER SESSIONS", "/ "+editorDisplay(m.overlayEditor), "Type to filter · Ctrl+U clear · Enter apply · Esc close"
+		indices := m.filteredSessionIndices()
+		body = append(body, fmt.Sprintf("  %d of %d Sessions match", len(indices), len(m.task.Sessions)), "")
+		for _, index := range indices {
+			current := m.task.Sessions[index]
+			body = append(body, fmt.Sprintf("  %-24s %-12s %-14s %s", current.ID, current.Agent, current.Role, current.Status))
+		}
+	}
+	header := []string{frameTop(title, "", width), frameLine(subtitle, width), frameBottom(width)}
+	bodyHeight := max(1, height-len(header)-1)
+	return renderScreen(append(append(header, padLines(body, bodyHeight, width)...), fitLine(footer, width)), width, height)
+}
+
+func displayActionKey(key string) string {
+	if key == "enter" {
+		return "Enter"
+	}
+	return key
+}
+
+func editorDisplay(editor composerState) string {
+	cursor := min(max(0, editor.cursor), len(editor.value))
+	return safeText(string(editor.value[:cursor]) + "▌" + string(editor.value[cursor:]))
 }
 
 func (m Model) sessionSummary(sessionID string) string {
