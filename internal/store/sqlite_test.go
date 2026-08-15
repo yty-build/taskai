@@ -149,3 +149,26 @@ func TestConcurrentTaskCreation(t *testing.T) {
 		t.Fatalf("created %d Tasks, want %d", len(seen), count)
 	}
 }
+
+func TestCreateTaskWithSessionRollsBackAtomically(t *testing.T) {
+	ctx := context.Background()
+	store, _ := openTestStore(t)
+	existingTask, err := store.CreateTask(ctx, task.CreateParams{ID: "T-existing", Title: "existing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateSession(ctx, session.CreateParams{ID: "S-duplicate", TaskID: existingTask.ID, Agent: "codex"}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = store.CreateTaskWithSession(ctx,
+		task.CreateParams{ID: "T-should-rollback", Title: "atomic"},
+		session.CreateParams{ID: "S-duplicate", Agent: "claude"},
+	)
+	if err == nil {
+		t.Fatal("CreateTaskWithSession() error = nil")
+	}
+	if _, err := store.GetTask(ctx, "T-should-rollback"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("rolled-back Task lookup error = %v", err)
+	}
+}

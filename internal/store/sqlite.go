@@ -252,6 +252,75 @@ func (s *Store) CreateSession(ctx context.Context, params session.CreateParams) 
 	return result, nil
 }
 
+// CreateTaskWithSession atomically persists the convenience one-Session Task
+// without changing the underlying Task -> Session relationship.
+func (s *Store) CreateTaskWithSession(ctx context.Context, taskParams task.CreateParams, sessionParams session.CreateParams) (task.Task, session.Session, error) {
+	if taskParams.ID == "" {
+		id, err := identity.New("T")
+		if err != nil {
+			return task.Task{}, session.Session{}, err
+		}
+		taskParams.ID = id
+	}
+	sessionParams.TaskID = taskParams.ID
+	if sessionParams.ID == "" {
+		id, err := identity.New("S")
+		if err != nil {
+			return task.Task{}, session.Session{}, err
+		}
+		sessionParams.ID = id
+	}
+	if err := taskParams.Validate(); err != nil {
+		return task.Task{}, session.Session{}, err
+	}
+	if err := sessionParams.Validate(); err != nil {
+		return task.Task{}, session.Session{}, err
+	}
+	if taskParams.Status == "" {
+		taskParams.Status = task.StatusOpen
+	}
+	if sessionParams.Status == "" {
+		sessionParams.Status = session.StatusStarting
+	}
+	now := s.now().UTC()
+	createdTask := task.Task{
+		ID: taskParams.ID, Title: strings.TrimSpace(taskParams.Title), Description: taskParams.Description, Status: taskParams.Status,
+		ExternalRef: taskParams.ExternalRef, MetadataJSON: cloneJSON(taskParams.MetadataJSON), CreatedAt: now, UpdatedAt: now,
+	}
+	createdSession := session.Session{
+		ID: sessionParams.ID, TaskID: taskParams.ID, Role: sessionParams.Role, Agent: strings.TrimSpace(sessionParams.Agent), Provider: sessionParams.Provider,
+		RepoPath: sessionParams.RepoPath, WorktreePath: sessionParams.WorktreePath, Branch: sessionParams.Branch,
+		ACPSessionID: sessionParams.ACPSessionID, NativeSessionID: sessionParams.NativeSessionID, Status: sessionParams.Status,
+		WorkerPID: sessionParams.WorkerPID, WorkerSocket: sessionParams.WorkerSocket, LogPath: sessionParams.LogPath,
+		MetadataJSON: cloneJSON(sessionParams.MetadataJSON), CreatedAt: now, UpdatedAt: now,
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return task.Task{}, session.Session{}, fmt.Errorf("begin Task creation: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO tasks
+		(id, title, description, status, external_ref, metadata_json, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, createdTask.ID, createdTask.Title, nullString(createdTask.Description), string(createdTask.Status),
+		nullString(createdTask.ExternalRef), nullJSON(createdTask.MetadataJSON), formatTime(now), formatTime(now)); err != nil {
+		return task.Task{}, session.Session{}, fmt.Errorf("create Task %s: %w", createdTask.ID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO sessions
+		(id, task_id, role, agent, provider, repo_path, worktree_path, branch, acp_session_id, native_session_id,
+		 status, worker_pid, worker_socket, log_path, metadata_json, created_at, updated_at, last_activity_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+		createdSession.ID, createdSession.TaskID, nullString(createdSession.Role), createdSession.Agent, nullString(createdSession.Provider), nullString(createdSession.RepoPath),
+		nullString(createdSession.WorktreePath), nullString(createdSession.Branch), nullString(createdSession.ACPSessionID), nullString(createdSession.NativeSessionID),
+		string(createdSession.Status), nullInt(createdSession.WorkerPID), nullString(createdSession.WorkerSocket), nullString(createdSession.LogPath),
+		nullJSON(createdSession.MetadataJSON), formatTime(now), formatTime(now)); err != nil {
+		return task.Task{}, session.Session{}, fmt.Errorf("create Session %s: %w", createdSession.ID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return task.Task{}, session.Session{}, fmt.Errorf("commit Task creation: %w", err)
+	}
+	return createdTask, createdSession, nil
+}
+
 func (s *Store) GetSession(ctx context.Context, id string) (session.Session, error) {
 	row := s.db.QueryRowContext(ctx, sessionSelect+` WHERE id = ?`, id)
 	result, err := scanSession(row)
