@@ -105,14 +105,14 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, info buil
 		err = runStart(ctx, args[1:], stdout, sessionService)
 	case "session":
 		var registry *agentregistry.Registry
-		if len(args) > 1 && args[1] == "start" {
+		if len(args) > 1 && (args[1] == "start" || nativeAttachRequested(args[1:])) {
 			registry, err = agentregistry.Load(home.Agents)
 			if err != nil {
 				break
 			}
 		}
 		sessionService := appservice.NewSessionService(database, registry, home, runtime)
-		err = runSession(ctx, args[1:], stdout, sessionService)
+		err = runSession(ctx, args[1:], stdout, stderr, sessionService)
 	case "agents":
 		registry, loadErr := agentregistry.Load(home.Agents)
 		if loadErr != nil {
@@ -286,7 +286,7 @@ func runStart(ctx context.Context, args []string, stdout io.Writer, sessions *ap
 	return nil
 }
 
-func runSession(ctx context.Context, args []string, stdout io.Writer, service *appservice.SessionService) error {
+func runSession(ctx context.Context, args []string, stdout, stderr io.Writer, service *appservice.SessionService) error {
 	if len(args) == 0 {
 		return usagef("usage: agent session start|attach|prompt|cancel|resume|stop|logs|<session-id>")
 	}
@@ -335,16 +335,41 @@ func runSession(ctx context.Context, args []string, stdout io.Writer, service *a
 	case "logs":
 		return runSessionLogs(ctx, args[1:], stdout, service)
 	case "attach":
-		if len(args) != 2 {
-			return usagef("usage: agent session attach <session-id>")
+		options, err := parseOptions(args[1:], map[string]optionKind{"--native": boolOption, "--cancel-active": boolOption, "--reconcile-only": boolOption})
+		if err != nil || len(options.positionals) != 1 {
+			return usagef("usage: agent session attach <session-id> [--native [--cancel-active|--reconcile-only]]")
 		}
-		return console.AttachSession(ctx, console.Services{Sessions: service}, args[1], os.Stdin, stdout)
+		if options.booleans["--cancel-active"] && options.booleans["--reconcile-only"] {
+			return usagef("agent session attach: --cancel-active and --reconcile-only cannot be combined")
+		}
+		if options.booleans["--cancel-active"] || options.booleans["--reconcile-only"] {
+			options.booleans["--native"] = true
+		}
+		if options.booleans["--native"] {
+			return service.AttachNative(ctx, options.positionals[0], appservice.NativeAttachOptions{
+				Input: os.Stdin, Output: stdout, ErrorOutput: stderr,
+				CancelActive: options.booleans["--cancel-active"], ReconcileOnly: options.booleans["--reconcile-only"],
+			})
+		}
+		return console.AttachSession(ctx, console.Services{Sessions: service}, options.positionals[0], os.Stdin, stdout)
 	default:
 		if len(args) != 1 {
 			return usagef("usage: agent session <session-id>")
 		}
 		return showSession(ctx, args[0], stdout, service)
 	}
+}
+
+func nativeAttachRequested(arguments []string) bool {
+	if len(arguments) == 0 || arguments[0] != "attach" {
+		return false
+	}
+	for _, argument := range arguments[1:] {
+		if argument == "--native" || argument == "--cancel-active" || argument == "--reconcile-only" {
+			return true
+		}
+	}
+	return false
 }
 
 func runSessionStart(ctx context.Context, args []string, stdout io.Writer, service *appservice.SessionService) error {

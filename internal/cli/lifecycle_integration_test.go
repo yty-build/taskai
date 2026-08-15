@@ -51,6 +51,15 @@ func TestSessionLifecycleThroughBuiltCLIAndDetachedWorker(t *testing.T) {
 		t.Fatalf("task new output = %q", output)
 	}
 	taskID := fields[1]
+	nativeFixture, err := filepath.Abs(filepath.Join("..", "native", "testdata", "fake-native"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	nativeRecord := filepath.Join(root, "native-record")
+	profile := fmt.Sprintf("name: codex\nprovider: openai\ncommand: %q\nenvironment:\n  FAKE_NATIVE_RECORD: %q\n  FAKE_NATIVE_MARKER: lifecycle\n", nativeFixture, nativeRecord)
+	if err := os.WriteFile(filepath.Join(root, "agents", "codex.yaml"), []byte(profile), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	code, output, stderr = runBinary(root, binary, "session", "start", taskID, "--agent", "codex", "--repo", repo, "--role", "researcher", "--prompt", "Check one hour", "--approve-all")
 	if code != 0 || stderr != "" {
@@ -72,6 +81,24 @@ func TestSessionLifecycleThroughBuiltCLIAndDetachedWorker(t *testing.T) {
 		if !strings.Contains(detail, expected) {
 			t.Errorf("Session detail does not contain %q:\n%s", expected, detail)
 		}
+	}
+
+	code, output, stderr = runBinary(root, binary, "session", "attach", sessionID, "--native")
+	if code != 0 || !strings.Contains(output, "fake native attached") || !strings.Contains(stderr, "native lease acquired") || !strings.Contains(stderr, "reconciled") {
+		t.Fatalf("native attach: code=%d output=%q stderr=%q", code, output, stderr)
+	}
+	nativeInvocation, err := os.ReadFile(nativeRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"cwd=" + canonicalRepo, "arg=resume", "arg=native-reconnected", "marker=lifecycle"} {
+		if !strings.Contains(string(nativeInvocation), expected+"\n") {
+			t.Errorf("native invocation missing %q:\n%s", expected, nativeInvocation)
+		}
+	}
+	code, output, stderr = runBinary(root, binary, "session", "logs", sessionID)
+	if code != 0 || stderr != "" || !strings.Contains(output, "native acquired") || !strings.Contains(output, "native released") {
+		t.Fatalf("native lease history: code=%d output=%q stderr=%q", code, output, stderr)
 	}
 
 	argsLog, err := os.ReadFile(filepath.Join(root, "acpx-args.log"))

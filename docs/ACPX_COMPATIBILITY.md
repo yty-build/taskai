@@ -13,3 +13,5 @@ The implementation spike on 2026-08-14 used an authenticated Codex session and v
 - The harmless probe completed with `ACPX_COMPAT_OK`, then its named acpx session was soft-closed.
 
 Adapter fixtures cover malformed and partial NDJSON, nonzero exits, cancellation, version mismatch, missing native IDs, explicit resume, and literal custom command arguments.
+
+Provider-native resume mappings are isolated in `internal/native`: Codex uses `resume <id>`, Claude and Gemini use `--resume <id>`, and OpenCode uses `--session <id>`. Unknown profiles and missing identifiers fail closed. The real Codex safety/queue/reconciliation check is documented in [CODEX_NATIVE_SMOKE.md](CODEX_NATIVE_SMOKE.md).

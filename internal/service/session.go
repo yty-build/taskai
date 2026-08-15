@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"path/filepath"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/yty-build/acp-gateway/internal/config"
 	gitrepo "github.com/yty-build/acp-gateway/internal/git"
 	"github.com/yty-build/acp-gateway/internal/identity"
+	"github.com/yty-build/acp-gateway/internal/native"
 	"github.com/yty-build/acp-gateway/internal/session"
 	"github.com/yty-build/acp-gateway/internal/sessionlog"
 	"github.com/yty-build/acp-gateway/internal/task"
@@ -44,7 +46,11 @@ func (r LocalRuntime) Spawn(ctx context.Context, sessionID string) (worker.Spawn
 }
 
 func (r LocalRuntime) Send(ctx context.Context, socket string, command worker.Command) (worker.Message, error) {
-	return worker.NewSocketClient(socket).Send(ctx, command)
+	client := worker.NewSocketClient(socket)
+	if command.Type == "native_release" {
+		client.Timeout = 0
+	}
+	return client.Send(ctx, command)
 }
 
 func (r LocalRuntime) Subscribe(ctx context.Context, socket string, cursor uint64, consume func(worker.Message) error) error {
@@ -80,6 +86,15 @@ type LaunchResult struct {
 type TaskLaunchResult struct {
 	Task task.Task
 	LaunchResult
+}
+
+type NativeAttachOptions struct {
+	Runner        native.Runner
+	Input         io.Reader
+	Output        io.Writer
+	ErrorOutput   io.Writer
+	CancelActive  bool
+	ReconcileOnly bool
 }
 
 func NewSessionService(repository SessionRepository, registry *agents.Registry, home config.Home, runtime Runtime) *SessionService {
@@ -453,6 +468,149 @@ func (s *SessionService) Stop(ctx context.Context, id string) error {
 		time.Sleep(25 * time.Millisecond)
 	}
 	return fmt.Errorf("Session %s worker did not stop in time", id)
+}
+
+// AttachNative transfers exclusive ownership of the provider conversation
+// from the ACP worker to a supported interactive native CLI. The worker stays
+// alive and queues prompts until successful reconciliation.
+func (s *SessionService) AttachNative(ctx context.Context, id string, options NativeAttachOptions) error {
+	current, err := s.repository.GetSession(ctx, id)
+	if err != nil {
+		return err
+	}
+	if current.WorkerSocket == "" {
+		return fmt.Errorf("Session %s has no live worker; resume it before native attachment", id)
+	}
+	if options.ErrorOutput == nil {
+		options.ErrorOutput = io.Discard
+	}
+	if options.Output == nil {
+		options.Output = io.Discard
+	}
+	if options.Input == nil {
+		options.Input = strings.NewReader("")
+	}
+	if options.ReconcileOnly {
+		return s.reconcileNative(ctx, current, options.ErrorOutput)
+	}
+	if strings.TrimSpace(current.NativeSessionID) == "" {
+		return fmt.Errorf("Session %s has no provider-native Session ID; native attachment is unavailable and no new conversation was started", id)
+	}
+	if strings.TrimSpace(current.ACPSessionID) == "" {
+		return fmt.Errorf("Session %s has no ACP Session ID for reconciliation; native attachment is unavailable and no new conversation was started", id)
+	}
+	if s.registry == nil {
+		return fmt.Errorf("agent registry is required for provider-native attachment")
+	}
+	profile, err := s.registry.Get(current.Agent)
+	if err != nil {
+		return err
+	}
+	workingDirectory := current.WorktreePath
+	if workingDirectory == "" {
+		workingDirectory = current.RepoPath
+	}
+	invocation, err := native.BuildResume(profile, current.NativeSessionID, workingDirectory)
+	if err != nil {
+		return fmt.Errorf("Session %s native attachment: %w", id, err)
+	}
+	if options.Runner == nil {
+		options.Runner = native.ExecRunner{}
+	}
+	if err := s.acquireNative(ctx, current, options.CancelActive, options.ErrorOutput); err != nil {
+		return err
+	}
+	fmt.Fprintf(options.ErrorOutput, "Agent Task Console: native lease acquired for %s; ACP prompts are paused until reconciliation.\n", id)
+	runErr := options.Runner.Run(ctx, invocation, options.Input, options.Output, options.ErrorOutput)
+
+	reconcileContext, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	releaseErr := s.releaseNative(reconcileContext, current)
+	if releaseErr != nil {
+		if runErr != nil {
+			return fmt.Errorf("native CLI failed (%v) and %w", runErr, releaseErr)
+		}
+		return releaseErr
+	}
+	fmt.Fprintf(options.ErrorOutput, "Agent Task Console: %s reconciled; queued ACP prompts may continue.\n", id)
+	if runErr != nil {
+		return fmt.Errorf("native CLI exited after Session %s was safely reconciled: %w", id, runErr)
+	}
+	return nil
+}
+
+func (s *SessionService) acquireNative(ctx context.Context, current session.Session, cancelActive bool, notices io.Writer) error {
+	lastActive := ""
+	cancelled := make(map[string]bool)
+	for {
+		status, err := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{Type: "status"})
+		if err != nil {
+			return fmt.Errorf("read Session %s worker status before native attachment: %w", current.ID, err)
+		}
+		if status.NativeLease {
+			return fmt.Errorf("Session %s already has an exclusive native lease; do not start another native CLI. If the prior CLI has exited, run 'agent session attach %s --native --reconcile-only'", current.ID, current.ID)
+		}
+		if status.ActiveRequestID != "" {
+			if cancelActive && !cancelled[status.ActiveRequestID] {
+				fmt.Fprintf(notices, "Agent Task Console: cancelling active ACP turn %s before native attachment.\n", status.ActiveRequestID)
+				if _, err := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{Type: "cancel", RequestID: status.ActiveRequestID}); err != nil {
+					return fmt.Errorf("cancel active ACP turn before native attachment: %w", err)
+				}
+				cancelled[status.ActiveRequestID] = true
+			} else if status.ActiveRequestID != lastActive {
+				fmt.Fprintf(notices, "Agent Task Console: waiting for active ACP turn %s to finish before native attachment (use --cancel-active to cancel explicitly).\n", status.ActiveRequestID)
+			}
+			lastActive = status.ActiveRequestID
+			if err := waitContext(ctx, 150*time.Millisecond); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, err := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{Type: "native_acquire"}); err == nil {
+			return nil
+		} else {
+			// A queued prompt may have won the small status/acquire race. Only
+			// retry when status confirms that an ACP turn is now active.
+			latest, statusErr := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{Type: "status"})
+			if statusErr == nil && latest.ActiveRequestID != "" && !latest.NativeLease {
+				continue
+			}
+			return fmt.Errorf("acquire exclusive native lease for Session %s: %w", current.ID, err)
+		}
+	}
+}
+
+func (s *SessionService) reconcileNative(ctx context.Context, current session.Session, notices io.Writer) error {
+	status, err := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{Type: "status"})
+	if err != nil {
+		return fmt.Errorf("read Session %s native lease: %w", current.ID, err)
+	}
+	if !status.NativeLease {
+		return fmt.Errorf("Session %s has no native lease to reconcile", current.ID)
+	}
+	if err := s.releaseNative(ctx, current); err != nil {
+		return err
+	}
+	fmt.Fprintf(notices, "Agent Task Console: %s reconciled; queued ACP prompts may continue.\n", current.ID)
+	return nil
+}
+
+func (s *SessionService) releaseNative(ctx context.Context, current session.Session) error {
+	if _, err := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{Type: "native_release"}); err != nil {
+		return fmt.Errorf("native reconciliation failed for Session %s; the exclusive lease remains held and queued prompts remain paused. Resolve the provider/acpx issue, ensure the native CLI has exited, then run 'agent session attach %s --native --reconcile-only': %w", current.ID, current.ID, err)
+	}
+	return nil
+}
+
+func waitContext(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (s *SessionService) History(ctx context.Context, id string, cursor uint64) ([]sessionlog.Line, error) {

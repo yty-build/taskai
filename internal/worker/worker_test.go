@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,14 +21,15 @@ import (
 )
 
 type fakeACP struct {
-	mu            sync.Mutex
-	active        map[string]chan struct{}
-	cancelled     map[string]bool
-	started       chan string
-	concurrent    int
-	maxConcurrent int
-	resumeCount   int
-	resumeErr     error
+	mu             sync.Mutex
+	active         map[string]chan struct{}
+	cancelled      map[string]bool
+	started        chan string
+	concurrent     int
+	maxConcurrent  int
+	resumeCount    int
+	resumeErr      error
+	resumeNativeID string
 }
 
 func newFakeACP() *fakeACP {
@@ -45,7 +47,11 @@ func (f *fakeACP) Resume(context.Context, acp.StartSpec) (acp.SessionInfo, error
 	if f.resumeErr != nil {
 		return acp.SessionInfo{}, f.resumeErr
 	}
-	return acp.SessionInfo{ACPXRecordID: "acpx-resumed", ACPSessionID: "acp-resumed", NativeSessionID: "native-resumed"}, nil
+	nativeID := f.resumeNativeID
+	if nativeID == "" {
+		nativeID = "native-start"
+	}
+	return acp.SessionInfo{ACPXRecordID: "acpx-resumed", ACPSessionID: "acp-resumed", NativeSessionID: nativeID}, nil
 }
 
 func (f *fakeACP) Prompt(ctx context.Context, spec acp.PromptSpec, emit func(acp.Event) error) (acp.PromptReceipt, error) {
@@ -98,7 +104,7 @@ func (f *fakeACP) Cancel(context.Context, acp.Target) error {
 }
 
 func (f *fakeACP) Inspect(context.Context, acp.Target) (acp.SessionInfo, error) {
-	return acp.SessionInfo{ACPXRecordID: "acpx-inspected", ACPSessionID: "acp-inspected", NativeSessionID: "native-inspected"}, nil
+	return acp.SessionInfo{ACPXRecordID: "acpx-inspected", ACPSessionID: "acp-inspected", NativeSessionID: "native-start"}, nil
 }
 
 func (f *fakeACP) Complete(requestID string) {
@@ -300,6 +306,17 @@ func TestNativeLeaseHoldsQueueUntilSuccessfulReconciliation(t *testing.T) {
 	}
 	harness.acp.mu.Lock()
 	harness.acp.resumeErr = nil
+	harness.acp.resumeNativeID = "different-native-conversation"
+	harness.acp.mu.Unlock()
+	if _, err := harness.client.Send(context.Background(), Command{Type: "native_release"}); err == nil || !strings.Contains(err.Error(), "could not prove conversation identity") {
+		t.Fatalf("native identity mismatch error = %v", err)
+	}
+	status, err = harness.client.Send(context.Background(), Command{Type: "status"})
+	if err != nil || !status.NativeLease || status.Queued != 1 {
+		t.Fatalf("status after identity mismatch = %#v, %v", status, err)
+	}
+	harness.acp.mu.Lock()
+	harness.acp.resumeNativeID = "native-start"
 	harness.acp.mu.Unlock()
 	if _, err := harness.client.Send(context.Background(), Command{Type: "native_release"}); err != nil {
 		t.Fatal(err)

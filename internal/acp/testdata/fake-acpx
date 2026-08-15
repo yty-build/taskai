@@ -31,6 +31,8 @@ case "$command_line" in
     fi
     if [ "$scenario" = "missing-native" ]; then
       printf '%s\n' '{"action":"session_ensured","acpxRecordId":"acpx-record","acpxSessionId":"acp-session"}'
+    elif [ "${command_line#*--resume-session}" != "$command_line" ]; then
+      printf '%s\n' '{"action":"session_ensured","acpxRecordId":"acpx-record","acpxSessionId":"acp-reconnected","agentSessionId":"native-reconnected"}'
     else
       printf '%s\n' '{"action":"session_ensured","acpxRecordId":"acpx-record","acpxSessionId":"acp-session","agentSessionId":"native-session"}'
     fi

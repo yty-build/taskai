@@ -57,16 +57,17 @@ type Worker struct {
 	config Config
 	target acp.Target
 
-	mu             sync.Mutex
-	status         session.Status
-	acpSessionID   string
-	queue          []queuedPrompt
-	active         *queuedPrompt
-	activeCancel   context.CancelFunc
-	nativeLease    bool
-	seenRequestIDs map[string]struct{}
-	wake           chan struct{}
-	stop           context.CancelFunc
+	mu              sync.Mutex
+	status          session.Status
+	acpSessionID    string
+	nativeSessionID string
+	queue           []queuedPrompt
+	active          *queuedPrompt
+	activeCancel    context.CancelFunc
+	nativeLease     bool
+	seenRequestIDs  map[string]struct{}
+	wake            chan struct{}
+	stop            context.CancelFunc
 
 	publishMu sync.Mutex
 	log       *sessionlog.Log
@@ -105,7 +106,7 @@ func New(config Config) (*Worker, error) {
 		return nil, fmt.Errorf("Session %s has no repo/worktree path", config.Session.ID)
 	}
 	return &Worker{
-		config: config, target: target, status: config.Session.Status, acpSessionID: config.Session.ACPSessionID,
+		config: config, target: target, status: config.Session.Status, acpSessionID: config.Session.ACPSessionID, nativeSessionID: config.Session.NativeSessionID,
 		seenRequestIDs: make(map[string]struct{}), wake: make(chan struct{}, 1),
 	}, nil
 }
@@ -434,6 +435,14 @@ func (w *Worker) acquireNative(ctx context.Context) error {
 		w.mu.Unlock()
 		return fmt.Errorf("native mode is already leased")
 	}
+	if w.nativeSessionID == "" {
+		w.mu.Unlock()
+		return fmt.Errorf("provider-native Session ID is unavailable; refusing to start an uncorrelated native conversation")
+	}
+	if w.acpSessionID == "" {
+		w.mu.Unlock()
+		return fmt.Errorf("ACP Session ID is unavailable; refusing native mode without a reconciliation target")
+	}
 	w.nativeLease = true
 	w.mu.Unlock()
 	if err := w.updateStatus(session.StatusWaiting); err != nil {
@@ -442,8 +451,13 @@ func (w *Worker) acquireNative(ctx context.Context) error {
 		w.mu.Unlock()
 		return err
 	}
-	_, err := w.publish("", "native_acquired", map[string]bool{"exclusive": true})
-	return err
+	if _, err := w.publish("", "native_acquired", map[string]bool{"exclusive": true}); err != nil {
+		w.mu.Lock()
+		w.nativeLease = false
+		w.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 func (w *Worker) releaseNative(ctx context.Context) error {
@@ -453,20 +467,25 @@ func (w *Worker) releaseNative(ctx context.Context) error {
 		return fmt.Errorf("native mode is not leased")
 	}
 	acpSessionID := w.acpSessionID
+	expectedNativeSessionID := w.nativeSessionID
 	w.mu.Unlock()
 
 	var (
 		info acp.SessionInfo
 		err  error
 	)
-	if acpSessionID != "" {
-		info, err = w.config.ACP.Resume(ctx, acp.StartSpec{Target: w.target, ResumeACPSessionID: acpSessionID})
-	} else {
-		info, err = w.config.ACP.Start(ctx, acp.StartSpec{Target: w.target})
+	if acpSessionID == "" {
+		return fmt.Errorf("native reconciliation cannot resume without the prior ACP Session ID; Session remains waiting with its lease held")
 	}
+	info, err = w.config.ACP.Resume(ctx, acp.StartSpec{Target: w.target, ResumeACPSessionID: acpSessionID})
 	if err != nil {
 		_, _ = w.publish("", "native_reconcile_error", map[string]string{"message": err.Error()})
 		return fmt.Errorf("native reconciliation failed; Session remains waiting with its lease held: %w", err)
+	}
+	if info.NativeSessionID == "" || info.NativeSessionID != expectedNativeSessionID {
+		message := fmt.Sprintf("expected provider-native Session ID %q, received %q", expectedNativeSessionID, info.NativeSessionID)
+		_, _ = w.publish("", "native_reconcile_error", map[string]string{"message": message})
+		return fmt.Errorf("native reconciliation could not prove conversation identity (%s); Session remains waiting with its lease held", message)
 	}
 	if err := w.persistRuntimeInfo(ctx, info); err != nil {
 		return fmt.Errorf("native reconciliation persistence failed; Session remains waiting with its lease held: %w", err)
@@ -474,15 +493,17 @@ func (w *Worker) releaseNative(ctx context.Context) error {
 	if err := w.writeMetadata(info); err != nil {
 		return fmt.Errorf("native reconciliation metadata failed; Session remains waiting with its lease held: %w", err)
 	}
+	if _, err = w.publish("", "native_released", map[string]bool{"reconciled": true}); err != nil {
+		return fmt.Errorf("record native reconciliation before release; Session remains waiting with its lease held: %w", err)
+	}
 	w.mu.Lock()
 	w.nativeLease = false
 	hasQueue := len(w.queue) > 0
 	w.mu.Unlock()
-	_, err = w.publish("", "native_released", map[string]bool{"reconciled": true})
 	if hasQueue {
 		w.signalWake()
 	}
-	return err
+	return nil
 }
 
 func (w *Worker) subscribe(ctx context.Context, connection net.Conn, from uint64) {
@@ -577,6 +598,7 @@ func (w *Worker) persistRuntimeInfo(ctx context.Context, info acp.SessionInfo) e
 	}
 	w.mu.Lock()
 	w.acpSessionID = updated.ACPSessionID
+	w.nativeSessionID = updated.NativeSessionID
 	w.mu.Unlock()
 	return nil
 }
