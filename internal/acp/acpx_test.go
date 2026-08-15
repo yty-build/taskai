@@ -257,6 +257,15 @@ func TestOpenCodePromptContinuesDurableSessionAcrossProcessesAndFailsClosed(t *t
 	var messages []string
 	var sessionIDs []string
 	for turn := 1; turn <= 2; turn++ {
+		if turn == 2 {
+			resumed, err := client.Resume(context.Background(), StartSpec{Target: target, ResumeACPSessionID: info.ACPSessionID})
+			if err != nil {
+				t.Fatalf("Resume() error = %v", err)
+			}
+			if resumed.ACPXRecordID != info.ACPXRecordID || resumed.ACPSessionID != info.ACPSessionID || resumed.NativeSessionID != info.NativeSessionID {
+				t.Fatalf("Resume() = %#v, want exact conversation identity %#v", resumed, info)
+			}
+		}
 		_, err := client.Prompt(context.Background(), PromptSpec{
 			Target: target, RequestID: fmt.Sprintf("req-%d", turn), Message: fmt.Sprintf("turn %d", turn),
 		}, func(event Event) error {
@@ -296,16 +305,26 @@ func TestOpenCodePromptContinuesDurableSessionAcrossProcessesAndFailsClosed(t *t
 		t.Fatal(err)
 	}
 	pidLines := strings.Fields(string(pids))
-	if len(pidLines) != 3 || pidLines[0] == pidLines[1] || pidLines[1] == pidLines[2] || pidLines[0] == pidLines[2] {
-		t.Fatalf("operational process IDs = %q, want three distinct processes", pidLines)
+	seenPIDs := make(map[string]bool, len(pidLines))
+	for _, pid := range pidLines {
+		if seenPIDs[pid] {
+			t.Fatalf("operational process IDs = %q, want distinct processes", pidLines)
+		}
+		seenPIDs[pid] = true
+	}
+	if len(pidLines) != 4 {
+		t.Fatalf("operational process IDs = %q, want start, first prompt, resume, and second prompt", pidLines)
 	}
 
 	args, err := os.ReadFile(argsLog)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if occurrences := strings.Count(string(args), "--agent\n\"npx\" \"-y\" \"opencode-ai@1.1.4\" \"acp\"\n"); occurrences != 3 {
-		t.Fatalf("pinned OpenCode --agent occurrences = %d, want 3; argv log:\n%s", occurrences, args)
+	if occurrences := strings.Count(string(args), "--agent\n\"npx\" \"-y\" \"opencode-ai@1.18.18\" \"acp\"\n"); occurrences != 4 {
+		t.Fatalf("pinned OpenCode --agent occurrences = %d, want 4; argv log:\n%s", occurrences, args)
+	}
+	if !strings.Contains(string(args), "--resume-session\nacp-opencode-durable\n") {
+		t.Fatalf("resume argv did not preserve ACP Session ID; argv log:\n%s", args)
 	}
 
 	if err := os.Remove(stateFile); err != nil {

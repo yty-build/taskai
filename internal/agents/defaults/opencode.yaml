@@ -3,5 +3,5 @@ provider: opencode
 command: npx
 args:
   - -y
-  - opencode-ai@1.1.4
+  - opencode-ai@1.18.18
   - acp

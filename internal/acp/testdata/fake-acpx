@@ -42,7 +42,19 @@ case "$command_line" in
         printf '%s\n' "fixture durable state path is required" >&2
         exit 7
       fi
-      printf '%s %s\n' "acp-opencode-durable" "0" > "${FAKE_ACPX_DURABLE_STATE}"
+      if [ "${command_line#*--resume-session}" != "$command_line" ]; then
+        if [ ! -f "${FAKE_ACPX_DURABLE_STATE}" ]; then
+          printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"durable ACP session unavailable; refusing a replacement conversation"}}'
+          exit 1
+        fi
+        read -r durable_session durable_turn < "${FAKE_ACPX_DURABLE_STATE}"
+        if [ "$durable_session" != "acp-opencode-durable" ]; then
+          printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"durable ACP session identifier changed; refusing a replacement conversation"}}'
+          exit 1
+        fi
+      else
+        printf '%s %s\n' "acp-opencode-durable" "0" > "${FAKE_ACPX_DURABLE_STATE}"
+      fi
       printf '%s\n' '{"action":"session_ensured","acpxRecordId":"acpx-opencode-durable","acpxSessionId":"acp-opencode-durable","agentSessionId":"native-opencode-durable"}'
     elif [ "$scenario" = "missing-native" ]; then
       printf '%s\n' '{"action":"session_ensured","acpxRecordId":"acpx-record","acpxSessionId":"acp-session"}'

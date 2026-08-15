@@ -25,7 +25,7 @@ func TestLoadEmbeddedProfiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantOpenCodeArgv := []string{"npx", "-y", "opencode-ai@1.1.4", "acp"}
+	wantOpenCodeArgv := []string{"npx", "-y", "opencode-ai@1.18.18", "acp"}
 	if got := opencode.Argv(); !reflect.DeepEqual(got, wantOpenCodeArgv) {
 		t.Fatalf("opencode Argv() = %q, want %q", got, wantOpenCodeArgv)
 	}
