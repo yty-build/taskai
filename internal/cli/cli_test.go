@@ -7,7 +7,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/yty-build/acp-gateway/internal/buildinfo"
 	"github.com/yty-build/acp-gateway/internal/config"
@@ -48,6 +50,70 @@ func TestRunUnknownCommandHasStableError(t *testing.T) {
 	if got, want := stderr.String(), "agent: unknown command \"wat\"; run 'agent help' for usage\n"; got != want {
 		t.Fatalf("stderr = %q, want %q", got, want)
 	}
+}
+
+func TestServeUsesLoopbackAndStopsOnlyTheViewer(t *testing.T) {
+	t.Setenv("AGENT_HOME", filepath.Join(t.TempDir(), "state"))
+	ctx, cancel := context.WithCancel(context.Background())
+	stdout := newReadyWriter()
+	var stderr bytes.Buffer
+	done := make(chan int, 1)
+	go func() {
+		done <- Run(ctx, []string{"serve", "--listen", "127.0.0.1:0"}, stdout, &stderr, buildinfo.Info{Version: "test"})
+	}()
+	select {
+	case <-stdout.ready:
+	case <-time.After(4 * time.Second):
+		cancel()
+		t.Fatal("agent serve did not start")
+	}
+	cancel()
+	select {
+	case code := <-done:
+		if code != ExitOK || stderr.Len() != 0 {
+			t.Fatalf("serve: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("agent serve did not stop after context cancellation")
+	}
+	for _, expected := range []string{"http://127.0.0.1:", "Session workers will continue"} {
+		if !strings.Contains(stdout.String(), expected) {
+			t.Errorf("serve output %q does not contain %q", stdout.String(), expected)
+		}
+	}
+}
+
+func TestServeRejectsPublicOrImplicitBinding(t *testing.T) {
+	t.Setenv("AGENT_HOME", filepath.Join(t.TempDir(), "state"))
+	for _, address := range []string{"0.0.0.0:0", "[::]:0", "localhost:0"} {
+		code, _, stderr := runForTest(t, "serve", "--listen", address)
+		if code != ExitFailure || !strings.Contains(stderr, "refusing non-loopback listen address") {
+			t.Errorf("serve %s: code=%d stderr=%q", address, code, stderr)
+		}
+	}
+}
+
+type readyWriter struct {
+	mu    sync.Mutex
+	text  bytes.Buffer
+	ready chan struct{}
+	once  sync.Once
+}
+
+func newReadyWriter() *readyWriter { return &readyWriter{ready: make(chan struct{})} }
+
+func (w *readyWriter) Write(value []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	written, err := w.text.Write(value)
+	w.once.Do(func() { close(w.ready) })
+	return written, err
+}
+
+func (w *readyWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.text.String()
 }
 
 func TestTaskCommandLifecycle(t *testing.T) {

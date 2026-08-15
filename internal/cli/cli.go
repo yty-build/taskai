@@ -14,6 +14,7 @@ import (
 	"time"
 
 	agentregistry "github.com/yty-build/acp-gateway/internal/agents"
+	"github.com/yty-build/acp-gateway/internal/api"
 	"github.com/yty-build/acp-gateway/internal/buildinfo"
 	"github.com/yty-build/acp-gateway/internal/config"
 	"github.com/yty-build/acp-gateway/internal/console"
@@ -22,6 +23,7 @@ import (
 	"github.com/yty-build/acp-gateway/internal/sessionlog"
 	"github.com/yty-build/acp-gateway/internal/store"
 	"github.com/yty-build/acp-gateway/internal/task"
+	"github.com/yty-build/acp-gateway/internal/web"
 	"github.com/yty-build/acp-gateway/internal/worker"
 )
 
@@ -119,6 +121,14 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, info buil
 			break
 		}
 		err = runAgents(args[1:], stdout, registry)
+	case "serve":
+		registry, loadErr := agentregistry.Load(home.Agents)
+		if loadErr != nil {
+			err = loadErr
+			break
+		}
+		sessionService := appservice.NewSessionService(database, registry, home, runtime)
+		err = runServe(ctx, args[1:], stdout, taskService, sessionService, registry)
 	default:
 		err = usagef("unknown command %q; run 'agent help' for usage", strings.Join(args, " "))
 	}
@@ -130,6 +140,30 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, info buil
 		return fail(stderr, ExitUsage, usageErr)
 	}
 	return fail(stderr, ExitFailure, err)
+}
+
+func runServe(ctx context.Context, args []string, stdout io.Writer, tasks *task.Service, sessions *appservice.SessionService, registry *agentregistry.Registry) error {
+	options, err := parseOptions(args, map[string]optionKind{"--listen": stringOption})
+	if err != nil || len(options.positionals) != 0 {
+		return usagef("usage: agent serve [--listen 127.0.0.1:8080]")
+	}
+	address := options.values["--listen"]
+	if strings.TrimSpace(address) == "" {
+		address = "127.0.0.1:8080"
+	}
+	server, err := web.New(tasks, sessions, registry)
+	if err != nil {
+		return err
+	}
+	listener, err := api.ListenLoopback(address)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+	if _, err := fmt.Fprintf(stdout, "Agent Task Console listening at http://%s\nPress Ctrl-C to stop the web viewer; Session workers will continue.\n", listener.Addr().String()); err != nil {
+		return err
+	}
+	return api.Serve(ctx, listener, server.Handler())
 }
 
 func runHiddenWorker(ctx context.Context, args []string, home config.Home, database *store.Store) error {

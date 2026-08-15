@@ -300,6 +300,17 @@ func TestVersionedTaskAndSessionAPI(t *testing.T) {
 	if !seen[sessionID] || !seen[secondSessionID] {
 		t.Fatalf("Task replay did not aggregate every Session: %#v", replayedTaskEvents)
 	}
+	reviewResponse := performJSON(t, fixture.handler, http.MethodPost, "/api/v1/sessions/"+sessionID+"/review", map[string]any{"agent": "claude"})
+	assertStatus(t, reviewResponse, http.StatusCreated)
+	var reviewStarted struct {
+		Session   SessionDTO `json:"session"`
+		RequestID string     `json:"request_id"`
+	}
+	decodeResponse(t, reviewResponse, &reviewStarted)
+	if reviewStarted.Session.TaskID != taskID || reviewStarted.Session.Role != "reviewer" || reviewStarted.Session.Agent != "claude" || reviewStarted.RequestID == "" {
+		t.Fatalf("review response = %#v", reviewStarted)
+	}
+	assertStatus(t, performRequest(t, fixture.handler, http.MethodPost, "/api/v1/sessions/"+reviewStarted.Session.ID+"/stop", nil, nil), http.StatusOK)
 	assertDTOIsRedacted(t, getSession.Body.String(), fixture.home, sessionID)
 }
 

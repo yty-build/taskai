@@ -43,6 +43,7 @@ func New(tasks *task.Service, sessions *appservice.SessionService) *Server {
 	mux.HandleFunc("POST /api/v1/sessions/{sessionID}/cancel", server.cancel)
 	mux.HandleFunc("POST /api/v1/sessions/{sessionID}/resume", server.resume)
 	mux.HandleFunc("POST /api/v1/sessions/{sessionID}/stop", server.stop)
+	mux.HandleFunc("POST /api/v1/sessions/{sessionID}/review", server.review)
 	mux.HandleFunc("GET /api/v1/sessions/{sessionID}/stream", server.streamSession)
 	server.handler = securityHeaders(mux)
 	return server
@@ -235,6 +236,29 @@ func (s *Server) stop(writer http.ResponseWriter, request *http.Request) {
 	writeJSON(writer, http.StatusOK, map[string]string{"session_id": id, "status": "stopped"})
 }
 
+type reviewRequest struct {
+	Agent               string `json:"agent"`
+	AllowActiveProducer bool   `json:"allow_active_producer"`
+}
+
+func (s *Server) review(writer http.ResponseWriter, request *http.Request) {
+	var body reviewRequest
+	if err := decodeJSON(writer, request, &body, false); err != nil {
+		writeBadRequest(writer, err)
+		return
+	}
+	launched, err := s.sessions.Review(request.Context(), appservice.ReviewSessionParams{
+		ProducerID: request.PathValue("sessionID"), Agent: body.Agent, AllowActiveProducer: body.AllowActiveProducer,
+	})
+	if err != nil {
+		writeValidationError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusCreated, map[string]any{
+		"session": makeSessionDTO(launched.Session), "request_id": launched.RequestID, "state": launched.State,
+	})
+}
+
 func (s *Server) streamSession(writer http.ResponseWriter, request *http.Request) {
 	cursor, err := sessionCursor(request)
 	if err != nil {
@@ -366,7 +390,7 @@ func writeValidationError(writer http.ResponseWriter, err error) {
 		writeJSONError(writer, http.StatusNotFound, "not_found", "The requested Task or Session was not found")
 		return
 	}
-	if strings.Contains(err.Error(), "already used by active Session") {
+	if strings.Contains(err.Error(), "already used by active Session") || strings.Contains(err.Error(), "checkout may still change") {
 		writeJSONError(writer, http.StatusConflict, "checkout_conflict", err.Error())
 		return
 	}
