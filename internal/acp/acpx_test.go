@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -198,6 +199,99 @@ func TestCustomCommandIsPassedAsOneLiteralAgentArgument(t *testing.T) {
 	}
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("custom argument was unexpectedly evaluated; marker stat error = %v", err)
+	}
+}
+
+func TestOpenCodePromptContinuesDurableSessionAcrossProcessesAndFailsClosed(t *testing.T) {
+	client, target := fixtureClient(t, "durable-opencode")
+	registry, err := agents.Load(filepath.Join(t.TempDir(), "missing-profiles"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target.Profile, err = registry.Get("opencode")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stateFile := filepath.Join(t.TempDir(), "durable-session")
+	pidFile := filepath.Join(t.TempDir(), "pids")
+	argsLog := filepath.Join(t.TempDir(), "args")
+	t.Setenv("FAKE_ACPX_DURABLE_STATE", stateFile)
+	t.Setenv("FAKE_ACPX_PID_LOG", pidFile)
+	t.Setenv("FAKE_ACPX_ARGS_LOG", argsLog)
+
+	info, err := client.Start(context.Background(), StartSpec{Target: target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.ACPXRecordID != "acpx-opencode-durable" || info.ACPSessionID != "acp-opencode-durable" || info.NativeSessionID != "native-opencode-durable" {
+		t.Fatalf("Start() = %#v", info)
+	}
+
+	var messages []string
+	var sessionIDs []string
+	for turn := 1; turn <= 2; turn++ {
+		_, err := client.Prompt(context.Background(), PromptSpec{
+			Target: target, RequestID: fmt.Sprintf("req-%d", turn), Message: fmt.Sprintf("turn %d", turn),
+		}, func(event Event) error {
+			if event.Type != "agent_message_chunk" {
+				return nil
+			}
+			var raw struct {
+				Params struct {
+					Update struct {
+						Content struct {
+							Text string `json:"text"`
+						} `json:"content"`
+					} `json:"update"`
+				} `json:"params"`
+			}
+			if err := json.Unmarshal(event.Raw, &raw); err != nil {
+				return err
+			}
+			messages = append(messages, raw.Params.Update.Content.Text)
+			sessionIDs = append(sessionIDs, event.SessionID)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("Prompt(turn %d) error = %v", turn, err)
+		}
+	}
+	wantMessages := []string{"turn-1 continued acp-opencode-durable", "turn-2 continued acp-opencode-durable"}
+	if !reflect.DeepEqual(messages, wantMessages) {
+		t.Fatalf("messages = %q, want %q", messages, wantMessages)
+	}
+	if wantSessionIDs := []string{"acp-opencode-durable", "acp-opencode-durable"}; !reflect.DeepEqual(sessionIDs, wantSessionIDs) {
+		t.Fatalf("ACP Session IDs = %q, want %q", sessionIDs, wantSessionIDs)
+	}
+
+	pids, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pidLines := strings.Fields(string(pids))
+	if len(pidLines) != 3 || pidLines[0] == pidLines[1] || pidLines[1] == pidLines[2] || pidLines[0] == pidLines[2] {
+		t.Fatalf("operational process IDs = %q, want three distinct processes", pidLines)
+	}
+
+	args, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if occurrences := strings.Count(string(args), "--agent\n\"npx\" \"-y\" \"opencode-ai@1.1.4\" \"acp\"\n"); occurrences != 3 {
+		t.Fatalf("pinned OpenCode --agent occurrences = %d, want 3; argv log:\n%s", occurrences, args)
+	}
+
+	if err := os.Remove(stateFile); err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Prompt(context.Background(), PromptSpec{Target: target, RequestID: "req-lost", Message: "must not fork"}, nil)
+	var protocolErr *ProtocolError
+	if !errors.As(err, &protocolErr) || !strings.Contains(err.Error(), "durable ACP session unavailable; refusing a replacement conversation") {
+		t.Fatalf("Prompt() after durable state loss error = %#v", err)
+	}
+	if _, statErr := os.Stat(stateFile); !os.IsNotExist(statErr) {
+		t.Fatalf("lost durable state was unexpectedly replaced; stat error = %v", statErr)
 	}
 }
 

@@ -24,6 +24,10 @@ if [ -n "${FAKE_ACPX_CWD_FILE:-}" ]; then
   pwd -P > "${FAKE_ACPX_CWD_FILE}"
 fi
 
+if [ -n "${FAKE_ACPX_PID_LOG:-}" ]; then
+  printf '%s\n' "$$" >> "${FAKE_ACPX_PID_LOG}"
+fi
+
 scenario="${FAKE_ACPX_SCENARIO:-success}"
 command_line="$*"
 
@@ -33,7 +37,14 @@ case "$command_line" in
       printf '%s\n' "fixture ensure failed" >&2
       exit 7
     fi
-    if [ "$scenario" = "missing-native" ]; then
+    if [ "$scenario" = "durable-opencode" ]; then
+      if [ -z "${FAKE_ACPX_DURABLE_STATE:-}" ]; then
+        printf '%s\n' "fixture durable state path is required" >&2
+        exit 7
+      fi
+      printf '%s %s\n' "acp-opencode-durable" "0" > "${FAKE_ACPX_DURABLE_STATE}"
+      printf '%s\n' '{"action":"session_ensured","acpxRecordId":"acpx-opencode-durable","acpxSessionId":"acp-opencode-durable","agentSessionId":"native-opencode-durable"}'
+    elif [ "$scenario" = "missing-native" ]; then
       printf '%s\n' '{"action":"session_ensured","acpxRecordId":"acpx-record","acpxSessionId":"acp-session"}'
     elif [ "${command_line#*--resume-session}" != "$command_line" ]; then
       printf '%s\n' '{"action":"session_ensured","acpxRecordId":"acpx-record","acpxSessionId":"acp-reconnected","agentSessionId":"native-reconnected"}'
@@ -68,6 +79,22 @@ case "$command_line" in
       nonzero)
         printf '%s\n' "fixture prompt failed" >&2
         exit 7
+        ;;
+      durable-opencode)
+        if [ -z "${FAKE_ACPX_DURABLE_STATE:-}" ] || [ ! -f "${FAKE_ACPX_DURABLE_STATE}" ]; then
+          printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"durable ACP session unavailable; refusing a replacement conversation"}}'
+          exit 1
+        fi
+        read -r durable_session durable_turn < "${FAKE_ACPX_DURABLE_STATE}"
+        if [ "$durable_session" != "acp-opencode-durable" ]; then
+          printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"durable ACP session identifier changed; refusing a replacement conversation"}}'
+          exit 1
+        fi
+        durable_turn=$((durable_turn + 1))
+        printf '%s %s\n' "$durable_session" "$durable_turn" > "${FAKE_ACPX_DURABLE_STATE}"
+        printf '%s\n' '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}'
+        printf '%s\n' "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"$durable_session\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"turn-$durable_turn continued $durable_session\"}}}}"
+        printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
         ;;
       *)
         printf '%s\n' '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}'

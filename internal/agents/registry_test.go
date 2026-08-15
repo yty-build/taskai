@@ -21,6 +21,14 @@ func TestLoadEmbeddedProfiles(t *testing.T) {
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("profiles = %v, want %v", names, want)
 	}
+	opencode, err := registry.Get("opencode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantOpenCodeArgv := []string{"npx", "-y", "opencode-ai@1.1.4", "acp"}
+	if got := opencode.Argv(); !reflect.DeepEqual(got, wantOpenCodeArgv) {
+		t.Fatalf("opencode Argv() = %q, want %q", got, wantOpenCodeArgv)
+	}
 }
 
 func TestUserProfilesOverlayDefaultsAndAddCustomCommands(t *testing.T) {
