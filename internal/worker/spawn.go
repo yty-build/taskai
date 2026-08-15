@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,12 @@ type SpawnResult struct {
 	PID    int
 	Socket string
 }
+
+const (
+	workerStartupTimeout   = 30 * time.Second
+	startupLogTailBytes    = 1 << 20
+	maxStartupErrorMessage = 8 << 10
+)
 
 // Spawn launches the hidden worker in a new session and waits until its socket
 // answers ping. The worker is not tied to the caller's terminal lifetime.
@@ -50,7 +57,7 @@ func Spawn(ctx context.Context, executable string, home config.Home, sessionID s
 	exited := make(chan error, 1)
 	go func() { exited <- command.Wait() }()
 
-	deadline := time.NewTimer(8 * time.Second)
+	deadline := time.NewTimer(workerStartupTimeout)
 	defer deadline.Stop()
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
@@ -63,9 +70,15 @@ func Spawn(ctx context.Context, executable string, home config.Home, sessionID s
 			if err == nil {
 				err = fmt.Errorf("worker exited before becoming ready")
 			}
+			if detail := latestWorkerStartupError(filepath.Join(home.Logs, sessionID+".jsonl")); detail != "" {
+				return SpawnResult{}, fmt.Errorf("Session worker %d failed to start: %s", pid, detail)
+			}
 			return SpawnResult{}, fmt.Errorf("Session worker %d failed to start: %w", pid, err)
 		case <-deadline.C:
 			_ = command.Process.Signal(syscall.SIGTERM)
+			if detail := latestWorkerStartupError(filepath.Join(home.Logs, sessionID+".jsonl")); detail != "" {
+				return SpawnResult{}, fmt.Errorf("Session worker %d did not become ready at %s: %s", pid, socket, detail)
+			}
 			return SpawnResult{}, fmt.Errorf("Session worker %d did not become ready at %s", pid, socket)
 		case <-ticker.C:
 			pingContext, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
@@ -76,6 +89,48 @@ func Spawn(ctx context.Context, executable string, home config.Home, sessionID s
 			}
 		}
 	}
+}
+
+func latestWorkerStartupError(path string) string {
+	file, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return ""
+	}
+	start := info.Size() - startupLogTailBytes
+	if start < 0 {
+		start = 0
+	}
+	if _, err := file.Seek(start, 0); err != nil {
+		return ""
+	}
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), startupLogTailBytes)
+	if start > 0 {
+		// The seek can land in a JSONL record; discard that partial record.
+		scanner.Scan()
+	}
+	var latest string
+	for scanner.Scan() {
+		var line struct {
+			Type string `json:"type"`
+			Data struct {
+				Message string `json:"message"`
+			} `json:"data"`
+		}
+		if json.Unmarshal(scanner.Bytes(), &line) == nil && line.Type == "worker_error" {
+			latest = strings.TrimSpace(line.Data.Message)
+		}
+	}
+	if len(latest) > maxStartupErrorMessage {
+		latest = latest[:maxStartupErrorMessage] + "..."
+	}
+	return latest
 }
 
 func IsProcessAlive(pid int) bool {

@@ -410,7 +410,7 @@ func TestReconcileStaleWorkerMarksSessionStoppedAndRemovesRuntimeFiles(t *testin
 	}
 }
 
-func TestDetachedHiddenWorkerBecomesReachableAndStopsCleanly(t *testing.T) {
+func TestDetachedHiddenWorkerStartupLifecycleAndDiagnostics(t *testing.T) {
 	root, err := os.MkdirTemp("/tmp", "atc-detached-test-")
 	if err != nil {
 		t.Fatal(err)
@@ -435,6 +435,10 @@ func TestDetachedHiddenWorkerBecomesReachableAndStopsCleanly(t *testing.T) {
 	}
 	createdTask, _ := repository.CreateTask(context.Background(), task.CreateParams{ID: "T-detached", Title: "Detached"})
 	_, err = repository.CreateSession(context.Background(), session.CreateParams{ID: "S-detached", TaskID: createdTask.ID, Agent: "codex", Provider: "openai", RepoPath: repo})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = repository.CreateSession(context.Background(), session.CreateParams{ID: "S-detached-failure", TaskID: createdTask.ID, Agent: "codex", Provider: "openai", RepoPath: repo})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -477,6 +481,16 @@ func TestDetachedHiddenWorkerBecomesReachableAndStopsCleanly(t *testing.T) {
 	stopped, err := reopened.GetSession(context.Background(), "S-detached")
 	if err != nil || stopped.Status != session.StatusStopped || stopped.WorkerPID != 0 || stopped.WorkerSocket != "" {
 		t.Fatalf("stopped Session = %#v, %v", stopped, err)
+	}
+
+	t.Setenv("FAKE_ACPX_SCENARIO", "nonzero")
+	_, err = Spawn(context.Background(), executable, home, "S-detached-failure")
+	if err == nil || !strings.Contains(err.Error(), "fixture ensure failed") {
+		t.Fatalf("Spawn() startup failure = %v, want underlying acpx detail", err)
+	}
+	failed, getErr := reopened.GetSession(context.Background(), "S-detached-failure")
+	if getErr != nil || failed.Status != session.StatusFailed {
+		t.Fatalf("failed Session = %#v, %v", failed, getErr)
 	}
 }
 

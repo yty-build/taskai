@@ -202,6 +202,32 @@ func TestCustomCommandIsPassedAsOneLiteralAgentArgument(t *testing.T) {
 	}
 }
 
+func TestGeminiProfilePassesExperimentalACPAsLiteralAgentArgv(t *testing.T) {
+	client, target := fixtureClient(t, "success")
+	registry, err := agents.Load(filepath.Join(t.TempDir(), "missing-profiles"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target.Profile, err = registry.Get("gemini")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	argsFile := filepath.Join(t.TempDir(), "args")
+	t.Setenv("FAKE_ACPX_ARGS_FILE", argsFile)
+	if _, err := client.Start(context.Background(), StartSpec{Target: target}); err != nil {
+		t.Fatal(err)
+	}
+	args, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "--agent\n\"gemini\" \"--experimental-acp\"\nsessions\nensure\n"
+	if !strings.Contains(string(args), want) {
+		t.Fatalf("Gemini acpx argv =\n%s\nwant contiguous literal agent argv =\n%s", args, want)
+	}
+}
+
 func TestOpenCodePromptContinuesDurableSessionAcrossProcessesAndFailsClosed(t *testing.T) {
 	client, target := fixtureClient(t, "durable-opencode")
 	registry, err := agents.Load(filepath.Join(t.TempDir(), "missing-profiles"))
