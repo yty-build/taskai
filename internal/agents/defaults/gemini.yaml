@@ -1,3 +1,5 @@
 name: gemini
 provider: google
 command: gemini
+args:
+  - --experimental-acp

@@ -202,7 +202,7 @@ func TestCustomCommandIsPassedAsOneLiteralAgentArgument(t *testing.T) {
 	}
 }
 
-func TestGeminiFriendlyProfilePassesLiteralAgentName(t *testing.T) {
+func TestGeminiProfilePassesExperimentalACPAsLiteralAgentArgv(t *testing.T) {
 	client, target := fixtureClient(t, "success")
 	registry, err := agents.Load(filepath.Join(t.TempDir(), "missing-profiles"))
 	if err != nil {
@@ -222,9 +222,9 @@ func TestGeminiFriendlyProfilePassesLiteralAgentName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "gemini\nsessions\nensure\n"
+	want := "--agent\n\"gemini\" \"--experimental-acp\"\nsessions\nensure\n"
 	if !strings.Contains(string(args), want) {
-		t.Fatalf("Gemini acpx argv =\n%s\nwant contiguous friendly profile invocation =\n%s", args, want)
+		t.Fatalf("Gemini acpx argv =\n%s\nwant contiguous literal agent argv =\n%s", args, want)
 	}
 }
 

@@ -79,6 +79,7 @@ func TestRuntimeAgentConfigurationExpandsFriendlyBuiltinsOnly(t *testing.T) {
 	}{
 		{name: "friendly codex", profile: agents.Profile{Name: "codex", Command: "codex"}, wantAgent: "codex", wantBuiltin: true},
 		{name: "friendly alias", profile: agents.Profile{Name: "team-codex", Command: "codex"}, wantAgent: "codex", wantBuiltin: true},
+		{name: "gemini compatibility override", profile: agents.Profile{Name: "gemini", Command: "gemini", Args: []string{"--experimental-acp"}}, wantAgent: "gemini"},
 		{name: "raw custom", profile: agents.Profile{Name: "custom", Command: "/opt/acp/custom", Args: []string{"--stdio"}}, wantAgent: "custom"},
 		{name: "built-in name with raw args", profile: agents.Profile{Name: "codex", Command: "codex", Args: []string{"--stdio"}}, wantAgent: "codex"},
 	}

@@ -57,7 +57,7 @@ Embedded profiles:
 | --- | --- | --- |
 | `codex` | `openai` | `codex` |
 | `claude` | `anthropic` | `claude` |
-| `gemini` | `google` | `gemini` |
+| `gemini` | `google` | `gemini --experimental-acp` |
 | `grok-build` | `xai` | `grok-build` |
 | `opencode` | `opencode` | `npx -y opencode-ai@1.18.18 acp` |
 

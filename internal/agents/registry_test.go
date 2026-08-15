@@ -33,8 +33,8 @@ func TestLoadEmbeddedProfiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := gemini.Argv(), []string{"gemini"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("gemini Argv() = %q, want friendly profile %q", got, want)
+	if got, want := gemini.Argv(), []string{"gemini", "--experimental-acp"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("gemini Argv() = %q, want installed CLI-compatible profile %q", got, want)
 	}
 }
 
