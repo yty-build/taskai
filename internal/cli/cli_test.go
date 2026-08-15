@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -95,6 +96,7 @@ func TestStartCreatesTaskAndSession(t *testing.T) {
 	if err := os.MkdirAll(repo, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	initializeCLIRepository(t, repo)
 	originalFactory := sessionRuntimeFactory
 	sessionRuntimeFactory = func(config.Home, string) appservice.Runtime { return fakeSessionRuntime{} }
 	t.Cleanup(func() { sessionRuntimeFactory = originalFactory })
@@ -110,6 +112,38 @@ func TestStartCreatesTaskAndSession(t *testing.T) {
 	code, stdout, stderr = runForTest(t, "task", taskID)
 	if code != ExitOK || stderr != "" || !strings.Contains(stdout, sessionID) || !strings.Contains(stdout, "implementer") || !strings.Contains(stdout, "codex") || !strings.Contains(stdout, "starting") {
 		t.Fatalf("task show: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
+func TestStartWorktreeFlagsPersistIsolatedCheckout(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "state")
+	t.Setenv("AGENT_HOME", home)
+	repo := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(repo, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	initializeCLIRepository(t, repo)
+	originalFactory := sessionRuntimeFactory
+	sessionRuntimeFactory = func(config.Home, string) appservice.Runtime { return fakeSessionRuntime{} }
+	t.Cleanup(func() { sessionRuntimeFactory = originalFactory })
+
+	code, stdout, stderr := runForTest(t, "start", "Isolated change", "--agent", "codex", "--repo", repo, "--worktree")
+	if code != ExitOK || stderr != "" {
+		t.Fatalf("start --worktree: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	fields := strings.Fields(stdout)
+	if len(fields) < 4 {
+		t.Fatalf("start output = %q", stdout)
+	}
+	taskID, sessionID := fields[1], fields[3]
+	wantPath := filepath.Join(home, "worktrees", taskID+"-"+sessionID)
+	wantBranch := "agent/" + taskID + "/" + sessionID
+	code, stdout, stderr = runForTest(t, "session", sessionID)
+	if code != ExitOK || stderr != "" || !strings.Contains(stdout, "Worktree: "+wantPath) || !strings.Contains(stdout, "Branch: "+wantBranch) {
+		t.Fatalf("Session context: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if _, err := os.Stat(filepath.Join(wantPath, "README.md")); err != nil {
+		t.Fatalf("isolated checkout missing: %v", err)
 	}
 }
 
@@ -178,4 +212,29 @@ func runForTest(t *testing.T, args ...string) (int, string, string) {
 	var stdout, stderr bytes.Buffer
 	code := Run(context.Background(), args, &stdout, &stderr, buildinfo.Info{Version: "test"})
 	return code, stdout.String(), stderr.String()
+}
+
+func initializeCLIRepository(t *testing.T, path string) {
+	t.Helper()
+	for _, arguments := range [][]string{
+		{"init", "-b", "main"},
+		{"config", "user.name", "Agent Test"},
+		{"config", "user.email", "agent@example.invalid"},
+	} {
+		command := exec.Command("git", arguments...)
+		command.Dir = path
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(arguments, " "), err, output)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(path, "README.md"), []byte("fixture\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, arguments := range [][]string{{"add", "README.md"}, {"commit", "-m", "fixture"}} {
+		command := exec.Command("git", arguments...)
+		command.Dir = path
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(arguments, " "), err, output)
+		}
+	}
 }

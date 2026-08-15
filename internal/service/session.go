@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -14,6 +13,7 @@ import (
 	"github.com/yty-build/acp-gateway/internal/acp"
 	"github.com/yty-build/acp-gateway/internal/agents"
 	"github.com/yty-build/acp-gateway/internal/config"
+	gitrepo "github.com/yty-build/acp-gateway/internal/git"
 	"github.com/yty-build/acp-gateway/internal/identity"
 	"github.com/yty-build/acp-gateway/internal/session"
 	"github.com/yty-build/acp-gateway/internal/sessionlog"
@@ -25,6 +25,7 @@ type SessionRepository interface {
 	task.Repository
 	session.Repository
 	ListSessions(context.Context) ([]session.Session, error)
+	CreateTaskWithSession(context.Context, task.CreateParams, session.CreateParams) (task.Task, session.Session, error)
 }
 
 type Runtime interface {
@@ -58,14 +59,16 @@ type SessionService struct {
 }
 
 type StartSessionParams struct {
-	TaskID       string
-	Agent        string
-	Role         string
-	RepoPath     string
-	WorktreePath string
-	Branch       string
-	Prompt       string
-	ApproveAll   bool
+	TaskID              string
+	Agent               string
+	Role                string
+	RepoPath            string
+	WorktreePath        string
+	Branch              string
+	Worktree            bool
+	AllowSharedCheckout bool
+	Prompt              string
+	ApproveAll          bool
 }
 
 type LaunchResult struct {
@@ -74,29 +77,69 @@ type LaunchResult struct {
 	State     string
 }
 
+type TaskLaunchResult struct {
+	Task task.Task
+	LaunchResult
+}
+
 func NewSessionService(repository SessionRepository, registry *agents.Registry, home config.Home, runtime Runtime) *SessionService {
 	return &SessionService{repository: repository, registry: registry, home: home, runtime: runtime}
 }
 
 func (s *SessionService) Prepare(params StartSessionParams) (session.CreateParams, error) {
+	return s.PrepareContext(context.Background(), params)
+}
+
+func (s *SessionService) PrepareContext(ctx context.Context, params StartSessionParams) (session.CreateParams, error) {
 	profile, err := s.registry.Get(params.Agent)
 	if err != nil {
 		return session.CreateParams{}, err
 	}
-	repoPath, err := resolveDirectory(params.RepoPath)
+	repoPath, err := gitrepo.ValidateRepository(ctx, params.RepoPath)
 	if err != nil {
 		return session.CreateParams{}, fmt.Errorf("resolve repo: %w", err)
 	}
 	worktreePath := ""
+	branch := params.Branch
+	if params.Worktree && params.WorktreePath != "" {
+		return session.CreateParams{}, fmt.Errorf("--worktree cannot be combined with an existing worktree path")
+	}
 	if params.WorktreePath != "" {
-		worktreePath, err = resolveDirectory(params.WorktreePath)
+		worktreePath, err = gitrepo.ValidateRepository(ctx, params.WorktreePath)
 		if err != nil {
 			return session.CreateParams{}, fmt.Errorf("resolve worktree: %w", err)
+		}
+		same, err := gitrepo.SameRepository(ctx, repoPath, worktreePath)
+		if err != nil {
+			return session.CreateParams{}, err
+		}
+		if !same {
+			return session.CreateParams{}, fmt.Errorf("worktree %q does not belong to repository %q", worktreePath, repoPath)
 		}
 	}
 	id, err := identity.New("S")
 	if err != nil {
 		return session.CreateParams{}, err
+	}
+	if params.Worktree {
+		if params.TaskID == "" {
+			return session.CreateParams{}, fmt.Errorf("Task ID is required to create an isolated worktree")
+		}
+		planned, err := gitrepo.PlanWorktree(s.home.Worktrees, repoPath, params.TaskID, id)
+		if err != nil {
+			return session.CreateParams{}, err
+		}
+		worktreePath, branch = planned.Path, planned.Branch
+	} else if worktreePath != "" {
+		branch, err = gitrepo.CurrentBranch(ctx, worktreePath)
+		if err != nil {
+			return session.CreateParams{}, err
+		}
+	} else if branch == "" {
+		branch, err = gitrepo.CurrentBranch(ctx, repoPath)
+		if err != nil {
+			return session.CreateParams{}, err
+		}
 	}
 	role := strings.TrimSpace(params.Role)
 	if role == "" {
@@ -108,7 +151,7 @@ func (s *SessionService) Prepare(params StartSessionParams) (session.CreateParam
 	}
 	return session.CreateParams{
 		ID: id, TaskID: params.TaskID, Role: role, Agent: profile.Name, Provider: profile.Provider,
-		RepoPath: repoPath, WorktreePath: worktreePath, Branch: params.Branch,
+		RepoPath: repoPath, WorktreePath: worktreePath, Branch: branch,
 		Status: session.StatusStarting, LogPath: filepath.Join(s.home.Logs, id+".jsonl"), MetadataJSON: metadata,
 	}, nil
 }
@@ -117,18 +160,125 @@ func (s *SessionService) Start(ctx context.Context, params StartSessionParams) (
 	if _, err := s.repository.GetTask(ctx, params.TaskID); err != nil {
 		return LaunchResult{}, err
 	}
-	createParams, err := s.Prepare(params)
+	createParams, err := s.PrepareContext(ctx, params)
 	if err != nil {
 		return LaunchResult{}, err
 	}
-	created, err := s.repository.CreateSession(ctx, createParams)
+	created, err := s.createSessionContext(ctx, createParams, params.Worktree, params.AllowSharedCheckout)
 	if err != nil {
-		return LaunchResult{}, err
+		return LaunchResult{Session: created}, err
 	}
 	if _, err := s.repository.UpdateTaskStatus(ctx, params.TaskID, task.StatusWorking); err != nil {
 		return LaunchResult{Session: created}, err
 	}
 	return s.Launch(ctx, created.ID, params.Prompt)
+}
+
+// StartTask atomically creates the convenience Task -> first Session pair,
+// then provisions any requested worktree before launching its worker.
+func (s *SessionService) StartTask(ctx context.Context, taskParams task.CreateParams, params StartSessionParams) (TaskLaunchResult, error) {
+	if taskParams.ID == "" {
+		id, err := identity.New("T")
+		if err != nil {
+			return TaskLaunchResult{}, err
+		}
+		taskParams.ID = id
+	}
+	params.TaskID = taskParams.ID
+	createParams, err := s.PrepareContext(ctx, params)
+	if err != nil {
+		return TaskLaunchResult{}, err
+	}
+	lock, err := gitrepo.LockRepository(ctx, s.home.Root, createParams.RepoPath)
+	if err != nil {
+		return TaskLaunchResult{}, err
+	}
+	defer func() { _ = gitrepo.UnlockRepository(lock) }() // best-effort release; persistence errors remain primary
+	if err := s.checkCheckout(ctx, createParams, params.Worktree, params.AllowSharedCheckout, ""); err != nil {
+		return TaskLaunchResult{}, err
+	}
+	createdTask, createdSession, err := s.repository.CreateTaskWithSession(ctx, taskParams, createParams)
+	if err != nil {
+		return TaskLaunchResult{}, err
+	}
+	partial := TaskLaunchResult{Task: createdTask, LaunchResult: LaunchResult{Session: createdSession}}
+	if params.Worktree {
+		planned := gitrepo.Worktree{Repository: createdSession.RepoPath, Path: createdSession.WorktreePath, Branch: createdSession.Branch}
+		if err := planned.Create(ctx); err != nil {
+			failed, _ := s.repository.UpdateSessionStatus(context.Background(), createdSession.ID, session.StatusFailed)
+			partial.Session = failed
+			_, _ = s.repository.UpdateTaskStatus(context.Background(), createdTask.ID, task.StatusFailed)
+			return partial, err
+		}
+	}
+	if err := gitrepo.UnlockRepository(lock); err != nil {
+		return partial, err
+	}
+	lock = nil
+	launched, err := s.Launch(ctx, createdSession.ID, params.Prompt)
+	partial.LaunchResult = launched
+	return partial, err
+}
+
+func (s *SessionService) createSessionContext(ctx context.Context, createParams session.CreateParams, createWorktree, allowShared bool) (session.Session, error) {
+	lock, err := gitrepo.LockRepository(ctx, s.home.Root, createParams.RepoPath)
+	if err != nil {
+		return session.Session{}, err
+	}
+	defer gitrepo.UnlockRepository(lock)
+	if err := s.checkCheckout(ctx, createParams, createWorktree, allowShared, ""); err != nil {
+		return session.Session{}, err
+	}
+	created, err := s.repository.CreateSession(ctx, createParams)
+	if err != nil {
+		return session.Session{}, err
+	}
+	if createWorktree {
+		planned := gitrepo.Worktree{Repository: created.RepoPath, Path: created.WorktreePath, Branch: created.Branch}
+		if err := planned.Create(ctx); err != nil {
+			failed, _ := s.repository.UpdateSessionStatus(context.Background(), created.ID, session.StatusFailed)
+			return failed, err
+		}
+	}
+	return created, nil
+}
+
+func (s *SessionService) checkCheckout(ctx context.Context, createParams session.CreateParams, createWorktree, allowShared bool, excludeSessionID string) error {
+	if createWorktree {
+		planned := gitrepo.Worktree{Repository: createParams.RepoPath, Path: createParams.WorktreePath, Branch: createParams.Branch}
+		return planned.CheckAvailable(ctx)
+	}
+	if allowShared {
+		return nil
+	}
+	checkout := createParams.WorktreePath
+	if checkout == "" {
+		checkout = createParams.RepoPath
+	}
+	existing, err := s.repository.ListSessions(ctx)
+	if err != nil {
+		return err
+	}
+	for _, current := range existing {
+		if current.ID == excludeSessionID {
+			continue
+		}
+		if !activeCheckoutStatus(current.Status) {
+			continue
+		}
+		currentCheckout := current.WorktreePath
+		if currentCheckout == "" {
+			currentCheckout = current.RepoPath
+		}
+		if gitrepo.SameCheckout(checkout, currentCheckout) {
+			return fmt.Errorf("checkout %q is already used by active Session %s (%s); use --worktree or --allow-shared-checkout", checkout, current.ID, current.Status)
+		}
+	}
+	return nil
+}
+
+func activeCheckoutStatus(status session.Status) bool {
+	return status == session.StatusStarting || status == session.StatusWorking || status == session.StatusWaiting
 }
 
 // Launch starts the detached worker and submits the Task-derived initial turn.
@@ -246,6 +396,10 @@ func (s *SessionService) Cancel(ctx context.Context, id string) error {
 }
 
 func (s *SessionService) Resume(ctx context.Context, id string) (session.Session, error) {
+	return s.ResumeWithOptions(ctx, id, false)
+}
+
+func (s *SessionService) ResumeWithOptions(ctx context.Context, id string, allowSharedCheckout bool) (session.Session, error) {
 	current, err := s.repository.GetSession(ctx, id)
 	if err != nil {
 		return session.Session{}, err
@@ -254,6 +408,16 @@ func (s *SessionService) Resume(ctx context.Context, id string) (session.Session
 		if _, err := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{Type: "ping"}); err == nil {
 			return current, fmt.Errorf("Session %s worker is already running", id)
 		}
+	}
+	lock, err := gitrepo.LockRepository(ctx, s.home.Root, current.RepoPath)
+	if err != nil {
+		return session.Session{}, err
+	}
+	defer gitrepo.UnlockRepository(lock)
+	if err := s.checkCheckout(ctx, session.CreateParams{
+		ID: current.ID, RepoPath: current.RepoPath, WorktreePath: current.WorktreePath,
+	}, false, allowSharedCheckout, current.ID); err != nil {
+		return session.Session{}, err
 	}
 	spawned, err := s.runtime.Spawn(ctx, id)
 	if err != nil {
@@ -329,22 +493,4 @@ func (s *SessionService) logPath(current session.Session) string {
 		return current.LogPath
 	}
 	return filepath.Join(s.home.Logs, current.ID+".jsonl")
-}
-
-func resolveDirectory(path string) (string, error) {
-	if strings.TrimSpace(path) == "" {
-		return "", fmt.Errorf("path is required")
-	}
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return "", err
-	}
-	info, err := os.Stat(absPath)
-	if err != nil {
-		return "", err
-	}
-	if !info.IsDir() {
-		return "", fmt.Errorf("%s is not a directory", absPath)
-	}
-	return filepath.Clean(absPath), nil
 }

@@ -30,6 +30,11 @@ func TestSessionLifecycleThroughBuiltCLIAndDetachedWorker(t *testing.T) {
 	if err := os.MkdirAll(repo, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	initializeCLIRepository(t, repo)
+	canonicalRepo, err := filepath.EvalSymlinks(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
 	binary := filepath.Join(root, "agent")
 	build := exec.Command("go", "build", "-o", binary, "./cmd/agent")
 	build.Dir = filepath.Join("..", "..")
@@ -73,7 +78,7 @@ func TestSessionLifecycleThroughBuiltCLIAndDetachedWorker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{"Task " + taskID + ": Investigate BTC edge", "Description: Compare horizons", "Role: researcher", "Repository: " + repo, "Check one hour"} {
+	for _, expected := range []string{"Task " + taskID + ": Investigate BTC edge", "Description: Compare horizons", "Role: researcher", "Repository: " + canonicalRepo, "Check one hour"} {
 		if !strings.Contains(string(argsLog), expected) {
 			t.Errorf("acpx argv log does not contain %q", expected)
 		}

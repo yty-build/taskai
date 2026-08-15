@@ -102,7 +102,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, info buil
 			break
 		}
 		sessionService := appservice.NewSessionService(database, registry, home, runtime)
-		err = runStart(ctx, args[1:], stdout, taskService, sessionService)
+		err = runStart(ctx, args[1:], stdout, sessionService)
 	case "session":
 		var registry *agentregistry.Registry
 		if len(args) > 1 && args[1] == "start" {
@@ -257,35 +257,32 @@ func showTask(ctx context.Context, id string, stdout io.Writer, service *task.Se
 	return w.Flush()
 }
 
-func runStart(ctx context.Context, args []string, stdout io.Writer, tasks *task.Service, sessions *appservice.SessionService) error {
+func runStart(ctx context.Context, args []string, stdout io.Writer, sessions *appservice.SessionService) error {
 	options, err := parseOptions(args, map[string]optionKind{
 		"--agent": stringOption, "--repo": stringOption, "--role": stringOption, "--description": stringOption,
 		"--external-ref": stringOption, "--metadata-json": stringOption, "--prompt": stringOption, "--approve-all": boolOption,
+		"--worktree": boolOption, "--allow-shared-checkout": boolOption,
 	})
 	if err != nil {
 		return usagef("agent start: %s", err)
 	}
 	if len(options.positionals) != 1 || strings.TrimSpace(options.values["--agent"]) == "" || strings.TrimSpace(options.values["--repo"]) == "" {
-		return usagef("usage: agent start <title> --agent <name> --repo <path> [--role <role>]")
+		return usagef("usage: agent start <title> --agent <name> --repo <path> [--role <role>] [--worktree] [--allow-shared-checkout]")
 	}
-	prepared, err := sessions.Prepare(appservice.StartSessionParams{
-		Agent: options.values["--agent"], RepoPath: options.values["--repo"], Role: options.values["--role"], ApproveAll: options.booleans["--approve-all"],
-	})
-	if err != nil {
-		return err
-	}
-	createdTask, createdSession, err := tasks.Start(ctx,
+	started, err := sessions.StartTask(ctx,
 		task.CreateParams{Title: options.positionals[0], Description: options.values["--description"], ExternalRef: options.values["--external-ref"], MetadataJSON: rawJSON(options.values["--metadata-json"]), Status: task.StatusWorking},
-		prepared,
+		appservice.StartSessionParams{
+			Agent: options.values["--agent"], RepoPath: options.values["--repo"], Role: options.values["--role"], Prompt: options.values["--prompt"],
+			ApproveAll: options.booleans["--approve-all"], Worktree: options.booleans["--worktree"], AllowSharedCheckout: options.booleans["--allow-shared-checkout"],
+		},
 	)
 	if err != nil {
+		if started.Task.ID != "" && started.Session.ID != "" {
+			return fmt.Errorf("created Task %s and Session %s, but start failed: %w", started.Task.ID, started.Session.ID, err)
+		}
 		return err
 	}
-	launched, err := sessions.Launch(ctx, createdSession.ID, options.values["--prompt"])
-	if err != nil {
-		return fmt.Errorf("created Task %s and Session %s, but launch failed: %w", createdTask.ID, createdSession.ID, err)
-	}
-	fmt.Fprintf(stdout, "Created %s\nStarted %s\nInitial request %s (%s)\n", createdTask.ID, createdSession.ID, launched.RequestID, launched.State)
+	fmt.Fprintf(stdout, "Created %s\nStarted %s\nInitial request %s (%s)\n", started.Task.ID, started.Session.ID, started.RequestID, started.State)
 	return nil
 }
 
@@ -316,10 +313,11 @@ func runSession(ctx context.Context, args []string, stdout io.Writer, service *a
 		fmt.Fprintf(stdout, "Cancellation requested for %s\n", args[1])
 		return nil
 	case "resume":
-		if len(args) != 2 {
-			return usagef("usage: agent session resume <session-id>")
+		options, err := parseOptions(args[1:], map[string]optionKind{"--allow-shared-checkout": boolOption})
+		if err != nil || len(options.positionals) != 1 {
+			return usagef("usage: agent session resume <session-id> [--allow-shared-checkout]")
 		}
-		resumed, err := service.Resume(ctx, args[1])
+		resumed, err := service.ResumeWithOptions(ctx, options.positionals[0], options.booleans["--allow-shared-checkout"])
 		if err != nil {
 			return err
 		}
@@ -352,17 +350,18 @@ func runSession(ctx context.Context, args []string, stdout io.Writer, service *a
 func runSessionStart(ctx context.Context, args []string, stdout io.Writer, service *appservice.SessionService) error {
 	options, err := parseOptions(args, map[string]optionKind{
 		"--agent": stringOption, "--repo": stringOption, "--role": stringOption,
-		"--prompt": stringOption, "--approve-all": boolOption,
+		"--prompt": stringOption, "--approve-all": boolOption, "--worktree": boolOption, "--allow-shared-checkout": boolOption,
 	})
 	if err != nil {
 		return usagef("agent session start: %s", err)
 	}
 	if len(options.positionals) != 1 || options.values["--agent"] == "" || options.values["--repo"] == "" {
-		return usagef("usage: agent session start <task-id> --agent <name> --repo <path> --role <role> [--prompt <text>] [--approve-all]")
+		return usagef("usage: agent session start <task-id> --agent <name> --repo <path> --role <role> [--worktree] [--allow-shared-checkout] [--prompt <text>] [--approve-all]")
 	}
 	launched, err := service.Start(ctx, appservice.StartSessionParams{
 		TaskID: options.positionals[0], Agent: options.values["--agent"], RepoPath: options.values["--repo"],
 		Role: options.values["--role"], Prompt: options.values["--prompt"], ApproveAll: options.booleans["--approve-all"],
+		Worktree: options.booleans["--worktree"], AllowSharedCheckout: options.booleans["--allow-shared-checkout"],
 	})
 	if err != nil {
 		return err
