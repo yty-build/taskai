@@ -23,7 +23,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const currentSchemaVersion = 1
+const currentSchemaVersion = 2
 
 var ErrNotFound = errors.New("not found")
 
@@ -234,16 +234,16 @@ func (s *Store) CreateSession(ctx context.Context, params session.CreateParams) 
 	result := session.Session{
 		ID: params.ID, TaskID: params.TaskID, Role: params.Role, Agent: strings.TrimSpace(params.Agent), Provider: params.Provider,
 		RepoPath: params.RepoPath, WorktreePath: params.WorktreePath, Branch: params.Branch,
-		ACPSessionID: params.ACPSessionID, NativeSessionID: params.NativeSessionID, Status: params.Status,
+		ACPXRecordID: params.ACPXRecordID, ACPSessionID: params.ACPSessionID, NativeSessionID: params.NativeSessionID, Status: params.Status,
 		WorkerPID: params.WorkerPID, WorkerSocket: params.WorkerSocket, LogPath: params.LogPath,
 		MetadataJSON: cloneJSON(params.MetadataJSON), CreatedAt: now, UpdatedAt: now,
 	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO sessions
-		(id, task_id, role, agent, provider, repo_path, worktree_path, branch, acp_session_id, native_session_id,
+		(id, task_id, role, agent, provider, repo_path, worktree_path, branch, acpx_record_id, acp_session_id, native_session_id,
 		 status, worker_pid, worker_socket, log_path, metadata_json, created_at, updated_at, last_activity_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
 		result.ID, result.TaskID, nullString(result.Role), result.Agent, nullString(result.Provider), nullString(result.RepoPath),
-		nullString(result.WorktreePath), nullString(result.Branch), nullString(result.ACPSessionID), nullString(result.NativeSessionID),
+		nullString(result.WorktreePath), nullString(result.Branch), nullString(result.ACPXRecordID), nullString(result.ACPSessionID), nullString(result.NativeSessionID),
 		string(result.Status), nullInt(result.WorkerPID), nullString(result.WorkerSocket), nullString(result.LogPath), nullJSON(result.MetadataJSON),
 		formatTime(result.CreatedAt), formatTime(result.UpdatedAt))
 	if err != nil {
@@ -290,7 +290,7 @@ func (s *Store) CreateTaskWithSession(ctx context.Context, taskParams task.Creat
 	createdSession := session.Session{
 		ID: sessionParams.ID, TaskID: taskParams.ID, Role: sessionParams.Role, Agent: strings.TrimSpace(sessionParams.Agent), Provider: sessionParams.Provider,
 		RepoPath: sessionParams.RepoPath, WorktreePath: sessionParams.WorktreePath, Branch: sessionParams.Branch,
-		ACPSessionID: sessionParams.ACPSessionID, NativeSessionID: sessionParams.NativeSessionID, Status: sessionParams.Status,
+		ACPXRecordID: sessionParams.ACPXRecordID, ACPSessionID: sessionParams.ACPSessionID, NativeSessionID: sessionParams.NativeSessionID, Status: sessionParams.Status,
 		WorkerPID: sessionParams.WorkerPID, WorkerSocket: sessionParams.WorkerSocket, LogPath: sessionParams.LogPath,
 		MetadataJSON: cloneJSON(sessionParams.MetadataJSON), CreatedAt: now, UpdatedAt: now,
 	}
@@ -306,11 +306,11 @@ func (s *Store) CreateTaskWithSession(ctx context.Context, taskParams task.Creat
 		return task.Task{}, session.Session{}, fmt.Errorf("create Task %s: %w", createdTask.ID, err)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO sessions
-		(id, task_id, role, agent, provider, repo_path, worktree_path, branch, acp_session_id, native_session_id,
+		(id, task_id, role, agent, provider, repo_path, worktree_path, branch, acpx_record_id, acp_session_id, native_session_id,
 		 status, worker_pid, worker_socket, log_path, metadata_json, created_at, updated_at, last_activity_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
 		createdSession.ID, createdSession.TaskID, nullString(createdSession.Role), createdSession.Agent, nullString(createdSession.Provider), nullString(createdSession.RepoPath),
-		nullString(createdSession.WorktreePath), nullString(createdSession.Branch), nullString(createdSession.ACPSessionID), nullString(createdSession.NativeSessionID),
+		nullString(createdSession.WorktreePath), nullString(createdSession.Branch), nullString(createdSession.ACPXRecordID), nullString(createdSession.ACPSessionID), nullString(createdSession.NativeSessionID),
 		string(createdSession.Status), nullInt(createdSession.WorkerPID), nullString(createdSession.WorkerSocket), nullString(createdSession.LogPath),
 		nullJSON(createdSession.MetadataJSON), formatTime(now), formatTime(now)); err != nil {
 		return task.Task{}, session.Session{}, fmt.Errorf("create Session %s: %w", createdSession.ID, err)
@@ -367,8 +367,26 @@ func (s *Store) UpdateSessionStatus(ctx context.Context, id string, status sessi
 	return s.GetSession(ctx, id)
 }
 
+// UpdateSessionRuntimeIDs persists product, acpx, ACP, and provider-native IDs
+// as distinct concepts on the existing Session entity.
+func (s *Store) UpdateSessionRuntimeIDs(ctx context.Context, id, acpxRecordID, acpSessionID, nativeSessionID string) (session.Session, error) {
+	now := s.now().UTC()
+	result, err := s.db.ExecContext(ctx, `UPDATE sessions
+		SET acpx_record_id = ?, acp_session_id = ?, native_session_id = ?, updated_at = ?, last_activity_at = ?
+		WHERE id = ?`, nullString(acpxRecordID), nullString(acpSessionID), nullString(nativeSessionID), formatTime(now), formatTime(now), id)
+	if err != nil {
+		return session.Session{}, fmt.Errorf("update Session %s runtime IDs: %w", id, err)
+	}
+	if count, err := result.RowsAffected(); err != nil {
+		return session.Session{}, fmt.Errorf("update Session %s runtime IDs: %w", id, err)
+	} else if count == 0 {
+		return session.Session{}, fmt.Errorf("Session %s: %w", id, ErrNotFound)
+	}
+	return s.GetSession(ctx, id)
+}
+
 const sessionSelect = `SELECT id, task_id, role, agent, provider, repo_path, worktree_path, branch,
-	acp_session_id, native_session_id, status, worker_pid, worker_socket, log_path, metadata_json,
+	acpx_record_id, acp_session_id, native_session_id, status, worker_pid, worker_socket, log_path, metadata_json,
 	created_at, updated_at, last_activity_at FROM sessions`
 
 type scanner interface {
@@ -399,15 +417,15 @@ func scanTask(row scanner) (task.Task, error) {
 
 func scanSession(row scanner) (session.Session, error) {
 	var result session.Session
-	var role, provider, repoPath, worktreePath, branch, acpID, nativeID, socket, logPath, metadata, lastActivity sql.NullString
+	var role, provider, repoPath, worktreePath, branch, acpxRecordID, acpID, nativeID, socket, logPath, metadata, lastActivity sql.NullString
 	var workerPID sql.NullInt64
 	var status, createdAt, updatedAt string
 	if err := row.Scan(&result.ID, &result.TaskID, &role, &result.Agent, &provider, &repoPath, &worktreePath, &branch,
-		&acpID, &nativeID, &status, &workerPID, &socket, &logPath, &metadata, &createdAt, &updatedAt, &lastActivity); err != nil {
+		&acpxRecordID, &acpID, &nativeID, &status, &workerPID, &socket, &logPath, &metadata, &createdAt, &updatedAt, &lastActivity); err != nil {
 		return session.Session{}, err
 	}
 	result.Role, result.Provider, result.RepoPath, result.WorktreePath, result.Branch = role.String, provider.String, repoPath.String, worktreePath.String, branch.String
-	result.ACPSessionID, result.NativeSessionID, result.WorkerSocket, result.LogPath = acpID.String, nativeID.String, socket.String, logPath.String
+	result.ACPXRecordID, result.ACPSessionID, result.NativeSessionID, result.WorkerSocket, result.LogPath = acpxRecordID.String, acpID.String, nativeID.String, socket.String, logPath.String
 	result.Status, result.WorkerPID = session.Status(status), int(workerPID.Int64)
 	if metadata.Valid {
 		result.MetadataJSON = json.RawMessage(metadata.String)

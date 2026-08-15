@@ -1,0 +1,69 @@
+#!/bin/sh
+set -eu
+
+if [ "${1-}" = "--version" ]; then
+  printf '%s\n' "${FAKE_ACPX_VERSION:-0.13.0}"
+  exit 0
+fi
+
+if [ -n "${FAKE_ACPX_ARGS_FILE:-}" ]; then
+  : > "${FAKE_ACPX_ARGS_FILE}"
+  for argument in "$@"; do
+    printf '%s\n' "$argument" >> "${FAKE_ACPX_ARGS_FILE}"
+  done
+fi
+
+scenario="${FAKE_ACPX_SCENARIO:-success}"
+command_line="$*"
+
+case "$command_line" in
+  *"sessions ensure"*)
+    if [ "$scenario" = "nonzero" ]; then
+      printf '%s\n' "fixture ensure failed" >&2
+      exit 7
+    fi
+    if [ "$scenario" = "missing-native" ]; then
+      printf '%s\n' '{"action":"session_ensured","acpxRecordId":"acpx-record","acpxSessionId":"acp-session"}'
+    else
+      printf '%s\n' '{"action":"session_ensured","acpxRecordId":"acpx-record","acpxSessionId":"acp-session","agentSessionId":"native-session"}'
+    fi
+    ;;
+  *"sessions show"*)
+    printf '%s\n' '{"schema":"acpx.session.v1","acpxRecordId":"acpx-record","acpSessionId":"acp-reconnected","agentSessionId":"native-reconnected"}'
+    ;;
+  *" status --session "*)
+    printf '%s\n' '{"action":"status_snapshot","status":"idle","summary":"ready","acpxRecordId":"acpx-record","acpxSessionId":"acp-session","agentSessionId":"native-session"}'
+    ;;
+  *" cancel --session "*)
+    printf '%s\n' '{"action":"cancelled","acpxRecordId":"acpx-record","acpxSessionId":"acp-session"}'
+    ;;
+  *" prompt --session "*)
+    case "$scenario" in
+      cancellation)
+        exec sleep 30
+        ;;
+      malformed)
+        printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp-session","update":{"sessionUpdate":"agent_message_chunk"}}}'
+        printf '%s\n' '{malformed'
+        ;;
+      partial)
+        printf '%s' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+        ;;
+      remote-error)
+        printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32603,"message":"fixture remote failure"}}'
+        ;;
+      nonzero)
+        printf '%s\n' "fixture prompt failed" >&2
+        exit 7
+        ;;
+      *)
+        printf '%s\n' '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}'
+        printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ok"}}}}'
+        printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+        ;;
+    esac
+    ;;
+  *)
+    printf '%s\n' '{"jsonrpc":"2.0","id":null,"error":{"code":-32601,"message":"unknown fixture command"}}'
+    ;;
+esac

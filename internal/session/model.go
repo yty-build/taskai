@@ -46,6 +46,7 @@ type Session struct {
 	RepoPath        string
 	WorktreePath    string
 	Branch          string
+	ACPXRecordID    string
 	ACPSessionID    string
 	NativeSessionID string
 	Status          Status
@@ -67,6 +68,7 @@ type CreateParams struct {
 	RepoPath        string
 	WorktreePath    string
 	Branch          string
+	ACPXRecordID    string
 	ACPSessionID    string
 	NativeSessionID string
 	Status          Status
@@ -101,4 +103,5 @@ type Repository interface {
 	GetSession(context.Context, string) (Session, error)
 	ListSessionsByTask(context.Context, string) ([]Session, error)
 	UpdateSessionStatus(context.Context, string, Status) (Session, error)
+	UpdateSessionRuntimeIDs(context.Context, string, string, string, string) (Session, error)
 }

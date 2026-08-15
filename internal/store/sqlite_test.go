@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -72,6 +73,53 @@ func TestDatabaseReopenAndIdempotentMigration(t *testing.T) {
 	}
 }
 
+func TestMigrationFromVersionOneAddsDistinctACPXRecordID(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "agent.db")
+	database, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, err := migrationFiles.ReadFile("migrations/001_init.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, string(initial)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, "PRAGMA user_version = 1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	upgraded, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upgraded.Close()
+	rows, err := upgraded.db.QueryContext(ctx, "PRAGMA table_info(sessions)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var found bool
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatal(err)
+		}
+		found = found || name == "acpx_record_id"
+	}
+	if !found {
+		t.Fatal("sessions.acpx_record_id was not added")
+	}
+}
+
 func TestForeignKeysAreEnforced(t *testing.T) {
 	store, _ := openTestStore(t)
 	_, err := store.CreateSession(context.Background(), session.CreateParams{TaskID: "T-missing", Agent: "codex"})
@@ -107,6 +155,10 @@ func TestRepositoriesValidateAndRoundTrip(t *testing.T) {
 	updated, err := store.UpdateSessionStatus(ctx, loaded.ID, session.StatusWorking)
 	if err != nil || updated.Status != session.StatusWorking || updated.LastActivityAt == nil {
 		t.Fatalf("UpdateSessionStatus() = %#v, %v", updated, err)
+	}
+	withIDs, err := store.UpdateSessionRuntimeIDs(ctx, loaded.ID, "acpx-record", "acp-session", "native-session")
+	if err != nil || withIDs.ID != loaded.ID || withIDs.ACPXRecordID != "acpx-record" || withIDs.ACPSessionID != "acp-session" || withIDs.NativeSessionID != "native-session" {
+		t.Fatalf("UpdateSessionRuntimeIDs() = %#v, %v", withIDs, err)
 	}
 	if _, err := store.GetTask(ctx, "T-nope"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("GetTask missing error = %v", err)
