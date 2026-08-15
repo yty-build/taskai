@@ -107,6 +107,7 @@ Controls:
 | --- | --- |
 | `↑`/`↓`, `j`/`k`, mouse | Select or scroll |
 | `Enter` or click | Open selected Session |
+| `n` (Task screen) | Open the in-console New Session wizard; choose agent, role, repository, worktree, permission mode, and optional prompt |
 | `p` | Prompt the selected/current Session only |
 | `Esc` or `c` | Request cancellation of the active turn |
 | `u` | Resume a stopped Session |
@@ -162,9 +163,9 @@ The JSON/SSE API is rooted at `/api/v1`, with `/healthz` for local health checks
 
 ## Permissions and checkout safety
 
-Sessions default to `read-approval`. Read-like work may resolve automatically; write/execute/unknown ACP permission requests stay pending and are shown in the Session harness. A pending request survives detach, and concurrent viewers use first-valid-decision-wins. Persistent `allow_always`/`reject_always` choices are visibly marked and require confirmation. Use `--approve-all` only when unattended writes are intentional; the choice is persisted and visible in Session detail.
+Sessions default to `read-approval`. Read-like work may resolve automatically; write/execute/unknown ACP permission requests stay pending and are shown in the Session harness. Codex, Claude, and OpenCode are launched with restrictive provider settings so their defaults cannot silently write, while acpx host filesystem/terminal prompts are brokered as one-shot cards. A pending request survives detach, and concurrent viewers use first-valid-decision-wins. Persistent `allow_always`/`reject_always` choices are visibly marked and require confirmation. Use `--approve-all` only when unattended writes are intentional; the choice is persisted and visible in Session detail.
 
-The pinned public runtime exposes interactive ACP `session/request_permission` requests but not every client-side host callback. Unsupported host operations fail closed. The `r` view shows complete gateway envelopes and normalized runtime payloads, not an exact underlying JSON-RPC packet capture.
+The pinned public runtime exposes interactive ACP `session/request_permission` requests. The bridge additionally brokers its known `fs/write_text_file` and `terminal/create` host prompts with one-shot choices; unknown host operations fail closed. The `r` view shows complete gateway envelopes and normalized runtime payloads, not an exact underlying JSON-RPC packet capture.
 
 Without `--worktree`, Agent Task Console refuses another active Session in the same checkout. Prefer isolated worktrees:
 

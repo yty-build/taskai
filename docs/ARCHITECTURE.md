@@ -87,6 +87,8 @@ The worker:
 
 Pending permissions are runtime state plus append-only Session history, not another entity or table. A viewer detach has no permission or turn side effect. The first valid viewer decision wins; cancel/stop/bridge failure abandons the request safely.
 
+The runtime bridge uses a bounded NDJSON control pipe on child fd 3. Child stdin is reserved for the pinned runtime's own one-shot filesystem/terminal host prompt, allowing structured `client_operation` events to become normal permission cards without mixing provider terminal text into the protocol. Provider-specific restrictive modes/configuration prevent silent internal writes before this boundary.
+
 The spawning CLI is not the worker's parent lifecycle owner. Terminal and web connections may exit without affecting it. Every normal CLI invocation reconciles stale persisted PID/socket state and removes stale runtime files.
 
 ## History and reconnect

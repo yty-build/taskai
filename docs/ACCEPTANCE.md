@@ -125,6 +125,20 @@ Each provider gets its own worktree under one acceptance Task, produces a harmle
 
 Provider-native live smoke is conditional on an exact native ID. Follow [CODEX_NATIVE_SMOKE.md](CODEX_NATIVE_SMOKE.md). If the ID is absent, record native attachment as unavailable for that adapter version; never create or conflate a second conversation.
 
+### Local authenticated matrix — 2026-08-15
+
+The current macOS installation was exercised with `acpx` 0.13.0 and Node.js 26.0.0 under Task `T-01M036XX78-H1JYYAJ4NN`. These are live-provider observations, not substitutes for the deterministic suite above.
+
+| Provider | Live ACP result | Read-approval result |
+| --- | --- | --- |
+| Codex | Multi-turn response succeeded; detach and reattach continued the same ACP conversation | Provider `read-only` mode produced a native console card; allow created the harmless marker only after approval, and a second request survived detach then remained absent after reject |
+| Claude | Authenticated response succeeded | Provider `default`/manual mode produced the exact offered permission choices; reject kept the marker absent |
+| Grok | Authenticated response and reasoning stream succeeded; stop/resume preserved the exact ACP/native ID | The one-shot host broker gated a filesystem write and a terminal command; allow created the filesystem marker only afterward, while terminal reject kept its marker absent |
+| OpenCode | Authenticated response succeeded; stop/resume preserved the exact ACP/native ID | The inline `edit`/`bash: ask` override produced a native console card; reject kept the marker absent |
+| Gemini | ACP startup reached the installed Gemini adapter | External cached Google authentication required `GOOGLE_CLOUD_PROJECT` or `GOOGLE_CLOUD_PROJECT_ID`; no project value was invented, so the live turn remains an environment blocker |
+
+Task attachment listed every child Session, Enter opened the selected full native Session harness, and `b` returned to the Task without interrupting workers. The real Grok terminal rejection additionally verified that the marker was absent both while the card was pending and after rejection.
+
 ## Release sign-off record
 
 Record:

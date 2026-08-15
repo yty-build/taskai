@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import readline from "node:readline/promises";
 
 function appendArguments(values) {
   const destination = process.env.FAKE_ACPX_ARGS_LOG;
@@ -49,6 +50,30 @@ export function createAcpRuntime(options = {}) {
           `fixture registry was ${options.agentRegistry?.registryKind}, expected ${process.env.FAKE_ACPX_EXPECT_REGISTRY}`,
         );
       }
+      if (process.env.FAKE_ACPX_EXPECT_OPENCODE_PERMISSION) {
+        const config = JSON.parse(process.env.OPENCODE_CONFIG_CONTENT || "{}");
+        const expected = process.env.FAKE_ACPX_EXPECT_OPENCODE_PERMISSION;
+        if (expected === "read-approval") {
+          const expectsDenyRules = process.env.FAKE_ACPX_EXPECT_OPENCODE_DENY_RULES === "1";
+          if (
+            config.permission?.read !== "allow" ||
+            (!expectsDenyRules && (config.permission?.edit !== "ask" || config.permission?.bash !== "ask"))
+          ) {
+            throw new Error(`unexpected OpenCode read-approval config: ${JSON.stringify(config.permission)}`);
+          }
+        } else if (expected === "approve-all" && config.permission !== "allow") {
+          throw new Error(`unexpected OpenCode approve-all config: ${JSON.stringify(config.permission)}`);
+        }
+        if (
+          process.env.FAKE_ACPX_EXPECT_OPENCODE_DENY_RULES === "1" &&
+          (config.permission?.edit?.["*"] !== "ask" ||
+            config.permission?.edit?.["*.secret"] !== "deny" ||
+            config.permission?.bash !== "deny" ||
+            config.model !== "keep-me")
+        ) {
+          throw new Error(`OpenCode deny rules were not preserved: ${JSON.stringify(config)}`);
+        }
+      }
       const ids = identifiers(session.resumeSessionId);
       handle = {
         sessionKey: session.sessionKey,
@@ -80,6 +105,38 @@ export function createAcpRuntime(options = {}) {
             return;
           }
           const scenario = process.env.FAKE_ACPX_SCENARIO;
+          if (
+            scenario === "host-permission" ||
+            scenario === "host-permission-terminal" ||
+            scenario === "host-permission-unknown"
+          ) {
+            const method =
+              scenario === "host-permission-terminal"
+                ? "terminal/create"
+                : scenario === "host-permission-unknown"
+                  ? "fs/delete"
+                  : "fs/write_text_file";
+            const detail =
+              scenario === "host-permission-terminal"
+                ? "terminal/create running terminal: printf safe"
+                : scenario === "host-permission-unknown"
+                  ? "fs/delete running delete: /private/worktree/marker"
+                : "fs/write_text_file running write_text_file: /private/worktree/marker";
+            yield {
+              type: "status",
+              tag: "client_operation",
+              text: detail,
+            };
+            process.stderr.write(`\n[permission] Allow ${method}?\n`);
+            const prompt = readline.createInterface({ input: process.stdin, output: process.stderr });
+            const answer = await prompt.question("Allow write? (y/N) ");
+            prompt.close();
+            appendPermissionDecision({ host_answer: answer });
+            if (!cancelled) {
+              yield { type: "text_delta", stream: "output", text: `host:${answer}`, tag: "agent_message_chunk" };
+            }
+            return;
+          }
           if (scenario === "permission" || scenario === "permission-duplicate" || scenario === "permission-read") {
             const duplicate = scenario === "permission-duplicate";
             const read = scenario === "permission-read";
@@ -129,6 +186,16 @@ export function createAcpRuntime(options = {}) {
 
     async getStatus() {
       return { summary: active ? "working" : "ready", ...identifiers(handle?.backendSessionId) };
+    },
+
+    async setMode({ mode }) {
+      if (process.env.FAKE_ACPX_REJECT_SET_MODE === "1") {
+        throw new Error(`fixture did not expect setMode(${mode})`);
+      }
+      if (process.env.FAKE_ACPX_EXPECT_MODE && mode !== process.env.FAKE_ACPX_EXPECT_MODE) {
+        throw new Error(`fixture mode was ${mode}, expected ${process.env.FAKE_ACPX_EXPECT_MODE}`);
+      }
+      appendArguments(["--set-mode", mode]);
     },
 
     async cancel() {

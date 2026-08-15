@@ -31,8 +31,9 @@ const (
 )
 
 type runtimeBridge struct {
-	command *exec.Cmd
-	stdin   io.WriteCloser
+	command     *exec.Cmd
+	stdin       io.WriteCloser
+	promptInput io.WriteCloser
 
 	writeMu sync.Mutex
 	mu      sync.Mutex
@@ -128,26 +129,40 @@ func startRuntimeBridge(ctx context.Context, binary, stateDirectory string) (*ru
 	// bridge command so pending permission callbacks are cancelled cleanly;
 	// stdin EOF is the crash fallback.
 	command := exec.Command(node, scriptPath, packageRoot, stateDirectory)
-	stdin, err := command.StdinPipe()
+	promptInput, err := command.StdinPipe()
 	if err != nil {
-		return nil, fmt.Errorf("open acpx runtime bridge stdin: %w", err)
+		return nil, fmt.Errorf("open acpx runtime permission input: %w", err)
 	}
+	controlRead, controlWrite, err := os.Pipe()
+	if err != nil {
+		_ = promptInput.Close()
+		return nil, fmt.Errorf("open acpx runtime bridge control pipe: %w", err)
+	}
+	command.ExtraFiles = []*os.File{controlRead}
 	stdout, err := command.StdoutPipe()
 	if err != nil {
-		_ = stdin.Close()
+		_ = promptInput.Close()
+		_ = controlRead.Close()
+		_ = controlWrite.Close()
 		return nil, fmt.Errorf("open acpx runtime bridge stdout: %w", err)
 	}
 	stderr, err := command.StderrPipe()
 	if err != nil {
-		_ = stdin.Close()
+		_ = promptInput.Close()
+		_ = controlRead.Close()
+		_ = controlWrite.Close()
 		return nil, fmt.Errorf("open acpx runtime bridge stderr: %w", err)
 	}
 	if err := command.Start(); err != nil {
-		_ = stdin.Close()
+		_ = promptInput.Close()
+		_ = controlRead.Close()
+		_ = controlWrite.Close()
 		return nil, fmt.Errorf("start acpx runtime bridge: %w", err)
 	}
+	_ = controlRead.Close()
 	bridge := &runtimeBridge{
-		command: command, stdin: stdin, pending: make(map[string]chan bridgeMessage), closed: make(chan struct{}),
+		command: command, stdin: controlWrite, promptInput: promptInput,
+		pending: make(map[string]chan bridgeMessage), closed: make(chan struct{}),
 	}
 	ready := make(chan error, 1)
 	go bridge.read(stdout, ready)
@@ -312,6 +327,8 @@ func (b *runtimeBridge) captureStderr(reader io.Reader) {
 
 func (b *runtimeBridge) wait() {
 	err := b.command.Wait()
+	_ = b.stdin.Close()
+	_ = b.promptInput.Close()
 	if err == nil {
 		err = io.EOF
 	} else if detail := b.stderrDetail(); detail != "" {
@@ -426,6 +443,8 @@ func (b *runtimeBridge) closeProcess() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	err := b.call(ctx, bridgeCommand{Type: "shutdown"}, nil)
+	_ = b.stdin.Close()
+	_ = b.promptInput.Close()
 	if err == nil {
 		select {
 		case <-b.closed:

@@ -114,7 +114,7 @@ For every provider:
 - Stop and resume the same Session.
 - Verify it appears and drills down correctly in `acpctl task attach`.
 - Exercise one harmless write permission in `read-approval`: the file must not exist before allow, must appear after allow, and must remain absent after reject.
-- Record whether each provider uses `session/request_permission` or a public-runtime host callback that currently fails closed.
+- Record whether each provider uses `session/request_permission` or the one-shot host broker for `fs/write_text_file`/`terminal/create`; unknown host paths must fail closed.
 
 Do not edit authentication configuration. Report an unexpected login prompt as a blocker for that provider.
 

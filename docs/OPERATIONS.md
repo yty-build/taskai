@@ -137,7 +137,7 @@ The choice is persisted in Session `metadata_json` and surfaced as `Permission` 
 
 When an approval card appears, press its displayed number and confirm the exact provider-offered choice. `allow_always` and `reject_always` are marked `PERSISTENT`. Pressing `q`, closing the terminal, or losing the viewer connection leaves the request pending; attach again to decide it. If two viewers decide concurrently, exactly one wins. Cancelling the turn or stopping the worker cancels the pending request.
 
-The public `acpx/runtime` hook covers ACP `session/request_permission`. Some providers may instead request client-side host operations such as `fs/write_text_file` or `terminal/create`, whose interactive callbacks are not exposed by this pinned runtime. Those operations fail closed. Consult provider capability-test results before relying on interactive approval for a specific adapter.
+The public `acpx/runtime` hook covers ACP `session/request_permission`. The pinned bridge also brokers the runtime's client-side `fs/write_text_file` and `terminal/create` y/N host prompts as one-shot approval cards over a separate private control/input channel. Unknown host permission paths fail closed. Codex/Claude restrictive modes and the OpenCode inline `edit`/`bash: ask` policy prevent their permissive defaults from bypassing this contract. OpenCode's permission configuration is described in its [official permission documentation](https://opencode.ai/docs/permissions).
 
 Agent Task Console does not replace provider sandboxing. Provider command behavior and local OS permissions still apply.
 
@@ -197,6 +197,8 @@ acpctl session attach <session-id>
 Use `q`/`Ctrl-C` to detach. This cancels only viewer subscriptions. Do not use `stop` merely to close a UI.
 
 Task attach targets one selected Session for every prompt or control action; there is no broadcast. Stored history appears before live output, and positions prevent duplicate replay.
+
+From the Task screen, press `n` to add a Session without leaving the console. The wizard chooses the agent, role, repository, isolated worktree setting, permission mode, and optional initial prompt; `Ctrl+S` starts it and opens the new Session automatically.
 
 Session attach renders a native conversation harness by default: user/assistant turns, collapsed reasoning, merged tool cards, plans, errors, and permission cards. Press `r` for the bounded gateway raw/debug envelope view; the public runtime does not provide an exact JSON-RPC packet capture.
 

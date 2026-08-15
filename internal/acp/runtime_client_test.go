@@ -117,6 +117,112 @@ func TestRuntimeBridgeUsesBuiltinRegistryOnlyForFriendlyProfiles(t *testing.T) {
 	}
 }
 
+func TestRuntimeReadApprovalForcesRestrictiveProviderModes(t *testing.T) {
+	tests := []struct {
+		agent string
+		mode  string
+	}{
+		{agent: "codex", mode: "read-only"},
+		{agent: "claude", mode: "default"},
+	}
+	for _, test := range tests {
+		t.Run(test.agent, func(t *testing.T) {
+			client, target, _ := runtimeFixture(t, "success")
+			target.Profile = agents.Profile{
+				Name: test.agent, Provider: "test", Command: test.agent,
+				Environment: map[string]string{
+					"FAKE_ACPX_SCENARIO":        "success",
+					"FAKE_ACPX_EXPECT_REGISTRY": "builtin",
+					"FAKE_ACPX_EXPECT_MODE":     test.mode,
+				},
+			}
+			if _, err := client.Start(context.Background(), StartSpec{Target: target}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestRuntimeCodexApproveAllDoesNotForceReadOnlyMode(t *testing.T) {
+	client, target, _ := runtimeFixture(t, "success")
+	target.Permission = PermissionApproveAll
+	target.Profile = agents.Profile{
+		Name: "codex", Provider: "test", Command: "codex",
+		Environment: map[string]string{
+			"FAKE_ACPX_SCENARIO":        "success",
+			"FAKE_ACPX_EXPECT_REGISTRY": "builtin",
+			"FAKE_ACPX_REJECT_SET_MODE": "1",
+		},
+	}
+	if _, err := client.Start(context.Background(), StartSpec{Target: target}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRuntimeOpenCodePermissionPolicyOverridesPermissiveDefaults(t *testing.T) {
+	tests := []struct {
+		name       string
+		permission PermissionMode
+		expected   string
+	}{
+		{name: "read approval", permission: PermissionReadApproval, expected: "read-approval"},
+		{name: "approve all", permission: PermissionApproveAll, expected: "approve-all"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, target, _ := runtimeFixture(t, "success")
+			target.Permission = test.permission
+			target.Profile = agents.Profile{
+				Name: "opencode", Provider: "test", Command: "npx", Args: []string{"opencode-ai", "acp"},
+				Environment: map[string]string{
+					"FAKE_ACPX_SCENARIO":                   "success",
+					"FAKE_ACPX_EXPECT_REGISTRY":            "override",
+					"FAKE_ACPX_EXPECT_OPENCODE_PERMISSION": test.expected,
+					"OPENCODE_CONFIG_CONTENT":              `{"permission":{"read":"allow","edit":"allow","bash":"allow"},"model":"keep-me"}`,
+				},
+			}
+			if _, err := client.Start(context.Background(), StartSpec{Target: target}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestRuntimeOpenCodePermissionPolicyPreservesStricterDenyRules(t *testing.T) {
+	client, target, _ := runtimeFixture(t, "success")
+	target.Profile = agents.Profile{
+		Name: "opencode", Provider: "test", Command: "npx", Args: []string{"opencode-ai", "acp"},
+		Environment: map[string]string{
+			"FAKE_ACPX_SCENARIO":                   "success",
+			"FAKE_ACPX_EXPECT_REGISTRY":            "override",
+			"FAKE_ACPX_EXPECT_OPENCODE_PERMISSION": "read-approval",
+			"FAKE_ACPX_EXPECT_OPENCODE_DENY_RULES": "1",
+			"OPENCODE_CONFIG_CONTENT":              `{"permission":{"read":"allow","edit":{"*":"allow","*.secret":"deny"},"bash":"deny"},"model":"keep-me"}`,
+		},
+	}
+	if _, err := client.Start(context.Background(), StartSpec{Target: target}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRuntimeOpenCodeInvalidInlineConfigFailsClosedWithoutLeakingIt(t *testing.T) {
+	client, target, _ := runtimeFixture(t, "success")
+	target.Profile = agents.Profile{
+		Name: "opencode", Provider: "test", Command: "npx", Args: []string{"opencode-ai", "acp"},
+		Environment: map[string]string{
+			"FAKE_ACPX_SCENARIO":      "success",
+			"OPENCODE_CONFIG_CONTENT": `{"token":"DO_NOT_LEAK"`,
+		},
+	}
+	_, err := client.Start(context.Background(), StartSpec{Target: target})
+	if err == nil || !strings.Contains(err.Error(), "must contain a valid JSON object") {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if strings.Contains(err.Error(), "DO_NOT_LEAK") {
+		t.Fatalf("Start() leaked inline config: %v", err)
+	}
+}
+
 func TestRuntimePermissionStaysPendingAndFirstDecisionWins(t *testing.T) {
 	client, target, permissionLog := runtimeFixture(t, "permission")
 	if _, err := client.Start(context.Background(), StartSpec{Target: target}); err != nil {
@@ -177,6 +283,115 @@ func TestRuntimePermissionStaysPendingAndFirstDecisionWins(t *testing.T) {
 	}
 	if got := string(body); !strings.Contains(got, `"outcome":"allow_once"`) && !strings.Contains(got, `"outcome":"reject_once"`) {
 		t.Fatalf("provider decision = %q", got)
+	}
+}
+
+func TestRuntimeHostPermissionBrokerAllowsRejectsAndCancels(t *testing.T) {
+	tests := []struct {
+		name       string
+		scenario   string
+		optionID   string
+		cancel     bool
+		wantAnswer string
+	}{
+		{name: "allow filesystem", scenario: "host-permission", optionID: "host-allow-once", wantAnswer: "y"},
+		{name: "reject filesystem", scenario: "host-permission", optionID: "host-reject-once", wantAnswer: "n"},
+		{name: "reject terminal", scenario: "host-permission-terminal", optionID: "host-reject-once", wantAnswer: "n"},
+		{name: "cancel filesystem", scenario: "host-permission", cancel: true, wantAnswer: "n"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, target, permissionLog := runtimeFixture(t, test.scenario)
+			if _, err := client.Start(context.Background(), StartSpec{Target: target}); err != nil {
+				t.Fatal(err)
+			}
+			events := make(chan Event, 8)
+			done := make(chan error, 1)
+			go func() {
+				_, err := client.Prompt(context.Background(), PromptSpec{Target: target, RequestID: "REQ-host", Message: "write marker"}, func(event Event) error {
+					events <- event
+					return nil
+				})
+				done <- err
+			}()
+			permissionID := waitRuntimePermission(t, events)
+			select {
+			case err := <-done:
+				t.Fatalf("host turn ended while permission was pending: %v", err)
+			case <-time.After(100 * time.Millisecond):
+			}
+			if test.cancel {
+				if err := client.Cancel(context.Background(), target); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := client.DecidePermission(context.Background(), permissionID, test.optionID, false); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("Prompt() error = %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("host-permission turn did not finish")
+			}
+			body, err := os.ReadFile(permissionLog)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(body), `"host_answer":"`+test.wantAnswer+`"`) {
+				t.Fatalf("host permission log = %q, want answer %q", body, test.wantAnswer)
+			}
+		})
+	}
+}
+
+func TestRuntimeUnknownHostPermissionFailsClosedAndCanBeCancelled(t *testing.T) {
+	client, target, permissionLog := runtimeFixture(t, "host-permission-unknown")
+	if _, err := client.Start(context.Background(), StartSpec{Target: target}); err != nil {
+		t.Fatal(err)
+	}
+	events := make(chan Event, 8)
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.Prompt(context.Background(), PromptSpec{Target: target, RequestID: "REQ-unknown-host", Message: "unknown host operation"}, func(event Event) error {
+			events <- event
+			return nil
+		})
+		done <- err
+	}()
+	select {
+	case event := <-events:
+		if event.Type == "session_request_permission" {
+			t.Fatalf("unknown host operation unexpectedly offered approval: %#v", event)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("unknown host operation did not begin")
+	}
+	select {
+	case event := <-events:
+		if event.Type == "session_request_permission" {
+			t.Fatalf("unknown host operation unexpectedly offered approval: %#v", event)
+		}
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := client.Cancel(context.Background(), target); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Prompt() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("unknown host prompt remained stranded after cancellation")
+	}
+	body, err := os.ReadFile(permissionLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `"host_answer":"n"`) {
+		t.Fatalf("unknown host permission log = %q", body)
 	}
 }
 

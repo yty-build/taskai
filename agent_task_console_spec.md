@@ -509,9 +509,11 @@ If the submitting client remains connected, it receives the correlated response 
 
 Under `read-approval`, read/search/fetch/thought work may be resolved automatically by the pinned runtime. Write, execute, and unknown ACP `session/request_permission` calls remain pending until a viewer selects one of the exact options offered by the provider. The worker exposes pending choices in status, records requested/resolved/abandoned transitions in Session JSONL, validates Session/request/option identity, and applies first-valid-decision-wins when viewers race.
 
+The adapter must override permissive provider/user defaults when necessary to preserve this contract. In the pinned provider matrix, a read-approval Codex Session uses Codex `read-only` mode, a read-approval Claude Session uses Claude `default` (manual) mode, and OpenCode receives an inline permission override that makes `edit` and `bash` ask while preserving stricter deny rules. These controls prevent provider defaults from executing writes silently.
+
 Detaching a viewer does not resolve, cancel, or time out a permission request. A later viewer sees the same pending card and can decide it. Cancelling the turn, stopping the worker, bridge failure, or stdin/process shutdown cancels pending callbacks and fails closed. `allow_always` and `reject_always` must be visibly persistent choices and are selectable only when the provider offered them.
 
-The public runtime callback covers ACP `session/request_permission`. Client-side host callbacks such as `fs/write_text_file` or `terminal/create` are not yet exposed interactively by `acpx/runtime`; those paths must remain fail-closed and must be called out in provider capability tests rather than silently treated as supported.
+The public runtime callback covers ACP `session/request_permission`. For the pinned runtime's client-side `fs/write_text_file` and `terminal/create` prompts, the bridge reserves child stdin for the host answer, observes the structured `client_operation` running event, and exposes only gateway-owned `Allow Once` and `Reject` choices. It does not parse provider terminal output or claim a persistent choice the host did not offer. Unknown host permission paths remain fail-closed and must be called out in provider capability tests.
 
 ---
 
