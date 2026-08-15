@@ -172,6 +172,63 @@ func TestTaskConsoleKeyboardMouseAndExplicitPromptTarget(t *testing.T) {
 	}
 }
 
+func TestInteractivePromptPreservesSpaceKeyInput(t *testing.T) {
+	for _, attachment := range []string{"task", "session"} {
+		t.Run(attachment, func(t *testing.T) {
+			backend := newConsoleBackend()
+			var model Model
+			var cancel context.CancelFunc
+			var err error
+			if attachment == "task" {
+				model, cancel, err = newTaskModel(context.Background(), backend, "T-1")
+			} else {
+				model, cancel, err = newSessionModel(context.Background(), backend, "S-1")
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cancel()
+
+			applyKey := func(key tea.KeyMsg) tea.Cmd {
+				updated, command := model.Update(key)
+				model = updated.(Model)
+				return command
+			}
+			applyKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+			for _, key := range []tea.KeyMsg{
+				{Type: tea.KeySpace, Runes: []rune{' '}},
+				{Type: tea.KeySpace, Runes: []rune{' '}},
+				{Type: tea.KeyRunes, Runes: []rune("T05x")},
+				{Type: tea.KeyBackspace},
+				{Type: tea.KeySpace, Runes: []rune{' '}},
+				{Type: tea.KeyRunes, Runes: []rune("targeted")},
+				{Type: tea.KeySpace, Runes: []rune{' '}},
+				{Type: tea.KeySpace, Runes: []rune{' '}},
+				{Type: tea.KeyRunes, Runes: []rune("only")},
+			} {
+				applyKey(key)
+			}
+			command := applyKey(tea.KeyMsg{Type: tea.KeyEnter})
+			if command == nil {
+				t.Fatal("Enter did not submit the prompt")
+			}
+			updated, _ := model.Update(command())
+			model = updated.(Model)
+
+			backend.mu.Lock()
+			prompts := append([]promptCall(nil), backend.prompts...)
+			backend.mu.Unlock()
+			want := promptCall{sessionID: "S-1", message: "  T05 targeted  only"}
+			if len(prompts) != 1 || prompts[0] != want {
+				t.Fatalf("prompt calls = %#v, want %#v", prompts, []promptCall{want})
+			}
+			if model.inputMode || len(model.input) != 0 || !strings.Contains(model.notice, "accepted") {
+				t.Fatalf("submitted input state: mode=%v input=%q notice=%q", model.inputMode, model.input, model.notice)
+			}
+		})
+	}
+}
+
 func TestSessionConsoleReplaysThenDeduplicatesLiveAndTogglesRaw(t *testing.T) {
 	backend := newConsoleBackend()
 	model, cancel, err := newSessionModel(context.Background(), backend, "S-1")

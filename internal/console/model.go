@@ -208,8 +208,8 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 	if m.inputMode {
 		switch name {
 		case "enter":
-			message := strings.TrimSpace(string(m.input))
-			if message == "" {
+			message := string(m.input)
+			if strings.TrimSpace(message) == "" {
 				m.notice = "Prompt cannot be empty."
 				return m, nil
 			}
@@ -232,7 +232,9 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 			}
 			return m, nil
 		default:
-			if key.Type == tea.KeyRunes {
+			if key.Type == tea.KeySpace {
+				m.input = append(m.input, ' ')
+			} else if key.Type == tea.KeyRunes {
 				m.input = append(m.input, key.Runes...)
 			}
 			return m, nil
