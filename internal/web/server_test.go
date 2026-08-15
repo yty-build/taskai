@@ -85,6 +85,10 @@ func newWebFixture(t *testing.T) *webFixture {
 	if _, err := repository.UpdateSessionRuntimeIDs(context.Background(), "S-web", "acpx-private", "acp-private", "native-private"); err != nil {
 		t.Fatal(err)
 	}
+	verifiedAt := time.Date(2026, time.August, 15, 12, 0, 0, 0, time.UTC)
+	if _, err := repository.UpdateSessionConversation(context.Background(), "S-web", "native-private", session.ConversationSourceProviderStore, &verifiedAt); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := repository.UpdateSessionWorker(
 		context.Background(), "S-web", 4242, filepath.Join(home.Workers, "S-web.sock"), filepath.Join(home.Logs, "S-web.jsonl"), session.StatusWaiting,
 	); err != nil {
@@ -120,7 +124,7 @@ func TestServerRenderedPagesAndVersionedBrowserBoundary(t *testing.T) {
 
 	taskPage := webRequest(fixture.handler, "/tasks/T-web")
 	assertWebStatus(t, taskPage, http.StatusOK)
-	for _, expected := range []string{"Sessions", "/sessions/S-web", "Start a Session", "Current activity", "Show raw execution", "sanitized DTO"} {
+	for _, expected := range []string{"Sessions", "/sessions/S-web", "Start a Session", "Current activity", "Show raw execution", "sanitized DTO", "structured ACP view"} {
 		if !strings.Contains(taskPage.Body.String(), expected) {
 			t.Errorf("Task page does not contain %q", expected)
 		}
@@ -129,7 +133,7 @@ func TestServerRenderedPagesAndVersionedBrowserBoundary(t *testing.T) {
 
 	sessionPage := webRequest(fixture.handler, "/sessions/S-web")
 	assertWebStatus(t, sessionPage, http.StatusOK)
-	for _, expected := range []string{"Stored + live", "Send prompt", "Cancel turn", "Resume", "Stop worker", "Start review", "Create reviewer Session", "Detach is safe", "Execution context", "/private/product"} {
+	for _, expected := range []string{"Structured ACP view", "Same provider conversation", "Verified against the provider", "WEB / MOBILE · ACP", "Stored + live", "Send prompt", "Cancel turn", "Resume", "Stop worker", "Start review", "Create reviewer Session", "Detach is safe", "Execution context", "/private/product"} {
 		if !strings.Contains(sessionPage.Body.String(), expected) {
 			t.Errorf("Session page does not contain %q", expected)
 		}
@@ -151,6 +155,9 @@ func TestServerRenderedPagesAndVersionedBrowserBoundary(t *testing.T) {
 	assertWebStatus(t, apiResponse, http.StatusOK)
 	if !strings.Contains(apiResponse.Body.String(), `"id":"S-web"`) {
 		t.Fatalf("versioned API was not mounted: %s", apiResponse.Body.String())
+	}
+	if !strings.Contains(apiResponse.Body.String(), `"conversation_ready":true`) || !strings.Contains(apiResponse.Body.String(), `"conversation_verified":true`) {
+		t.Fatalf("API conversation continuity state missing: %s", apiResponse.Body.String())
 	}
 	assertNoWebRuntimeLeak(t, apiResponse.Body.String(), fixture)
 

@@ -41,20 +41,23 @@ type taskSummary struct {
 }
 
 type sessionView struct {
-	ID             string
-	TaskID         string
-	Role           string
-	Agent          string
-	Provider       string
-	RepoPath       string
-	WorktreePath   string
-	CheckoutLabel  string
-	Branch         string
-	Status         string
-	Permission     string
-	WorkerRunning  bool
-	UpdatedAt      time.Time
-	LastActivityAt *time.Time
+	ID                     string
+	TaskID                 string
+	Role                   string
+	Agent                  string
+	Provider               string
+	RepoPath               string
+	WorktreePath           string
+	CheckoutLabel          string
+	Branch                 string
+	Status                 string
+	Permission             string
+	WorkerRunning          bool
+	ConversationReady      bool
+	ConversationVerified   bool
+	ConversationVerifiedAt *time.Time
+	UpdatedAt              time.Time
+	LastActivityAt         *time.Time
 }
 
 type tasksPage struct {
@@ -195,7 +198,9 @@ func makeSessionView(current session.Session) sessionView {
 		ID: current.ID, TaskID: current.TaskID, Role: current.Role, Agent: current.Agent, Provider: current.Provider,
 		RepoPath: current.RepoPath, WorktreePath: current.WorktreePath, CheckoutLabel: label, Branch: current.Branch,
 		Status: string(current.Status), Permission: appservice.PermissionLabel(current), WorkerRunning: current.WorkerSocket != "",
-		UpdatedAt: current.UpdatedAt, LastActivityAt: current.LastActivityAt,
+		ConversationReady: current.ProviderConversationID != "", ConversationVerified: current.ConversationIDVerifiedAt != nil,
+		ConversationVerifiedAt: current.ConversationIDVerifiedAt,
+		UpdatedAt:              current.UpdatedAt, LastActivityAt: current.LastActivityAt,
 	}
 }
 

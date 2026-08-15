@@ -82,12 +82,12 @@
 
     <div class="two-column">
       <section>
-        <div class="section-heading"><div><p class="eyebrow">Agents</p><h2>Sessions</h2></div><span id="session-count" class="count-chip">{{len .Sessions}}</span></div>
+        <div class="section-heading"><div><p class="eyebrow">Agents</p><h2>Sessions</h2><p class="section-note">Browser selection opens the structured ACP view for the same provider conversation.</p></div><span id="session-count" class="count-chip">{{len .Sessions}}</span></div>
         <div id="session-list" class="session-list">
           {{range .Sessions}}
           <a class="session-card{{if eq .Role "reviewer"}} reviewer{{end}}" href="/sessions/{{.ID}}">
             <div><strong>{{.Agent}} · {{.Role}}</strong><span class="mono">{{.ID}}</span></div>
-            <div class="session-meta"><span>{{.CheckoutLabel}}</span>{{if .Branch}}<span>{{.Branch}}</span>{{end}}</div>
+            <div class="session-meta"><span class="surface-chip">ACP</span><span>{{.CheckoutLabel}}</span>{{if .Branch}}<span>{{.Branch}}</span>{{end}}</div>
             <span class="status status-{{statusTone .Status}}"><i></i>{{.Status}}</span>
           </a>
           {{else}}
@@ -148,7 +148,7 @@
     <a class="back-link" href="/tasks/{{.Task.ID}}">← {{.Task.Title}}</a>
     <section class="hero session-hero">
       <div>
-        <p class="eyebrow">Session · <span class="mono">{{.Session.ID}}</span></p>
+        <p class="eyebrow">Structured ACP view · <span class="mono">{{.Session.ID}}</span></p>
         <h1>{{.Session.Agent}} <span>· {{.Session.Role}}</span></h1>
         <div class="session-facts">
           <span id="session-status" class="status status-{{statusTone .Session.Status}}"><i></i>{{.Session.Status}}</span>
@@ -162,6 +162,15 @@
         <button type="button" data-action="resume">Resume</button>
         <button type="button" data-action="stop" class="danger-button">Stop worker</button>
       </div>
+    </section>
+
+    <section id="conversation-continuity" class="continuity-banner{{if .Session.ConversationVerified}} verified{{else if .Session.ConversationReady}} linked{{end}}">
+      <div><span class="continuity-icon">{{if .Session.ConversationVerified}}✓{{else if .Session.ConversationReady}}↔{{else}}○{{end}}</span></div>
+      <div>
+        <strong>{{if .Session.ConversationReady}}Same provider conversation{{else}}Provider conversation identity pending{{end}}</strong>
+        <p>{{if .Session.ConversationVerified}}Verified against the provider's local store. Terminal attachment opens its native harness; this web/mobile view continues it through ACP.{{else if .Session.ConversationReady}}The canonical conversation is linked. This page uses ACP; terminal attachment uses the native provider harness.{{else}}The worker will link the canonical provider conversation when the provider Session is established.{{end}}</p>
+      </div>
+      <span class="surface-chip">WEB / MOBILE · ACP</span>
     </section>
 
     <div class="two-column session-layout">
@@ -184,9 +193,10 @@
             {{if .Session.WorktreePath}}<dt>Worktree</dt><dd class="mono">{{.Session.WorktreePath}}</dd>{{end}}
             {{if .Session.Branch}}<dt>Branch</dt><dd class="mono">{{.Session.Branch}}</dd>{{end}}
             <dt>Permission</dt><dd>{{.Session.Permission}}</dd>
+            <dt>Conversation</dt><dd id="conversation-state">{{if .Session.ConversationVerified}}Linked · verified{{else if .Session.ConversationReady}}Linked{{else}}Pending{{end}}</dd>
           </dl>
         </section>
-        <section class="panel">
+        <section class="panel prompt-panel">
           <p class="eyebrow">New turn</p><h2>Message Session</h2>
           <form id="prompt-form">
             <label class="wide">Prompt<textarea name="message" rows="6" required placeholder="Steer the next turn…"></textarea></label>

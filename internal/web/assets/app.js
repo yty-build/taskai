@@ -109,10 +109,13 @@ function makeSessionCard(item) {
 
   const meta = document.createElement("div");
   meta.className = "session-meta";
+  const surface = document.createElement("span");
+  surface.className = "surface-chip";
+  surface.textContent = "ACP";
   const checkout = document.createElement("span");
   const path = item.worktree_path || item.repo_path || "No checkout";
   checkout.textContent = path.split("/").filter(Boolean).pop() || path;
-  meta.append(checkout);
+  meta.append(surface, checkout);
   if (item.branch) {
     const branch = document.createElement("span");
     branch.textContent = item.branch;
@@ -202,14 +205,18 @@ function makePermissionCard(permission, sessionID) {
 
 function makeActivityElement(activity, showRaw) {
   const row = document.createElement("article");
-  row.className = "activity-item";
+  const safeKind = String(activity.kind || "activity").toLowerCase().replace(/[^a-z0-9_-]/g, "-");
+  row.className = `activity-item kind-${safeKind}`;
   const label = document.createElement("div");
   label.className = "activity-label";
   const owner = document.createElement("strong");
   owner.textContent = activity.session_id || "Session";
+  const kind = document.createElement("span");
+  kind.className = "activity-kind";
+  kind.textContent = String(activity.kind || "activity").replaceAll("_", " ");
   const position = document.createElement("span");
   position.textContent = `#${activity.position}${activity.request_id ? ` · ${activity.request_id}` : ""}`;
-  label.append(owner, position);
+  label.append(owner, kind, position);
 
   const message = document.createElement(showRaw ? "pre" : "p");
   message.className = showRaw ? "activity-message raw" : "activity-message";
@@ -287,6 +294,10 @@ function attachActivityStream(path) {
 async function refreshSession(sessionID) {
   const result = await apiRequest(`/api/v1/sessions/${encodeURIComponent(sessionID)}`);
   setStatus(document.querySelector("#session-status"), result.session.status);
+  const conversation = document.querySelector("#conversation-state");
+  if (conversation) {
+    conversation.textContent = result.session.conversation_verified ? "Linked · verified" : (result.session.conversation_ready ? "Linked" : "Pending");
+  }
   return result.session;
 }
 

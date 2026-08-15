@@ -26,20 +26,23 @@ type TaskDTO struct {
 }
 
 type SessionDTO struct {
-	ID             string  `json:"id"`
-	TaskID         string  `json:"task_id"`
-	Role           string  `json:"role"`
-	Agent          string  `json:"agent"`
-	Provider       string  `json:"provider,omitempty"`
-	RepoPath       string  `json:"repo_path"`
-	WorktreePath   string  `json:"worktree_path,omitempty"`
-	Branch         string  `json:"branch,omitempty"`
-	Status         string  `json:"status"`
-	Permission     string  `json:"permission"`
-	WorkerRunning  bool    `json:"worker_running"`
-	CreatedAt      string  `json:"created_at"`
-	UpdatedAt      string  `json:"updated_at"`
-	LastActivityAt *string `json:"last_activity_at,omitempty"`
+	ID                     string  `json:"id"`
+	TaskID                 string  `json:"task_id"`
+	Role                   string  `json:"role"`
+	Agent                  string  `json:"agent"`
+	Provider               string  `json:"provider,omitempty"`
+	RepoPath               string  `json:"repo_path"`
+	WorktreePath           string  `json:"worktree_path,omitempty"`
+	Branch                 string  `json:"branch,omitempty"`
+	Status                 string  `json:"status"`
+	Permission             string  `json:"permission"`
+	WorkerRunning          bool    `json:"worker_running"`
+	ConversationReady      bool    `json:"conversation_ready"`
+	ConversationVerified   bool    `json:"conversation_verified"`
+	ConversationVerifiedAt *string `json:"conversation_verified_at,omitempty"`
+	CreatedAt              string  `json:"created_at"`
+	UpdatedAt              string  `json:"updated_at"`
+	LastActivityAt         *string `json:"last_activity_at,omitempty"`
 }
 
 type ActivityDTO struct {
@@ -144,7 +147,12 @@ func makeSessionDTO(current session.Session) SessionDTO {
 		ID: current.ID, TaskID: current.TaskID, Role: current.Role, Agent: current.Agent, Provider: current.Provider,
 		RepoPath: current.RepoPath, WorktreePath: current.WorktreePath, Branch: current.Branch,
 		Status: string(current.Status), Permission: appservice.PermissionLabel(current), WorkerRunning: current.WorkerSocket != "",
+		ConversationReady: current.ProviderConversationID != "", ConversationVerified: current.ConversationIDVerifiedAt != nil,
 		CreatedAt: formatTime(current.CreatedAt), UpdatedAt: formatTime(current.UpdatedAt),
+	}
+	if current.ConversationIDVerifiedAt != nil {
+		value := formatTime(*current.ConversationIDVerifiedAt)
+		result.ConversationVerifiedAt = &value
 	}
 	if current.LastActivityAt != nil {
 		value := formatTime(*current.LastActivityAt)
