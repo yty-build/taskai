@@ -64,9 +64,10 @@ for (let position = 9; position < 10009; position += 1) {
 }
 const assistantBlocks = transcriptState.turns[0].blocks.filter((block) => block.type === "assistant");
 const longBlock = assistantBlocks[assistantBlocks.length - 1];
-testAssert(longBlock.bytes <= LIMITS.assistant && longBlock.clipped, "assistant cumulative limit failed");
+testAssert(transcriptState.turns[0].assistantBytes <= LIMITS.assistant && transcriptState.turns[0].contentClipped, "assistant cumulative limit failed");
 applyActivity(activity(10009, "turn_completed", {type:"turn_state", state:"complete", stop_reason:"end_turn"}));
 testAssert(transcriptState.turns[0].state === "complete", "lifecycle update was lost after clipping");
+testAssert(completedResponseBlock(transcriptState.turns[0]) === longBlock, "completed response was not identified from the final ACP assistant segment");
 testAssert(!applyOptimisticPromptState(transcriptState.turns[0], "queued") && transcriptState.turns[0].state === "complete", "HTTP receipt regressed streamed terminal state");
 
 applyActivity(activity(10010, "permission_requested", {type:"permission", state:"waiting"}, {id:"permission", state:"waiting", options:[{id:"allow",name:"Allow once",kind:"allow_once"}]}));
@@ -82,9 +83,42 @@ testAssert(transcriptState.turns.length === 0, "diagnostic-only activity created
 resetTranscript();
 applyActivity(activity(1, "acp", {type:"assistant_chunk", message_id:"exact", text:"x".repeat(LIMITS.assistant)}));
 let exact = transcriptState.turns[0].blocks[0];
-testAssert(exact.bytes === LIMITS.assistant && !exact.clipped, "exact assistant limit was falsely clipped");
+testAssert(exact.bytes === LIMITS.assistant && !blockWasClipped(exact), "exact assistant limit was falsely clipped");
 applyActivity(activity(2, "acp", {type:"assistant_chunk", message_id:"exact", text:"x"}));
-testAssert(exact.clipped, "assistant overflow was not marked clipped");
+testAssert(exact.leadingClipped && exact.text.endsWith("x"), "assistant overflow did not preserve and mark the newest output");
+
+resetTranscript();
+applyActivity(activity(1, "acp", {type:"thought_chunk", text:"reasoning A"}));
+applyActivity(activity(2, "acp", {type:"assistant_chunk", message_id:"commentary", text:"commentary"}));
+applyActivity(activity(3, "acp", {type:"tool_upsert", tool:{id:"ordered-tool", title:"Inspect", status:"completed"}}));
+applyActivity(activity(4, "acp", {type:"thought_chunk", text:"reasoning B"}));
+applyActivity(activity(5, "acp", {type:"assistant_chunk", message_id:"response", text:"FINAL-RESPONSE"}));
+applyActivity(activity(6, "turn_completed", {type:"turn_state", state:"complete", stop_reason:"end_turn"}));
+const ordered = transcriptState.turns[0];
+testAssert(ordered.blocks.map((block) => block.type).join(",") === "thought,assistant,tool,thought,assistant", "interleaved ACP reasoning chronology was collapsed");
+testAssert(ordered.blocks.filter((block) => block.type === "thought").map((block) => block.text).join("|") === "reasoning A|reasoning B", "separate reasoning phases were merged");
+testAssert(completedResponseBlock(ordered)?.text === "FINAL-RESPONSE", "final ACP assistant segment was not presented as the completed response");
+testAssert(turnHasACPReasoning(ordered), "ACP reasoning availability was not detected");
+
+resetTranscript();
+applyActivity(activity(1, "acp", {type:"assistant_chunk", message_id:"verbose", text:"a".repeat(LIMITS.assistant)}));
+applyActivity(activity(2, "acp", {type:"assistant_chunk", message_id:"verbose", text:"FINAL-MARKER"}));
+const rollingAssistant = transcriptState.turns[0].blocks.find((block) => block.type === "assistant");
+testAssert(rollingAssistant.text.endsWith("FINAL-MARKER") && rollingAssistant.leadingClipped, "verbose ACP output dropped the newest response marker");
+testAssert(transcriptState.turns[0].assistantBytes <= LIMITS.assistant, "rolling assistant budget exceeded its bound");
+
+resetTranscript();
+applyActivity(activity(1, "acp", {type:"thought_chunk", text:"r".repeat(LIMITS.thought)}));
+applyActivity(activity(2, "acp", {type:"assistant_chunk", message_id:"separator", text:"status"}));
+applyActivity(activity(3, "acp", {type:"thought_chunk", text:"TAIL-REASONING"}));
+const rollingThoughts = transcriptState.turns[0].blocks.filter((block) => block.type === "thought");
+testAssert(rollingThoughts.some((block) => block.text.endsWith("TAIL-REASONING")), "reasoning budget dropped the newest ACP thought marker");
+testAssert(transcriptState.turns[0].thoughtBytes <= LIMITS.thought && transcriptState.turns[0].contentClipped, "rolling reasoning budget exceeded its bound or hid truncation");
+
+resetTranscript();
+applyActivity(activity(1, "acp", {type:"assistant_chunk", message_id:"plain", text:"answer"}));
+applyActivity(activity(2, "turn_completed", {type:"turn_state", state:"complete", stop_reason:"end_turn"}));
+testAssert(!turnHasACPReasoning(transcriptState.turns[0]), "provider-without-thought turn falsely advertised reasoning");
 
 resetTranscript();
 for (let position = 1; position <= 2000; position += 1) {

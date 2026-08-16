@@ -110,7 +110,7 @@ Commit: `feat: add session lifecycle controls`
 - New Sessions must appear without restarting the console.
 - Keyboard and mouse selection drill into a Session and allow return to the Task view.
 - Session detail replays complete stored ACP-visible history, then continues live without duplication.
-- Render messages, tools, commands, results, diffs, permissions, errors, and provider-exposed reasoning; provide a raw toggle.
+- Render messages, tools, commands, results, diffs, permissions, errors, and provider-exposed reasoning in event order; identify the completed response without claiming a protocol-level final-answer channel, and provide a raw toggle.
 - Number exact provider-offered permission choices, distinguish persistent decisions, and keep a permission actionable across detach/reattach.
 - A prompt submitted while busy is visibly queued.
 - `Esc` requests cancellation of the current turn; it is not true suspension.

@@ -207,6 +207,11 @@ button:disabled { opacity: .5; cursor: wait; }
 .turn[data-state="error"] .turn-state-line { color: var(--red); }
 .message { display: grid; grid-template-columns: 29px minmax(0, 1fr); gap: 13px; margin: 0 0 23px; }
 .message-avatar { display: inline-grid; width: 27px; height: 27px; place-items: center; border: 1px solid var(--line); border-radius: 8px; color: var(--accent); background: var(--surface); font-size: 10px; font-weight: 750; }
+.assistant-content { min-width: 0; }
+.message-meta { display: flex; align-items: baseline; gap: 8px; margin: -1px 0 5px; font-size: 10px; line-height: 1.35; }
+.message-meta strong { color: var(--text); font-size: 11px; font-weight: 680; text-transform: capitalize; }
+.message-meta span { color: var(--faint); }
+.final-response .message-meta span { color: var(--accent); }
 .message-body { min-width: 0; color: var(--text-soft); font-size: 14px; line-height: 1.72; overflow-wrap: anywhere; }
 .message-body > :first-child { margin-top: 0; }
 .message-body > :last-child { margin-bottom: 0; }
@@ -227,9 +232,13 @@ button:disabled { opacity: .5; cursor: wait; }
 .thought-card summary, .tool-card summary { list-style: none; cursor: pointer; }
 .thought-card summary::-webkit-details-marker, .tool-card summary::-webkit-details-marker { display: none; }
 .thought-card summary { display: inline-flex; align-items: center; gap: 7px; padding: 5px 0; font-size: 11px; }
+.thought-card summary strong { color: var(--text-soft); font-weight: 620; }
+.thought-card summary span { color: var(--faint); font-size: 10px; font-weight: 450; }
 .thought-card summary::before, .tool-card summary::before { content: "›"; display: inline-block; color: var(--faint); transition: transform .15s ease; }
 .thought-card[open] summary::before, .tool-card[open] summary::before { transform: rotate(90deg); }
 .thought-content { margin: 6px 0 5px 15px; padding: 9px 13px; border-left: 1px solid var(--line); color: var(--muted); font-size: 12px; line-height: 1.65; overflow-wrap: anywhere; white-space: pre-wrap; }
+.thought-content > :first-child { margin-top: 0; }
+.thought-content > :last-child { margin-bottom: 0; }
 .tool-card { border: 1px solid var(--line-soft); background: rgba(255, 255, 255, .018); }
 .tool-card.running { border-color: rgba(120, 201, 155, .22); }
 .tool-card.failed { border-color: rgba(231, 133, 128, .28); background: var(--red-soft); }
@@ -257,7 +266,9 @@ button:disabled { opacity: .5; cursor: wait; }
 .plan-list li.in-progress .plan-mark { color: var(--amber); }
 .error-card { margin: 0 0 15px 42px; padding: 12px 14px; border: 1px solid rgba(231, 133, 128, .28); border-radius: 10px; color: #efaaa6; background: var(--red-soft); font-size: 12px; overflow-wrap: anywhere; white-space: pre-wrap; }
 .resolved-permission { margin: 0 0 12px 42px; color: var(--faint); font-size: 10px; }
-.turn-limit-note, .history-limit-note { margin: 0 0 14px 42px; color: var(--faint); font-size: 10px; }
+.turn-limit-note, .reasoning-unavailable, .history-limit-note { margin: 0 0 14px 42px; color: var(--faint); font-size: 10px; }
+.reasoning-unavailable::before { content: "○"; margin-right: 6px; }
+.response-missing { margin: 0 0 14px 42px; padding: 9px 11px; border: 1px solid rgba(226, 174, 108, .25); border-radius: 9px; color: var(--amber); background: var(--amber-soft); font-size: 11px; }
 .history-limit-note { margin: 0 0 24px; padding: 9px 12px; border: 1px solid var(--line-soft); border-radius: 9px; background: var(--surface-soft); }
 .conversation-empty { display: grid; min-height: 54vh; place-items: center; align-content: center; color: var(--muted); text-align: center; }
 .conversation-empty .empty-orbit { margin-bottom: 16px; }
@@ -392,7 +403,7 @@ dialog { color: var(--text); }
   .message-avatar { width: 25px; height: 25px; }
   .message-body { font-size: 13px; line-height: 1.68; }
   .user-message .message-body { max-width: 90%; }
-  .thought-card, .tool-card, .plan-card, .error-card, .resolved-permission, .turn-state-line { margin-left: 35px; }
+  .thought-card, .tool-card, .plan-card, .error-card, .resolved-permission, .turn-state-line, .reasoning-unavailable, .response-missing, .turn-limit-note { margin-left: 35px; }
   .composer-region { padding: 0 10px max(8px, env(safe-area-inset-bottom)); }
   .mobile-session-actions { display: flex; justify-content: flex-end; gap: 7px; margin-bottom: 7px; }
   .composer { border-radius: 14px; }

@@ -161,7 +161,7 @@ func TestServerRenderedPagesAndVersionedBrowserBoundary(t *testing.T) {
 
 	javascript := webRequest(fixture.handler, "/assets/app.js")
 	assertWebStatus(t, javascript, http.StatusOK)
-	for _, expected := range []string{"new EventSource", "/api/v1/tasks/", "/api/v1/sessions/", "/permissions/decision", "allow_always", "JSON.stringify(activity", "assistant_chunk", "tool_upsert", "plan_replace", "appendBounded", "nearBottom", "patchTurnElement", "patchBlockElement", "blocksPerTurn", "beginFormSubmission"} {
+	for _, expected := range []string{"new EventSource", "/api/v1/tasks/", "/api/v1/sessions/", "/permissions/decision", "allow_always", "JSON.stringify(activity", "assistant_chunk", "thought_chunk", "tool_upsert", "plan_replace", "makeRollingTextRoom", "completedResponseBlock", "turnHasACPReasoning", "nearBottom", "patchTurnElement", "patchBlockElement", "blocksPerTurn", "beginFormSubmission"} {
 		if !strings.Contains(javascript.Body.String(), expected) {
 			t.Errorf("browser client does not contain %q", expected)
 		}

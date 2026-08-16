@@ -914,7 +914,7 @@ A Task is not itself an agent. A message entered at Task scope must target an ex
 
 `acpctl session attach <session-id> --acp` opens the structured ACP Session console directly. Web and mobile Session selection always opens this same structured ACP view because those clients cannot embed a local provider terminal.
 
-The console first replays stored ACP-visible history and then subscribes to live output. It should render agent messages, tool calls, command results, diffs, permission requests, errors, and reasoning information when the provider exposes them through ACP. A raw/debug gateway-envelope view is available as an advanced toggle; with the public runtime bridge it is not an exact JSON-RPC packet capture.
+The console first replays stored ACP-visible history and then subscribes to live output. It should render agent messages, tool calls, command results, diffs, permission requests, errors, and reasoning information when the provider exposes them through ACP. Reasoning segments stay in event order and are visible while streaming. When a turn completes, the last assistant segment may be labeled as the completed response; this is a presentation inference because ACP does not promise a separate final-answer channel. If no reasoning segment was exposed, the UI states that explicitly. A raw/debug gateway-envelope view is available as an advanced toggle; with the public runtime bridge it is not an exact JSON-RPC packet capture.
 
 While an ACP turn is active:
 
@@ -1116,7 +1116,7 @@ VID-17  Create property walkthrough       ✓ Done
 └─────────────────────────┴────────────────────────────────────────┘
 ```
 
-The browser is a conversation-first structured ACP client over the same Task/Session state as CLI. The selected Session owns the main canvas. User and assistant turns are primary; reasoning, successful tools, plan detail, IDs, checkout paths, and diagnostics use progressive disclosure. Actionable permissions are pinned above the sticky composer and must not disappear when the transcript scrolls.
+The browser is a conversation-first structured ACP client over the same Task/Session state as CLI. The selected Session owns the main canvas. User and assistant turns are primary. Provider-exposed reasoning streams in event order inside a collapsible surface that is open by default; successful tools, plan detail, IDs, checkout paths, and diagnostics use progressive disclosure. Actionable permissions are pinned above the sticky composer and must not disappear when the transcript scrolls.
 
 Desktop keeps Task/Session navigation visible. Mobile uses a focus-managed navigation drawer and one full-height conversation pane, but retains response cancel/resume controls and an explicit Send action. Streamed updates preserve reader position, expanded tool/reasoning state, focus, and text selection. The transcript and approval shelf expose live-region/author semantics for assistive technology.
 

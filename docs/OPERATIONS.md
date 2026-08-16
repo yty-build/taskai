@@ -205,7 +205,7 @@ From the Task screen, press `n` to add a Session without leaving the console. Th
 
 A mouse click selects a Session without leaving the Task navigator. Press Enter to open the selected real native harness, `a` to open its structured ACP view, `n` to add a Session, `p` to compose an ACP prompt, `/` to filter Sessions, `:` for the searchable action palette, and `?` for contextual help.
 
-The `--acp` view renders user/assistant turns, collapsed reasoning, merged tool cards, plans, errors, and permission cards. Press `r` for the bounded gateway raw/debug envelope view; the public runtime does not provide an exact JSON-RPC packet capture.
+The `--acp` view renders user/assistant turns, provider-exposed reasoning in event order, merged tool cards, plans, errors, and permission cards. A completed turn marks its last assistant segment as the response; a turn with no ACP reasoning says that none was exposed. Press `r` for the bounded gateway raw/debug envelope view; the public runtime does not provide an exact JSON-RPC packet capture.
 
 ## Provider-native mode
 
@@ -269,7 +269,7 @@ acpctl serve --listen 127.0.0.1:0
 
 Use the exact URL printed. The handler rejects arbitrary Host headers; `localhost` may therefore be rejected even though it resolves locally. Browser mutations must be same-origin. Closing the browser or sending SIGINT/SIGTERM to `acpctl serve` has no worker lifecycle effect.
 
-The browser Session page is a conversation-first structured ACP view. It coalesces assistant chunks, collapses reasoning, merges bounded tool cards, pins actionable permissions above the composer, and keeps IDs/checkouts plus bounded sanitized activity summaries in Details and Diagnostics. It intentionally does not reveal provider errors, ACP JSON-RPC, worker sockets, native identifiers, JSONL paths, commands derived from raw input, raw tool objects, or structured environment/auth fields. Allowlisted provider-visible text, diffs, and terminal output may still contain sensitive repository or tool-produced content, so the loopback browser remains a same-trusted-user surface. Use the local terminal `--raw` log view for forensic inspection.
+The browser Session page is a conversation-first structured ACP view. It coalesces assistant chunks, shows provider-exposed reasoning live and in event order, marks completed responses, merges bounded tool cards, pins actionable permissions above the composer, and keeps IDs/checkouts plus bounded sanitized activity summaries in Details and Diagnostics. Reasoning is collapsible but open by default; if an adapter emits none, the page says so. It intentionally does not reveal provider errors, ACP JSON-RPC, worker sockets, native identifiers, JSONL paths, commands derived from raw input, raw tool objects, or structured environment/auth fields. Allowlisted provider-visible text, diffs, and terminal output may still contain sensitive repository or tool-produced content, so the loopback browser remains a same-trusted-user surface. Use the local terminal `--raw` log view for forensic inspection.
 
 On mobile, Task/Session navigation becomes a focus-managed drawer while response cancel/resume controls remain next to the composer. Closing the page only detaches the viewer. The browser replays stored activity on connection and deduplicates by monotonically increasing Session position; native EventSource reconnects advance with `Last-Event-ID`.
 

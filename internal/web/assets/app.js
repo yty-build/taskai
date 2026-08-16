@@ -341,13 +341,42 @@ function truncateUTF8(value, limit) {
   return { text, bytes, clipped: true };
 }
 
-function appendBounded(block, addition, limit) {
-  if (!addition || block.clipped) return;
-  const available = Math.max(0, limit - block.bytes);
-  const part = truncateUTF8(addition, available);
-  block.text += part.text;
-  block.bytes += part.bytes;
-  block.clipped = block.clipped || part.clipped;
+function dropUTF8Prefix(value, minimumBytes) {
+  if (!value || minimumBytes <= 0) return { text: value || "", dropped: 0 };
+  let dropped = 0;
+  let units = 0;
+  for (const character of value) {
+    if (dropped >= minimumBytes) break;
+    dropped += textEncoder.encode(character).length;
+    units += character.length;
+  }
+  return { text: value.slice(units), dropped };
+}
+
+function truncateUTF8Tail(value, limit) {
+  if (!value || limit <= 0) return { text: "", bytes: 0, clipped: Boolean(value) };
+  const bytes = textEncoder.encode(value).length;
+  if (bytes <= limit) return { text: value, bytes, clipped: false };
+  const result = dropUTF8Prefix(value, bytes - limit);
+  return { text: result.text, bytes: bytes - result.dropped, clipped: true };
+}
+
+function makeRollingTextRoom(turn, type, byteField, incomingBytes, limit) {
+  let needed = Math.max(0, turn[byteField] + incomingBytes - limit);
+  while (needed > 0) {
+    const index = turn.blocks.findIndex((block) => block.type === type && block.bytes > 0);
+    if (index < 0) break;
+    const block = turn.blocks[index];
+    const trimmed = dropUTF8Prefix(block.text, Math.min(needed, block.bytes));
+    block.text = trimmed.text;
+    block.bytes = Math.max(0, block.bytes - trimmed.dropped);
+    block.leadingClipped = true;
+    turn[byteField] = Math.max(0, turn[byteField] - trimmed.dropped);
+    needed = Math.max(0, turn[byteField] + incomingBytes - limit);
+    turn.contentClipped = true;
+    touchBlock(block);
+    if (block.bytes === 0) turn.blocks.splice(index, 1);
+  }
 }
 
 function beginFormSubmission(form) {
@@ -504,8 +533,8 @@ function turnFor(activity) {
   }
   turn = {
     id: requestID, firstPosition: activityPosition(activity), state: "", stopReason: "", blocks: [],
-    tools: new Map(), plan: null, thought: null, error: null, permissionIDs: new Set(),
-    assistantBytes: 0, toolBytes: 0, retainedBytes: 0, lifecycleSeen: false, contentClipped: false, dirty: true, element: null
+    tools: new Map(), plan: null, error: null, permissionIDs: new Set(),
+    assistantBytes: 0, thoughtBytes: 0, toolBytes: 0, retainedBytes: 0, lifecycleSeen: false, contentClipped: false, dirty: true, element: null
   };
   transcriptState.byRequest.set(requestID, turn);
   transcriptState.turns.push(turn);
@@ -547,41 +576,35 @@ function applyDisplay(activity, turn) {
     break;
   }
   case "assistant_chunk": {
-    if (turn.assistantBytes >= LIMITS.assistant) {
-      const last = [...turn.blocks].reverse().find((item) => item.type === "assistant");
-      if (last) {
-        last.clipped = true;
-        touchBlock(last);
-      }
-      turn.contentClipped = true;
-      turn.dirty = true;
-      break;
-    }
+    const incoming = truncateUTF8Tail(display.text || "", LIMITS.assistant);
+    makeRollingTextRoom(turn, "assistant", "assistantBytes", incoming.bytes, LIMITS.assistant);
     const previous = turn.blocks[turn.blocks.length - 1];
     const compatible = previous?.type === "assistant" && (previous.messageID === display.message_id || !previous.messageID || !display.message_id);
-    const block = compatible ? previous : { type: "assistant", text: "", bytes: 0, clipped: false, messageID: display.message_id || "", key: activity.position };
+    const block = compatible ? previous : { type: "assistant", text: "", bytes: 0, clipped: false, leadingClipped: false, trailingClipped: false, messageID: display.message_id || "", key: activity.position };
     if (!compatible && !appendTurnBlock(turn, block)) break;
-    const remaining = LIMITS.assistant - turn.assistantBytes;
-    const before = block.bytes;
-    appendBounded(block, display.text || "", before + remaining);
-    turn.assistantBytes += block.bytes - before;
-    block.clipped = block.clipped || Boolean(display.truncated);
-    if (turn.assistantBytes >= LIMITS.assistant && textEncoder.encode(display.text || "").length > block.bytes - before) block.clipped = true;
+    block.text += incoming.text;
+    block.bytes += incoming.bytes;
+    turn.assistantBytes += incoming.bytes;
+    block.leadingClipped = block.leadingClipped || incoming.clipped;
+    block.trailingClipped = block.trailingClipped || Boolean(display.truncated);
+    turn.contentClipped = turn.contentClipped || incoming.clipped || Boolean(display.truncated);
     touchBlock(block);
     turn.dirty = true;
     break;
   }
   case "thought_chunk": {
-    if (!turn.thought) {
-      turn.thought = { type: "thought", text: "", bytes: 0, clipped: false };
-      if (!appendTurnBlock(turn, turn.thought)) {
-        turn.thought = null;
-        break;
-      }
-    }
-    appendBounded(turn.thought, display.text || "", LIMITS.thought);
-    turn.thought.clipped = turn.thought.clipped || Boolean(display.truncated);
-    touchBlock(turn.thought);
+    const incoming = truncateUTF8Tail(display.text || "", LIMITS.thought);
+    makeRollingTextRoom(turn, "thought", "thoughtBytes", incoming.bytes, LIMITS.thought);
+    const previous = turn.blocks[turn.blocks.length - 1];
+    const block = previous?.type === "thought" ? previous : { type: "thought", text: "", bytes: 0, clipped: false, leadingClipped: false, trailingClipped: false, key: activity.position };
+    if (block !== previous && !appendTurnBlock(turn, block)) break;
+    block.text += incoming.text;
+    block.bytes += incoming.bytes;
+    turn.thoughtBytes += incoming.bytes;
+    block.leadingClipped = block.leadingClipped || incoming.clipped;
+    block.trailingClipped = block.trailingClipped || Boolean(display.truncated);
+    turn.contentClipped = turn.contentClipped || incoming.clipped || Boolean(display.truncated);
+    touchBlock(block);
     turn.dirty = true;
     break;
   }
@@ -840,7 +863,7 @@ function appendRichText(container, text) {
   }
 }
 
-function messageElement(block, assistantName) {
+function messageElement(block, assistantName, context = {}) {
   if (block.type === "user") {
     const wrapper = document.createElement("div");
     wrapper.className = "user-message";
@@ -849,7 +872,7 @@ function messageElement(block, assistantName) {
     const body = document.createElement("div");
     body.className = "message-body";
     body.textContent = block.text;
-    if (block.clipped) body.append(clippedNote());
+    if (blockWasClipped(block)) body.append(clippedNote(block));
     wrapper.append(body);
     return wrapper;
   }
@@ -860,31 +883,57 @@ function messageElement(block, assistantName) {
   const avatar = document.createElement("span");
   avatar.className = "message-avatar";
   avatar.textContent = agentInitial(assistantName);
+  const content = document.createElement("div");
+  content.className = "assistant-content";
+  const meta = document.createElement("div");
+  meta.className = "message-meta";
+  const author = document.createElement("strong");
+  author.textContent = assistantName;
+  const phase = document.createElement("span");
+  phase.textContent = context.final ? "Response · turn complete" : context.streaming ? "Streaming over ACP" : "ACP update";
+  meta.append(author, phase);
   const body = document.createElement("div");
   body.className = "message-body";
   appendRichText(body, block.text);
-  if (block.clipped) body.append(clippedNote());
-  wrapper.append(avatar, body);
+  if (blockWasClipped(block)) body.append(clippedNote(block));
+  content.append(meta, body);
+  wrapper.classList.toggle("final-response", Boolean(context.final));
+  wrapper.append(avatar, content);
   return wrapper;
 }
 
-function clippedNote() {
+function blockWasClipped(block) {
+  return Boolean(block?.clipped || block?.leadingClipped || block?.trailingClipped);
+}
+
+function clippedNote(block = {}) {
   const note = document.createElement("div");
   note.className = "message-clipped";
-  note.textContent = "Display clipped for safety; the provider transcript remains authoritative.";
+  if (block.leadingClipped) {
+    note.textContent = "Earlier output was omitted to keep this view responsive; the newest ACP output is preserved.";
+  } else if (block.trailingClipped) {
+    note.textContent = "The provider marked this ACP output as truncated.";
+  } else {
+    note.textContent = "Display clipped for safety; the provider transcript remains authoritative.";
+  }
   return note;
 }
 
-function thoughtElement(block) {
+function thoughtElement(block, context = {}) {
   const details = document.createElement("details");
   details.className = "thought-card";
   details.dataset.detailKey = "reasoning";
+  details.open = true;
   const summary = document.createElement("summary");
-  summary.textContent = "Reasoning";
+  const title = document.createElement("strong");
+  title.textContent = "Reasoning";
+  const state = document.createElement("span");
+  state.textContent = context.streaming ? "Streaming from ACP" : "Captured from ACP";
+  summary.append(title, state);
   const content = document.createElement("div");
   content.className = "thought-content";
-  content.textContent = block.text;
-  if (block.clipped) content.append(clippedNote());
+  appendRichText(content, block.text);
+  if (blockWasClipped(block)) content.append(clippedNote(block));
   details.append(summary, content);
   summary.addEventListener("click", () => { details.dataset.userToggled = "true"; });
   summary.addEventListener("keydown", (event) => { if (["Enter", " "].includes(event.key)) details.dataset.userToggled = "true"; });
@@ -958,9 +1007,9 @@ function planElement(block) {
   return card;
 }
 
-function renderBlockElement(block, assistantName) {
-  if (block.type === "user" || block.type === "assistant") return messageElement(block, assistantName);
-  if (block.type === "thought") return thoughtElement(block);
+function renderBlockElement(block, assistantName, context = {}) {
+  if (block.type === "user" || block.type === "assistant") return messageElement(block, assistantName, context);
+  if (block.type === "thought") return thoughtElement(block, context);
   if (block.type === "tool") return toolElement(block);
   if (block.type === "plan") return block.entries.length > 0 ? planElement(block) : null;
   if (block.type === "error") {
@@ -970,6 +1019,16 @@ function renderBlockElement(block, assistantName) {
     return error;
   }
   return null;
+}
+
+function completedResponseBlock(turn) {
+  if (turn.state !== "complete") return null;
+  const assistant = turn.blocks.filter((block) => block.type === "assistant" && block.text.trim());
+  return assistant[assistant.length - 1] || null;
+}
+
+function turnHasACPReasoning(turn) {
+  return turn.blocks.some((block) => block.type === "thought" && block.text.trim());
 }
 
 function renderTurnTail(turn) {
@@ -990,6 +1049,21 @@ function renderTurnTail(turn) {
     const copy = ({ queued: "Queued for the next turn", working: "Working…", cancelling: "Stopping response…", cancelled: "Response stopped" })[turn.state];
     state.append(dot, document.createTextNode(copy));
     tail.append(state);
+  }
+  if (turn.state === "complete") {
+    const hasAssistant = Boolean(completedResponseBlock(turn));
+    if (!turnHasACPReasoning(turn)) {
+      const unavailable = document.createElement("div");
+      unavailable.className = "reasoning-unavailable";
+      unavailable.textContent = "No separate reasoning was exposed over ACP for this turn.";
+      tail.append(unavailable);
+    }
+    if (!hasAssistant) {
+      const missing = document.createElement("div");
+      missing.className = "response-missing";
+      missing.textContent = "The turn completed without an ACP assistant message. Check Diagnostics or open the native provider CLI.";
+      tail.append(missing);
+    }
   }
   if (turn.contentClipped) {
     const clipped = document.createElement("div");
@@ -1130,14 +1204,15 @@ function focusIndex(root) {
   return Array.from(root.querySelectorAll("a[href], button, summary, [tabindex]")).indexOf(active);
 }
 
-function patchBlockElement(block, assistantName) {
+function patchBlockElement(block, assistantName, context = {}) {
   const previous = block.element;
-  if (previous && block.renderedRevision === block.revision) return previous;
+  const contextKey = `${context.streaming ? "streaming" : "stored"}:${context.final ? "final" : "update"}`;
+  if (previous && block.renderedRevision === block.revision && block.renderedContext === contextKey) return previous;
   const selection = previous ? selectionOffsets(previous) : null;
   const focusedIndex = previous ? focusIndex(previous) : -1;
   const details = previous?.matches?.("details[data-detail-key]") ? previous : null;
   const userOpen = details?.dataset.userToggled === "true" ? details.open : null;
-  const next = renderBlockElement(block, assistantName);
+  const next = renderBlockElement(block, assistantName, context);
   if (next?.matches?.("details[data-detail-key]") && userOpen !== null) {
     next.open = userOpen;
     next.dataset.userToggled = "true";
@@ -1148,6 +1223,7 @@ function patchBlockElement(block, assistantName) {
   }
   block.element = next;
   block.renderedRevision = block.revision;
+  block.renderedContext = contextKey;
   if (next && focusedIndex >= 0) {
     const focusable = next.querySelectorAll("a[href], button, summary, [tabindex]")[focusedIndex];
     focusable?.focus({ preventScroll: true });
@@ -1170,8 +1246,12 @@ function patchTurnElement(turn, assistantName) {
   article.dataset.state = turn.state || "";
   const blocks = article.querySelector(".turn-blocks");
   const desired = [];
+  const completedResponse = completedResponseBlock(turn);
   for (const block of turn.blocks) {
-    const element = patchBlockElement(block, assistantName);
+    const element = patchBlockElement(block, assistantName, {
+      streaming: turn.state === "working",
+      final: block === completedResponse
+    });
     if (element) desired.push(element);
   }
   for (let index = 0; index < desired.length; index += 1) {

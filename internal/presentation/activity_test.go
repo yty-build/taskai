@@ -43,6 +43,15 @@ func TestProjectBuildsSemanticConversationActivity(t *testing.T) {
 			},
 		},
 		{
+			name: "reasoning chunk",
+			line: acpLine(t, "agent_thought_chunk", `{"jsonrpc":"2.0","params":{"update":{"content":{"type":"text","text":"Inspect the request\u001b[31m carefully"}}}}`),
+			check: func(t *testing.T, got *Activity) {
+				if got == nil || got.Type != "thought_chunk" || got.Text != "Inspect the request carefully" {
+					t.Fatalf("projection = %#v", got)
+				}
+			},
+		},
+		{
 			name: "tool update",
 			line: acpLine(t, "tool_call_update", `{"jsonrpc":"2.0","params":{"update":{"toolCallId":"tool-1","title":"Run tests","kind":"execute","status":"completed","rawInput":{"path":"/private/repo/worker.go","command":"SECRET_COMMAND","secret":"must-not-appear"},"rawOutput":{"token":"RAW_SECRET"},"_meta":{"environment":{"TOKEN":"META_SECRET"}},"content":[{"type":"content","content":{"type":"text","text":"PASS"}},{"type":"unknown","secret":"UNKNOWN_SECRET"}]}}}`),
 			check: func(t *testing.T, got *Activity) {

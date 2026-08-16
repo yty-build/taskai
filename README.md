@@ -101,7 +101,7 @@ acpctl session attach <session-id>
 acpctl session attach <session-id> --acp
 ```
 
-The Task console aggregates every child Session, discovers new Sessions without restart, and opens the selected provider's real native harness on Enter. Press `a` for the selected Session's structured ACP view. That view replays complete stored ACP-visible history, deduplicates it against live output, and reconnects from the last Session position; it renders user/assistant turns, collapsed reasoning, merged tool cards, a multiline composer, and actionable permission cards.
+The Task console aggregates every child Session, discovers new Sessions without restart, and opens the selected provider's real native harness on Enter. Press `a` for the selected Session's structured ACP view. That view replays complete stored ACP-visible history, deduplicates it against live output, and reconnects from the last Session position; it renders user/assistant turns, provider-exposed reasoning in event order, merged tool cards, a multiline composer, and actionable permission cards. The last assistant segment is identified as the completed response when the ACP turn completes; if the provider exposes no separate reasoning, the view says so instead of implying that data was lost.
 
 Task and structured ACP console controls (provider-native keys remain owned by that provider):
 
@@ -163,7 +163,7 @@ acpctl serve
 
 Use `--listen 127.0.0.1:0` for an automatically selected port. Only explicit loopback IPs are accepted; wildcard, hostname, and public bindings are rejected. Stopping `acpctl serve` does not stop Session workers.
 
-The responsive web UI is a conversation-first structured ACP client: a persistent Task/Session rail, user and assistant turns, collapsed reasoning, bounded tool and plan cards, a pinned approval shelf, and a sticky multiline composer. It supports prompt/cancel/resume/stop and reviewer creation, preserves reading position during streaming, and becomes a single-pane drawer layout on mobile. Session IDs, checkout details, continuity state, and bounded sanitized diagnostics live behind Details instead of competing with the conversation.
+The responsive web UI is a conversation-first structured ACP client: a persistent Task/Session rail, user and assistant turns, live provider-exposed reasoning, clearly marked completed responses, bounded tool and plan cards, a pinned approval shelf, and a sticky multiline composer. It supports prompt/cancel/resume/stop and reviewer creation, preserves reading position during streaming, and becomes a single-pane drawer layout on mobile. Session IDs, checkout details, continuity state, and bounded sanitized diagnostics live behind Details instead of competing with the conversation.
 
 The browser shows whether the same canonical provider conversation is linked and provider-store verified without exposing that identifier. Raw worker/provider errors, sockets, JSONL paths, provider identifiers, structured environment/auth fields, commands derived from raw input, raw tool objects, and ACP wire payloads do not cross the browser API boundary. Allowlisted provider-visible text, diffs, and terminal output are intentionally rendered and can contain sensitive repository or tool-produced content; this loopback console is for the same trusted OS user and is not a secret scanner. Trusted local forensic inspection remains available through terminal `--raw` logs.
 
