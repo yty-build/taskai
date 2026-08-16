@@ -450,6 +450,58 @@ func TestRuntimePermissionAutoReadDuplicateFailClosedAndCancel(t *testing.T) {
 	}
 }
 
+func TestRuntimePermissionBridgeCapsPendingCallbacks(t *testing.T) {
+	client, target, permissionLog := runtimeFixture(t, "permission-overflow")
+	if _, err := client.Start(context.Background(), StartSpec{Target: target}); err != nil {
+		t.Fatal(err)
+	}
+	events := make(chan Event, 256)
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.Prompt(context.Background(), PromptSpec{Target: target, RequestID: "REQ-overflow", Message: "overflow"}, func(event Event) error {
+			events <- event
+			return nil
+		})
+		done <- err
+	}()
+	for index := 0; index < 128; index++ {
+		select {
+		case event := <-events:
+			if event.Type != "session_request_permission" {
+				t.Fatalf("event %d type = %q", index, event.Type)
+			}
+			if strings.Contains(string(event.Raw), "ignored") || len(event.Raw) > 32<<10 {
+				t.Fatalf("permission %d retained unvalidated payload: %d bytes %s", index, len(event.Raw), event.Raw)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("received %d pending permissions, want 128", index)
+		}
+	}
+	select {
+	case extra := <-events:
+		t.Fatalf("bridge emitted permission beyond cap: %#v", extra)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := client.Cancel(context.Background(), target); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("Prompt() error = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("overflow turn did not cancel")
+	}
+	body, err := os.ReadFile(permissionLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(body), `"cancel"`) != 129 || strings.Contains(string(body), strings.Repeat("x", 1000)) {
+		t.Fatalf("overflow outcomes were not bounded and cancelled: %s", body)
+	}
+}
+
 func TestRuntimeResumeRequiresExactACPIdentity(t *testing.T) {
 	client, target, _ := runtimeFixture(t, "success")
 	info, err := client.Resume(context.Background(), StartSpec{Target: target, ResumeACPSessionID: "acp-existing"})

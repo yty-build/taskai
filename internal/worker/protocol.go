@@ -27,12 +27,11 @@ type PermissionOption struct {
 }
 
 type PendingPermission struct {
-	ID         string             `json:"id"`
-	RequestID  string             `json:"request_id"`
-	ToolCallID string             `json:"tool_call_id,omitempty"`
-	Title      string             `json:"title,omitempty"`
-	Kind       string             `json:"kind,omitempty"`
-	Options    []PermissionOption `json:"options"`
+	ID        string             `json:"id"`
+	RequestID string             `json:"request_id"`
+	Title     string             `json:"title,omitempty"`
+	Kind      string             `json:"kind,omitempty"`
+	Options   []PermissionOption `json:"options"`
 }
 
 type Message struct {

@@ -3,6 +3,7 @@ package worker
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,7 +23,12 @@ import (
 	"github.com/yty-build/acp-gateway/internal/sessionlog"
 )
 
-var ErrAlreadyRunning = errors.New("Session worker is already running")
+var (
+	ErrAlreadyRunning       = errors.New("Session worker is already running")
+	errPendingPermissionCap = errors.New("pending permission limit reached")
+)
+
+const maxPendingPermissions = 128
 
 type Repository interface {
 	GetSession(context.Context, string) (session.Session, error)
@@ -903,13 +909,9 @@ func parsePendingPermission(requestID string, event acp.Event) (*pendingPermissi
 	if len(envelope.Params.Options) == 0 || len(envelope.Params.Options) > 16 {
 		return nil, fmt.Errorf("ACP permission request has an invalid option count")
 	}
-	consoleID := bridgeID
-	if envelope.Params.ToolCall.ID != "" {
-		consoleID += ":" + envelope.Params.ToolCall.ID
-	}
 	pending := &pendingPermission{
 		PendingPermission: PendingPermission{
-			ID: consoleID, RequestID: requestID, ToolCallID: envelope.Params.ToolCall.ID,
+			ID: PermissionConsoleID(requestID, bridgeID), RequestID: requestID,
 			Title: envelope.Params.ToolCall.Title, Kind: envelope.Params.ToolCall.Kind,
 		},
 		bridgeID: bridgeID, byID: make(map[string]PermissionOption),
@@ -931,6 +933,13 @@ func parsePendingPermission(requestID string, event acp.Event) (*pendingPermissi
 		kinds[option.Kind] = struct{}{}
 	}
 	return pending, nil
+}
+
+// PermissionConsoleID derives a stable gateway-opaque ID for one permission
+// callback without exposing the provider's tool-call or RPC identifiers.
+func PermissionConsoleID(requestID, bridgeID string) string {
+	digest := sha256.Sum256([]byte(requestID + "\x00" + bridgeID))
+	return fmt.Sprintf("permission-%x", digest[:12])
 }
 
 func permissionRPCID(raw json.RawMessage) string {
@@ -962,6 +971,9 @@ func (w *Worker) registerPermission(pending *pendingPermission) error {
 	}
 	if _, exists := w.permissions[pending.ID]; exists {
 		return fmt.Errorf("permission %s is already pending", pending.ID)
+	}
+	if len(w.permissions) >= maxPendingPermissions {
+		return errPendingPermissionCap
 	}
 	w.permissions[pending.ID] = pending
 	return nil
@@ -1006,7 +1018,7 @@ func (w *Worker) decidePermission(ctx context.Context, permissionID, optionID st
 		_ = responder.DecidePermission(cancelContext, pending.bridgeID, "", true)
 		cancel()
 		_, _ = w.publish(pending.RequestID, "permission_abandoned", map[string]string{
-			"permission_id": pending.ID, "message": err.Error(),
+			"permission_id": pending.ID, "message": "permission decision transport unavailable",
 		})
 		return err
 	}

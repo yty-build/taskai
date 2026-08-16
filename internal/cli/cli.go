@@ -512,26 +512,18 @@ func runTaskLogs(ctx context.Context, args []string, stdout io.Writer, service *
 		return usagef("usage: acpctl task logs <task-id> [--follow] [--raw]")
 	}
 	taskID := options.positionals[0]
-	stored, err := service.TaskHistory(ctx, taskID, nil)
-	if err != nil {
+	printActivity := func(item appservice.TaskActivity) error {
+		fmt.Fprintf(stdout, "%s  %s\n", item.SessionID, render.Activity(item.Line, options.booleans["--raw"]))
+		return nil
+	}
+	if options.booleans["--follow"] {
+		err = service.FollowTask(ctx, taskID, nil, printActivity)
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
 		return err
 	}
-	cursors := make(map[string]uint64)
-	for _, item := range stored {
-		cursors[item.SessionID] = item.Line.Seq
-		fmt.Fprintf(stdout, "%s  %s\n", item.SessionID, render.Activity(item.Line, options.booleans["--raw"]))
-	}
-	if !options.booleans["--follow"] {
-		return nil
-	}
-	err = service.FollowTask(ctx, taskID, cursors, func(item appservice.TaskActivity) error {
-		fmt.Fprintf(stdout, "%s  %s\n", item.SessionID, render.Activity(item.Line, options.booleans["--raw"]))
-		return nil
-	})
-	if errors.Is(err, context.Canceled) {
-		return nil
-	}
-	return err
+	return service.ReplayTask(ctx, taskID, nil, printActivity)
 }
 
 func parseCursor(value string) (uint64, error) {

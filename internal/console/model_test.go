@@ -616,7 +616,7 @@ func TestSessionHarnessChoosesExactOfferedPermissionAndHighlightsAlways(t *testi
 	backend.mu.Lock()
 	decisions := append([]permissionCall(nil), backend.permissions...)
 	backend.mu.Unlock()
-	if len(decisions) != 1 || decisions[0].sessionID != "S-1" || decisions[0].permissionID != "permission-7:tool-write" || decisions[0].optionID != "allow-always" || decisions[0].cancelled {
+	if len(decisions) != 1 || decisions[0].sessionID != "S-1" || decisions[0].permissionID != worker.PermissionConsoleID(requestID, "permission-7") || decisions[0].optionID != "allow-always" || decisions[0].cancelled {
 		t.Fatalf("permission decision = %#v", decisions)
 	}
 	if !strings.Contains(model.notice, "turn continues") {

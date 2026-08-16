@@ -1094,31 +1094,33 @@ VID-17  Create property walkthrough       ✓ Done
 ### Task detail
 
 ```text
-TASK: APP-91
-Fix login regression
-
-SESSIONS
-
-Codex · Implementer              ● Working
-product repo · S201
-
-Claude · Reviewer                ○ Waiting
-product repo · S202
-
-CURRENT ACTIVITY
-
-17:41  searched auth middleware
-17:42  ran pytest
-       3 failed
-17:44  modified session.py
-17:45  running tests...
-
-[ Message ] [ Cancel ] [ Resume ] [ Review ]
-
-[ Show raw execution ]
+┌ Tasks / Sessions ───────┬────────────────────────────────────────┐
+│ APP-91                  │ Codex · Implementer       ● Working    │
+│ Fix login regression    │                          ✓ Verified     │
+│                         ├────────────────────────────────────────┤
+│ Sessions                │ You                                    │
+│ ● Codex · implementer   │ Fix the login regression and test it.  │
+│ ○ Claude · reviewer     │                                        │
+│                         │ C  I found the regression in the       │
+│ + New Session           │    session refresh path.               │
+│                         │                                        │
+│                         │    › Reasoning                          │
+│                         │    ✓ Read auth middleware               │
+│                         │    ● Run tests · working                │
+│                         │                                        │
+│                         ├────────────────────────────────────────┤
+│                         │ Approval required                      │
+│                         │ [Allow once] [Reject]                  │
+│                         │                                        │
+│                         │ Message Codex…                  [Send] │
+└─────────────────────────┴────────────────────────────────────────┘
 ```
 
-This is the same Task/Session data as CLI.
+The browser is a conversation-first structured ACP client over the same Task/Session state as CLI. The selected Session owns the main canvas. User and assistant turns are primary; reasoning, successful tools, plan detail, IDs, checkout paths, and diagnostics use progressive disclosure. Actionable permissions are pinned above the sticky composer and must not disappear when the transcript scrolls.
+
+Desktop keeps Task/Session navigation visible. Mobile uses a focus-managed navigation drawer and one full-height conversation pane, but retains response cancel/resume controls and an explicit Send action. Streamed updates preserve reader position, expanded tool/reasoning state, focus, and text selection. The transcript and approval shelf expose live-region/author semantics for assistive technology.
+
+The public browser projection is semantic, sanitized, and cumulatively bounded. It coalesces assistant chunks, merges tool updates, replaces plans, and exposes only safe labels plus opaque IDs needed for display or a permission decision. Provider/worker errors, commands derived from raw input, raw tool objects, structured environment/auth fields, ACP envelopes, sockets, native identifiers, and JSONL paths stay below the browser boundary. Allowlisted provider-visible text, diffs, and terminal output remain visible and can contain sensitive repository or tool-produced content; the local browser is a same-trusted-user surface, not a secret scanner. Trusted forensic inspection remains a terminal `--raw` operation.
 
 No channels.
 
@@ -1378,10 +1380,10 @@ load Task and every Session
 subscribe to live Session streams
        │
        ▼
-select S201
-       ├── Enter/click ──► verify canonical provider ID ──► real native harness
+select S201 (keyboard or single click)
+       ├── Enter ──► verify canonical provider ID ──► real native harness
        │
-       └── ACP action ──► replay stored history, then receive live ACP output
+       └── `a` / ACP action ──► replay stored history, then receive live ACP output
 ```
 
 If worker is not available:
@@ -1493,14 +1495,14 @@ The canonical provider conversation ID is the only ID used for subsequent provid
 1. **Task is always the top-level screen/object.**
 2. Never present an agent Session as if it is the Task itself.
 3. Do not expose implementation vocabulary unless useful.
-4. Raw ACP details should live under an advanced/debug view.
+4. Bounded sanitized diagnostics may live under an advanced browser view; exact raw ACP/runtime detail remains a trusted local terminal-log operation.
 5. Repo/worktree should always be visible on Session details.
 6. Task attachment is a gateway navigator; selecting a Session opens the provider-native harness by default.
 7. Direct terminal Session attachment is native by default; `acpctl session attach <id> --acp` opens the structured ACP console used by web/mobile.
 8. Detaching a viewer must never stop a worker or active turn.
 9. Reviewer Sessions should be visually distinct from producer Sessions.
 10. A user should be able to understand the current state without reading raw logs.
-11. A developer should be able to inspect the raw execution when suspicious.
+11. A developer should be able to inspect bounded sanitized browser diagnostics and opt into trusted local raw terminal logs when suspicious.
 12. Never require a terminal or web UI to keep Sessions alive.
 13. A Task-scoped message must target a selected Session; never silently broadcast.
 14. Keyboard interaction must always work; mouse selection is an additional convenience.
@@ -1765,6 +1767,11 @@ V1 is complete when all of these work.
 - [ ] Web streams live Session output.
 - [ ] Web can send a prompt.
 - [ ] Web can cancel/resume/stop.
+- [ ] Web renders a conversation-first semantic transcript with bounded assistant, reasoning, tool, plan, permission, and diagnostic state.
+- [ ] Streaming preserves scroll anchor, expanded disclosure state, focus, and text selection.
+- [ ] Mobile retains named cancel/resume controls, a focus-managed Task/Session drawer, and explicit Send behavior.
+- [ ] Transcript authors and approval changes are announced through accessible semantics.
+- [ ] Browser projection omits provider/worker errors, raw tool objects, commands derived from raw input, structured environment/auth fields, ACP envelopes, and runtime paths; allowlisted tool text/output is explicitly treated as trusted-user sensitive content.
 - [ ] Stopping web server does not stop Sessions.
 
 ## API and future clients

@@ -144,6 +144,23 @@ export function createAcpRuntime(options = {}) {
             }
             return;
           }
+          if (scenario === "permission-overflow") {
+            const decisions = await Promise.all(Array.from({ length: 129 }, (_, index) => options.onPermissionRequest?.(
+              {
+                sessionId: handle.backendSessionId,
+                raw: {
+                  sessionId: handle.backendSessionId,
+                  toolCall: { toolCallId: `tool-${index}`, title: `Write ${index}`, kind: "edit", ignored: "x".repeat(10000) },
+                  options: [{ optionId: "reject-once", name: "Reject", kind: "reject_once", ignored: "z".repeat(10000) }],
+                  ignored: "y".repeat(10000),
+                },
+                inferredKind: "edit",
+              },
+              { signal: abort.signal },
+            )));
+            appendPermissionDecision({ overflow_outcomes: decisions.map((decision) => decision?.outcome ?? "automatic") });
+            return;
+          }
           if (scenario === "permission" || scenario === "permission-duplicate" || scenario === "permission-read") {
             const duplicate = scenario === "permission-duplicate";
             const read = scenario === "permission-read";

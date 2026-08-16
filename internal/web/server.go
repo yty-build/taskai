@@ -4,6 +4,7 @@
 package web
 
 import (
+	"context"
 	"embed"
 	"errors"
 	"fmt"
@@ -35,11 +36,6 @@ type Server struct {
 	handler   http.Handler
 }
 
-type taskSummary struct {
-	Task         task.Task
-	SessionCount int
-}
-
 type sessionView struct {
 	ID                     string
 	TaskID                 string
@@ -60,26 +56,37 @@ type sessionView struct {
 	LastActivityAt         *time.Time
 }
 
+type navigationTask struct {
+	Task         task.Task
+	SessionCount int
+	Sessions     []sessionView
+}
+
+type pageBase struct {
+	PageTitle        string
+	Page             string
+	Navigation       []navigationTask
+	CurrentTaskID    string
+	CurrentSessionID string
+}
+
 type tasksPage struct {
-	PageTitle string
-	Page      string
-	Tasks     []taskSummary
+	pageBase
+	Tasks []navigationTask
 }
 
 type taskPage struct {
-	PageTitle string
-	Page      string
-	Task      task.Task
-	Sessions  []sessionView
-	Agents    []agents.Profile
+	pageBase
+	Task     task.Task
+	Sessions []sessionView
+	Agents   []agents.Profile
 }
 
 type sessionPage struct {
-	PageTitle string
-	Page      string
-	Task      task.Task
-	Session   sessionView
-	Agents    []agents.Profile
+	pageBase
+	Task    task.Task
+	Session sessionView
+	Agents  []agents.Profile
 }
 
 func New(tasks *task.Service, sessions *appservice.SessionService, registry *agents.Registry) (*Server, error) {
@@ -87,7 +94,15 @@ func New(tasks *task.Service, sessions *appservice.SessionService, registry *age
 		return nil, fmt.Errorf("web server requires Task, Session, and agent registry services")
 	}
 	templates, err := template.New("pages").Funcs(template.FuncMap{
-		"statusTone": statusTone,
+		"statusTone":  statusTone,
+		"statusLabel": statusLabel,
+		"agentInitial": func(value string) string {
+			value = strings.TrimSpace(value)
+			if value == "" {
+				return "A"
+			}
+			return strings.ToUpper(string([]rune(value)[0]))
+		},
 		"formatTime": func(value time.Time) string {
 			if value.IsZero() {
 				return ""
@@ -127,21 +142,15 @@ func (s *Server) tasksPage(writer http.ResponseWriter, request *http.Request) {
 		http.NotFound(writer, request)
 		return
 	}
-	items, err := s.tasks.List(request.Context())
+	navigation, err := s.navigation(request.Context(), "")
 	if err != nil {
 		writePageError(writer, err)
 		return
 	}
-	summaries := make([]taskSummary, 0, len(items))
-	for _, item := range items {
-		detail, err := s.tasks.Get(request.Context(), item.ID)
-		if err != nil {
-			writePageError(writer, err)
-			return
-		}
-		summaries = append(summaries, taskSummary{Task: item, SessionCount: len(detail.Sessions)})
-	}
-	s.execute(writer, "tasks", tasksPage{PageTitle: "Tasks · Agent Task Console", Page: "tasks", Tasks: summaries})
+	s.execute(writer, "tasks", tasksPage{
+		pageBase: pageBase{PageTitle: "Tasks · Agent Task Console", Page: "tasks", Navigation: navigation},
+		Tasks:    navigation,
+	})
 }
 
 func (s *Server) taskPage(writer http.ResponseWriter, request *http.Request) {
@@ -154,8 +163,14 @@ func (s *Server) taskPage(writer http.ResponseWriter, request *http.Request) {
 	for _, current := range detail.Sessions {
 		sessions = append(sessions, makeSessionView(current))
 	}
+	navigation, err := s.navigation(request.Context(), detail.Task.ID)
+	if err != nil {
+		writePageError(writer, err)
+		return
+	}
 	s.execute(writer, "task", taskPage{
-		PageTitle: detail.Task.Title + " · Agent Task Console", Page: "task", Task: detail.Task, Sessions: sessions, Agents: s.agents,
+		pageBase: pageBase{PageTitle: detail.Task.Title + " · Agent Task Console", Page: "task", Navigation: navigation, CurrentTaskID: detail.Task.ID},
+		Task:     detail.Task, Sessions: sessions, Agents: s.agents,
 	})
 }
 
@@ -170,10 +185,41 @@ func (s *Server) sessionPage(writer http.ResponseWriter, request *http.Request) 
 		writePageError(writer, err)
 		return
 	}
+	navigation, err := s.navigation(request.Context(), detail.Task.ID)
+	if err != nil {
+		writePageError(writer, err)
+		return
+	}
 	s.execute(writer, "session", sessionPage{
-		PageTitle: current.Agent + " " + current.Role + " · Agent Task Console", Page: "session",
+		pageBase: pageBase{
+			PageTitle: current.Agent + " " + current.Role + " · Agent Task Console", Page: "session",
+			Navigation: navigation, CurrentTaskID: detail.Task.ID, CurrentSessionID: current.ID,
+		},
 		Task: detail.Task, Session: makeSessionView(current), Agents: s.agents,
 	})
+}
+
+func (s *Server) navigation(ctx context.Context, currentTaskID string) ([]navigationTask, error) {
+	items, err := s.tasks.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	navigation := make([]navigationTask, 0, len(items))
+	for _, item := range items {
+		detail, err := s.tasks.Get(ctx, item.ID)
+		if err != nil {
+			return nil, err
+		}
+		entry := navigationTask{Task: item, SessionCount: len(detail.Sessions)}
+		if item.ID == currentTaskID {
+			entry.Sessions = make([]sessionView, 0, len(detail.Sessions))
+			for _, current := range detail.Sessions {
+				entry.Sessions = append(entry.Sessions, makeSessionView(current))
+			}
+		}
+		navigation = append(navigation, entry)
+	}
+	return navigation, nil
 }
 
 func (s *Server) execute(writer http.ResponseWriter, name string, data any) {
@@ -186,13 +232,12 @@ func (s *Server) execute(writer http.ResponseWriter, name string, data any) {
 }
 
 func makeSessionView(current session.Session) sessionView {
-	checkout := current.WorktreePath
-	if checkout == "" {
-		checkout = current.RepoPath
-	}
-	label := filepath.Base(checkout)
+	label := filepath.Base(current.RepoPath)
 	if label == "." || label == string(filepath.Separator) || strings.TrimSpace(label) == "" {
-		label = checkout
+		label = current.RepoPath
+	}
+	if current.WorktreePath != "" {
+		label += " · isolated worktree"
 	}
 	return sessionView{
 		ID: current.ID, TaskID: current.TaskID, Role: current.Role, Agent: current.Agent, Provider: current.Provider,
@@ -216,6 +261,34 @@ func statusTone(status string) string {
 		return "danger"
 	default:
 		return "neutral"
+	}
+}
+
+func statusLabel(status string) string {
+	switch status {
+	case "starting":
+		return "Starting"
+	case "working":
+		return "Working"
+	case "waiting":
+		return "Ready"
+	case "review":
+		return "In review"
+	case "open":
+		return "Open"
+	case "stopped":
+		return "Stopped"
+	case "done":
+		return "Complete"
+	case "failed":
+		return "Failed"
+	case "cancelled":
+		return "Cancelled"
+	default:
+		if strings.TrimSpace(status) == "" {
+			return "Unknown"
+		}
+		return strings.ToUpper(status[:1]) + status[1:]
 	}
 }
 

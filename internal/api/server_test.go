@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yty-build/acp-gateway/internal/acp"
 	"github.com/yty-build/acp-gateway/internal/agents"
 	"github.com/yty-build/acp-gateway/internal/config"
 	appservice "github.com/yty-build/acp-gateway/internal/service"
@@ -225,7 +226,7 @@ func TestVersionedTaskAndSessionAPI(t *testing.T) {
 	}
 	fixture.runtime.mu.Lock()
 	fixture.runtime.pending[sessionID] = []worker.PendingPermission{{
-		ID: "permission-1:tool-write", RequestID: "request-permission", ToolCallID: "tool-write",
+		ID: "permission-safe-1", RequestID: "request-permission",
 		Title: "Write marker\x1b]52;c;hidden\a", Kind: "edit",
 		Options: []worker.PermissionOption{
 			{ID: "allow-once", Name: "Allow once", Kind: "allow_once"},
@@ -239,20 +240,20 @@ func TestVersionedTaskAndSessionAPI(t *testing.T) {
 		Permissions []PermissionDTO `json:"permissions"`
 	}
 	decodeResponse(t, permissions, &permissionResult)
-	if len(permissionResult.Permissions) != 1 || permissionResult.Permissions[0].ID != "permission-1:tool-write" || len(permissionResult.Permissions[0].Options) != 2 {
+	if len(permissionResult.Permissions) != 1 || permissionResult.Permissions[0].ID != "permission-safe-1" || len(permissionResult.Permissions[0].Options) != 2 {
 		t.Fatalf("permissions response = %#v", permissionResult)
 	}
 	if strings.Contains(permissionResult.Permissions[0].Title, "\x1b") {
 		t.Fatalf("permission title retained terminal controls: %q", permissionResult.Permissions[0].Title)
 	}
 	decision := performJSON(t, fixture.handler, http.MethodPost, "/api/v1/sessions/"+sessionID+"/permissions/decision", map[string]any{
-		"permission_id": "permission-1:tool-write", "option_id": "allow-once",
+		"permission_id": "permission-safe-1", "option_id": "allow-once",
 	})
 	assertStatus(t, decision, http.StatusAccepted)
 	fixture.runtime.mu.Lock()
 	lastCommand := fixture.runtime.commands[len(fixture.runtime.commands)-1]
 	fixture.runtime.mu.Unlock()
-	if lastCommand.Type != "permission_decision" || lastCommand.PermissionID != "permission-1:tool-write" || lastCommand.OptionID != "allow-once" {
+	if lastCommand.Type != "permission_decision" || lastCommand.PermissionID != "permission-safe-1" || lastCommand.OptionID != "allow-once" {
 		t.Fatalf("permission transport command = %#v", lastCommand)
 	}
 	cancel := performRequest(t, fixture.handler, http.MethodPost, "/api/v1/sessions/"+sessionID+"/cancel", nil, nil)
@@ -292,14 +293,40 @@ func TestVersionedTaskAndSessionAPI(t *testing.T) {
 	if strings.Contains(sessionStream.Body.String(), "DO_NOT_EXPOSE") || strings.Contains(sessionStream.Body.String(), `"data"`) {
 		t.Fatalf("raw Session data crossed API boundary: %s", sessionStream.Body.String())
 	}
-	if sessionEvents[0].Activity.SessionID != sessionID || sessionEvents[0].Activity.Position != 2 || !strings.Contains(sessionEvents[0].Activity.Activity, "visible two") {
+	if sessionEvents[0].Activity.SessionID != sessionID || sessionEvents[0].Activity.Position != 2 || sessionEvents[0].Activity.Activity != "notice" {
 		t.Fatalf("normalized Session activity = %#v", sessionEvents[0].Activity)
+	}
+	if strings.Contains(sessionStream.Body.String(), "visible two") {
+		t.Fatalf("arbitrary diagnostic message crossed API boundary: %s", sessionStream.Body.String())
+	}
+	if !strings.Contains(sessionStream.Body.String(), "event: ready\ndata: {}") {
+		t.Fatalf("Session stream did not mark the replay/live boundary: %s", sessionStream.Body.String())
 	}
 
 	disagree := performRequest(t, fixture.handler, http.MethodGet, "/api/v1/sessions/"+sessionID+"/stream?cursor=1", nil, map[string]string{"Last-Event-ID": "2"})
 	assertStatus(t, disagree, http.StatusBadRequest)
 	badTaskCursor := performRequest(t, fixture.handler, http.MethodGet, "/api/v1/tasks/"+taskID+"/stream?cursor=not_base64!", nil, nil)
 	assertStatus(t, badTaskCursor, http.StatusBadRequest)
+	foreign := make(map[string]uint64, maxCursorSessions)
+	for index := 0; index < maxCursorSessions; index++ {
+		foreign[fmt.Sprintf("%x", index)] = 0
+	}
+	foreignToken, err := encodeTaskCursor(foreign)
+	if err != nil {
+		t.Fatal(err)
+	}
+	filteredTaskEvents := taskStreamEvents(t, fixture.handler, "/api/v1/tasks/"+taskID+"/stream?cursor="+foreignToken, "")
+	if len(filteredTaskEvents) != 2 {
+		t.Fatalf("foreign cursor replay = %#v", filteredTaskEvents)
+	}
+	for _, event := range filteredTaskEvents {
+		request := httptest.NewRequest(http.MethodGet, "/", nil)
+		request.Header.Set("Last-Event-ID", event.ID)
+		decoded, decodeErr := taskCursor(request)
+		if decodeErr != nil || len(decoded) != 1 || decoded[sessionID] == 0 {
+			t.Fatalf("emitted Task cursor is not self-validating: %#v, %v", decoded, decodeErr)
+		}
+	}
 
 	allTaskEvents := taskStreamEvents(t, fixture.handler, "/api/v1/tasks/"+taskID+"/stream", "")
 	if len(allTaskEvents) != 2 || allTaskEvents[0].Activity.SessionID != sessionID || allTaskEvents[1].Activity.SessionID != sessionID {
@@ -372,9 +399,52 @@ func TestActivityPermissionDTOExposesOnlyActionableSafeFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, forbidden := range []string{"worker_socket", "log_path", "rawInput", "environment"} {
+	for _, forbidden := range []string{"worker_socket", "log_path", "rawInput", "environment", "tool_call_id"} {
 		if strings.Contains(string(encoded), forbidden) {
 			t.Fatalf("permission DTO leaked %q: %s", forbidden, encoded)
+		}
+	}
+}
+
+func TestAbandonedPermissionDTOHidesTransportError(t *testing.T) {
+	line := sessionlog.Line{
+		Seq: 5, RequestID: "REQ", Type: "permission_abandoned",
+		Data: json.RawMessage(`{"permission_id":"permission-5:tool","message":"bridge failed: TOKEN=must-not-cross /private/provider/path"}`),
+	}
+	dto := makeActivityDTO("S-one", line, "")
+	if dto.Permission == nil || dto.Permission.State != "abandoned" || dto.Permission.Decision != "unavailable" {
+		t.Fatalf("abandoned permission DTO = %#v", dto.Permission)
+	}
+	encoded, err := json.Marshal(dto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"must-not-cross", "/private/provider/path", "bridge failed"} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Fatalf("abandoned permission leaked %q: %s", forbidden, encoded)
+		}
+	}
+}
+
+func TestActivityDTOCarriesBoundedSemanticDisplayWithoutACPEnvelope(t *testing.T) {
+	event, err := json.Marshal(acp.Event{
+		EventVersion: 1, RequestID: "REQ", Type: "agent_message_chunk",
+		Raw: json.RawMessage(`{"jsonrpc":"2.0","params":{"update":{"content":{"type":"text","text":"A readable answer"},"messageId":"message-1"}},"environment":{"TOKEN":"must-not-appear"}}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dto := makeActivityDTO("S-one", sessionlog.Line{Seq: 5, RequestID: "REQ", Type: "acp", Data: event}, "")
+	if dto.Display == nil || dto.Display.Type != "assistant_chunk" || dto.Display.Text != "A readable answer" {
+		t.Fatalf("semantic display = %#v", dto.Display)
+	}
+	encoded, err := json.Marshal(dto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"jsonrpc", "must-not-appear", "environment", "eventVersion"} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Fatalf("activity DTO leaked %q: %s", forbidden, encoded)
 		}
 	}
 }
@@ -545,6 +615,15 @@ func TestCursorValidation(t *testing.T) {
 	if cursor, err := sessionCursor(request); err != nil || cursor != 12 {
 		t.Fatalf("Session cursor = %d, %v", cursor, err)
 	}
+	request = httptest.NewRequest(http.MethodGet, "/?seed=11", nil)
+	request.Header.Set("Last-Event-ID", "12")
+	if cursor, err := sessionCursor(request); err != nil || cursor != 12 {
+		t.Fatalf("Session reconnect cursor over seed = %d, %v", cursor, err)
+	}
+	request = httptest.NewRequest(http.MethodGet, "/?seed=11", nil)
+	if cursor, err := sessionCursor(request); err != nil || cursor != 11 {
+		t.Fatalf("Session initial seed = %d, %v", cursor, err)
+	}
 
 	token, err := encodeTaskCursor(map[string]uint64{"S-one": 4, "S-two": 9})
 	if err != nil {
@@ -561,6 +640,18 @@ func TestCursorValidation(t *testing.T) {
 	request = httptest.NewRequest(http.MethodGet, "/?cursor="+invalidPayload, nil)
 	if _, err := taskCursor(request); err == nil {
 		t.Fatal("Task cursor accepted concatenated JSON payload")
+	}
+
+	maximum := make(map[string]uint64, maxCursorSessions)
+	for index := 0; index < maxCursorSessions; index++ {
+		maximum[fmt.Sprintf("%x", index)] = 0
+	}
+	if _, err := encodeTaskCursor(maximum); err != nil {
+		t.Fatalf("maximum Task cursor was not encodable: %v", err)
+	}
+	maximum["overflow"] = 0
+	if _, err := encodeTaskCursor(maximum); err == nil {
+		t.Fatal("Task cursor encoder emitted a token its decoder would reject")
 	}
 }
 

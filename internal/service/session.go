@@ -666,6 +666,22 @@ func (s *SessionService) History(ctx context.Context, id string, cursor uint64) 
 	return sessionlog.ReadFile(s.logPath(current), cursor)
 }
 
+// Replay streams durable history without materializing a long-lived Session's
+// entire JSONL file. It returns the last position delivered so a transport can
+// hand off to Follow without a gap.
+func (s *SessionService) Replay(ctx context.Context, id string, cursor uint64, consume func(sessionlog.Line) error) (uint64, error) {
+	current, err := s.repository.GetSession(ctx, id)
+	if err != nil {
+		return cursor, err
+	}
+	return sessionlog.WalkFile(ctx, s.logPath(current), cursor, 0, func(line sessionlog.Line) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return consume(line)
+	})
+}
+
 func (s *SessionService) Follow(ctx context.Context, id string, cursor uint64, consume func(sessionlog.Line) error) error {
 	current, err := s.repository.GetSession(ctx, id)
 	if err != nil {

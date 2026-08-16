@@ -41,6 +41,7 @@ Object.defineProperty(process, "stderr", { value: promptStderr, configurable: tr
 
 const maxCommandFrameBytes = 4 * 1024 * 1024;
 const maxOutputFrameBytes = 8 * 1024 * 1024;
+const maxPendingPermissions = 128;
 const permissionKinds = new Set([
   "allow_once",
   "allow_always",
@@ -148,7 +149,7 @@ function cancelPendingPermissions(reason = "cancelled") {
   }
 }
 
-function validatedPermissionOptions(raw) {
+function validatedPermission(raw) {
   if (
     !raw ||
     !raw.toolCall ||
@@ -156,6 +157,8 @@ function validatedPermissionOptions(raw) {
     raw.toolCall.toolCallId.length === 0 ||
     raw.toolCall.toolCallId.length > 512 ||
     (raw.toolCall.title !== undefined && (typeof raw.toolCall.title !== "string" || raw.toolCall.title.length > 4096)) ||
+    (raw.toolCall.kind !== undefined && (typeof raw.toolCall.kind !== "string" || raw.toolCall.kind.length > 64)) ||
+    (raw.sessionId !== undefined && (typeof raw.sessionId !== "string" || raw.sessionId.length > 512)) ||
     !Array.isArray(raw.options) ||
     raw.options.length === 0 ||
     raw.options.length > 16
@@ -164,6 +167,7 @@ function validatedPermissionOptions(raw) {
   }
   const byId = new Map();
   const kinds = new Set();
+  const safeOptions = [];
   for (const option of raw.options) {
     if (
       !option ||
@@ -179,13 +183,50 @@ function validatedPermissionOptions(raw) {
     ) {
       return undefined;
     }
-    byId.set(option.optionId, option);
+    const safeOption = { optionId: option.optionId, name: option.name, kind: option.kind };
+    byId.set(option.optionId, safeOption);
+    safeOptions.push(safeOption);
     kinds.add(option.kind);
   }
-  return byId;
+  return {
+    byId,
+    request: {
+      sessionId: typeof raw.sessionId === "string" ? raw.sessionId : "",
+      toolCall: {
+        toolCallId: raw.toolCall.toolCallId,
+        title: typeof raw.toolCall.title === "string" ? raw.toolCall.title : "",
+        kind: typeof raw.toolCall.kind === "string" ? raw.toolCall.kind : "",
+      },
+      options: safeOptions,
+    },
+  };
 }
 
-async function permissionRequest(request, context) {
+function waitForPermissionDecision(validated, inferredKind, signal, commandId, requestId) {
+  const permissionId = `permission-${crypto.randomUUID()}`;
+  return new Promise((resolve) => {
+    const onAbort = () => settlePermission(permissionId, { outcome: "cancel" });
+    signal.addEventListener("abort", onAbort, { once: true });
+    pendingPermissions.set(permissionId, {
+      source: "acp",
+      resolve,
+      options: validated.byId,
+      requestId,
+      turnCommandId: commandId,
+      cleanup: () => signal.removeEventListener("abort", onAbort),
+    });
+    emit({
+      type: "permission_request",
+      commandId,
+      requestId,
+      permissionId,
+      inferredKind,
+      request: validated.request,
+    });
+  });
+}
+
+function permissionRequest(request, context) {
   if (configuredPermissionMode === "approve-all") {
     return undefined;
   }
@@ -196,34 +237,12 @@ async function permissionRequest(request, context) {
     return { outcome: "cancel" };
   }
 
-  const raw = request.raw;
-  const options = validatedPermissionOptions(raw);
-  if (!options) {
+  const validated = validatedPermission(request.raw);
+  if (!validated || pendingPermissions.size >= maxPendingPermissions) {
     return { outcome: "cancel" };
   }
-
-  const permissionId = `permission-${crypto.randomUUID()}`;
-  return await new Promise((resolve) => {
-    const onAbort = () => settlePermission(permissionId, { outcome: "cancel" });
-    context.signal.addEventListener("abort", onAbort, { once: true });
-    pendingPermissions.set(permissionId, {
-      source: "acp",
-      resolve,
-      options,
-      raw,
-      requestId: activeRequestId,
-      turnCommandId: activeTurnCommandId,
-      cleanup: () => context.signal.removeEventListener("abort", onAbort),
-    });
-    emit({
-      type: "permission_request",
-      commandId: activeTurnCommandId,
-      requestId: activeRequestId,
-      permissionId,
-      inferredKind: request.inferredKind,
-      request: raw,
-    });
-  });
+  const inferredKind = typeof request.inferredKind === "string" ? request.inferredKind.slice(0, 64) : "";
+  return waitForPermissionDecision(validated, inferredKind, context.signal, activeTurnCommandId, activeRequestId);
 }
 
 function hostPermissionForRuntimeEvent(event) {
@@ -254,6 +273,10 @@ function hostPermissionForRuntimeEvent(event) {
   // Suppress that prompt before it is written so paths, commands, and file
   // previews never enter the bounded diagnostic stderr capture.
   permissionPromptOutput = true;
+  if (pendingPermissions.size >= maxPendingPermissions) {
+    answerHostPrompt(false);
+    return;
+  }
   for (const pending of pendingPermissions.values()) {
     if (pending.source === "host") {
       throw new Error("multiple concurrent acpx host permission prompts are unsupported");
@@ -273,7 +296,6 @@ function hostPermissionForRuntimeEvent(event) {
   pendingPermissions.set(permissionId, {
     source: "host",
     options: new Map(raw.options.map((option) => [option.optionId, option])),
-    raw,
     requestId: activeRequestId,
     turnCommandId: activeTurnCommandId,
     cleanup: () => {},

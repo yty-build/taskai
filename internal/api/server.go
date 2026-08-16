@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yty-build/acp-gateway/internal/render"
+	"github.com/yty-build/acp-gateway/internal/presentation"
 	appservice "github.com/yty-build/acp-gateway/internal/service"
 	"github.com/yty-build/acp-gateway/internal/sessionlog"
 	"github.com/yty-build/acp-gateway/internal/store"
@@ -317,6 +317,15 @@ func (s *Server) streamSession(writer http.ResponseWriter, request *http.Request
 		return
 	}
 	startSSE(writer, flusher)
+	cursor, err = s.sessions.Replay(request.Context(), id, cursor, func(line sessionlog.Line) error {
+		return writeSSE(writer, flusher, strconvUint(line.Seq), makeActivityDTO(id, line, ""))
+	})
+	if err != nil {
+		return
+	}
+	if err := writeSSEReady(writer, flusher); err != nil {
+		return
+	}
 	err = s.sessions.Follow(request.Context(), id, cursor, func(line sessionlog.Line) error {
 		event := makeActivityDTO(id, line, "")
 		return writeSSE(writer, flusher, strconvUint(line.Seq), event)
@@ -333,10 +342,24 @@ func (s *Server) streamTask(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	id := request.PathValue("taskID")
-	if _, err := s.tasks.Get(request.Context(), id); err != nil {
+	detail, err := s.tasks.Get(request.Context(), id)
+	if err != nil {
 		writeLookupError(writer, "Task", err)
 		return
 	}
+	filtered := make(map[string]uint64, len(detail.Sessions))
+	maximum := make(map[string]uint64, len(detail.Sessions))
+	for _, current := range detail.Sessions {
+		if position, exists := cursor[current.ID]; exists {
+			filtered[current.ID] = position
+		}
+		maximum[current.ID] = ^uint64(0)
+	}
+	if _, err := encodeTaskCursor(maximum); err != nil {
+		writeJSONError(writer, http.StatusUnprocessableEntity, "stream_limit", "This Task has too many Sessions for one aggregate stream")
+		return
+	}
+	cursor = filtered
 	flusher, ok := writer.(http.Flusher)
 	if !ok {
 		writeJSONError(writer, http.StatusInternalServerError, "stream_unsupported", "Streaming is unavailable")
@@ -358,10 +381,11 @@ func (s *Server) streamTask(writer http.ResponseWriter, request *http.Request) {
 }
 
 func makeActivityDTO(sessionID string, line sessionlog.Line, cursor string) ActivityDTO {
+	display := presentation.Project(line)
 	return ActivityDTO{
 		SessionID: sessionID, Position: line.Seq, RequestID: line.RequestID, Kind: line.Type,
-		Timestamp: formatTime(line.Timestamp), Activity: render.Activity(line, false), Cursor: cursor,
-		Permission: makeActivityPermissionDTO(line),
+		Timestamp: formatTime(line.Timestamp), Activity: presentation.Summary(line, display), Cursor: cursor,
+		Permission: makeActivityPermissionDTO(line), Display: display,
 	}
 }
 
@@ -380,6 +404,14 @@ func writeSSE(writer io.Writer, flusher http.Flusher, id string, value any) erro
 		return err
 	}
 	if _, err := fmt.Fprintf(writer, "id: %s\nevent: activity\ndata: %s\n\n", id, data); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
+func writeSSEReady(writer io.Writer, flusher http.Flusher) error {
+	if _, err := io.WriteString(writer, "event: ready\ndata: {}\n\n"); err != nil {
 		return err
 	}
 	flusher.Flush()

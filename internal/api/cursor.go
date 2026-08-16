@@ -54,21 +54,40 @@ func taskCursor(request *http.Request) (map[string]uint64, error) {
 }
 
 func encodeTaskCursor(cursor map[string]uint64) (string, error) {
+	if len(cursor) > maxCursorSessions {
+		return "", fmt.Errorf("Task cursor contains too many Sessions")
+	}
+	for sessionID := range cursor {
+		if strings.TrimSpace(sessionID) == "" || len(sessionID) > 200 {
+			return "", fmt.Errorf("Task cursor contains an invalid Session ID")
+		}
+	}
 	encoded, err := json.Marshal(cursor)
 	if err != nil {
 		return "", err
 	}
-	return base64.RawURLEncoding.EncodeToString(encoded), nil
+	result := base64.RawURLEncoding.EncodeToString(encoded)
+	if len(result) > maxCursorLength {
+		return "", fmt.Errorf("Task cursor is too long")
+	}
+	return result, nil
 }
 
 func cursorValue(request *http.Request) (string, error) {
 	query := request.URL.Query().Get("cursor")
+	seed := request.URL.Query().Get("seed")
 	header := request.Header.Get("Last-Event-ID")
+	if query != "" && seed != "" {
+		return "", fmt.Errorf("cursor and seed cannot both be supplied")
+	}
 	if query != "" && header != "" && query != header {
 		return "", fmt.Errorf("cursor and Last-Event-ID disagree")
+	}
+	if header != "" {
+		return header, nil
 	}
 	if query != "" {
 		return query, nil
 	}
-	return header, nil
+	return seed, nil
 }

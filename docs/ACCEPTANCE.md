@@ -51,7 +51,7 @@ Primary end-to-end evidence:
 | Cursor reconnect recovers missed output | API test, `TestWorkerSerializesPromptsBroadcastsAndReplays`, console replay test | Provider disconnect/reconnect |
 | Request/response correlation | adapter request test, worker test, lifecycle raw JSONL test, API test | Provider matrix |
 | Normalized/raw Session logs | renderer tests, lifecycle test | Inspect live output |
-| Aggregate Task logs | lifecycle test, `TestTaskHistoryUsesIndependentSessionCursors` | Multi-provider Task |
+| Aggregate Task logs | lifecycle test, `TestReplayTaskUsesIndependentSessionCursors`, `TestReplayTaskStreamsLongHistoryWithoutMaterializingIt` | Multi-provider Task |
 | Cancel Session | adapter, worker, console, and API tests | Provider matrix |
 | Resume stopped Session | lifecycle test, service/API tests | Provider matrix |
 | Persist one immutable canonical provider identity plus adapter evidence | `TestMigrationBackfillsCanonicalProviderConversation`, store round-trip, adapter, lifecycle tests | Provider metadata inspection |
@@ -85,8 +85,9 @@ Primary end-to-end evidence:
 | Stored and live Session history | embedded EventSource client plus versioned API SSE replay test | Provider browser smoke |
 | Web streams output | EventSource asset assertion and API SSE tests | Observe live turn |
 | Prompt/cancel/resume/stop | versioned API route test plus browser client control bindings | Click controls |
-| Review and sanitized raw execution view | API review test, rendered controls/asset assertions, raw-data redaction test | Click controls |
-| Responsive structured ACP view exposes only linked/verified continuity state | web rendering/DTO tests | Narrow desktop and mobile visual smoke |
+| Review and bounded sanitized diagnostics | API review test, rendered controls/asset assertions, semantic projection/error/tool redaction tests | Click controls |
+| Conversation-first streamed transcript | `TestBrowserTranscriptReducerIsBoundedAndDeterministic`, semantic projection tests | Observe prompt, assistant, reasoning, tool, plan, and permission states |
+| Responsive structured ACP view exposes only linked/verified continuity state | web rendering/DTO tests; named mobile actions and live-region assertions | 1440/1024/390 visual and accessibility smoke |
 | Web shutdown leaves workers running | `TestStoppingWebServerLeavesSessionWorkerUntouched` proves unchanged PID/socket/status and zero runtime commands | Stop server during live turn |
 | Browser hardening | DNS-rebinding/cross-origin test, CSP/escaping assertions | Inspect response headers |
 

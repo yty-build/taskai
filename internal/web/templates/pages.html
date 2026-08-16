@@ -1,54 +1,129 @@
-{{define "tasks"}}
-<!doctype html>
-<html lang="en">
+{{define "head"}}
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
   <title>{{.PageTitle}}</title>
   <link rel="stylesheet" href="/assets/app.css">
   <script src="/assets/app.js" defer></script>
 </head>
-<body data-page="{{.Page}}">
-  <header class="site-header">
-    <a class="brand" href="/"><span class="brand-mark">AT</span><span>Agent Task Console</span></a>
-    <span class="local-badge">LOCAL V1</span>
-  </header>
-  <main class="shell">
-    <section class="hero compact-hero">
-      <p class="eyebrow">Workspace</p>
-      <h1>Tasks</h1>
-      <p>Persistent work, grouped into independent agent Sessions.</p>
-    </section>
+{{end}}
 
-    <details class="panel create-panel">
-      <summary>Create a Task</summary>
-      <form id="create-task-form" class="form-grid">
-        <label class="wide">Title<input name="title" required maxlength="300" placeholder="Fix login regression"></label>
-        <label class="wide">Description<textarea name="description" rows="3" placeholder="What outcome should this Task produce?"></textarea></label>
-        <label>External reference<input name="external_ref" placeholder="APP-91"></label>
-        <div class="form-action"><button type="submit" class="primary">Create Task</button></div>
-      </form>
-      <p id="form-notice" class="notice" role="status" aria-live="polite"></p>
-    </details>
-
-    <section class="section-heading">
-      <div><p class="eyebrow">Current work</p><h2>{{len .Tasks}} Tasks</h2></div>
-    </section>
-    <div class="task-grid">
-      {{range .Tasks}}
-      <a class="task-card" href="/tasks/{{.Task.ID}}">
-        <div class="card-topline"><span class="mono">{{.Task.ID}}</span><span class="status status-{{statusTone (printf "%s" .Task.Status)}}"><i></i>{{.Task.Status}}</span></div>
-        <h3>{{.Task.Title}}</h3>
-        {{if .Task.Description}}<p>{{.Task.Description}}</p>{{else}}<p class="muted">No description</p>{{end}}
-        <div class="card-footer"><span>{{.SessionCount}} {{if eq .SessionCount 1}}Session{{else}}Sessions{{end}}</span><span>Updated {{formatTime .Task.UpdatedAt}}</span></div>
+{{define "sidebar"}}
+<aside id="app-sidebar" class="app-sidebar" aria-label="Task and Session navigation">
+  <div class="sidebar-brand-row">
+    <a class="brand" href="/" aria-label="Agent Task Console home"><span class="brand-mark">A</span><span>Agent Console</span></a>
+    <button type="button" class="icon-button sidebar-close" data-close-sidebar aria-label="Close navigation">×</button>
+  </div>
+  <button type="button" class="new-button" data-open-dialog="create-task-dialog"><span>＋</span> New Task</button>
+  <nav class="task-navigation" aria-label="Tasks">
+    <p class="nav-label">Tasks</p>
+    {{range .Navigation}}
+    <section class="nav-task-group">
+      <a class="nav-task{{if eq .Task.ID $.CurrentTaskID}} current{{end}}" href="/tasks/{{.Task.ID}}"{{if eq .Task.ID $.CurrentTaskID}}{{if $.CurrentSessionID}} aria-current="location"{{else}} aria-current="page"{{end}}{{end}}>
+        <span class="nav-task-copy"><strong>{{.Task.Title}}</strong><small>{{statusLabel (printf "%s" .Task.Status)}}</small></span>
+        <span class="nav-count">{{.SessionCount}}</span>
       </a>
-      {{else}}
-      <div class="empty-state"><span class="empty-icon">◎</span><h3>No Tasks yet</h3><p>Create a Task above, then start its first agent Session.</p></div>
+      {{if eq .Task.ID $.CurrentTaskID}}
+      <div class="nav-sessions">
+        <div class="nav-section-heading"><span>Sessions</span><button type="button" data-open-dialog="create-session-dialog" aria-label="Start a Session">＋</button></div>
+        {{range .Sessions}}
+        <a class="nav-session{{if eq .ID $.CurrentSessionID}} current{{end}}" href="/sessions/{{.ID}}"{{if eq .ID $.CurrentSessionID}} aria-current="page"{{end}}>
+          <span class="provider-avatar small">{{agentInitial .Agent}}</span>
+          <span><strong>{{.Agent}}</strong><small>{{.Role}}</small></span>
+          <i class="status-dot status-{{statusTone .Status}}" aria-label="{{statusLabel .Status}}"></i>
+        </a>
+        {{else}}
+        <p class="nav-empty">No Sessions yet</p>
+        {{end}}
+      </div>
       {{end}}
+    </section>
+    {{else}}
+    <div class="nav-empty-state"><p>No Tasks yet</p><button type="button" data-open-dialog="create-task-dialog">Create your first Task</button></div>
+    {{end}}
+  </nav>
+  <div class="sidebar-footer"><span class="local-indicator"><i></i> Local console</span><span>Task → Sessions</span></div>
+</aside>
+<button type="button" class="sidebar-scrim" data-close-sidebar aria-label="Close navigation"></button>
+{{end}}
+
+{{define "mobile-bar"}}
+<div class="mobile-bar">
+  <button type="button" class="icon-button" data-open-sidebar aria-controls="app-sidebar" aria-expanded="false" aria-label="Open Task navigation">☰</button>
+  <a class="mobile-brand" href="/"><span class="brand-mark">A</span><span>Agent Console</span></a>
+  <span class="local-indicator"><i></i> Local</span>
+</div>
+{{end}}
+
+{{define "create-task-dialog"}}
+<dialog id="create-task-dialog" class="modal compact-modal" aria-labelledby="create-task-title">
+  <form method="dialog" class="modal-close-form"><button class="icon-button" aria-label="Close">×</button></form>
+  <div class="modal-heading"><span class="modal-icon">＋</span><div><p class="eyebrow">New workspace</p><h2 id="create-task-title">Create a Task</h2><p>Group related agent Sessions around one outcome.</p></div></div>
+  <form id="create-task-form" class="stack-form">
+    <label>Title<input name="title" required maxlength="300" autocomplete="off" placeholder="Fix login regression"></label>
+    <label>Description<textarea name="description" rows="4" placeholder="What should this Task accomplish?"></textarea></label>
+    <label>External reference <span>Optional</span><input name="external_ref" autocomplete="off" placeholder="APP-91"></label>
+    <p id="task-form-notice" class="notice" role="status" aria-live="polite"></p>
+    <div class="modal-actions"><button type="button" class="secondary" data-close-dialog>Cancel</button><button type="submit" class="primary">Create Task</button></div>
+  </form>
+</dialog>
+{{end}}
+
+{{define "create-session-dialog"}}
+<dialog id="create-session-dialog" class="modal" aria-labelledby="create-session-title">
+  <form method="dialog" class="modal-close-form"><button class="icon-button" aria-label="Close">×</button></form>
+  <div class="modal-heading"><span class="modal-icon">◎</span><div><p class="eyebrow">New conversation</p><h2 id="create-session-title">Start a Session</h2><p>The agent starts through structured ACP. The verified native CLI continues this same conversation.</p></div></div>
+  <form id="create-session-form" class="stack-form">
+    <div class="form-pair">
+      <label>Agent<select name="agent" required>{{range .Agents}}<option value="{{.Name}}">{{.Name}} · {{.Provider}}</option>{{end}}</select></label>
+      <label>Role<input name="role" value="worker" required autocomplete="off"></label>
     </div>
-  </main>
-  <footer><span>Loopback-only console</span><span>Task → Sessions</span></footer>
+    <label>Git repository<input name="repo_path" required autocomplete="off" placeholder="/absolute/path/to/repository"></label>
+    <label>Instructions <span>Optional</span><textarea name="prompt" rows="4" placeholder="Additional instructions appended to the Task context"></textarea></label>
+    <details class="advanced-options">
+      <summary>Advanced options</summary>
+      <div class="check-list">
+        <label class="check"><input type="checkbox" name="worktree"><span><strong>Create isolated worktree</strong><small>Recommended for independent coding work.</small></span></label>
+        <label class="check"><input type="checkbox" name="approve_all"><span><strong>Approve writes unattended</strong><small>Allows the agent to make changes without each approval.</small></span></label>
+        <label class="check"><input type="checkbox" name="allow_shared_checkout"><span><strong>Share this checkout explicitly</strong><small>Use only when concurrent writers are intentional.</small></span></label>
+      </div>
+    </details>
+    <p id="session-form-notice" class="notice" role="status" aria-live="polite"></p>
+    <div class="modal-actions"><button type="button" class="secondary" data-close-dialog>Cancel</button><button type="submit" class="primary">Start Session</button></div>
+  </form>
+</dialog>
+{{end}}
+
+{{define "tasks"}}
+<!doctype html>
+<html lang="en">
+{{template "head" .}}
+<body data-page="{{.Page}}">
+  <a class="skip-link" href="#main-content">Skip to content</a>
+  <div class="app-shell">
+    {{template "sidebar" .}}
+    <main id="main-content" class="main-pane collection-pane">
+      {{template "mobile-bar" .}}
+      <header class="collection-header">
+        <div><p class="eyebrow">Your work</p><h1>Tasks</h1><p>Persistent workspaces for conversations with your agents.</p></div>
+        <button type="button" class="primary" data-open-dialog="create-task-dialog" aria-label="New Task"><span aria-hidden="true">＋</span><span class="action-label">New Task</span></button>
+      </header>
+      <section class="task-list" aria-label="Tasks">
+        {{range .Tasks}}
+        <a class="task-row" href="/tasks/{{.Task.ID}}">
+          <span class="task-glyph">{{if eq (printf "%s" .Task.Status) "done"}}✓{{else}}◇{{end}}</span>
+          <span class="task-row-copy"><strong>{{.Task.Title}}</strong>{{if .Task.Description}}<small>{{.Task.Description}}</small>{{else}}<small>No description</small>{{end}}</span>
+          <span class="task-row-meta"><span class="status status-{{statusTone (printf "%s" .Task.Status)}}"><i></i>{{statusLabel (printf "%s" .Task.Status)}}</span><small>{{.SessionCount}} {{if eq .SessionCount 1}}Session{{else}}Sessions{{end}}</small></span>
+          <span class="row-chevron">›</span>
+        </a>
+        {{else}}
+        <div class="welcome-empty"><span class="empty-orbit">◎</span><h2>Start with a Task</h2><p>Give the work a clear outcome, then add Codex, Claude, Grok, OpenCode, or another ACP agent as a Session.</p><button type="button" class="primary" data-open-dialog="create-task-dialog">Create your first Task</button></div>
+        {{end}}
+      </section>
+    </main>
+  </div>
+  {{template "create-task-dialog" .}}
 </body>
 </html>
 {{end}}
@@ -56,74 +131,43 @@
 {{define "task"}}
 <!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark">
-  <title>{{.PageTitle}}</title>
-  <link rel="stylesheet" href="/assets/app.css">
-  <script src="/assets/app.js" defer></script>
-</head>
+{{template "head" .}}
 <body data-page="{{.Page}}" data-task-id="{{.Task.ID}}">
-  <header class="site-header">
-    <a class="brand" href="/"><span class="brand-mark">AT</span><span>Agent Task Console</span></a>
-    <span class="local-badge">LOCAL V1</span>
-  </header>
-  <main class="shell">
-    <a class="back-link" href="/">← All Tasks</a>
-    <section class="hero task-hero">
-      <div>
-        <div class="title-line"><span class="mono id-chip">{{.Task.ID}}</span><span id="task-status" class="status status-{{statusTone (printf "%s" .Task.Status)}}"><i></i>{{.Task.Status}}</span></div>
-        <h1>{{.Task.Title}}</h1>
-        {{if .Task.Description}}<p>{{.Task.Description}}</p>{{else}}<p class="muted">No description</p>{{end}}
-        {{if .Task.ExternalRef}}<p class="reference">External reference · {{.Task.ExternalRef}}</p>{{end}}
-      </div>
-    </section>
-
-    <div class="two-column">
-      <section>
-        <div class="section-heading"><div><p class="eyebrow">Agents</p><h2>Sessions</h2><p class="section-note">Browser selection opens the structured ACP view for the same provider conversation.</p></div><span id="session-count" class="count-chip">{{len .Sessions}}</span></div>
+  <a class="skip-link" href="#main-content">Skip to content</a>
+  <div class="app-shell">
+    {{template "sidebar" .}}
+    <main id="main-content" class="main-pane collection-pane">
+      {{template "mobile-bar" .}}
+      <header class="task-header">
+        <div class="task-heading-copy">
+          <div class="breadcrumb"><a href="/">Tasks</a><span>›</span><span>Workspace</span></div>
+          <div class="heading-line"><h1>{{.Task.Title}}</h1><span id="task-status" class="status status-{{statusTone (printf "%s" .Task.Status)}}"><i></i>{{statusLabel (printf "%s" .Task.Status)}}</span></div>
+          {{if .Task.Description}}<p>{{.Task.Description}}</p>{{else}}<p class="muted">No description yet.</p>{{end}}
+          {{if .Task.ExternalRef}}<span class="reference-chip">{{.Task.ExternalRef}}</span>{{end}}
+        </div>
+        <button type="button" class="primary" data-open-dialog="create-session-dialog" aria-label="New Session"><span aria-hidden="true">＋</span><span class="action-label">New Session</span></button>
+      </header>
+      <section class="session-collection" aria-labelledby="sessions-heading">
+        <div class="section-title"><div><p class="eyebrow">Conversations</p><h2 id="sessions-heading">Sessions</h2></div><span id="session-count" class="count-chip">{{len .Sessions}}</span></div>
+        <p class="section-intro">Choose a Session to see its structured ACP conversation. From the terminal, the same Session opens in its native provider CLI.</p>
         <div id="session-list" class="session-list">
           {{range .Sessions}}
-          <a class="session-card{{if eq .Role "reviewer"}} reviewer{{end}}" href="/sessions/{{.ID}}">
-            <div><strong>{{.Agent}} · {{.Role}}</strong><span class="mono">{{.ID}}</span></div>
-            <div class="session-meta"><span class="surface-chip">ACP</span><span>{{.CheckoutLabel}}</span>{{if .Branch}}<span>{{.Branch}}</span>{{end}}</div>
-            <span class="status status-{{statusTone .Status}}"><i></i>{{.Status}}</span>
+          <a class="session-row{{if eq .Role "reviewer"}} reviewer{{end}}" href="/sessions/{{.ID}}" data-session-id="{{.ID}}">
+            <span class="provider-avatar">{{agentInitial .Agent}}</span>
+            <span class="session-row-copy"><strong>{{.Agent}} <small>· {{.Role}}</small></strong><span>{{.CheckoutLabel}}</span></span>
+            <span class="session-row-state"><span class="status status-{{statusTone .Status}}"><i></i>{{statusLabel .Status}}</span><small>{{.Permission}}</small></span>
+            <span class="row-chevron">›</span>
           </a>
           {{else}}
-          <div class="empty-state small"><h3>No Sessions</h3><p>Start the first agent Session below.</p></div>
+          <div class="welcome-empty compact"><span class="empty-orbit">◎</span><h2>No Sessions yet</h2><p>Start one agent conversation under this Task. You can add implementers, researchers, and independent reviewers.</p><button type="button" class="primary" data-open-dialog="create-session-dialog">Start the first Session</button></div>
           {{end}}
         </div>
-
-        <details class="panel create-panel">
-          <summary>Start a Session</summary>
-          <form id="create-session-form" class="form-grid">
-            <label>Agent<select name="agent" required>{{range .Agents}}<option value="{{.Name}}">{{.Name}} · {{.Provider}}</option>{{end}}</select></label>
-            <label>Role<input name="role" value="worker" required></label>
-            <label class="wide">Git repository<input name="repo_path" required placeholder="/absolute/path/to/repository"></label>
-            <label class="wide">Session instructions<textarea name="prompt" rows="3" placeholder="Optional instructions appended to Task context"></textarea></label>
-            <label class="check"><input type="checkbox" name="worktree"> Create isolated worktree</label>
-            <label class="check"><input type="checkbox" name="approve_all"> Approve writes unattended</label>
-            <label class="check"><input type="checkbox" name="allow_shared_checkout"> Explicitly share checkout</label>
-            <div class="form-action"><button type="submit" class="primary">Start Session</button></div>
-          </form>
-          <p id="form-notice" class="notice" role="status" aria-live="polite"></p>
-        </details>
       </section>
-
-      <section class="activity-column">
-        <div class="section-heading">
-          <div><p class="eyebrow">All Sessions</p><h2>Current activity</h2></div>
-          <span id="stream-state" class="stream-state"><i></i>Connecting</span>
-        </div>
-        <label class="raw-toggle"><input type="checkbox" id="raw-toggle"> Show raw execution <span>(sanitized DTO)</span></label>
-        <div id="activity" class="activity-feed" aria-live="polite">
-          <div class="empty-state small activity-placeholder"><p>Waiting for Session activity…</p></div>
-        </div>
-      </section>
-    </div>
-  </main>
-  <footer><span>Loopback-only console</span><span>Raw ACP remains private</span></footer>
+      <p id="task-live-status" class="sr-only" role="status" aria-live="polite"></p>
+    </main>
+  </div>
+  {{template "create-task-dialog" .}}
+  {{template "create-session-dialog" .}}
 </body>
 </html>
 {{end}}
@@ -131,93 +175,104 @@
 {{define "session"}}
 <!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark">
-  <title>{{.PageTitle}}</title>
-  <link rel="stylesheet" href="/assets/app.css">
-  <script src="/assets/app.js" defer></script>
-</head>
-<body data-page="{{.Page}}" data-session-id="{{.Session.ID}}" data-task-id="{{.Task.ID}}">
-  <header class="site-header">
-    <a class="brand" href="/"><span class="brand-mark">AT</span><span>Agent Task Console</span></a>
-    <span class="local-badge">LOCAL V1</span>
-  </header>
-  <main class="shell">
-    <a class="back-link" href="/tasks/{{.Task.ID}}">← {{.Task.Title}}</a>
-    <section class="hero session-hero">
-      <div>
-        <p class="eyebrow">Structured ACP view · <span class="mono">{{.Session.ID}}</span></p>
-        <h1>{{.Session.Agent}} <span>· {{.Session.Role}}</span></h1>
-        <div class="session-facts">
-          <span id="session-status" class="status status-{{statusTone .Session.Status}}"><i></i>{{.Session.Status}}</span>
-          <span>{{.Session.CheckoutLabel}}</span>
-          {{if .Session.Branch}}<span class="mono">{{.Session.Branch}}</span>{{end}}
-          <span>{{.Session.Permission}}</span>
+{{template "head" .}}
+<body data-page="{{.Page}}" data-session-id="{{.Session.ID}}" data-task-id="{{.Task.ID}}" data-session-status="{{.Session.Status}}">
+  <a class="skip-link" href="#conversation">Skip to conversation</a>
+  <div class="app-shell conversation-shell">
+    {{template "sidebar" .}}
+    <main class="main-pane conversation-pane">
+      <header class="session-header">
+        <button type="button" class="icon-button mobile-nav-button" data-open-sidebar aria-controls="app-sidebar" aria-expanded="false" aria-label="Open Task navigation">☰</button>
+        <span class="provider-avatar">{{agentInitial .Session.Agent}}</span>
+        <div class="session-title">
+          <div class="breadcrumb"><a href="/tasks/{{.Task.ID}}">{{.Task.Title}}</a><span>›</span><span>{{.Session.Role}}</span></div>
+          <h1>{{.Session.Agent}} <span>· {{.Session.Role}}</span></h1>
         </div>
-      </div>
-      <div class="control-row">
-        <button type="button" data-action="cancel">Cancel turn</button>
-        <button type="button" data-action="resume">Resume</button>
-        <button type="button" data-action="stop" class="danger-button">Stop worker</button>
-      </div>
-    </section>
+        <div class="session-header-actions">
+          <span id="session-status" class="status status-{{statusTone .Session.Status}}"><i></i>{{statusLabel .Session.Status}}</span>
+          <span id="continuity-chip" class="continuity-chip{{if .Session.ConversationVerified}} verified{{else if .Session.ConversationReady}} linked{{end}}">{{if .Session.ConversationVerified}}✓ Verified{{else if .Session.ConversationReady}}↔ Linked{{else}}○ Linking{{end}}</span>
+          <span id="stream-state" class="connection-state"><i></i><span>Connecting</span></span>
+          <button type="button" class="secondary compact-action" data-action="cancel" data-visible-status="starting,working">Stop response</button>
+          <button type="button" class="primary compact-action" data-action="resume" data-visible-status="stopped,failed,cancelled">Resume</button>
+          <button type="button" class="icon-button" data-open-dialog="session-details-dialog" aria-label="Session details and actions">•••</button>
+        </div>
+      </header>
 
-    <section id="conversation-continuity" class="continuity-banner{{if .Session.ConversationVerified}} verified{{else if .Session.ConversationReady}} linked{{end}}">
-      <div><span class="continuity-icon">{{if .Session.ConversationVerified}}✓{{else if .Session.ConversationReady}}↔{{else}}○{{end}}</span></div>
-      <div>
-        <strong>{{if .Session.ConversationReady}}Same provider conversation{{else}}Provider conversation identity pending{{end}}</strong>
-        <p>{{if .Session.ConversationVerified}}Verified against the provider's local store. Terminal attachment opens its native harness; this web/mobile view continues it through ACP.{{else if .Session.ConversationReady}}The canonical conversation is linked. This page uses ACP; terminal attachment uses the native provider harness.{{else}}The worker will link the canonical provider conversation when the provider Session is established.{{end}}</p>
+      <div id="conversation-scroll" class="conversation-scroll">
+        <section id="conversation" class="conversation" role="log" aria-live="off" aria-label="Conversation transcript">
+          <div class="conversation-loading" aria-hidden="true"><span></span><span></span><span></span></div>
+        </section>
+        <button type="button" id="jump-latest" class="jump-latest" hidden>New updates ↓</button>
       </div>
-      <span class="surface-chip">WEB / MOBILE · ACP</span>
-    </section>
 
-    <div class="two-column session-layout">
-      <section class="activity-column">
-        <div class="section-heading">
-          <div><p class="eyebrow">Stored + live</p><h2>Session activity</h2></div>
-          <span id="stream-state" class="stream-state"><i></i>Connecting</span>
+      <section class="composer-region" aria-label="Message composer">
+        <p id="conversation-announcer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
+        <p id="approval-announcer" class="sr-only" role="alert" aria-live="assertive" aria-atomic="true"></p>
+        <div class="mobile-session-actions" aria-label="Session response controls">
+          <button type="button" class="secondary compact-action" data-action="cancel" data-visible-status="starting,working">Stop response</button>
+          <button type="button" class="primary compact-action" data-action="resume" data-visible-status="stopped,failed,cancelled">Resume Session</button>
         </div>
-        <label class="raw-toggle"><input type="checkbox" id="raw-toggle"> Show raw execution <span>(sanitized DTO)</span></label>
-        <div id="activity" class="activity-feed session-feed" aria-live="polite">
-          <div class="empty-state small activity-placeholder"><p>Loading complete stored history…</p></div>
-        </div>
+        <div id="approval-shelf" class="approval-shelf" aria-label="Pending permission request" hidden></div>
+        <form id="prompt-form" class="composer">
+          <label class="sr-only" for="prompt-message">Message this Session</label>
+          <textarea id="prompt-message" name="message" rows="1" required placeholder="Message {{.Session.Agent}}…"></textarea>
+          <div class="composer-footer">
+            <div class="composer-context"><span class="surface-label">Structured ACP</span><span id="composer-hint">Enter to send · Shift+Enter for a new line</span></div>
+            <button type="submit" class="send-button" aria-label="Send message"><span>Send</span><b>↑</b></button>
+          </div>
+        </form>
+        <p id="action-notice" class="action-notice" role="status" aria-live="polite"></p>
+        <p class="detach-note">Closing this page only detaches the viewer. Session work continues.</p>
       </section>
+    </main>
+  </div>
 
-      <aside class="control-panel">
-        <section class="panel context-panel">
-          <p class="eyebrow">Execution context</p><h2>Checkout</h2>
-          <dl>
-            <dt>Repository</dt><dd class="mono">{{.Session.RepoPath}}</dd>
-            {{if .Session.WorktreePath}}<dt>Worktree</dt><dd class="mono">{{.Session.WorktreePath}}</dd>{{end}}
-            {{if .Session.Branch}}<dt>Branch</dt><dd class="mono">{{.Session.Branch}}</dd>{{end}}
-            <dt>Permission</dt><dd>{{.Session.Permission}}</dd>
-            <dt>Conversation</dt><dd id="conversation-state">{{if .Session.ConversationVerified}}Linked · verified{{else if .Session.ConversationReady}}Linked{{else}}Pending{{end}}</dd>
-          </dl>
-        </section>
-        <section class="panel prompt-panel">
-          <p class="eyebrow">New turn</p><h2>Message Session</h2>
-          <form id="prompt-form">
-            <label class="wide">Prompt<textarea name="message" rows="6" required placeholder="Steer the next turn…"></textarea></label>
-            <button type="submit" class="primary full">Send prompt</button>
-          </form>
-          <p id="action-notice" class="notice" role="status" aria-live="polite"></p>
-        </section>
-        <section class="panel">
-          <p class="eyebrow">Independent verification</p><h2>Start review</h2>
-          <form id="review-form">
-            <label>Reviewer agent<select name="agent" required>{{range .Agents}}<option value="{{.Name}}">{{.Name}} · {{.Provider}}</option>{{end}}</select></label>
-            <label class="check"><input type="checkbox" name="allow_active_producer"> Review while producer may change</label>
-            <button type="submit" class="secondary full">Create reviewer Session</button>
-          </form>
-          <p class="fine-print">By default, review requires this producer to be stopped or terminal.</p>
-        </section>
-        <section class="boundary-note"><strong>Detach is safe.</strong><p>Closing this page or stopping <span class="mono">acpctl serve</span> never stops the Session worker.</p></section>
-      </aside>
-    </div>
-  </main>
-  <footer><span>Loopback-only console</span><span>Task → Sessions</span></footer>
+  {{template "create-task-dialog" .}}
+  {{template "create-session-dialog" .}}
+
+  <dialog id="session-details-dialog" class="modal side-modal" aria-labelledby="session-details-title">
+    <form method="dialog" class="modal-close-form"><button class="icon-button" aria-label="Close">×</button></form>
+    <div class="modal-heading"><span class="modal-icon">i</span><div><p class="eyebrow">Conversation details</p><h2 id="session-details-title">{{.Session.Agent}} · {{.Session.Role}}</h2><p>Structured ACP and the native provider CLI continue the same canonical conversation.</p></div></div>
+    <dl class="detail-list">
+      <dt>Task</dt><dd>{{.Task.Title}}</dd>
+      <dt>Session</dt><dd class="mono">{{.Session.ID}}</dd>
+      <dt>Repository</dt><dd class="mono">{{.Session.RepoPath}}</dd>
+      {{if .Session.WorktreePath}}<dt>Worktree</dt><dd class="mono">{{.Session.WorktreePath}}</dd>{{end}}
+      {{if .Session.Branch}}<dt>Branch</dt><dd class="mono">{{.Session.Branch}}</dd>{{end}}
+      <dt>Permission</dt><dd>{{.Session.Permission}}</dd>
+      <dt>Continuity</dt><dd id="conversation-state">{{if .Session.ConversationVerified}}Verified{{else if .Session.ConversationReady}}Linked{{else}}Pending provider identity{{end}}</dd>
+    </dl>
+    <p class="muted">Tool text, diffs, and terminal output can contain sensitive repository content. This loopback console is for the same trusted OS user.</p>
+    <div class="details-actions"><button type="button" class="secondary" data-open-dialog="review-dialog">Create reviewer Session</button><button type="button" class="secondary" data-open-dialog="diagnostics-dialog">Open diagnostics</button></div>
+    <section class="danger-zone"><div><strong>Stop Session worker</strong><p>The conversation remains resumable, but active work is cancelled.</p></div><button type="button" class="danger-button" data-open-dialog="stop-dialog">Stop worker</button></section>
+  </dialog>
+
+  <dialog id="review-dialog" class="modal compact-modal" aria-labelledby="review-title">
+    <form method="dialog" class="modal-close-form"><button class="icon-button" aria-label="Close">×</button></form>
+    <div class="modal-heading"><span class="modal-icon">✓</span><div><p class="eyebrow">Independent verification</p><h2 id="review-title">Create a reviewer Session</h2><p>The reviewer receives evidence and repository context, not the producer's conversation.</p></div></div>
+    <form id="review-form" class="stack-form">
+      <label>Reviewer agent<select name="agent" required>{{range .Agents}}<option value="{{.Name}}">{{.Name}} · {{.Provider}}</option>{{end}}</select></label>
+      <label class="check"><input type="checkbox" name="allow_active_producer"><span><strong>Review while producer may change</strong><small>Normally the producer must be stopped or terminal.</small></span></label>
+      <p id="review-notice" class="notice" role="status" aria-live="polite"></p>
+      <div class="modal-actions"><button type="button" class="secondary" data-close-dialog>Cancel</button><button type="submit" class="primary">Create reviewer</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="diagnostics-dialog" class="modal diagnostics-modal" aria-labelledby="diagnostics-title">
+    <form method="dialog" class="modal-close-form"><button class="icon-button" aria-label="Close">×</button></form>
+    <div class="modal-heading"><span class="modal-icon">⌘</span><div><p class="eyebrow">Advanced</p><h2 id="diagnostics-title">Session diagnostics</h2><p>Bounded, sanitized gateway summaries. Provider errors, ACP envelopes, and worker internals stay in local server logs.</p></div></div>
+    <div id="diagnostics-feed" class="diagnostics-feed"><p class="muted">Waiting for activity…</p></div>
+  </dialog>
+
+  <dialog id="stop-dialog" class="modal confirm-modal" aria-labelledby="stop-title">
+    <div class="confirm-icon">!</div><h2 id="stop-title">Stop this Session worker?</h2><p>This cancels active ACP work. Closing the page does not.</p>
+    <div class="modal-actions"><button type="button" class="secondary" data-close-dialog autofocus>Keep running</button><button type="button" class="danger-button" data-action="stop">Stop worker</button></div>
+  </dialog>
+
+  <dialog id="permission-confirm-dialog" class="modal confirm-modal" aria-labelledby="permission-confirm-title">
+    <div class="confirm-icon permission">!</div><h2 id="permission-confirm-title">Confirm persistent permission</h2><p id="permission-confirm-copy">This choice may apply to later tool requests in this provider conversation.</p>
+    <div class="modal-actions"><button type="button" class="secondary" data-permission-confirm="cancel" autofocus>Go back</button><button type="button" class="primary" data-permission-confirm="accept">Confirm choice</button></div>
+  </dialog>
 </body>
 </html>
 {{end}}

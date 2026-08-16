@@ -6,6 +6,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/yty-build/acp-gateway/internal/presentation"
 	appservice "github.com/yty-build/acp-gateway/internal/service"
 	"github.com/yty-build/acp-gateway/internal/session"
 	"github.com/yty-build/acp-gateway/internal/sessionlog"
@@ -46,14 +47,15 @@ type SessionDTO struct {
 }
 
 type ActivityDTO struct {
-	SessionID  string         `json:"session_id"`
-	Position   uint64         `json:"position"`
-	RequestID  string         `json:"request_id,omitempty"`
-	Kind       string         `json:"kind"`
-	Timestamp  string         `json:"timestamp,omitempty"`
-	Activity   string         `json:"activity"`
-	Cursor     string         `json:"cursor,omitempty"`
-	Permission *PermissionDTO `json:"permission,omitempty"`
+	SessionID  string                 `json:"session_id"`
+	Position   uint64                 `json:"position"`
+	RequestID  string                 `json:"request_id,omitempty"`
+	Kind       string                 `json:"kind"`
+	Timestamp  string                 `json:"timestamp,omitempty"`
+	Activity   string                 `json:"activity"`
+	Cursor     string                 `json:"cursor,omitempty"`
+	Permission *PermissionDTO         `json:"permission,omitempty"`
+	Display    *presentation.Activity `json:"display,omitempty"`
 }
 
 type PermissionOptionDTO struct {
@@ -63,19 +65,18 @@ type PermissionOptionDTO struct {
 }
 
 type PermissionDTO struct {
-	ID         string                `json:"id"`
-	RequestID  string                `json:"request_id,omitempty"`
-	ToolCallID string                `json:"tool_call_id,omitempty"`
-	Title      string                `json:"title,omitempty"`
-	Kind       string                `json:"kind,omitempty"`
-	State      string                `json:"state"`
-	Decision   string                `json:"decision,omitempty"`
-	Options    []PermissionOptionDTO `json:"options,omitempty"`
+	ID        string                `json:"id"`
+	RequestID string                `json:"request_id,omitempty"`
+	Title     string                `json:"title,omitempty"`
+	Kind      string                `json:"kind,omitempty"`
+	State     string                `json:"state"`
+	Decision  string                `json:"decision,omitempty"`
+	Options   []PermissionOptionDTO `json:"options,omitempty"`
 }
 
 func makePendingPermissionDTO(pending worker.PendingPermission) PermissionDTO {
 	result := PermissionDTO{
-		ID: pending.ID, RequestID: pending.RequestID, ToolCallID: pending.ToolCallID,
+		ID: pending.ID, RequestID: pending.RequestID,
 		Title: safePermissionText(pending.Title, 1024), Kind: safePermissionText(pending.Kind, 64), State: "waiting",
 	}
 	for _, option := range pending.Options {
@@ -108,7 +109,10 @@ func makeActivityPermissionDTO(line sessionlog.Line) *PermissionDTO {
 		decision := value.Decision
 		if line.Type == "permission_abandoned" {
 			state = "abandoned"
-			decision = value.Message
+			// Transport/provider diagnostics are deliberately excluded from the
+			// browser contract. The trusted local log remains available to the
+			// terminal operator.
+			decision = "unavailable"
 		}
 		return &PermissionDTO{ID: value.ID, RequestID: line.RequestID, State: state, Decision: safePermissionText(decision, 1024)}
 	default:

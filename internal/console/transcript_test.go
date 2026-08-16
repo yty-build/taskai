@@ -9,6 +9,7 @@ import (
 
 	"github.com/yty-build/acp-gateway/internal/acp"
 	"github.com/yty-build/acp-gateway/internal/sessionlog"
+	"github.com/yty-build/acp-gateway/internal/worker"
 )
 
 func TestTranscriptProjectsTurnsAndCoalescesRealShapedACP(t *testing.T) {
@@ -147,6 +148,7 @@ func TestTranscriptMergesToolLifecycleAndBoundsLargeBodies(t *testing.T) {
 func TestTranscriptUpdatesPlanPermissionErrorsAndCancellation(t *testing.T) {
 	projection := newTranscript()
 	requestID := "REQ-STATE"
+	permissionID := worker.PermissionConsoleID(requestID, "8")
 	lines := []sessionlog.Line{
 		projectionLine(1, requestID, "prompt_submitted", map[string]any{"display_message": "Make a safe change."}),
 		projectionLine(2, requestID, "turn_started", map[string]any{}),
@@ -162,7 +164,7 @@ func TestTranscriptUpdatesPlanPermissionErrorsAndCancellation(t *testing.T) {
 				"options": []any{map[string]any{"optionId": "allow", "name": "Allow once", "kind": "allow_once"}, map[string]any{"optionId": "reject", "name": "Deny", "kind": "reject_once"}},
 			},
 		}),
-		projectionLine(6, requestID, "permission_resolved", map[string]any{"permission_id": "8:tool-write", "decision": "deny"}),
+		projectionLine(6, requestID, "permission_resolved", map[string]any{"permission_id": permissionID, "decision": "deny"}),
 		projectionLine(7, requestID, "cancel_requested", map[string]any{}),
 		projectionACPLine(8, requestID, "prompt_result", map[string]any{"jsonrpc": "2.0", "id": 3, "result": map[string]any{"stopReason": "cancelled"}}),
 		projectionLine(9, requestID, "turn_completed", map[string]any{"stopReason": "cancelled"}),
@@ -180,7 +182,7 @@ func TestTranscriptUpdatesPlanPermissionErrorsAndCancellation(t *testing.T) {
 	if len(request.permission) != 1 {
 		t.Fatalf("permissions = %#v", request.permission)
 	}
-	card := request.permission["8:tool-write"]
+	card := request.permission[permissionID]
 	if card == nil || card.state != "resolved" || card.decision != "deny" {
 		t.Fatalf("permission = %#v", card)
 	}
@@ -191,20 +193,21 @@ func TestTranscriptUpdatesPlanPermissionErrorsAndCancellation(t *testing.T) {
 
 func TestTranscriptRestoresWorkerPermissionBeforeACPEventAndAbandonsIt(t *testing.T) {
 	projection := newTranscript()
+	permissionID := worker.PermissionConsoleID("REQ-PENDING", "permission-2")
 	projection.apply(projectionLine(1, "REQ-PENDING", "prompt_submitted", map[string]any{"display_message": "Write safely."}))
 	projection.apply(projectionLine(2, "REQ-PENDING", "permission_requested", map[string]any{
-		"id": "permission-2:tool-write", "request_id": "REQ-PENDING", "tool_call_id": "tool-write",
+		"id": permissionID, "request_id": "REQ-PENDING",
 		"title": "Write marker", "kind": "edit", "options": []any{
 			map[string]any{"id": "allow", "name": "Allow once", "kind": "allow_once"},
 			map[string]any{"id": "reject", "name": "Reject", "kind": "reject_once"},
 		},
 	}))
 	_, pending := projection.pendingPermission()
-	if pending == nil || pending.id != "permission-2:tool-write" || len(pending.options) != 2 {
+	if pending == nil || pending.id != permissionID || len(pending.options) != 2 {
 		t.Fatalf("worker permission was not restored: %#v", pending)
 	}
 	projection.apply(projectionLine(3, "REQ-PENDING", "permission_abandoned", map[string]any{
-		"permission_id": "permission-2:tool-write", "message": "worker stopped",
+		"permission_id": permissionID, "message": "worker stopped",
 	}))
 	if _, stillPending := projection.pendingPermission(); stillPending != nil {
 		t.Fatalf("abandoned permission remained actionable: %#v", stillPending)

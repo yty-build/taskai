@@ -169,8 +169,9 @@ Commit: `feat: expose the versioned task and session API`
 ## D13 — Local web UI
 
 - Implement `acpctl serve` with Go `net/http`, server-rendered HTML, minimal JavaScript, and SSE.
-- Add Tasks, Task detail, clickable Session detail, stored+live history, prompt/cancel/resume/stop, review, and raw execution controls.
-- Make desktop and mobile layouts responsive structured ACP views of the same canonical provider conversation.
+- Add Tasks, Task detail, clickable Session detail, stored+live semantic conversation history, prompt/cancel/resume/stop, review, and bounded sanitized diagnostics.
+- Make desktop and mobile layouts responsive structured ACP views of the same canonical provider conversation: persistent navigation on desktop; an accessible drawer, sticky composer, pinned approvals, and retained response controls on mobile.
+- Coalesce streamed assistant output, merge tool updates, preserve reader position and disclosure state, and enforce cumulative browser-state limits.
 - Expose only safe linked/verified continuity indicators; never send provider conversation identifiers to the browser.
 - Use `/api/v1` and shared services; do not duplicate business logic.
 - Prove stopping the web server does not affect workers.

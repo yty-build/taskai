@@ -66,10 +66,25 @@ Activity:
   "request_id": "REQ-…",
   "kind": "acp",
   "timestamp": "2026-08-14T20:02:00Z",
-  "activity": "13:02:00 [REQ-…] ran go test ./...",
+  "activity": "Run tests · completed",
+  "display": {
+    "type": "tool_upsert",
+    "tool": {
+      "id": "opaque-display-key",
+      "title": "Run tests",
+      "kind": "execute",
+      "status": "completed",
+      "detail": "PASS",
+      "detail_label": "result"
+    }
+  },
   "cursor": "opaque-task-cursor-only"
 }
 ```
+
+`activity` is a short, backward-compatible sanitized summary. `display` is an optional semantic delta for structured clients. Its `type` is one of `user_message`, `legacy_user_message`, `assistant_chunk`, `thought_chunk`, `tool_upsert`, `plan_replace`, `permission`, `error_upsert`, or `turn_state`. Clients merge deltas by request ID and monotonic position; tool IDs and assistant message IDs are opaque display-grouping keys, not provider identifiers.
+
+The projection is deliberately bounded. A single assistant message is at most 128 KiB, thought text 32 KiB, tool detail 64 KiB, plan text 128 KiB/128 entries, and preview text 2 KiB/three lines. Tool output uses an allowlist of normalized text/diff/terminal fields. Paths become basenames; commands, queries, URLs, raw input/output objects, arbitrary metadata, provider/worker error detail, and structured credential/environment fields are omitted. Allowlisted text, diffs, and terminal output are content rather than a secret-scanning boundary and may contain sensitive repository or tool-produced values. `truncated: true` tells clients that the authoritative local Session log contains more.
 
 For `permission_requested`, Activity may additionally include a sanitized actionable permission object:
 
@@ -78,7 +93,6 @@ For `permission_requested`, Activity may additionally include a sanitized action
   "permission": {
     "id": "permission-…:tool-…",
     "request_id": "REQ-…",
-    "tool_call_id": "tool-…",
     "title": "Write marker",
     "kind": "edit",
     "state": "waiting",
@@ -90,7 +104,7 @@ For `permission_requested`, Activity may additionally include a sanitized action
 }
 ```
 
-Only safe labels and exact opaque IDs needed to decide are exposed. Raw tool input, provider environment/auth, ACP wire data, and worker paths remain private.
+Only safe labels and the exact permission/option IDs needed to decide are exposed. Raw tool input, provider environment/auth, provider/worker errors, ACP wire data, and worker paths remain private.
 
 The three `conversation_*` fields expose only safe continuity state. Database/runtime-only values remain intentionally absent: worker PID, Unix socket, JSONL path, metadata JSON storage representation, the canonical provider conversation ID, acpx record ID, ACP Session ID, native adapter ID, and raw ACP data.
 
@@ -198,7 +212,11 @@ curl -N 'http://127.0.0.1:8080/api/v1/sessions/S-…/stream?cursor=17'
 
 If both are supplied they must agree. Positions are monotonically increasing within the Session. `request_id` correlates output with prompt submission.
 
-For a stopped Session, the server sends all stored records after the cursor and closes. For an active Session, worker subscription replays stored/missed output before live output.
+Browser EventSource clients that need a one-time resume point may use `?seed=17`. The seed applies only when `Last-Event-ID` is absent; after the first response, automatic reconnect uses the browser's advancing `Last-Event-ID`. Do not combine `seed` with `cursor`.
+
+After the connection's stored replay, the Session stream emits an unnumbered `event: ready` with `data: {}`. Activity received after that marker belongs to the live side of this connection; clients may use the boundary to suppress assistive announcements during history hydration. Every reconnect receives its own marker, and the marker does not advance the activity cursor.
+
+For a stopped Session, the server sends all stored records after the cursor, emits `ready`, and closes. For an active Session, records committed after the replay snapshot are delivered after `ready` through the worker subscription without a cursor gap.
 
 ## Task stream
 
@@ -212,7 +230,7 @@ data: {"session_id":"S-2","position":9,"request_id":"REQ-…","kind":"acp","time
 
 Pass the opaque value unchanged in `Last-Event-ID` or `?cursor=`. Do not decode or construct it. A reconnect replays only records not acknowledged for their owning Session. Newly created Sessions are discovered while the Task stream remains connected.
 
-Task cursor limits protect the local HTTP process from unbounded headers. Malformed, oversized, concatenated, or conflicting cursors receive `400`.
+Task cursor limits protect the local HTTP process from unbounded headers. Malformed, oversized, concatenated, or conflicting cursors receive `400`. If the Task's own Session set cannot fit a valid bounded cursor, opening its aggregate stream fails closed with `422 stream_limit`; individual Session streams remain available.
 
 ## Errors
 

@@ -107,8 +107,8 @@ Task and structured ACP console controls (provider-native keys remain owned by t
 
 | Key | Effect |
 | --- | --- |
-| `↑`/`↓`, `j`/`k`, mouse | Select or scroll |
-| `Enter` or click | Open selected Session in its real provider-native harness |
+| `↑`/`↓`, `j`/`k`, click | Select a Session; mouse wheel scrolls the pane under it |
+| `Enter` | Open the selected Session in its real provider-native harness |
 | `a` (Task screen) | Open the selected Session's structured ACP console |
 | `n` (Task screen) | Open the in-console New Session wizard; choose agent, role, repository, worktree, permission mode, and optional prompt |
 | `p` | Prompt the selected/current Session only |
@@ -163,7 +163,9 @@ acpctl serve
 
 Use `--listen 127.0.0.1:0` for an automatically selected port. Only explicit loopback IPs are accepted; wildcard, hostname, and public bindings are rejected. Stopping `acpctl serve` does not stop Session workers.
 
-The responsive web UI provides Task creation/list/detail, Session creation/detail, stored and live structured ACP activity, prompt/cancel/resume/stop, review creation, and a sanitized raw execution DTO view. It shows whether the same canonical provider conversation is linked and provider-store verified without exposing that identifier. Raw worker sockets, JSONL paths, provider identifiers, and ACP wire payloads do not cross the browser API boundary.
+The responsive web UI is a conversation-first structured ACP client: a persistent Task/Session rail, user and assistant turns, collapsed reasoning, bounded tool and plan cards, a pinned approval shelf, and a sticky multiline composer. It supports prompt/cancel/resume/stop and reviewer creation, preserves reading position during streaming, and becomes a single-pane drawer layout on mobile. Session IDs, checkout details, continuity state, and bounded sanitized diagnostics live behind Details instead of competing with the conversation.
+
+The browser shows whether the same canonical provider conversation is linked and provider-store verified without exposing that identifier. Raw worker/provider errors, sockets, JSONL paths, provider identifiers, structured environment/auth fields, commands derived from raw input, raw tool objects, and ACP wire payloads do not cross the browser API boundary. Allowlisted provider-visible text, diffs, and terminal output are intentionally rendered and can contain sensitive repository or tool-produced content; this loopback console is for the same trusted OS user and is not a secret scanner. Trusted local forensic inspection remains available through terminal `--raw` logs.
 
 The JSON/SSE API is rooted at `/api/v1`, with `/healthz` for local health checks. Session streams use numeric per-Session positions. Task streams use opaque cursors containing independent positions for every Session. Both accept `Last-Event-ID` or `?cursor=` for lossless replay. See [API.md](docs/API.md).
 

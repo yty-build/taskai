@@ -1,6 +1,12 @@
 "use strict";
 
 const page = document.body.dataset.page;
+const textEncoder = new TextEncoder();
+const LIMITS = Object.freeze({
+  assistant: 128 << 10, thought: 32 << 10, tool: 64 << 10, toolTotal: 256 << 10,
+  plan: 128 << 10, diagnostics: 1000, turns: 256, blocksPerTurn: 512,
+  toolsPerTurn: 256, permissions: 128, retained: 16 << 20, announcement: 768
+});
 
 async function apiRequest(path, method = "GET", body) {
   const options = { method, headers: { Accept: "application/json" } };
@@ -9,21 +15,23 @@ async function apiRequest(path, method = "GET", body) {
     options.body = JSON.stringify(body);
   }
   const response = await fetch(path, options);
-  const text = await response.text();
+  const responseText = await response.text();
   let payload = {};
-  if (text) {
-    try { payload = JSON.parse(text); } catch (_) { payload = {}; }
+  if (responseText) {
+    try { payload = JSON.parse(responseText); } catch (_) { payload = {}; }
   }
   if (!response.ok) {
-    const message = payload.error && payload.error.message ? payload.error.message : `Request failed (${response.status})`;
-    throw new Error(message);
+    const message = payload.error?.message || `Request failed (${response.status})`;
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
   }
   return payload;
 }
 
 function setNotice(element, message, isError = false) {
   if (!element) return;
-  element.textContent = message;
+  element.textContent = message || "";
   element.classList.toggle("error", isError);
 }
 
@@ -35,16 +43,128 @@ function statusTone(status) {
   return "neutral";
 }
 
+function statusLabel(status) {
+  return ({ starting: "Starting", working: "Working", waiting: "Ready", review: "In review", open: "Open", stopped: "Stopped", done: "Complete", failed: "Failed", cancelled: "Cancelled" })[status] || "Unknown";
+}
+
 function setStatus(element, status) {
   if (!element) return;
   element.className = `status status-${statusTone(status)}`;
-  element.replaceChildren();
-  element.append(document.createElement("i"), document.createTextNode(status));
+  const dot = document.createElement("i");
+  element.replaceChildren(dot, document.createTextNode(statusLabel(status)));
+}
+
+function agentInitial(value) {
+  return Array.from(String(value || "A").trim())[0]?.toUpperCase() || "A";
+}
+
+function findNavSession(sessionID) {
+  const target = `/sessions/${encodeURIComponent(sessionID)}`;
+  return Array.from(document.querySelectorAll(".nav-session")).find((link) => link.getAttribute("href") === target) || null;
+}
+
+function bindShell() {
+  const sidebar = document.querySelector("#app-sidebar");
+  const main = document.querySelector(".main-pane");
+  const mobileNavigation = window.matchMedia("(max-width: 760px)");
+  const dialogReturnFocus = new WeakMap();
+  let sidebarOpener = null;
+  const sidebarTriggers = Array.from(document.querySelectorAll("[data-open-sidebar]"));
+  const setSidebarExpanded = (expanded) => sidebarTriggers.forEach((button) => button.setAttribute("aria-expanded", String(expanded)));
+  const closeSidebar = () => {
+    if (!document.body.classList.contains("sidebar-open")) return;
+    document.body.classList.remove("sidebar-open");
+    setSidebarExpanded(false);
+    if (main) main.inert = false;
+    if (sidebar && mobileNavigation.matches) sidebar.inert = true;
+    sidebar?.removeAttribute("role");
+    sidebar?.removeAttribute("aria-modal");
+    if (mobileNavigation.matches) sidebar?.setAttribute("aria-hidden", "true");
+    const target = sidebarOpener;
+    sidebarOpener = null;
+    window.setTimeout(() => target?.focus(), 0);
+  };
+  const openSidebar = (button) => {
+    sidebarOpener = button;
+    document.body.classList.add("sidebar-open");
+    setSidebarExpanded(true);
+    if (main) main.inert = true;
+    if (sidebar) sidebar.inert = false;
+    sidebar?.setAttribute("aria-hidden", "false");
+    sidebar?.setAttribute("role", "dialog");
+    sidebar?.setAttribute("aria-modal", "true");
+    window.setTimeout(() => sidebar?.querySelector(".sidebar-close, a, button")?.focus(), 0);
+  };
+  for (const button of sidebarTriggers) button.addEventListener("click", () => openSidebar(button));
+  for (const button of document.querySelectorAll("[data-close-sidebar]")) button.addEventListener("click", closeSidebar);
+  const syncSidebarMode = () => {
+    if (!mobileNavigation.matches) {
+      document.body.classList.remove("sidebar-open");
+      setSidebarExpanded(false);
+      if (main) main.inert = false;
+      if (sidebar) sidebar.inert = false;
+      sidebar?.removeAttribute("aria-hidden");
+      sidebar?.removeAttribute("role");
+      sidebar?.removeAttribute("aria-modal");
+    } else if (!document.body.classList.contains("sidebar-open")) {
+      if (sidebar) sidebar.inert = true;
+      sidebar?.setAttribute("aria-hidden", "true");
+    }
+  };
+  syncSidebarMode();
+  mobileNavigation.addEventListener?.("change", syncSidebarMode);
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && document.body.classList.contains("sidebar-open")) {
+      closeSidebar();
+      return;
+    }
+    if (event.key === "Tab" && document.body.classList.contains("sidebar-open") && sidebar) {
+      const focusable = Array.from(sidebar.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'));
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+  });
+
+  for (const button of document.querySelectorAll("[data-open-dialog]")) {
+    button.addEventListener("click", () => {
+      const target = document.getElementById(button.dataset.openDialog);
+      if (!(target instanceof HTMLDialogElement)) return;
+      const source = button.closest("dialog");
+      dialogReturnFocus.set(target, source instanceof HTMLDialogElement ? (dialogReturnFocus.get(source) || document.querySelector(`[data-open-dialog="${source.id}"]`)) : button);
+      if (source instanceof HTMLDialogElement && source.open && source !== target) source.close();
+      if (!target.open) target.showModal();
+      const focusTarget = target.querySelector("input:not([type=checkbox]), textarea, select, button:not(.icon-button)");
+      window.setTimeout(() => focusTarget?.focus(), 0);
+    });
+  }
+  for (const button of document.querySelectorAll("[data-close-dialog]")) {
+    button.addEventListener("click", () => button.closest("dialog")?.close());
+  }
+  for (const dialog of document.querySelectorAll("dialog")) {
+    dialog.addEventListener("close", () => {
+      const target = dialogReturnFocus.get(dialog);
+      if (target && !document.querySelector("dialog[open]")) window.setTimeout(() => target.focus(), 0);
+    });
+    dialog.addEventListener("click", (event) => {
+      if (event.target !== dialog) return;
+      const bounds = dialog.getBoundingClientRect();
+      const inside = event.clientX >= bounds.left && event.clientX <= bounds.right && event.clientY >= bounds.top && event.clientY <= bounds.bottom;
+      if (!inside) dialog.close();
+    });
+  }
 }
 
 function bindTaskCreation() {
   const form = document.querySelector("#create-task-form");
-  const notice = document.querySelector("#form-notice");
+  const notice = document.querySelector("#task-form-notice");
   if (!form) return;
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -54,9 +174,7 @@ function bindTaskCreation() {
     try {
       const data = new FormData(form);
       const result = await apiRequest("/api/v1/tasks", "POST", {
-        title: data.get("title"),
-        description: data.get("description"),
-        external_ref: data.get("external_ref")
+        title: data.get("title"), description: data.get("description"), external_ref: data.get("external_ref")
       });
       window.location.assign(`/tasks/${encodeURIComponent(result.task.id)}`);
     } catch (error) {
@@ -68,23 +186,18 @@ function bindTaskCreation() {
 
 function bindSessionCreation(taskID) {
   const form = document.querySelector("#create-session-form");
-  const notice = document.querySelector("#form-notice");
-  if (!form) return;
+  const notice = document.querySelector("#session-form-notice");
+  if (!form || !taskID) return;
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     const submit = form.querySelector("button[type=submit]");
     submit.disabled = true;
-    setNotice(notice, "Starting detached Session worker…");
+    setNotice(notice, "Starting Session and connecting the agent…");
     try {
       const data = new FormData(form);
       const result = await apiRequest(`/api/v1/tasks/${encodeURIComponent(taskID)}/sessions`, "POST", {
-        agent: data.get("agent"),
-        role: data.get("role"),
-        repo_path: data.get("repo_path"),
-        prompt: data.get("prompt"),
-        worktree: data.has("worktree"),
-        approve_all: data.has("approve_all"),
-        allow_shared_checkout: data.has("allow_shared_checkout")
+        agent: data.get("agent"), role: data.get("role"), repo_path: data.get("repo_path"), prompt: data.get("prompt"),
+        worktree: data.has("worktree"), approve_all: data.has("approve_all"), allow_shared_checkout: data.has("allow_shared_checkout")
       });
       window.location.assign(`/sessions/${encodeURIComponent(result.session.id)}`);
     } catch (error) {
@@ -94,241 +207,1407 @@ function bindSessionCreation(taskID) {
   });
 }
 
-function makeSessionCard(item) {
+function makeSessionRow(item) {
   const link = document.createElement("a");
-  link.className = item.role === "reviewer" ? "session-card reviewer" : "session-card";
+  link.className = item.role === "reviewer" ? "session-row reviewer" : "session-row";
   link.href = `/sessions/${encodeURIComponent(item.id)}`;
+  link.dataset.sessionId = item.id;
 
-  const identity = document.createElement("div");
+  const avatar = document.createElement("span");
+  avatar.className = "provider-avatar";
+  avatar.textContent = agentInitial(item.agent);
+
+  const copy = document.createElement("span");
+  copy.className = "session-row-copy";
   const title = document.createElement("strong");
-  title.textContent = `${item.agent} · ${item.role}`;
-  const id = document.createElement("span");
-  id.className = "mono";
-  id.textContent = item.id;
-  identity.append(title, id);
-
-  const meta = document.createElement("div");
-  meta.className = "session-meta";
-  const surface = document.createElement("span");
-  surface.className = "surface-chip";
-  surface.textContent = "ACP";
-  const checkout = document.createElement("span");
-  const path = item.worktree_path || item.repo_path || "No checkout";
-  checkout.textContent = path.split("/").filter(Boolean).pop() || path;
-  meta.append(surface, checkout);
-  if (item.branch) {
-    const branch = document.createElement("span");
-    branch.textContent = item.branch;
-    meta.append(branch);
-  }
+  title.append(document.createTextNode(item.agent), document.createTextNode(" · "));
+  const role = document.createElement("small");
+  role.textContent = item.role;
+  title.append(role);
+  const context = document.createElement("span");
+  const path = item.repo_path || "No checkout";
+  const checkout = path.split("/").filter(Boolean).pop() || path;
+  context.textContent = `${checkout}${item.worktree_path ? " · isolated worktree" : ""}`;
+  copy.append(title, context);
 
   const state = document.createElement("span");
-  setStatus(state, item.status);
-  link.append(identity, meta, state);
+  state.className = "session-row-state";
+  const status = document.createElement("span");
+  setStatus(status, item.status);
+  const permission = document.createElement("small");
+  permission.textContent = item.permission;
+  state.append(status, permission);
+
+  const chevron = document.createElement("span");
+  chevron.className = "row-chevron";
+  chevron.textContent = "›";
+  link.append(avatar, copy, state, chevron);
   return link;
 }
 
+function updateSessionRow(link, item) {
+  link.className = item.role === "reviewer" ? "session-row reviewer" : "session-row";
+  link.href = `/sessions/${encodeURIComponent(item.id)}`;
+  link.dataset.sessionId = item.id;
+  const avatar = link.querySelector(".provider-avatar");
+  if (avatar) avatar.textContent = agentInitial(item.agent);
+  const title = link.querySelector(".session-row-copy > strong");
+  if (title) {
+    title.replaceChildren(document.createTextNode(item.agent), document.createTextNode(" · "));
+    const role = document.createElement("small");
+    role.textContent = item.role;
+    title.append(role);
+  }
+  const context = link.querySelector(".session-row-copy > span");
+  if (context) {
+    const path = item.repo_path || "No checkout";
+    const checkout = path.split("/").filter(Boolean).pop() || path;
+    context.textContent = `${checkout}${item.worktree_path ? " · isolated worktree" : ""}`;
+  }
+  setStatus(link.querySelector(".session-row-state .status"), item.status);
+  const permission = link.querySelector(".session-row-state small");
+  if (permission) permission.textContent = item.permission;
+}
+
+let taskSessionSignature = "";
 async function refreshTask(taskID) {
   const result = await apiRequest(`/api/v1/tasks/${encodeURIComponent(taskID)}`);
   setStatus(document.querySelector("#task-status"), result.task.status);
   const count = document.querySelector("#session-count");
   if (count) count.textContent = String(result.sessions.length);
+  const signature = JSON.stringify(result.sessions.map((item) => [item.id, item.status, item.agent, item.role, item.permission, item.updated_at]));
+  if (signature === taskSessionSignature) return;
+  taskSessionSignature = signature;
+  for (const item of result.sessions) {
+    const navLink = findNavSession(item.id);
+    const dot = navLink?.querySelector(".status-dot");
+    if (dot) {
+      dot.className = `status-dot status-${statusTone(item.status)}`;
+      dot.setAttribute("aria-label", statusLabel(item.status));
+    }
+  }
   const list = document.querySelector("#session-list");
   if (!list) return;
-  list.replaceChildren();
   if (result.sessions.length === 0) {
+    if (list.querySelector(".welcome-empty")) return;
+    const fragment = document.createDocumentFragment();
     const empty = document.createElement("div");
-    empty.className = "empty-state small";
-    const title = document.createElement("h3");
-    title.textContent = "No Sessions";
+    empty.className = "welcome-empty compact";
+    const icon = document.createElement("span");
+    icon.className = "empty-orbit";
+    icon.textContent = "◎";
+    const heading = document.createElement("h2");
+    heading.textContent = "No Sessions yet";
     const detail = document.createElement("p");
-    detail.textContent = "Start the first agent Session below.";
-    empty.append(title, detail);
-    list.append(empty);
-    return;
+    detail.textContent = "Start one agent conversation under this Task.";
+    const action = document.createElement("button");
+    action.type = "button";
+    action.className = "primary";
+    action.textContent = "Start the first Session";
+    action.addEventListener("click", () => document.querySelector("#create-session-dialog")?.showModal());
+    empty.append(icon, heading, detail, action);
+    fragment.append(empty);
+    list.replaceChildren(fragment);
+  } else {
+    list.querySelector(".welcome-empty")?.remove();
+    const existing = new Map(Array.from(list.querySelectorAll(".session-row[data-session-id]")).map((row) => [row.dataset.sessionId, row]));
+    const desired = [];
+    for (const item of result.sessions) {
+      const row = existing.get(item.id) || makeSessionRow(item);
+      updateSessionRow(row, item);
+      desired.push(row);
+      existing.delete(item.id);
+    }
+    for (const row of existing.values()) row.remove();
+    for (let index = 0; index < desired.length; index += 1) {
+      if (list.children[index] !== desired[index]) list.insertBefore(desired[index], list.children[index] || null);
+    }
   }
-  for (const item of result.sessions) list.append(makeSessionCard(item));
+  setNotice(document.querySelector("#task-live-status"), "Session list updated.");
 }
 
-const activityState = { entries: [], seen: new Set(), permissions: new Map() };
+function truncateUTF8(value, limit) {
+  if (!value || limit <= 0) return { text: "", bytes: 0, clipped: Boolean(value) };
+  const encoded = textEncoder.encode(value);
+  if (encoded.length <= limit) return { text: value, bytes: encoded.length, clipped: false };
+  let text = "";
+  let bytes = 0;
+  for (const character of value) {
+    const size = textEncoder.encode(character).length;
+    if (bytes + size > limit) break;
+    text += character;
+    bytes += size;
+  }
+  return { text, bytes, clipped: true };
+}
 
-function rememberPermission(activity) {
-  const permission = activity.permission;
-  if (!permission || !permission.id) return false;
-  activityState.permissions.set(permission.id, permission);
+function appendBounded(block, addition, limit) {
+  if (!addition || block.clipped) return;
+  const available = Math.max(0, limit - block.bytes);
+  const part = truncateUTF8(addition, available);
+  block.text += part.text;
+  block.bytes += part.bytes;
+  block.clipped = block.clipped || part.clipped;
+}
+
+function beginFormSubmission(form) {
+  if (form.dataset.submitting === "true") return false;
+  form.dataset.submitting = "true";
   return true;
 }
 
-async function submitPermission(sessionID, permission, option, card) {
-  const persistent = option.kind === "allow_always" || option.kind === "reject_always";
-  const warning = persistent ? " This is a persistent provider choice." : "";
-  if (!window.confirm(`${option.name || option.kind} for ${permission.title || "this tool request"}?${warning}`)) return;
-  for (const button of card.querySelectorAll("button")) button.disabled = true;
-  const notice = document.querySelector("#action-notice");
-  setNotice(notice, "Sending exact permission decision…");
-  try {
-    await apiRequest(`/api/v1/sessions/${encodeURIComponent(sessionID)}/permissions/decision`, "POST", {
-      permission_id: permission.id,
-      option_id: option.id,
-      cancelled: false
-    });
-    activityState.permissions.set(permission.id, { ...permission, state: "resolved", decision: option.kind });
-    renderActivities();
-    setNotice(notice, "Permission decision accepted; the agent turn continues.");
-  } catch (error) {
-    for (const button of card.querySelectorAll("button")) button.disabled = false;
-    setNotice(notice, error.message, true);
+function endFormSubmission(form) {
+  form.dataset.submitting = "false";
+}
+
+function applyOptimisticPromptState(turn, acceptedState) {
+  if (turn.lifecycleSeen) return false;
+  turn.state = acceptedState === "queued" ? "queued" : "working";
+  return true;
+}
+
+const transcriptState = {
+  turns: [], byRequest: new Map(), permissions: new Map(), diagnostics: [],
+  renderTimer: 0, shouldStick: true, newUpdates: 0, lastPosition: 0, historyClipped: false,
+  permissionOverflow: false, retainedBytes: 0
+};
+
+let streamAnnouncementsReady = false;
+let conversationAnnouncementTimer = 0;
+let conversationAnnouncementScheduled = false;
+let pendingConversationAnnouncement = "";
+let pendingConversationStatus = "";
+
+function queueConversationAnnouncement(text, status = "") {
+  if (text) {
+    const used = textEncoder.encode(pendingConversationAnnouncement).length;
+    const remaining = Math.max(0, LIMITS.announcement - used);
+    if (remaining > 0) pendingConversationAnnouncement += truncateUTF8(text, remaining).text;
+  }
+  if (status) {
+    const terminal = status.includes("complete") || status.includes("stopped");
+    const pendingTerminal = pendingConversationStatus.includes("complete") || pendingConversationStatus.includes("stopped");
+    if (terminal) {
+      // Terminal state supersedes the earlier working state for this turn.
+      pendingConversationStatus = status;
+    } else if (pendingTerminal && !pendingConversationStatus.includes(status.trim())) {
+      // A queued turn may start before this batch is announced. Preserve both
+      // the completed boundary and the next turn's working state.
+      pendingConversationStatus += status;
+    } else if (!pendingTerminal) {
+      pendingConversationStatus = status;
+    }
+  }
+  if ((!pendingConversationAnnouncement && !pendingConversationStatus) || conversationAnnouncementScheduled) return;
+  conversationAnnouncementScheduled = true;
+  conversationAnnouncementTimer = window.setTimeout(() => {
+    conversationAnnouncementScheduled = false;
+    conversationAnnouncementTimer = 0;
+    const announcer = document.querySelector("#conversation-announcer");
+    const statusText = pendingConversationStatus;
+    const statusBytes = textEncoder.encode(statusText).length;
+    const body = truncateUTF8(pendingConversationAnnouncement, Math.max(0, LIMITS.announcement - statusBytes)).text;
+    const announcement = `${body}${statusText}`;
+    pendingConversationAnnouncement = "";
+    pendingConversationStatus = "";
+    if (!announcer || !announcement) return;
+    announcer.textContent = "";
+    window.setTimeout(() => { announcer.textContent = announcement; }, 0);
+  }, 700);
+}
+
+function noteStreamActivity(activity) {
+  if (!streamAnnouncementsReady) return;
+  const display = activity.display;
+  if (!display) return;
+  if (display.type === "assistant_chunk") queueConversationAnnouncement(display.text || "");
+  if (display.type === "turn_state" && display.state === "working") queueConversationAnnouncement("", " Agent is working.");
+  if (display.type === "turn_state" && ["complete", "cancelled"].includes(display.state)) {
+    queueConversationAnnouncement("", display.state === "cancelled" ? " Response stopped." : " Response complete.");
   }
 }
 
-function makePermissionCard(permission, sessionID) {
+function activityPosition(activity) {
+  const position = Number(activity?.position);
+  return Number.isFinite(position) && position > 0 ? position : Number.POSITIVE_INFINITY;
+}
+
+function orderedTurns() {
+  return [...transcriptState.turns].sort((left, right) => left.firstPosition - right.firstPosition);
+}
+
+function turnRetainedBytes(turn) {
+  let total = 0;
+  for (const block of turn.blocks) {
+    if (["user", "assistant", "thought"].includes(block.type)) total += block.bytes || 0;
+    if (block.type === "error") total += textEncoder.encode(block.text || "").length;
+    if (block.type === "plan") {
+      for (const entry of block.entries || []) total += textEncoder.encode(`${entry.content || ""}${entry.status || ""}`).length;
+    }
+    if (block.type === "tool") {
+      total += block.detailBytes || 0;
+      total += textEncoder.encode(`${block.title || ""}${block.kind || ""}${block.status || ""}${block.metadata || ""}${block.preview || ""}${block.detailLabel || ""}`).length;
+    }
+  }
+  return total;
+}
+
+function removeTurn(turn) {
+  transcriptState.turns = transcriptState.turns.filter((item) => item !== turn);
+  transcriptState.byRequest.delete(turn.id);
+  transcriptState.retainedBytes = Math.max(0, transcriptState.retainedBytes - (turn.retainedBytes || 0));
+  turn.element?.remove();
+  for (const permissionID of turn.permissionIDs) {
+    if (transcriptState.permissions.get(permissionID)?.state !== "waiting") transcriptState.permissions.delete(permissionID);
+  }
+  transcriptState.historyClipped = true;
+}
+
+function updateTurnRetention(turn) {
+  const next = turnRetainedBytes(turn);
+  transcriptState.retainedBytes += next - (turn.retainedBytes || 0);
+  turn.retainedBytes = next;
+  while (transcriptState.retainedBytes > LIMITS.retained) {
+    const candidate = orderedTurns().find((item) => item !== turn);
+    if (!candidate) break;
+    removeTurn(candidate);
+  }
+}
+
+function trimTurns() {
+  while (transcriptState.turns.length > LIMITS.turns) {
+    removeTurn(orderedTurns()[0]);
+  }
+}
+
+function appendTurnBlock(turn, block) {
+  if (turn.blocks.length >= LIMITS.blocksPerTurn) {
+    turn.contentClipped = true;
+    return false;
+  }
+  if (!block.revision) block.revision = 1;
+  turn.blocks.push(block);
+  turn.dirty = true;
+  return true;
+}
+
+function touchBlock(block) {
+  block.revision = (block.revision || 0) + 1;
+}
+
+function turnFor(activity) {
+  const requestID = activity.request_id || `local:${activity.position}`;
+  let turn = transcriptState.byRequest.get(requestID);
+  if (turn) {
+    turn.firstPosition = Math.min(turn.firstPosition, activityPosition(activity));
+    return turn;
+  }
+  turn = {
+    id: requestID, firstPosition: activityPosition(activity), state: "", stopReason: "", blocks: [],
+    tools: new Map(), plan: null, thought: null, error: null, permissionIDs: new Set(),
+    assistantBytes: 0, toolBytes: 0, retainedBytes: 0, lifecycleSeen: false, contentClipped: false, dirty: true, element: null
+  };
+  transcriptState.byRequest.set(requestID, turn);
+  transcriptState.turns.push(turn);
+  return turn;
+}
+
+function applyDisplay(activity, turn) {
+  const display = activity.display;
+  if (!display) return;
+  switch (display.type) {
+  case "legacy_user_message": {
+    if (turn.blocks.some((item) => item.type === "user")) break;
+    const value = truncateUTF8(display.text || "", LIMITS.assistant);
+    if (turn.blocks.length >= LIMITS.blocksPerTurn) {
+      turn.contentClipped = true;
+      break;
+    }
+    turn.blocks.unshift({ type: "user", text: value.text, bytes: value.bytes, clipped: value.clipped || Boolean(display.truncated), legacy: true, revision: 1 });
+    turn.dirty = true;
+    break;
+  }
+  case "user_message": {
+    let block = turn.blocks.find((item) => item.type === "user");
+    if (!block) {
+      block = { type: "user", text: "", bytes: 0, clipped: false };
+      if (turn.blocks.length >= LIMITS.blocksPerTurn) {
+        turn.contentClipped = true;
+        break;
+      }
+      turn.blocks.unshift(block);
+    }
+    const value = truncateUTF8(display.text || "", LIMITS.assistant);
+    block.text = value.text;
+    block.bytes = value.bytes;
+    block.clipped = value.clipped || Boolean(display.truncated);
+    block.legacy = false;
+    touchBlock(block);
+    turn.dirty = true;
+    break;
+  }
+  case "assistant_chunk": {
+    if (turn.assistantBytes >= LIMITS.assistant) {
+      const last = [...turn.blocks].reverse().find((item) => item.type === "assistant");
+      if (last) {
+        last.clipped = true;
+        touchBlock(last);
+      }
+      turn.contentClipped = true;
+      turn.dirty = true;
+      break;
+    }
+    const previous = turn.blocks[turn.blocks.length - 1];
+    const compatible = previous?.type === "assistant" && (previous.messageID === display.message_id || !previous.messageID || !display.message_id);
+    const block = compatible ? previous : { type: "assistant", text: "", bytes: 0, clipped: false, messageID: display.message_id || "", key: activity.position };
+    if (!compatible && !appendTurnBlock(turn, block)) break;
+    const remaining = LIMITS.assistant - turn.assistantBytes;
+    const before = block.bytes;
+    appendBounded(block, display.text || "", before + remaining);
+    turn.assistantBytes += block.bytes - before;
+    block.clipped = block.clipped || Boolean(display.truncated);
+    if (turn.assistantBytes >= LIMITS.assistant && textEncoder.encode(display.text || "").length > block.bytes - before) block.clipped = true;
+    touchBlock(block);
+    turn.dirty = true;
+    break;
+  }
+  case "thought_chunk": {
+    if (!turn.thought) {
+      turn.thought = { type: "thought", text: "", bytes: 0, clipped: false };
+      if (!appendTurnBlock(turn, turn.thought)) {
+        turn.thought = null;
+        break;
+      }
+    }
+    appendBounded(turn.thought, display.text || "", LIMITS.thought);
+    turn.thought.clipped = turn.thought.clipped || Boolean(display.truncated);
+    touchBlock(turn.thought);
+    turn.dirty = true;
+    break;
+  }
+  case "tool_upsert": {
+    const patch = display.tool;
+    if (!patch?.id) break;
+    let block = turn.tools.get(patch.id);
+    if (!block) {
+      if (turn.tools.size >= LIMITS.toolsPerTurn) {
+        turn.contentClipped = true;
+        turn.dirty = true;
+        break;
+      }
+      block = { type: "tool", id: patch.id, title: "", kind: "", status: "", metadata: "", preview: "", detail: "", detailBytes: 0, clipped: false, sensitive: false };
+      if (!appendTurnBlock(turn, block)) break;
+      turn.tools.set(patch.id, block);
+    }
+    for (const field of ["title", "kind", "status", "metadata", "detail_label"]) {
+      if (patch[field]) block[field === "detail_label" ? "detailLabel" : field] = patch[field];
+    }
+    if (patch.detail) {
+      const available = Math.min(LIMITS.tool, Math.max(0, LIMITS.toolTotal - turn.toolBytes + block.detailBytes));
+      const detail = truncateUTF8(patch.detail, available);
+      turn.toolBytes = turn.toolBytes - block.detailBytes + detail.bytes;
+      block.detail = detail.text;
+      block.detailBytes = detail.bytes;
+      block.clipped = detail.clipped || Boolean(patch.detail_clipped);
+    }
+    block.sensitive = block.sensitive || Boolean(patch.sensitive);
+    if (block.sensitive) {
+      block.preview = "";
+    } else if (patch.preview) {
+      block.preview = truncateUTF8(patch.preview, 2 << 10).text.split("\n").slice(0, 3).join("\n");
+    }
+    touchBlock(block);
+    turn.dirty = true;
+    break;
+  }
+  case "plan_replace": {
+    if (!turn.plan) {
+      turn.plan = { type: "plan", entries: [] };
+      if (!appendTurnBlock(turn, turn.plan)) {
+        turn.plan = null;
+        break;
+      }
+    }
+    let remaining = LIMITS.plan;
+    turn.plan.entries = [];
+    for (const entry of (display.plan || []).slice(0, 128)) {
+      const content = truncateUTF8(entry.content || "", remaining);
+      if (!content.text) continue;
+      turn.plan.entries.push({ content: content.text, status: truncateUTF8(entry.status || "", 64).text });
+      remaining -= content.bytes;
+      if (remaining <= 0) break;
+    }
+    touchBlock(turn.plan);
+    turn.dirty = true;
+    break;
+  }
+  case "error_upsert": {
+    if (!turn.error) {
+      turn.error = { type: "error", text: "" };
+      if (!appendTurnBlock(turn, turn.error)) {
+        turn.error = null;
+        break;
+      }
+    }
+    turn.error.text = truncateUTF8(display.text || "The provider turn failed.", LIMITS.assistant).text;
+    touchBlock(turn.error);
+    turn.state = "error";
+    turn.lifecycleSeen = true;
+    turn.dirty = true;
+    updateRuntimeStatusFromDisplay(display);
+    break;
+  }
+  case "turn_state":
+    turn.state = display.state || turn.state;
+    turn.stopReason = display.stop_reason || turn.stopReason;
+    turn.lifecycleSeen = true;
+    turn.dirty = true;
+    updateRuntimeStatusFromDisplay(display);
+    break;
+  }
+}
+
+function rememberPermission(activity, turn) {
+  const permission = activity.permission;
+  if (!permission?.id) return;
+  const existing = transcriptState.permissions.get(permission.id) || {};
+  const merged = { ...existing, ...permission };
+  if ((!permission.options || permission.options.length === 0) && existing.options) merged.options = existing.options;
+  if (!ensurePermissionCapacity(permission.id)) return;
+  transcriptState.permissions.set(permission.id, merged);
+  turn.permissionIDs.add(permission.id);
+  turn.dirty = true;
+  enforcePermissionBound();
+}
+
+function flagPermissionOverflow() {
+  transcriptState.permissionOverflow = true;
+  activeEventSource?.close();
+  activeEventSource = null;
+  const state = document.querySelector("#stream-state");
+  state?.classList.remove("connected");
+  const label = state?.querySelector("span");
+  if (label) label.textContent = "Approval limit";
+}
+
+function removePermissionRecord(id) {
+  transcriptState.permissions.delete(id);
+  for (const item of transcriptState.turns) item.permissionIDs.delete(id);
+  transcriptState.historyClipped = true;
+}
+
+function ensurePermissionCapacity(permissionID) {
+  if (transcriptState.permissions.has(permissionID)) return true;
+  while (transcriptState.permissions.size >= LIMITS.permissions) {
+    const removable = Array.from(transcriptState.permissions).find(([, item]) => item.state !== "waiting");
+    if (!removable) {
+      flagPermissionOverflow();
+      return false;
+    }
+    removePermissionRecord(removable[0]);
+  }
+  transcriptState.permissionOverflow = false;
+  return true;
+}
+
+function enforcePermissionBound() {
+  while (transcriptState.permissions.size > LIMITS.permissions || (transcriptState.permissionOverflow && transcriptState.permissions.size >= LIMITS.permissions)) {
+    const removable = Array.from(transcriptState.permissions).find(([, item]) => item.state !== "waiting");
+    if (!removable) {
+      flagPermissionOverflow();
+      break;
+    }
+    removePermissionRecord(removable[0]);
+  }
+  if (transcriptState.permissions.size < LIMITS.permissions) transcriptState.permissionOverflow = false;
+}
+
+function applyActivity(activity) {
+  const position = Number(activity.position) || 0;
+  if (position > 0 && position <= transcriptState.lastPosition) return false;
+  transcriptState.lastPosition = Math.max(transcriptState.lastPosition, position);
+  transcriptState.diagnostics.push({
+    position: activity.position, request_id: activity.request_id, kind: activity.kind,
+    timestamp: activity.timestamp, activity: activity.activity
+  });
+  if (transcriptState.diagnostics.length > LIMITS.diagnostics) transcriptState.diagnostics.shift();
+  if (!activity.display && !activity.permission) return true;
+  const turn = turnFor(activity);
+  rememberPermission(activity, turn);
+  applyDisplay(activity, turn);
+  updateTurnRetention(turn);
+  trimTurns();
+  return true;
+}
+
+function nearBottom(element) {
+  return !element || element.scrollHeight - element.scrollTop - element.clientHeight < 90;
+}
+
+function scheduleTranscriptRender() {
+  const scroller = document.querySelector("#conversation-scroll");
+  const atBottom = nearBottom(scroller);
+  if (!atBottom) transcriptState.newUpdates += 1;
+  transcriptState.shouldStick = transcriptState.shouldStick && atBottom;
+  if (transcriptState.renderTimer) return;
+  transcriptState.renderTimer = window.setTimeout(() => {
+    transcriptState.renderTimer = 0;
+    renderConversation();
+  }, 55);
+}
+
+function appendInline(parent, text) {
+  const pattern = /(\[[^\]]+\]\(https?:\/\/[^\s)]+\)|`[^`]+`|\*\*[^*]+\*\*)/g;
+  let offset = 0;
+  for (const match of text.matchAll(pattern)) {
+    if (match.index > offset) parent.append(document.createTextNode(text.slice(offset, match.index)));
+    const token = match[0];
+    let node;
+    const link = token.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/);
+    if (link) {
+      node = document.createElement("a");
+      node.textContent = link[1];
+      node.href = link[2];
+      node.target = "_blank";
+      node.rel = "noreferrer noopener";
+    } else {
+      node = token.startsWith("`") ? document.createElement("code") : document.createElement("strong");
+      node.textContent = token.startsWith("`") ? token.slice(1, -1) : token.slice(2, -2);
+    }
+    parent.append(node);
+    offset = match.index + token.length;
+  }
+  if (offset < text.length) parent.append(document.createTextNode(text.slice(offset)));
+}
+
+function appendRichText(container, text) {
+  const lines = String(text || "").split("\n");
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    if (line.startsWith("```")) {
+      const language = line.slice(3).trim();
+      const codeLines = [];
+      index += 1;
+      while (index < lines.length && !lines[index].startsWith("```")) codeLines.push(lines[index++]);
+      if (index < lines.length) index += 1;
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      if (language) code.dataset.language = language;
+      code.textContent = codeLines.join("\n");
+      pre.append(code);
+      container.append(pre);
+      continue;
+    }
+    if (!line.trim()) { index += 1; continue; }
+    const heading = line.match(/^(#{1,3})\s+(.+)$/);
+    if (heading) {
+      const node = document.createElement(`h${heading[1].length + 2}`);
+      appendInline(node, heading[2]);
+      container.append(node);
+      index += 1;
+      continue;
+    }
+    if (/^[-*]\s+/.test(line)) {
+      const list = document.createElement("ul");
+      while (index < lines.length && /^[-*]\s+/.test(lines[index])) {
+        const item = document.createElement("li");
+        appendInline(item, lines[index].replace(/^[-*]\s+/, ""));
+        list.append(item);
+        index += 1;
+      }
+      container.append(list);
+      continue;
+    }
+    if (/^\d+\.\s+/.test(line)) {
+      const list = document.createElement("ol");
+      while (index < lines.length && /^\d+\.\s+/.test(lines[index])) {
+        const item = document.createElement("li");
+        appendInline(item, lines[index].replace(/^\d+\.\s+/, ""));
+        list.append(item);
+        index += 1;
+      }
+      container.append(list);
+      continue;
+    }
+    const paragraph = [];
+    while (index < lines.length && lines[index].trim() && !lines[index].startsWith("```") && !/^(#{1,3})\s+/.test(lines[index]) && !/^[-*]\s+/.test(lines[index]) && !/^\d+\.\s+/.test(lines[index])) {
+      paragraph.push(lines[index++]);
+    }
+    const node = document.createElement("p");
+    appendInline(node, paragraph.join("\n"));
+    container.append(node);
+  }
+}
+
+function messageElement(block, assistantName) {
+  if (block.type === "user") {
+    const wrapper = document.createElement("div");
+    wrapper.className = "user-message";
+    wrapper.setAttribute("role", "group");
+    wrapper.setAttribute("aria-label", "You");
+    const body = document.createElement("div");
+    body.className = "message-body";
+    body.textContent = block.text;
+    if (block.clipped) body.append(clippedNote());
+    wrapper.append(body);
+    return wrapper;
+  }
+  const wrapper = document.createElement("div");
+  wrapper.className = "message assistant-message";
+  wrapper.setAttribute("role", "group");
+  wrapper.setAttribute("aria-label", assistantName);
+  const avatar = document.createElement("span");
+  avatar.className = "message-avatar";
+  avatar.textContent = agentInitial(assistantName);
+  const body = document.createElement("div");
+  body.className = "message-body";
+  appendRichText(body, block.text);
+  if (block.clipped) body.append(clippedNote());
+  wrapper.append(avatar, body);
+  return wrapper;
+}
+
+function clippedNote() {
+  const note = document.createElement("div");
+  note.className = "message-clipped";
+  note.textContent = "Display clipped for safety; the provider transcript remains authoritative.";
+  return note;
+}
+
+function thoughtElement(block) {
+  const details = document.createElement("details");
+  details.className = "thought-card";
+  details.dataset.detailKey = "reasoning";
+  const summary = document.createElement("summary");
+  summary.textContent = "Reasoning";
+  const content = document.createElement("div");
+  content.className = "thought-content";
+  content.textContent = block.text;
+  if (block.clipped) content.append(clippedNote());
+  details.append(summary, content);
+  summary.addEventListener("click", () => { details.dataset.userToggled = "true"; });
+  summary.addEventListener("keydown", (event) => { if (["Enter", " "].includes(event.key)) details.dataset.userToggled = "true"; });
+  return details;
+}
+
+function toolElement(tool) {
+  const details = document.createElement("details");
+  details.dataset.detailKey = `tool:${tool.id}`;
+  const normalizedStatus = String(tool.status || "").toLowerCase();
+  const running = ["in_progress", "running", "pending"].includes(normalizedStatus);
+  const failed = ["failed", "error", "cancelled"].includes(normalizedStatus);
+  details.className = `tool-card${running ? " running" : ""}${failed ? " failed" : ""}`;
+  details.open = running || failed;
+  const summary = document.createElement("summary");
+  summary.className = "tool-summary";
+  const icon = document.createElement("span");
+  icon.className = "tool-icon";
+  icon.textContent = failed ? "!" : running ? "•" : "✓";
+  const copy = document.createElement("span");
+  copy.className = "tool-copy";
+  const title = document.createElement("strong");
+  title.textContent = tool.title || tool.metadata || (tool.kind ? tool.kind.replaceAll("_", " ") : "Tool");
+  const metadata = document.createElement("small");
+  metadata.textContent = tool.metadata || tool.kind?.replaceAll("_", " ") || "";
+  copy.append(title, metadata);
+  if (tool.preview) {
+    const preview = document.createElement("span");
+    preview.className = "tool-inline-preview";
+    preview.textContent = tool.preview;
+    copy.append(preview);
+  }
+  const state = document.createElement("span");
+  state.className = "tool-status";
+  state.textContent = normalizedStatus.replaceAll("_", " ") || "updated";
+  summary.append(icon, copy, state);
+  details.append(summary);
+  if (tool.detail) {
+    const detail = document.createElement("pre");
+    detail.className = "tool-detail";
+    detail.textContent = tool.detail;
+    if (tool.clipped) detail.textContent += "\n\n… output clipped";
+    details.append(detail);
+  }
+  summary.addEventListener("click", () => { details.dataset.userToggled = "true"; });
+  summary.addEventListener("keydown", (event) => { if (["Enter", " "].includes(event.key)) details.dataset.userToggled = "true"; });
+  return details;
+}
+
+function planElement(block) {
   const card = document.createElement("section");
-  card.className = "permission-card";
+  card.className = "plan-card";
+  const heading = document.createElement("h3");
+  heading.textContent = "Current plan";
+  const list = document.createElement("ul");
+  list.className = "plan-list";
+  for (const entry of block.entries) {
+    const item = document.createElement("li");
+    const status = String(entry.status || "").replaceAll("_", "-");
+    if (["completed", "done"].includes(status)) item.className = "completed";
+    if (["in-progress", "in_progress", "working"].includes(status)) item.className = "in-progress";
+    const mark = document.createElement("span");
+    mark.className = "plan-mark";
+    mark.textContent = item.className === "completed" ? "✓" : item.className === "in-progress" ? "●" : "○";
+    const text = document.createElement("span");
+    text.textContent = entry.content;
+    item.append(mark, text);
+    list.append(item);
+  }
+  card.append(heading, list);
+  return card;
+}
+
+function renderBlockElement(block, assistantName) {
+  if (block.type === "user" || block.type === "assistant") return messageElement(block, assistantName);
+  if (block.type === "thought") return thoughtElement(block);
+  if (block.type === "tool") return toolElement(block);
+  if (block.type === "plan") return block.entries.length > 0 ? planElement(block) : null;
+  if (block.type === "error") {
+    const error = document.createElement("div");
+    error.className = "error-card";
+    error.textContent = block.text;
+    return error;
+  }
+  return null;
+}
+
+function renderTurnTail(turn) {
+  const tail = document.createElement("div");
+  tail.className = "turn-tail";
+  for (const permissionID of turn.permissionIDs) {
+    const permission = transcriptState.permissions.get(permissionID);
+    if (!permission || permission.state === "waiting") continue;
+    const resolved = document.createElement("div");
+    resolved.className = "resolved-permission";
+    resolved.textContent = permission.state === "abandoned" ? "Permission request closed" : `Permission resolved${permission.decision ? ` · ${permission.decision.replaceAll("_", " ")}` : ""}`;
+    tail.append(resolved);
+  }
+  if (["queued", "working", "cancelling", "cancelled"].includes(turn.state)) {
+    const state = document.createElement("div");
+    state.className = "turn-state-line";
+    const dot = document.createElement("i");
+    const copy = ({ queued: "Queued for the next turn", working: "Working…", cancelling: "Stopping response…", cancelled: "Response stopped" })[turn.state];
+    state.append(dot, document.createTextNode(copy));
+    tail.append(state);
+  }
+  if (turn.contentClipped) {
+    const clipped = document.createElement("div");
+    clipped.className = "turn-limit-note";
+    clipped.textContent = "Older detail in this turn is hidden to keep the browser responsive.";
+    tail.append(clipped);
+  }
+  return tail;
+}
+
+const selectionScopeSelectors = [".message-body", ".thought-content", ".tool-detail", ".tool-inline-preview", ".plan-list", ".error-card"];
+
+function selectionOffsets(root) {
+  const selection = window.getSelection?.();
+  if (!selection || selection.rangeCount === 0) return null;
+  const range = selection.getRangeAt(0);
+  if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) return null;
+  let scope = root;
+  let selector = "";
+  for (const candidateSelector of selectionScopeSelectors) {
+    const candidate = root.querySelector?.(candidateSelector);
+    if (candidate?.contains(range.startContainer) && candidate.contains(range.endContainer)) {
+      scope = candidate;
+      selector = candidateSelector;
+      break;
+    }
+  }
+  return {
+    start: selectionPoint(scope, range.startContainer, range.startOffset),
+    end: selectionPoint(scope, range.endContainer, range.endOffset),
+    selector,
+    text: range.toString()
+  };
+}
+
+function textNodes(root) {
+  if (!document.createTreeWalker || typeof NodeFilter === "undefined") return [];
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const nodes = [];
+  let node = walker.nextNode();
+  while (node) {
+    nodes.push(node);
+    node = walker.nextNode();
+  }
+  return nodes;
+}
+
+function selectionPoint(root, container, offset) {
+  const nodes = textNodes(root);
+  let absolute = 0;
+  for (let index = 0; index < nodes.length; index += 1) {
+    const node = nodes[index];
+    if (node === container) {
+      const localOffset = Math.max(0, Math.min(offset, node.data.length));
+      return {
+        index, offset: localOffset, absolute: absolute + localOffset,
+        before: node.data.slice(Math.max(0, localOffset - 128), localOffset),
+        after: node.data.slice(localOffset, localOffset + 128)
+      };
+    }
+    absolute += node.data.length;
+  }
+  const before = document.createRange?.();
+  if (!before) return { index: -1, offset: 0, absolute: 0 };
+  before.selectNodeContents(root);
+  before.setEnd(container, offset);
+  return { index: -1, offset: 0, absolute: before.toString().length };
+}
+
+function textPoint(root, offset) {
+  if (!document.createTreeWalker || typeof NodeFilter === "undefined") return null;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let remaining = Math.max(0, offset);
+  let node = walker.nextNode();
+  while (node) {
+    if (remaining <= node.data.length) return { node, offset: remaining };
+    remaining -= node.data.length;
+    node = walker.nextNode();
+  }
+  return root.lastChild ? { node: root.lastChild, offset: root.lastChild.childNodes?.length || 0 } : null;
+}
+
+function pointFromSnapshot(root, snapshot) {
+  if (!snapshot) return null;
+  const nodes = textNodes(root);
+  if (snapshot.index >= 0 && snapshot.index < nodes.length) {
+    const node = nodes[snapshot.index];
+    const localOffset = Math.max(0, Math.min(snapshot.offset, node.data.length));
+    const before = node.data.slice(Math.max(0, localOffset - 128), localOffset);
+    const after = node.data.slice(localOffset, localOffset + 128);
+    if (snapshot.offset <= node.data.length && before === snapshot.before && (after.startsWith(snapshot.after) || snapshot.after.startsWith(after))) {
+      return { node, offset: localOffset };
+    }
+  }
+  return textPoint(root, snapshot.absolute);
+}
+
+function restoreSelection(root, offsets) {
+  if (!offsets || !document.createRange || !window.getSelection) return;
+  const scope = offsets.selector ? root.querySelector?.(offsets.selector) : root;
+  if (!scope) return;
+  let start = pointFromSnapshot(scope, offsets.start);
+  let end = pointFromSnapshot(scope, offsets.end);
+  if (!start || !end) return;
+  try {
+    let range = document.createRange();
+    range.setStart(start.node, start.offset);
+    range.setEnd(end.node, end.offset);
+    if (offsets.text && range.toString() !== offsets.text) {
+      const flat = textNodes(scope).map((node) => node.data).join("");
+      let match = flat.indexOf(offsets.text);
+      let nearest = -1;
+      while (match >= 0) {
+        if (nearest < 0 || Math.abs(match - offsets.start.absolute) < Math.abs(nearest - offsets.start.absolute)) nearest = match;
+        match = flat.indexOf(offsets.text, match + 1);
+      }
+      if (nearest >= 0) {
+        const matchedStart = textPoint(scope, nearest);
+        const matchedEnd = textPoint(scope, nearest + offsets.text.length);
+        if (matchedStart && matchedEnd) {
+          range = document.createRange();
+          range.setStart(matchedStart.node, matchedStart.offset);
+          range.setEnd(matchedEnd.node, matchedEnd.offset);
+        }
+      }
+    }
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  } catch (_) {
+    // A concurrently removed text node is harmless; the next update remains live.
+  }
+}
+
+function focusIndex(root) {
+  const active = document.activeElement;
+  if (!active || !root.contains(active)) return -1;
+  return Array.from(root.querySelectorAll("a[href], button, summary, [tabindex]")).indexOf(active);
+}
+
+function patchBlockElement(block, assistantName) {
+  const previous = block.element;
+  if (previous && block.renderedRevision === block.revision) return previous;
+  const selection = previous ? selectionOffsets(previous) : null;
+  const focusedIndex = previous ? focusIndex(previous) : -1;
+  const details = previous?.matches?.("details[data-detail-key]") ? previous : null;
+  const userOpen = details?.dataset.userToggled === "true" ? details.open : null;
+  const next = renderBlockElement(block, assistantName);
+  if (next?.matches?.("details[data-detail-key]") && userOpen !== null) {
+    next.open = userOpen;
+    next.dataset.userToggled = "true";
+  }
+  if (previous?.isConnected) {
+    if (next) previous.replaceWith(next);
+    else previous.remove();
+  }
+  block.element = next;
+  block.renderedRevision = block.revision;
+  if (next && focusedIndex >= 0) {
+    const focusable = next.querySelectorAll("a[href], button, summary, [tabindex]")[focusedIndex];
+    focusable?.focus({ preventScroll: true });
+  }
+  if (next) restoreSelection(next, selection);
+  return next;
+}
+
+function patchTurnElement(turn, assistantName) {
+  let article = turn.element;
+  if (!article) {
+    article = document.createElement("article");
+    article.className = "turn";
+    article.setAttribute("aria-label", "Conversation turn");
+    const blocks = document.createElement("div");
+    blocks.className = "turn-blocks";
+    article.append(blocks);
+    turn.element = article;
+  }
+  article.dataset.state = turn.state || "";
+  const blocks = article.querySelector(".turn-blocks");
+  const desired = [];
+  for (const block of turn.blocks) {
+    const element = patchBlockElement(block, assistantName);
+    if (element) desired.push(element);
+  }
+  for (let index = 0; index < desired.length; index += 1) {
+    if (blocks.children[index] !== desired[index]) blocks.insertBefore(desired[index], blocks.children[index] || null);
+  }
+  while (blocks.children.length > desired.length) blocks.lastElementChild.remove();
+  const previousTail = article.querySelector(".turn-tail");
+  const tail = renderTurnTail(turn);
+  if (previousTail) previousTail.replaceWith(tail);
+  else article.append(tail);
+  turn.dirty = false;
+  return article;
+}
+
+function renderConversation() {
+  const container = document.querySelector("#conversation");
+  const scroller = document.querySelector("#conversation-scroll");
+  if (!container || !scroller) return;
+  const priorTop = scroller.scrollTop;
+  const assistantName = document.querySelector(".session-title h1")?.firstChild?.textContent?.trim() || "Agent";
+  if (transcriptState.turns.length === 0) {
+    if (!container.querySelector(".conversation-empty")) {
+      const empty = document.createElement("div");
+      empty.className = "conversation-empty";
+      const icon = document.createElement("span");
+      icon.className = "empty-orbit";
+      icon.textContent = "◎";
+      const heading = document.createElement("h2");
+      heading.textContent = "Start the conversation";
+      const copy = document.createElement("p");
+      copy.textContent = "Send a message below. This structured ACP view remains linked to the provider's canonical conversation.";
+      empty.append(icon, heading, copy);
+      container.replaceChildren(empty);
+    }
+  } else {
+    const desired = [];
+    if (transcriptState.historyClipped) {
+      let notice = container.querySelector("#history-limit-note");
+      if (!notice) {
+        notice = document.createElement("div");
+        notice.id = "history-limit-note";
+        notice.className = "history-limit-note";
+        notice.textContent = "Earlier conversation is hidden in this browser view. The Session log remains authoritative.";
+      }
+      desired.push(notice);
+    }
+    for (const turn of orderedTurns()) {
+      if (!turn.element || turn.dirty) patchTurnElement(turn, assistantName);
+      desired.push(turn.element);
+    }
+    for (let index = 0; index < desired.length; index += 1) {
+      if (container.children[index] !== desired[index]) container.insertBefore(desired[index], container.children[index] || null);
+    }
+    while (container.children.length > desired.length) container.lastElementChild.remove();
+  }
+  renderApprovalShelf();
+  renderDiagnostics();
+  const jump = document.querySelector("#jump-latest");
+  if (transcriptState.shouldStick) {
+    scroller.scrollTop = scroller.scrollHeight;
+    transcriptState.newUpdates = 0;
+    if (jump) jump.hidden = true;
+  } else {
+    scroller.scrollTop = priorTop;
+    if (jump) {
+      jump.hidden = false;
+      jump.textContent = `${transcriptState.newUpdates} new update${transcriptState.newUpdates === 1 ? "" : "s"} ↓`;
+    }
+  }
+  transcriptState.shouldStick = nearBottom(scroller);
+}
+
+function latestWaitingPermission() {
+  const permissions = Array.from(transcriptState.permissions.values());
+  for (let index = permissions.length - 1; index >= 0; index -= 1) {
+    if (permissions[index].state === "waiting") return permissions[index];
+  }
+  return null;
+}
+
+let renderedPermissionSignature = "";
+function renderApprovalShelf() {
+  const shelf = document.querySelector("#approval-shelf");
+  if (!shelf) return;
+  const announcer = document.querySelector("#approval-announcer");
+  const permission = latestWaitingPermission();
+  const signature = permission ? JSON.stringify([permission.id, permission.state, permission.title, permission.options, transcriptState.permissionOverflow]) : `none:${transcriptState.permissionOverflow}`;
+  if (signature === renderedPermissionSignature) {
+    renderSessionStatus();
+    return;
+  }
+  renderedPermissionSignature = signature;
+  if (!permission) {
+    shelf.hidden = true;
+    shelf.replaceChildren();
+    if (announcer) announcer.textContent = "";
+    renderSessionStatus();
+    return;
+  }
+  const heading = document.createElement("div");
+  heading.className = "approval-heading";
+  const icon = document.createElement("span");
+  icon.className = "approval-icon";
+  icon.textContent = "!";
+  const copy = document.createElement("div");
   const title = document.createElement("strong");
   title.textContent = `Approval required · ${permission.title || "Tool request"}`;
   const detail = document.createElement("p");
-  detail.textContent = "The agent remains waiting if this browser detaches.";
+  detail.textContent = transcriptState.permissionOverflow ? "Many approvals are pending; none have been discarded. Close this page safely or resolve them one at a time." : "The Session remains safely waiting if you close this page.";
+  copy.append(title, detail);
+  heading.append(icon, copy);
   const options = document.createElement("div");
   options.className = "permission-options";
   for (const option of permission.options || []) {
     const button = document.createElement("button");
-    const persistent = option.kind === "allow_always" || option.kind === "reject_always";
     button.type = "button";
-    button.textContent = `${option.name || option.kind}${persistent ? " · PERSISTENT" : ""}`;
-    if (option.kind.startsWith("reject")) button.classList.add("permission-reject");
-    button.addEventListener("click", () => submitPermission(sessionID, permission, option, card));
+    button.textContent = option.name || option.kind.replaceAll("_", " ");
+    if (String(option.kind).startsWith("reject")) button.classList.add("reject");
+    if (["allow_always", "reject_always"].includes(option.kind)) button.classList.add("persistent");
+    button.addEventListener("click", () => submitPermission(permission, option));
     options.append(button);
   }
-  card.append(title, detail, options);
-  return card;
-}
-
-function makeActivityElement(activity, showRaw) {
-  const row = document.createElement("article");
-  const safeKind = String(activity.kind || "activity").toLowerCase().replace(/[^a-z0-9_-]/g, "-");
-  row.className = `activity-item kind-${safeKind}`;
-  const label = document.createElement("div");
-  label.className = "activity-label";
-  const owner = document.createElement("strong");
-  owner.textContent = activity.session_id || "Session";
-  const kind = document.createElement("span");
-  kind.className = "activity-kind";
-  kind.textContent = String(activity.kind || "activity").replaceAll("_", " ");
-  const position = document.createElement("span");
-  position.textContent = `#${activity.position}${activity.request_id ? ` · ${activity.request_id}` : ""}`;
-  label.append(owner, kind, position);
-
-  const message = document.createElement(showRaw ? "pre" : "p");
-  message.className = showRaw ? "activity-message raw" : "activity-message";
-  // "Raw" intentionally means the sanitized API DTO. The API never includes
-  // ACP wire payloads, worker sockets, or JSONL storage fields.
-  message.textContent = showRaw ? JSON.stringify(activity, null, 2) : activity.activity;
-  row.append(label, message);
-  if (page === "session" && activity.permission?.state === "waiting") {
-    const current = activityState.permissions.get(activity.permission.id);
-    if (current?.state === "waiting") row.append(makePermissionCard(current, activity.session_id));
+  shelf.replaceChildren(heading, options);
+  shelf.hidden = false;
+  if (announcer) {
+    announcer.textContent = "";
+    window.setTimeout(() => { announcer.textContent = `Approval required. ${permission.title || "Tool request"}.`; }, 0);
   }
-  return row;
+  renderSessionStatus();
 }
 
-function renderActivities() {
-  const feed = document.querySelector("#activity");
-  if (!feed) return;
-  const showRaw = Boolean(document.querySelector("#raw-toggle")?.checked);
-  feed.replaceChildren();
-  if (activityState.entries.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "empty-state small activity-placeholder";
-    const message = document.createElement("p");
-    message.textContent = "Waiting for Session activity…";
-    empty.append(message);
-    feed.append(empty);
-    return;
+function confirmPersistentChoice(option) {
+  const dialog = document.querySelector("#permission-confirm-dialog");
+  if (!(dialog instanceof HTMLDialogElement)) return Promise.resolve(false);
+  const copy = dialog.querySelector("#permission-confirm-copy");
+  if (copy) copy.textContent = `${option.name || option.kind} may apply to later tool requests in this provider conversation.`;
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      accept.removeEventListener("click", onAccept);
+      cancel.removeEventListener("click", onCancel);
+      dialog.removeEventListener("close", onClose);
+      if (dialog.open) dialog.close();
+      resolve(value);
+    };
+    const accept = dialog.querySelector('[data-permission-confirm="accept"]');
+    const cancel = dialog.querySelector('[data-permission-confirm="cancel"]');
+    const onAccept = () => finish(true);
+    const onCancel = () => finish(false);
+    const onClose = () => finish(false);
+    accept.addEventListener("click", onAccept);
+    cancel.addEventListener("click", onCancel);
+    dialog.addEventListener("close", onClose);
+    dialog.showModal();
+  });
+}
+
+async function submitPermission(permission, option) {
+  const persistent = ["allow_always", "reject_always"].includes(option.kind);
+  if (persistent && !(await confirmPersistentChoice(option))) return;
+  const shelf = document.querySelector("#approval-shelf");
+  for (const button of shelf?.querySelectorAll("button") || []) button.disabled = true;
+  const notice = document.querySelector("#action-notice");
+  setNotice(notice, "Sending permission decision…");
+  try {
+    const sessionID = document.body.dataset.sessionId;
+    await apiRequest(`/api/v1/sessions/${encodeURIComponent(sessionID)}/permissions/decision`, "POST", {
+      permission_id: permission.id, option_id: option.id, cancelled: false
+    });
+    transcriptState.permissions.set(permission.id, { ...permission, state: "resolved", decision: option.kind });
+    markPermissionDirty(permission.id);
+    enforcePermissionBound();
+    const rejected = String(option.kind).startsWith("reject");
+    setNotice(notice, rejected ? "Permission rejected. The agent will continue without that action." : "Permission allowed. The agent can continue.");
+    scheduleTranscriptRender();
+    refreshSession(sessionID).catch(() => {});
+  } catch (error) {
+    setNotice(notice, error.status === 409 ? "That permission was already decided by another viewer." : error.message, true);
+    await refreshPermissions().catch(() => {});
+    renderedPermissionSignature = "";
+    for (const button of shelf?.querySelectorAll("button") || []) button.disabled = false;
+    scheduleTranscriptRender();
   }
-  for (const activity of activityState.entries) feed.append(makeActivityElement(activity, showRaw));
-  feed.scrollTop = feed.scrollHeight;
 }
 
-function attachActivityStream(path) {
-  const feed = document.querySelector("#activity");
-  if (!feed || !window.EventSource) return;
-  document.querySelector("#raw-toggle")?.addEventListener("change", renderActivities);
-  const state = document.querySelector("#stream-state");
-  const source = new EventSource(path);
-  source.onopen = () => {
-    if (state) {
-      state.className = "stream-state connected";
-      state.replaceChildren(document.createElement("i"), document.createTextNode("Connected"));
+async function refreshPermissions() {
+  const sessionID = document.body.dataset.sessionId;
+  const result = await apiRequest(`/api/v1/sessions/${encodeURIComponent(sessionID)}/permissions`);
+  return reconcilePermissionSnapshot(result.permissions || []);
+}
+
+function reconcilePermissionSnapshot(received) {
+  if (!Array.isArray(received)) received = [];
+  if (received.length > LIMITS.permissions) {
+    flagPermissionOverflow();
+    return true;
+  }
+  const waiting = new Set(received.map((permission) => permission.id));
+  let changed = false;
+  // The GET is authoritative. Retire disappeared waiting records before
+  // admitting replacements so an exact-cap snapshot can swap IDs safely.
+  for (const [id, permission] of transcriptState.permissions) {
+    if (permission.state === "waiting" && !waiting.has(id)) {
+      transcriptState.permissions.set(id, { ...permission, state: "resolved" });
+      markPermissionDirty(id);
+      changed = true;
     }
+  }
+  for (const permission of received) {
+    if (!permission?.id || !ensurePermissionCapacity(permission.id)) continue;
+    const permissionChanged = JSON.stringify(transcriptState.permissions.get(permission.id)) !== JSON.stringify(permission);
+    if (permissionChanged) changed = true;
+    transcriptState.permissions.set(permission.id, permission);
+    if (permissionChanged) markPermissionDirty(permission.id);
+  }
+  enforcePermissionBound();
+  return changed;
+}
+
+function markPermissionDirty(permissionID) {
+  for (const turn of transcriptState.turns) {
+    if (turn.permissionIDs.has(permissionID)) turn.dirty = true;
+  }
+}
+
+function renderDiagnostics() {
+  const feed = document.querySelector("#diagnostics-feed");
+  if (!feed || !document.querySelector("#diagnostics-dialog")?.open) return;
+  const fragment = document.createDocumentFragment();
+  if (transcriptState.diagnostics.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "muted";
+    empty.textContent = "Waiting for activity…";
+    fragment.append(empty);
+  }
+  for (const activity of transcriptState.diagnostics) {
+    const row = document.createElement("article");
+    row.className = "diagnostic-row";
+    const meta = document.createElement("div");
+    meta.className = "diagnostic-meta";
+    meta.textContent = `#${activity.position}\n${activity.kind}`;
+    const data = document.createElement("pre");
+    data.textContent = JSON.stringify(activity, null, 2);
+    row.append(meta, data);
+    fragment.append(row);
+  }
+  feed.replaceChildren(fragment);
+}
+
+let activeEventSource = null;
+function attachActivityStream(path) {
+  if (!window.EventSource) return;
+  activeEventSource?.close();
+  const state = document.querySelector("#stream-state");
+  // `seed` applies only to this EventSource's first request. On automatic
+  // reconnect the server prefers EventSource's advancing Last-Event-ID, so a
+  // stale URL seed can never conflict with the live cursor.
+  const separator = path.includes("?") ? "&" : "?";
+  const streamPath = transcriptState.lastPosition > 0 ? `${path}${separator}seed=${transcriptState.lastPosition}` : path;
+  const source = new EventSource(streamPath);
+  activeEventSource = source;
+  source.onopen = () => {
+    state?.classList.add("connected");
+    const label = state?.querySelector("span");
+    if (label) label.textContent = "Live";
   };
+  source.addEventListener("ready", () => { streamAnnouncementsReady = true; });
   source.addEventListener("activity", (event) => {
     try {
       const activity = JSON.parse(event.data);
-      const key = `${activity.session_id}:${activity.position}`;
-      if (activityState.seen.has(key)) return;
-      activityState.seen.add(key);
-      activityState.entries.push(activity);
-      const permissionChanged = rememberPermission(activity);
-      const placeholder = feed.querySelector(".activity-placeholder");
-      if (placeholder) placeholder.remove();
-      if (permissionChanged) {
-        renderActivities();
-      } else {
-        const showRaw = Boolean(document.querySelector("#raw-toggle")?.checked);
-        feed.append(makeActivityElement(activity, showRaw));
-      }
-      feed.scrollTop = feed.scrollHeight;
+      noteStreamActivity(activity);
+      if (applyActivity(activity)) scheduleTranscriptRender();
     } catch (_) {
-      if (state) state.textContent = "Invalid activity";
+      state?.classList.remove("connected");
+      const label = state?.querySelector("span");
+      if (label) label.textContent = "Invalid update";
     }
   });
   source.onerror = () => {
-    if (state) {
-      state.className = "stream-state";
-      state.replaceChildren(document.createElement("i"), document.createTextNode("Reconnecting"));
-    }
+    state?.classList.remove("connected");
+    const label = state?.querySelector("span");
+    if (label) label.textContent = "Reconnecting";
   };
+  window.setTimeout(() => { if (transcriptState.turns.length === 0) renderConversation(); }, 450);
   window.addEventListener("beforeunload", () => source.close(), { once: true });
+}
+
+function reconcileStreamAvailability(sessionID, running) {
+  const state = document.querySelector("#stream-state");
+  if (!running && activeEventSource) {
+    activeEventSource.close();
+    activeEventSource = null;
+    state?.classList.remove("connected");
+    const label = state?.querySelector("span");
+    if (label) label.textContent = "Stored history";
+  } else if (running && !activeEventSource && !transcriptState.permissionOverflow) {
+    attachActivityStream(`/api/v1/sessions/${encodeURIComponent(sessionID)}/stream`);
+  }
+}
+
+function updateActionVisibility(status) {
+  document.body.dataset.sessionStatus = status;
+  for (const action of document.querySelectorAll("[data-visible-status]")) {
+    const visible = action.dataset.visibleStatus.split(",").includes(status);
+    action.dataset.statusHidden = visible ? "false" : "true";
+  }
+  const submitCopy = document.querySelector(".send-button span");
+  const submit = document.querySelector(".send-button");
+  const queueing = ["working", "starting"].includes(status);
+  if (submitCopy) submitCopy.textContent = queueing ? "Queue" : "Send";
+  if (submit) submit.setAttribute("aria-label", queueing ? "Queue message" : "Send message");
+}
+
+let currentSessionRuntimeStatus = document.body.dataset.sessionStatus || "";
+function setRuntimeStatus(status) {
+  if (!status) return;
+  currentSessionRuntimeStatus = status;
+  renderSessionStatus();
+  updateActionVisibility(status);
+}
+
+function updateRuntimeStatusFromDisplay(display) {
+  if (page !== "session" || !display) return;
+  if (display.type === "error_upsert" || display.type === "turn_state") reconcileRuntimeStatusSoon();
+}
+
+let runtimeReconcileTimer = 0;
+function reconcileRuntimeStatusSoon() {
+  window.clearTimeout?.(runtimeReconcileTimer);
+  runtimeReconcileTimer = window.setTimeout(() => {
+    const sessionID = document.body.dataset.sessionId;
+    if (sessionID) refreshSession(sessionID).catch(() => {});
+  }, 160);
+}
+
+function renderSessionStatus() {
+  const element = document.querySelector("#session-status");
+  if (!element) return;
+  if (latestWaitingPermission()) {
+    element.className = "status status-waiting";
+    element.replaceChildren(document.createElement("i"), document.createTextNode("Needs approval"));
+    return;
+  }
+  setStatus(element, currentSessionRuntimeStatus);
 }
 
 async function refreshSession(sessionID) {
   const result = await apiRequest(`/api/v1/sessions/${encodeURIComponent(sessionID)}`);
-  setStatus(document.querySelector("#session-status"), result.session.status);
+  const current = result.session;
+  setRuntimeStatus(current.status);
   const conversation = document.querySelector("#conversation-state");
-  if (conversation) {
-    conversation.textContent = result.session.conversation_verified ? "Linked · verified" : (result.session.conversation_ready ? "Linked" : "Pending");
+  if (conversation) conversation.textContent = current.conversation_verified ? "Verified" : (current.conversation_ready ? "Linked" : "Pending provider identity");
+  const continuity = document.querySelector("#continuity-chip");
+  if (continuity) {
+    continuity.className = `continuity-chip${current.conversation_verified ? " verified" : (current.conversation_ready ? " linked" : "")}`;
+    continuity.textContent = current.conversation_verified ? "✓ Verified" : (current.conversation_ready ? "↔ Linked" : "○ Linking");
   }
-  return result.session;
+  const navDot = findNavSession(sessionID)?.querySelector(".status-dot");
+  if (navDot) {
+    navDot.className = `status-dot status-${statusTone(current.status)}`;
+    navDot.setAttribute("aria-label", statusLabel(current.status));
+  }
+  reconcileStreamAvailability(sessionID, current.worker_running);
+  return current;
+}
+
+function bindComposer(sessionID) {
+  const form = document.querySelector("#prompt-form");
+  const textarea = form?.querySelector("textarea");
+  const notice = document.querySelector("#action-notice");
+  if (!form || !textarea) return;
+  const resize = () => {
+    const visualLines = textarea.value.split("\n").reduce((count, line) => count + Math.max(1, Math.ceil(Array.from(line).length / 76)), 0);
+    textarea.rows = Math.min(8, Math.max(1, visualLines));
+  };
+  textarea.addEventListener("input", resize);
+  textarea.addEventListener("keydown", (event) => {
+    const coarse = window.matchMedia("(pointer: coarse)").matches;
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing && !coarse) {
+      event.preventDefault();
+      form.requestSubmit();
+    }
+  });
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!beginFormSubmission(form)) return;
+    const message = textarea.value.trim();
+    if (!message) {
+      endFormSubmission(form);
+      return;
+    }
+    const submit = form.querySelector("button[type=submit]");
+    submit.disabled = true;
+    setNotice(notice, "Sending…");
+    try {
+      const result = await apiRequest(`/api/v1/sessions/${encodeURIComponent(sessionID)}/prompt`, "POST", { message });
+      const turn = transcriptState.byRequest.get(result.request_id) || turnFor({ request_id: result.request_id, position: Number.POSITIVE_INFINITY });
+      if (!turn.blocks.some((block) => block.type === "user")) {
+        const value = truncateUTF8(message, LIMITS.assistant);
+        if (turn.blocks.length < LIMITS.blocksPerTurn) turn.blocks.unshift({ type: "user", text: value.text, bytes: value.bytes, clipped: value.clipped });
+      }
+      const optimisticStateApplied = applyOptimisticPromptState(turn, result.state);
+      turn.dirty = true;
+      updateTurnRetention(turn);
+      trimTurns();
+      if (optimisticStateApplied) setRuntimeStatus("working");
+      else reconcileRuntimeStatusSoon();
+      textarea.value = "";
+      resize();
+      setNotice(notice, result.state === "queued" ? "Message queued for the next turn." : "Message sent.");
+      transcriptState.shouldStick = true;
+      scheduleTranscriptRender();
+    } catch (error) {
+      setNotice(notice, error.message, true);
+    } finally {
+      endFormSubmission(form);
+      submit.disabled = false;
+      textarea.focus();
+    }
+  });
+  if (!window.matchMedia("(pointer: coarse)").matches) window.setTimeout(() => textarea.focus(), 0);
 }
 
 function bindSessionControls(sessionID) {
   const notice = document.querySelector("#action-notice");
-  const promptForm = document.querySelector("#prompt-form");
-  promptForm?.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const submit = promptForm.querySelector("button[type=submit]");
-    submit.disabled = true;
-    try {
-      const data = new FormData(promptForm);
-      const result = await apiRequest(`/api/v1/sessions/${encodeURIComponent(sessionID)}/prompt`, "POST", { message: data.get("message") });
-      setNotice(notice, `Accepted request ${result.request_id} (${result.state}).`);
-      promptForm.reset();
-    } catch (error) {
-      setNotice(notice, error.message, true);
-    } finally {
-      submit.disabled = false;
-    }
-  });
-
   for (const button of document.querySelectorAll("[data-action]")) {
     button.addEventListener("click", async () => {
       const action = button.dataset.action;
       button.disabled = true;
-      setNotice(notice, `${action[0].toUpperCase()}${action.slice(1)} requested…`);
+      setNotice(notice, action === "cancel" ? "Stopping the active response…" : `${action[0].toUpperCase()}${action.slice(1)} requested…`);
       try {
-        const body = action === "resume" ? {} : undefined;
-        await apiRequest(`/api/v1/sessions/${encodeURIComponent(sessionID)}/${action}`, "POST", body);
-        setNotice(notice, `${action[0].toUpperCase()}${action.slice(1)} completed.`);
+        await apiRequest(`/api/v1/sessions/${encodeURIComponent(sessionID)}/${action}`, "POST", action === "resume" ? {} : undefined);
+        setNotice(notice, action === "cancel" ? "Cancellation requested. The Session remains resumable." : `${action[0].toUpperCase()}${action.slice(1)} completed.`);
+        button.closest("dialog")?.close();
         await refreshSession(sessionID);
       } catch (error) {
         setNotice(notice, error.message, true);
@@ -339,43 +1618,67 @@ function bindSessionControls(sessionID) {
   }
 
   const reviewForm = document.querySelector("#review-form");
+  const reviewNotice = document.querySelector("#review-notice");
   reviewForm?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const submit = reviewForm.querySelector("button[type=submit]");
     submit.disabled = true;
-    setNotice(notice, "Creating independent reviewer Session…");
+    setNotice(reviewNotice, "Creating independent reviewer Session…");
     try {
       const data = new FormData(reviewForm);
       const result = await apiRequest(`/api/v1/sessions/${encodeURIComponent(sessionID)}/review`, "POST", {
-        agent: data.get("agent"),
-        allow_active_producer: data.has("allow_active_producer")
+        agent: data.get("agent"), allow_active_producer: data.has("allow_active_producer")
       });
       window.location.assign(`/sessions/${encodeURIComponent(result.session.id)}`);
     } catch (error) {
-      setNotice(notice, error.message, true);
+      setNotice(reviewNotice, error.message, true);
       submit.disabled = false;
     }
   });
+
+  const scroller = document.querySelector("#conversation-scroll");
+  const jump = document.querySelector("#jump-latest");
+  scroller?.addEventListener("scroll", () => {
+    if (nearBottom(scroller)) {
+      transcriptState.shouldStick = true;
+      transcriptState.newUpdates = 0;
+      if (jump) jump.hidden = true;
+    } else {
+      transcriptState.shouldStick = false;
+    }
+  }, { passive: true });
+  jump?.addEventListener("click", () => {
+    transcriptState.shouldStick = true;
+    transcriptState.newUpdates = 0;
+    scroller.scrollTop = scroller.scrollHeight;
+    jump.hidden = true;
+  });
+  document.querySelector("#diagnostics-dialog")?.addEventListener("toggle", renderDiagnostics);
+  document.querySelector("#diagnostics-dialog")?.addEventListener("close", renderDiagnostics);
 }
 
-if (page === "tasks") {
-  bindTaskCreation();
-}
+bindShell();
+bindTaskCreation();
 
 if (page === "task") {
   const taskID = document.body.dataset.taskId;
   bindSessionCreation(taskID);
-  attachActivityStream(`/api/v1/tasks/${encodeURIComponent(taskID)}/stream`);
-  window.setInterval(() => {
-    if (!document.hidden) refreshTask(taskID).catch(() => {});
-  }, 3000);
+  refreshTask(taskID).catch(() => {});
+  window.setInterval(() => { if (!document.hidden) refreshTask(taskID).catch(() => {}); }, 4000);
 }
 
 if (page === "session") {
   const sessionID = document.body.dataset.sessionId;
+  const taskID = document.body.dataset.taskId;
+  bindSessionCreation(taskID);
+  bindComposer(sessionID);
   bindSessionControls(sessionID);
+  updateActionVisibility(document.body.dataset.sessionStatus);
   attachActivityStream(`/api/v1/sessions/${encodeURIComponent(sessionID)}/stream`);
+  refreshPermissions().then(scheduleTranscriptRender).catch(() => {});
   window.setInterval(() => {
-    if (!document.hidden) refreshSession(sessionID).catch(() => {});
-  }, 3000);
+    if (document.hidden) return;
+    refreshSession(sessionID).catch(() => {});
+    refreshPermissions().then((changed) => { if (changed) scheduleTranscriptRender(); }).catch(() => {});
+  }, 4000);
 }

@@ -113,7 +113,7 @@ func TestServerRenderedPagesAndVersionedBrowserBoundary(t *testing.T) {
 
 	tasksPage := webRequest(fixture.handler, "/")
 	assertWebStatus(t, tasksPage, http.StatusOK)
-	for _, expected := range []string{"Agent Task Console", "T-web", "Create a Task", "1 Session", "&lt;script&gt;"} {
+	for _, expected := range []string{"Agent Console", "Create a Task", "1 Session", "&lt;script&gt;", "Persistent workspaces"} {
 		if !strings.Contains(tasksPage.Body.String(), expected) {
 			t.Errorf("Tasks page does not contain %q", expected)
 		}
@@ -124,31 +124,61 @@ func TestServerRenderedPagesAndVersionedBrowserBoundary(t *testing.T) {
 
 	taskPage := webRequest(fixture.handler, "/tasks/T-web")
 	assertWebStatus(t, taskPage, http.StatusOK)
-	for _, expected := range []string{"Sessions", "/sessions/S-web", "Start a Session", "Current activity", "Show raw execution", "sanitized DTO", "structured ACP view"} {
+	for _, expected := range []string{"Conversations", "/sessions/S-web", "Start a Session", "structured ACP conversation", "New Session", "Task → Sessions"} {
 		if !strings.Contains(taskPage.Body.String(), expected) {
 			t.Errorf("Task page does not contain %q", expected)
 		}
 	}
+	for _, removed := range []string{"Current activity", "Show raw execution", "activity-feed"} {
+		if strings.Contains(taskPage.Body.String(), removed) {
+			t.Errorf("Task page still exposes the old activity console %q", removed)
+		}
+	}
 	assertNoWebRuntimeLeak(t, taskPage.Body.String(), fixture)
+	if !strings.Contains(taskPage.Body.String(), `aria-label="New Session"`) || !strings.Contains(taskPage.Body.String(), `data-session-id="S-web"`) {
+		t.Fatal("Task page is missing the named mobile action or stable Session row key")
+	}
 
 	sessionPage := webRequest(fixture.handler, "/sessions/S-web")
 	assertWebStatus(t, sessionPage, http.StatusOK)
-	for _, expected := range []string{"Structured ACP view", "Same provider conversation", "Verified against the provider", "WEB / MOBILE · ACP", "Stored + live", "Send prompt", "Cancel turn", "Resume", "Stop worker", "Start review", "Create reviewer Session", "Detach is safe", "Execution context", "/private/product"} {
+	for _, expected := range []string{"Structured ACP", "canonical conversation", "Verified", "Message codex", "Stop response", "Resume", "Stop worker", "Create reviewer Session", "Closing this page only detaches", "Conversation details", "Session diagnostics", "/private/product"} {
 		if !strings.Contains(sessionPage.Body.String(), expected) {
 			t.Errorf("Session page does not contain %q", expected)
 		}
 	}
 	assertNoWebRuntimeLeak(t, sessionPage.Body.String(), fixture)
+	for _, expected := range []string{`role="log"`, `aria-live="polite"`, `aria-live="assertive"`, `class="mobile-session-actions"`, `aria-controls="app-sidebar"`} {
+		if !strings.Contains(sessionPage.Body.String(), expected) {
+			t.Errorf("accessible Session page does not contain %q", expected)
+		}
+	}
+	if strings.Count(sessionPage.Body.String(), "Stop response") < 2 || strings.Count(sessionPage.Body.String(), "Resume") < 2 {
+		t.Fatal("Session response controls are not available in both desktop and mobile layouts")
+	}
+	if strings.Count(sessionPage.Body.String(), `aria-current="page"`) != 1 || !strings.Contains(sessionPage.Body.String(), `aria-current="location"`) {
+		t.Fatal("Session navigation does not distinguish the current page from its Task ancestor")
+	}
 
 	javascript := webRequest(fixture.handler, "/assets/app.js")
 	assertWebStatus(t, javascript, http.StatusOK)
-	for _, expected := range []string{"new EventSource", "/api/v1/tasks/", "/api/v1/sessions/", "/permissions/decision", "PERSISTENT", "JSON.stringify(activity", "ACP wire payloads"} {
+	for _, expected := range []string{"new EventSource", "/api/v1/tasks/", "/api/v1/sessions/", "/permissions/decision", "allow_always", "JSON.stringify(activity", "assistant_chunk", "tool_upsert", "plan_replace", "appendBounded", "nearBottom", "patchTurnElement", "patchBlockElement", "blocksPerTurn", "beginFormSubmission"} {
 		if !strings.Contains(javascript.Body.String(), expected) {
 			t.Errorf("browser client does not contain %q", expected)
 		}
 	}
 	if strings.Contains(javascript.Body.String(), "React") {
 		t.Fatal("browser client unexpectedly uses React")
+	}
+	if strings.Contains(javascript.Body.String(), "cursor=${transcriptState.lastPosition}") {
+		t.Fatal("browser client pins a stale cursor across EventSource reconnects")
+	}
+
+	stylesheet := webRequest(fixture.handler, "/assets/app.css")
+	assertWebStatus(t, stylesheet, http.StatusOK)
+	for _, expected := range []string{"100dvh", "safe-area-inset-bottom", "prefers-reduced-motion", "forced-colors", "@media (max-width: 760px)", ".approval-shelf", ".composer-region", ".mobile-session-actions", ".tool-inline-preview"} {
+		if !strings.Contains(stylesheet.Body.String(), expected) {
+			t.Errorf("responsive stylesheet does not contain %q", expected)
+		}
 	}
 
 	apiResponse := webRequest(fixture.handler, "/api/v1/sessions/S-web")

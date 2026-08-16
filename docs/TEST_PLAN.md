@@ -98,11 +98,14 @@ For `acpctl session attach --acp`:
 
 - Exercise every `/api/v1` endpoint and `/healthz`.
 - Verify CLI, TUI, API, and web show consistent state.
-- Verify Task aggregate SSE and Session replay/reconnect.
+- Verify Task aggregate SSE and Session replay/reconnect, including the Session `ready` replay/live boundary without gaps or duplicate positions.
 - Verify request/response correlation and invalid cursor handling.
 - Verify loopback-only binding and no socket/ACP leakage.
 - Verify web prompt/cancel/resume/stop and Session drill-down.
 - Verify responsive desktop/mobile ordering and the safe linked/verified conversation indicators without exposing any provider ID.
+- Verify semantic user/assistant reconstruction, cumulative transcript bounds, merged tool/plan updates, and diagnostic-only records creating no blank turns.
+- Verify reconnect after stop/resume does not pin a stale query cursor, rapid Enter cannot duplicate a prompt, and late replay remains ordered before an optimistic prompt.
+- Verify streaming preserves expanded tool/reasoning state, focus, text selection, and a reader's scroll anchor; verify mobile keeps named cancel/resume actions and announces conversation/approval updates.
 - Stop the web server and confirm workers continue.
 
 ## T08 — Authenticated live provider matrix

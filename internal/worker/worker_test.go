@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -500,7 +501,7 @@ func TestPermissionSurvivesDetachAndConcurrentViewerDecisionIsFirstWins(t *testi
 		t.Fatalf("pending status = %#v, %v", status, err)
 	}
 	pending := status.Permissions[0]
-	if pending.ID != "bridge-permission:tool-write" || pending.RequestID != "REQ-permission" || len(pending.Options) != 3 {
+	if pending.ID != PermissionConsoleID("REQ-permission", "bridge-permission") || strings.Contains(pending.ID, "tool-write") || pending.RequestID != "REQ-permission" || len(pending.Options) != 3 {
 		t.Fatalf("pending permission = %#v", pending)
 	}
 
@@ -643,6 +644,30 @@ func TestCancelAndStopAbandonPendingPermission(t *testing.T) {
 			t.Fatalf("stop history lacks permission_abandoned: %#v", lines)
 		}
 	})
+}
+
+func TestPendingPermissionLimitFailsClosed(t *testing.T) {
+	runtime := &Worker{
+		active:      &queuedPrompt{RequestID: "REQ-permission-cap"},
+		permissions: make(map[string]*pendingPermission),
+	}
+	for index := 0; index < maxPendingPermissions; index++ {
+		pending := &pendingPermission{PendingPermission: PendingPermission{
+			ID: fmt.Sprintf("permission-%03d", index), RequestID: "REQ-permission-cap",
+		}}
+		if err := runtime.registerPermission(pending); err != nil {
+			t.Fatalf("register permission %d: %v", index, err)
+		}
+	}
+	overflow := &pendingPermission{PendingPermission: PendingPermission{
+		ID: "permission-overflow", RequestID: "REQ-permission-cap",
+	}}
+	if err := runtime.registerPermission(overflow); !errors.Is(err, errPendingPermissionCap) {
+		t.Fatalf("overflow error = %v", err)
+	}
+	if len(runtime.permissions) != maxPendingPermissions || runtime.permissions[overflow.ID] != nil {
+		t.Fatalf("permission cap did not fail closed: count=%d overflow=%#v", len(runtime.permissions), runtime.permissions[overflow.ID])
+	}
 }
 
 func containsString(values []string, wanted string) bool {

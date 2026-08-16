@@ -109,13 +109,12 @@ type toolCard struct {
 }
 
 type permissionCard struct {
-	id         string
-	toolCallID string
-	title      string
-	kind       string
-	options    []permissionOption
-	state      string
-	decision   string
+	id       string
+	title    string
+	kind     string
+	options  []permissionOption
+	state    string
+	decision string
 }
 
 type permissionOption struct {
@@ -397,14 +396,14 @@ func (r *transcriptRequest) upsertPlan(update map[string]any) {
 func (r *transcriptRequest) upsertPermission(raw map[string]any) {
 	params := object(raw["params"])
 	tool := object(params["toolCall"])
-	toolCallID := stringValue(tool["toolCallId"])
-	id := permissionID(raw["id"], toolCallID)
-	if id == "" {
+	bridgeID := permissionRPCID(raw["id"])
+	if bridgeID == "" {
 		return
 	}
+	id := worker.PermissionConsoleID(r.id, bridgeID)
 	card := r.permission[id]
 	if card == nil {
-		card = &permissionCard{id: id, toolCallID: toolCallID, state: "waiting"}
+		card = &permissionCard{id: id, state: "waiting"}
 		r.permission[id] = card
 		r.blocks = append(r.blocks, &transcriptBlock{kind: blockPermission, id: id, permission: card})
 	}
@@ -428,7 +427,7 @@ func (r *transcriptRequest) upsertWorkerPermission(pending worker.PendingPermiss
 	}
 	card := r.permission[pending.ID]
 	if card == nil {
-		card = &permissionCard{id: pending.ID, toolCallID: pending.ToolCallID, state: "waiting"}
+		card = &permissionCard{id: pending.ID, state: "waiting"}
 		r.permission[pending.ID] = card
 		r.blocks = append(r.blocks, &transcriptBlock{kind: blockPermission, id: pending.ID, permission: card})
 	}
@@ -705,7 +704,7 @@ func genericToolTitle(value string) bool {
 	}
 }
 
-func permissionID(value any, toolCallID string) string {
+func permissionRPCID(value any) string {
 	var rpc string
 	switch typed := value.(type) {
 	case string:
@@ -715,10 +714,7 @@ func permissionID(value any, toolCallID string) string {
 	case json.Number:
 		rpc = typed.String()
 	}
-	if rpc != "" && toolCallID != "" {
-		return rpc + ":" + toolCallID
-	}
-	return firstNonEmpty(rpc, toolCallID)
+	return rpc
 }
 
 func object(value any) map[string]any {
