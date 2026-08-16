@@ -102,7 +102,7 @@ func TestReviewCreatesIndependentSessionWithCompleteEvidence(t *testing.T) {
 		"Repository: " + canonicalRepo, "Worktree: " + producerWorktree.Path, "Recorded producer branch: " + producerWorktree.Branch,
 		"producer change", "Independently rerun", "ignored test failures", "selective tests presented as complete tests",
 		"failed commands that were ignored", "claims unsupported by tool output", "suspicious shortcuts", "unrelated file changes",
-		"repeated broken approaches", "security regressions", "do not import that transcript",
+		"repeated broken approaches", "security regressions", "do not treat that journal as this Session's conversation",
 	} {
 		if !strings.Contains(prompt, expected) {
 			t.Errorf("review prompt missing %q:\n%s", expected, prompt)

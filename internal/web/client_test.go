@@ -98,7 +98,7 @@ const ordered = transcriptState.turns[0];
 testAssert(ordered.blocks.map((block) => block.type).join(",") === "thought,assistant,tool,thought,assistant", "interleaved ACP reasoning chronology was collapsed");
 testAssert(ordered.blocks.filter((block) => block.type === "thought").map((block) => block.text).join("|") === "reasoning A|reasoning B", "separate reasoning phases were merged");
 testAssert(completedResponseBlock(ordered)?.text === "FINAL-RESPONSE", "final ACP assistant segment was not presented as the completed response");
-testAssert(turnHasACPReasoning(ordered), "ACP reasoning availability was not detected");
+testAssert(turnHasReasoning(ordered), "reasoning availability was not detected");
 
 resetTranscript();
 applyActivity(activity(1, "acp", {type:"assistant_chunk", message_id:"verbose", text:"a".repeat(LIMITS.assistant)}));
@@ -138,13 +138,13 @@ applyActivity(activity(513, "acp", {type:"assistant_chunk", message_id:"response
 applyActivity(activity(514, "turn_completed", {type:"turn_state", state:"complete", stop_reason:"end_turn"}));
 const evictedReasoning = transcriptState.turns[0];
 testAssert(!evictedReasoning.blocks.some((block) => block.type === "thought"), "reasoning saturation fixture did not evict its oldest thought block");
-testAssert(turnHasACPReasoning(evictedReasoning), "bounded eviction falsely claimed ACP exposed no reasoning");
+testAssert(turnHasReasoning(evictedReasoning), "bounded eviction falsely claimed no reasoning was exposed");
 testAssert(evictedReasoning.assistantSeen && completedResponseBlock(evictedReasoning)?.text === "FINAL", "assistant-seen state or final response was lost at saturation");
 
 resetTranscript();
 applyActivity(activity(1, "acp", {type:"assistant_chunk", message_id:"plain", text:"answer"}));
 applyActivity(activity(2, "turn_completed", {type:"turn_state", state:"complete", stop_reason:"end_turn"}));
-testAssert(!turnHasACPReasoning(transcriptState.turns[0]), "provider-without-thought turn falsely advertised reasoning");
+testAssert(!turnHasReasoning(transcriptState.turns[0]), "provider-without-thought turn falsely advertised reasoning");
 
 resetTranscript();
 for (let position = 1; position <= 2000; position += 1) {
@@ -243,6 +243,159 @@ testAssert(beginFormSubmission(form), "first form submission was rejected");
 testAssert(!beginFormSubmission(form), "duplicate form submission was accepted");
 endFormSubmission(form);
 testAssert(beginFormSubmission(form), "form did not become reusable after completion");
+
+resetTranscript();
+const committedSnapshot = {
+  source:"provider-store", checkpoint:"pt1-three-turns", gateway_cursor:40,
+  turns:[
+    {key:"u1",committed:true,activities:[activity(0,"provider_transcript",{type:"user_message",text:"ACP one"}),activity(0,"provider_transcript",{type:"assistant_chunk",text:"ONE"}),activity(0,"provider_turn_completed",{type:"turn_state",state:"complete"})]},
+    {key:"u2",committed:true,activities:[activity(0,"provider_transcript",{type:"user_message",text:"Native middle"}),activity(0,"provider_transcript",{type:"thought_chunk",text:"native reasoning"}),activity(0,"provider_transcript",{type:"assistant_chunk",text:"TWO"}),activity(0,"provider_turn_completed",{type:"turn_state",state:"complete"})]},
+    {key:"u3",committed:true,activities:[activity(0,"provider_transcript",{type:"user_message",text:"ACP three"}),activity(0,"provider_transcript",{type:"assistant_chunk",text:"THREE"}),activity(0,"provider_turn_completed",{type:"turn_state",state:"complete"})]}
+  ], diagnostics:[]
+};
+const candidate = buildConversationSnapshot(committedSnapshot, [activity(41, "turn_started", {type:"turn_state",state:"working"}, null, "LIVE")]);
+testAssert(candidate.source === "provider-store" && candidate.checkpoint === "pt1-three-turns", "provider snapshot identity was not retained");
+testAssert(candidate.turns.length === 4 && candidate.turns[1].blocks.some((block) => block.type === "thought" && block.text === "native reasoning"), "provider ACP-native-ACP history was not grouped in order");
+testAssert(candidate.turns[1].blocks.filter((block) => ["thought","assistant"].includes(block.type)).every((block) => block.source === "provider"), "provider-backed blocks lost their stored-history provenance");
+testAssert(candidate.lastPosition === 41 && candidate.byRequest.get("LIVE")?.state === "working", "live activity crossing snapshot capture was lost");
+testAssert(candidate.turns.slice(0, 3).every((turn) => turn.state === "complete" && turn.committed), "committed provider turns were not marked complete");
+testAssert(!candidate.byRequest.get("LIVE").committed, "buffered ACP turn was falsely marked provider-committed");
+
+const provisional = turnFor({request_id:"PROVISIONAL",position:42});
+const provisionalAssistantElement = {id:"stable-assistant"};
+provisional.blocks.push(
+  {type:"user",text:"ACP three",bytes:9,revision:1},
+  {type:"assistant",text:"EE",bytes:2,revision:1,element:provisionalAssistantElement,renderedRevision:1,renderedContext:"stored:final"}
+);
+provisional.element = {id:"stable-turn"};
+candidate.turns[2].element = null;
+adoptConversationPresentation(transcriptState, candidate);
+testAssert(candidate.turns[2].element === provisional.element, "provider reconciliation did not preserve a matching provisional turn surface");
+const committedAssistant = candidate.turns[2].blocks.find((block) => block.type === "assistant");
+testAssert(committedAssistant.element === provisionalAssistantElement, "provider reconciliation discarded the stable assistant DOM surface");
+testAssert(committedAssistant.renderedRevision === -1, "changed provider text reused a stale provisional render revision");
+
+const repeatedOldTurns = [
+  {id:"OLD-A",blocks:[{type:"user",text:"Repeat"},{type:"assistant",text:"partial"}]},
+  {id:"OLD-B",blocks:[{type:"user",text:"Repeat"},{type:"assistant",text:"partial"}]},
+];
+const repeatedCandidate = {id:"PROVIDER",blocks:[{type:"user",text:"Repeat"},{type:"assistant",text:"completed partial"}]};
+testAssert(matchingOldTurn(repeatedCandidate, repeatedOldTurns, new Set()) === null, "ambiguous repeated turns reused the wrong DOM surface");
+testAssert(matchingOldBlock(
+  {type:"assistant",text:"completed partial"},
+  [{type:"assistant",text:"partial"},{type:"assistant",text:"partial"}],
+  new Set()
+) === null, "ambiguous repeated blocks reused the wrong DOM surface");
+
+const permissionPrevious = newTranscriptState();
+for (let index = 0; index < LIMITS.permissions; index += 1) {
+  permissionPrevious.permissions.set("OLD-WAIT-" + index, {id:"OLD-WAIT-" + index,state:"waiting"});
+}
+const permissionCandidate = newTranscriptState();
+permissionCandidate.permissions.set("CURRENT-WAIT", {id:"CURRENT-WAIT",state:"waiting"});
+adoptConversationPresentation(permissionPrevious, permissionCandidate);
+testAssert(permissionCandidate.permissions.size === LIMITS.permissions, "atomic snapshot adoption exceeded the permission bound");
+testAssert(permissionCandidate.permissionOverflow && permissionCandidate.historyClipped, "permission adoption overflow was not disclosed");
+
+transcriptState.shouldStick = false;
+let anchorTop = 40;
+const anchorElement = {
+	  isConnected:true,
+	  getBoundingClientRect(){ return {top:anchorTop,bottom:anchorTop + 80}; }
+};
+	const anchorBlock = {type:"assistant",element:anchorElement};
+	const savedTurns = transcriptState.turns;
+	transcriptState.turns = [{firstPosition:1,blocks:[anchorBlock]}];
+const fakeScroller = {
+  scrollTop:120,
+  style:{scrollBehavior:"smooth"},
+  getBoundingClientRect(){ return {top:0,bottom:300}; }
+};
+const scrollAnchor = captureConversationScrollAnchor(fakeScroller, {children:[anchorElement]});
+anchorTop = 85;
+	anchorElement.isConnected = false;
+	anchorBlock.element = {
+	  isConnected:true,
+	  getBoundingClientRect(){ return {top:anchorTop,bottom:anchorTop + 80}; }
+	};
+restoreConversationScrollAnchor(fakeScroller, scrollAnchor, 120);
+testAssert(fakeScroller.scrollTop === 165, "atomic reconciliation did not preserve the visible content anchor");
+testAssert(fakeScroller.style.scrollBehavior === "smooth", "scroll-anchor restoration changed the viewer's scroll behavior");
+	transcriptState.turns = savedTurns;
+
+const originalApiRequest = apiRequest;
+const gatewaySnapshot = {
+  source:"gateway-log", gateway_cursor:17, warning:"Provider history is not committed yet; showing live gateway history.",
+  turns:[
+    {key:"GATEWAY-REQ",committed:false,activities:[
+      activity(11,"prompt_submitted",{type:"user_message",text:"Gateway prompt"},null,"GATEWAY-REQ"),
+      activity(12,"acp",{type:"thought_chunk",text:"Gateway reasoning"},null,"GATEWAY-REQ"),
+      activity(13,"acp",{type:"assistant_chunk",text:"Gateway answer"},null,"GATEWAY-REQ"),
+      activity(14,"turn_completed",{type:"turn_state",state:"complete"},null,"GATEWAY-REQ")
+    ]}
+  ], diagnostics:[]
+};
+resetTranscript();
+conversationSnapshotSignature = "";
+conversationReconcileInFlight = false;
+conversationReconcilePending = false;
+conversationReconcileBuffer = [];
+apiRequest = async () => gatewaySnapshot;
+testAssert(await reconcileConversation("S", {initial:true}), "initial gateway fallback snapshot was not adopted");
+testAssert(transcriptState.source === "gateway-log" && transcriptState.lastPosition === 17, "initial gateway fallback lost its source or captured cursor");
+testAssert(transcriptState.byRequest.get("GATEWAY-REQ")?.blocks.some((block) => block.type === "assistant" && block.text === "Gateway answer"), "initial gateway fallback lost its bounded semantic turn");
+const gatewayStreamCount = createdEventSources.length;
+attachActivityStream("/api/v1/sessions/S/stream");
+testAssert(createdEventSources[gatewayStreamCount] === "/api/v1/sessions/S/stream?seed=17", "initial gateway fallback did not seed SSE after its captured cursor");
+
+let resolveConversationRequest;
+apiRequest = () => new Promise((resolve) => { resolveConversationRequest = resolve; });
+resetTranscript();
+transcriptState.shouldStick = true;
+conversationSnapshotSignature = "";
+conversationReconcileInFlight = false;
+conversationReconcilePending = false;
+conversationReconcileBuffer = [];
+scheduledTimeouts.length = 0;
+const inFlightReconcile = reconcileConversation("S");
+conversationReconcileBuffer.push(
+  activity(40, "acp", {type:"assistant_chunk",text:"stale"}, null, "STALE"),
+  activity(41, "turn_started", {type:"turn_state",state:"working"}, null, "LIVE-RACE")
+);
+const coalescedReconcile = reconcileConversation("S");
+resolveConversationRequest(committedSnapshot);
+await Promise.all([inFlightReconcile, coalescedReconcile]);
+testAssert(transcriptState.turns.length === 4 && transcriptState.byRequest.has("LIVE-RACE"), "SSE event crossing provider reload was lost");
+testAssert(!transcriptState.byRequest.has("STALE"), "provider reload replayed an event at the captured gateway cursor");
+testAssert(scheduledTimeouts.includes(120), "overlapping provider reload was not coalesced after the active fetch");
+
+conversationSnapshotSignature = snapshotSignature(committedSnapshot);
+transcriptState.sourceWarning = "Provider history refresh is delayed; live ACP output remains current.";
+apiRequest = async () => committedSnapshot;
+await reconcileConversation("S");
+testAssert(transcriptState.sourceWarning === "", "successful unchanged provider snapshot left a stale refresh warning");
+
+const turnsBeforeFallbackRefresh = transcriptState.turns;
+const cursorBeforeFallbackRefresh = transcriptState.lastPosition;
+apiRequest = async () => ({...gatewaySnapshot, gateway_cursor:999, turns:[{key:"STALE-FALLBACK",committed:false,activities:[activity(998,"acp",{type:"assistant_chunk",text:"must not replace current view"},null,"STALE-FALLBACK")]}]});
+await reconcileConversation("S");
+testAssert(transcriptState.turns === turnsBeforeFallbackRefresh && transcriptState.lastPosition === cursorBeforeFallbackRefresh, "later provider-store fallback replaced the current provider/live view");
+testAssert(transcriptState.source === "provider-store" && !transcriptState.byRequest.has("STALE-FALLBACK"), "later fallback downgraded provider authority or injected stale history");
+
+resetTranscript();
+applyActivity(activity(1, "turn_started", {type:"turn_state",state:"working"}, null, "RETRY"));
+applyActivity(activity(2, "turn_completed", {type:"turn_state",state:"complete"}, null, "RETRY"));
+conversationReconcileAttempts = 0;
+scheduledTimeouts.length = 0;
+apiRequest = async () => { throw new Error("temporary provider-store failure"); };
+await reconcileConversation("S");
+testAssert(transcriptState.sourceWarning.includes("delayed"), "transient provider failure was not disclosed without replacing live ACP output");
+testAssert(scheduledTimeouts.some((delay) => delay === 220), "transient provider failure did not schedule a commit retry");
+conversationReconcileAttempts = 6;
+scheduledTimeouts.length = 0;
+scheduleProviderCommitRetry("S");
+testAssert(scheduledTimeouts.some((delay) => delay === 10000), "late provider commit lost its bounded background retry");
+apiRequest = originalApiRequest;
 `)
 
 	root := t.TempDir()
@@ -255,23 +408,25 @@ testAssert(beginFormSubmission(form), "form did not become reusable after comple
 const fs = require("node:fs");
 const vm = require("node:vm");
 const createdEventSources = [];
+const scheduledTimeouts = [];
 class FakeEventSource {
   constructor(path) { createdEventSources.push(path); }
   addEventListener() {}
   close() {}
 }
 const sandbox = {
-  TextEncoder, console, EventSource: FakeEventSource, createdEventSources,
+  TextEncoder, console, EventSource: FakeEventSource, createdEventSources, scheduledTimeouts,
   document: {
     body: {dataset:{page:""}, classList:{add(){},remove(){},contains(){return false;}}},
     querySelectorAll(){return [];}, querySelector(){return null;}, getElementById(){return null;}, addEventListener(){},
   },
-  window: {EventSource:FakeEventSource, setTimeout(){return 0;}, setInterval(){return 0;}, addEventListener(){}, matchMedia(){return {matches:false};}},
+  window: {EventSource:FakeEventSource, setTimeout(_callback, delay = 0){scheduledTimeouts.push(delay);return scheduledTimeouts.length;}, clearTimeout(){}, setInterval(){return 0;}, addEventListener(){}, matchMedia(){return {matches:false};}},
   HTMLDialogElement: class {}, FormData: class {},
 };
 vm.createContext(sandbox);
 const source = fs.readFileSync(%q, "utf8");
-vm.runInContext(source + %q, sandbox, {timeout:10000});
+const result = vm.runInContext(source + "\n(async () => {\n" + %q + "\n})()", sandbox, {timeout:10000});
+Promise.resolve(result).catch((error) => { console.error(error); process.exitCode = 1; });
 `, sourceFile, string(harness))
 	if err := os.WriteFile(testFile, []byte(runner), 0o600); err != nil {
 		t.Fatal(err)

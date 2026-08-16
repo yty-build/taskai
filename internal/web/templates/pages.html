@@ -241,6 +241,7 @@
       {{if .Session.Branch}}<dt>Branch</dt><dd class="mono">{{.Session.Branch}}</dd>{{end}}
       <dt>Permission</dt><dd>{{.Session.Permission}}</dd>
       <dt>Continuity</dt><dd id="conversation-state">{{if .Session.ConversationVerified}}Verified{{else if .Session.ConversationReady}}Linked{{else}}Pending provider identity{{end}}</dd>
+      <dt>History</dt><dd id="history-source">Loading verified provider history…</dd>
     </dl>
     <p class="muted">Tool text, diffs, and terminal output can contain sensitive repository content. This loopback console is for the same trusted OS user.</p>
     <div class="details-actions"><button type="button" class="secondary" data-open-dialog="review-dialog">Create reviewer Session</button><button type="button" class="secondary" data-open-dialog="diagnostics-dialog">Open diagnostics</button></div>

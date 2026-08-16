@@ -39,6 +39,7 @@ func New(tasks *task.Service, sessions *appservice.SessionService) *Server {
 	mux.HandleFunc("POST /api/v1/tasks/{taskID}/sessions", server.startSession)
 	mux.HandleFunc("GET /api/v1/tasks/{taskID}/stream", server.streamTask)
 	mux.HandleFunc("GET /api/v1/sessions/{sessionID}", server.getSession)
+	mux.HandleFunc("GET /api/v1/sessions/{sessionID}/conversation", server.getConversation)
 	mux.HandleFunc("POST /api/v1/sessions/{sessionID}/prompt", server.prompt)
 	mux.HandleFunc("GET /api/v1/sessions/{sessionID}/permissions", server.permissions)
 	mux.HandleFunc("POST /api/v1/sessions/{sessionID}/permissions/decision", server.decidePermission)
@@ -170,6 +171,15 @@ func (s *Server) getSession(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	writeJSON(writer, http.StatusOK, map[string]any{"session": makeSessionDTO(current)})
+}
+
+func (s *Server) getConversation(writer http.ResponseWriter, request *http.Request) {
+	snapshot, err := s.sessions.Conversation(request.Context(), request.PathValue("sessionID"))
+	if err != nil {
+		writeLookupError(writer, "Session", err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, makeConversationDTO(snapshot))
 }
 
 type promptRequest struct {

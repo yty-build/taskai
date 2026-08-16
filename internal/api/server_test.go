@@ -406,6 +406,159 @@ func TestActivityPermissionDTOExposesOnlyActionableSafeFields(t *testing.T) {
 	}
 }
 
+func TestConversationAPIUsesOpaqueCommittedProviderHistory(t *testing.T) {
+	fixture := newAPIFixture(t)
+	ctx := context.Background()
+	if _, err := fixture.repository.CreateTask(ctx, task.CreateParams{ID: "T-conversation-api", Title: "Provider history"}); err != nil {
+		t.Fatal(err)
+	}
+	conversationID := "01-api-provider-secret"
+	verifiedAt := time.Now().UTC()
+	current, err := fixture.repository.CreateSession(ctx, session.CreateParams{
+		ID: "S-conversation-api", TaskID: "T-conversation-api", Agent: "codex", Provider: "openai",
+		RepoPath: fixture.repo, Status: session.StatusWaiting, LogPath: filepath.Join(fixture.home.Logs, "S-conversation-api.jsonl"),
+		ACPSessionID: conversationID, NativeSessionID: conversationID, ProviderConversationID: conversationID,
+		ConversationIDSource: session.ConversationSourceProviderStore, ConversationIDVerifiedAt: &verifiedAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	providerRoot := filepath.Join(fixture.home.Root, "codex-provider")
+	t.Setenv("CODEX_HOME", providerRoot)
+	providerPath := filepath.Join(providerRoot, "sessions", "2026", "08", "16", "rollout-"+conversationID+".jsonl")
+	if err := os.MkdirAll(filepath.Dir(providerPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	providerUser := "Task T-secret: Provider history\nDescription: Visible description\nSession: " + conversationID +
+		"\nRole: reviewer\nRepository: " + fixture.repo + "\nWorktree: /private/provider/worktree\nBranch: secret/provider-branch\n" +
+		"Work in the repository context at /private/provider/worktree. This is one Session under the Task; preserve the Task/Session boundary.\n\n" +
+		"Session-specific instructions:\nReview safely."
+	encodedProviderUser, err := json.Marshal(providerUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"timestamp":"2026-08-16T12:00:00Z","type":"session_meta","payload":{"id":"` + conversationID + `","cwd":"` + fixture.repo + `"}}` + "\n" +
+		`{"timestamp":"2026-08-16T12:00:00.500Z","type":"event_msg","auth_token":"PROVIDER-AUTH-MUST-NOT-LEAK","payload":{"type":"developer_message","message":"RAW-SYSTEM-MUST-NOT-LEAK"}}` + "\n" +
+		`{"timestamp":"2026-08-16T12:00:01Z","type":"event_msg","payload":{"type":"user_message","message":` + string(encodedProviderUser) + `}}` + "\n" +
+		`{"timestamp":"2026-08-16T12:00:02Z","type":"response_item","payload":{"id":"provider-record-secret","type":"message","role":"assistant","phase":"final_answer","encrypted_content":"ENCRYPTED-MUST-NOT-LEAK","content":[{"type":"output_text","text":"Provider-visible response"}]}}` + "\n"
+	if err := os.WriteFile(providerPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	log, err := sessionlog.Open(current.LogPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Append("REQ-live", "prompt_submitted", map[string]string{"display_message": "Live follow-up"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Append("", "worker_error", map[string]string{"message": "GATEWAY-RAW-MUST-NOT-LEAK /private/provider/path"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	response := performRequest(t, fixture.handler, http.MethodGet, "/api/v1/sessions/"+current.ID+"/conversation", nil, nil)
+	assertStatus(t, response, http.StatusOK)
+	var snapshot ConversationDTO
+	decodeResponse(t, response, &snapshot)
+	if snapshot.Source != "provider-store" || len(snapshot.Turns) != 2 || snapshot.GatewayCursor != 2 {
+		t.Fatalf("conversation DTO = %#v", snapshot)
+	}
+	if !snapshot.Turns[0].Committed || snapshot.Turns[1].Committed || len(snapshot.Turns[0].Activities) != 3 || len(snapshot.Turns[1].Activities) != 1 {
+		t.Fatalf("conversation turns = %#v", snapshot.Turns)
+	}
+	if snapshot.Turns[0].Activities[0].Display == nil || snapshot.Turns[0].Activities[0].Display.Type != "user_message" ||
+		snapshot.Turns[0].Activities[1].Display == nil || snapshot.Turns[0].Activities[1].Display.Type != "assistant_chunk" {
+		t.Fatalf("conversation activities = %#v", snapshot.Turns[0].Activities)
+	}
+	if snapshot.Turns[0].Activities[0].Display.Text != "Start work on \"Provider history\" as reviewer.\n\nVisible description\n\nReview safely." {
+		t.Fatalf("provider Task envelope was not converted to the clean user prompt: %q", snapshot.Turns[0].Activities[0].Display.Text)
+	}
+	for _, diagnostic := range snapshot.Diagnostics {
+		if diagnostic.Display != nil || diagnostic.Permission != nil || diagnostic.Activity == "" {
+			t.Fatalf("conversation diagnostic was not summary-only: %#v", diagnostic)
+		}
+	}
+	encoded := response.Body.String()
+	for _, forbidden := range []string{
+		conversationID, "provider-record-secret", providerPath, fixture.repo, "session_meta", "response_item",
+		"PROVIDER-AUTH-MUST-NOT-LEAK", "RAW-SYSTEM-MUST-NOT-LEAK", "ENCRYPTED-MUST-NOT-LEAK", "GATEWAY-RAW-MUST-NOT-LEAK", "/private/provider/path",
+		"/private/provider/worktree", "secret/provider-branch", "T-secret",
+	} {
+		if strings.Contains(encoded, forbidden) {
+			t.Fatalf("conversation API leaked %q: %s", forbidden, encoded)
+		}
+	}
+}
+
+func TestConversationAPIReturnsBoundedGatewayFallbackAtCapturedCursor(t *testing.T) {
+	fixture := newAPIFixture(t)
+	ctx := context.Background()
+	if _, err := fixture.repository.CreateTask(ctx, task.CreateParams{ID: "T-conversation-fallback", Title: "Gateway fallback"}); err != nil {
+		t.Fatal(err)
+	}
+	current, err := fixture.repository.CreateSession(ctx, session.CreateParams{
+		ID: "S-conversation-fallback", TaskID: "T-conversation-fallback", Agent: "codex", Provider: "openai",
+		RepoPath: fixture.repo, Status: session.StatusWorking, LogPath: filepath.Join(fixture.home.Logs, "S-conversation-fallback.jsonl"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	log, err := sessionlog.Open(current.LogPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Append("REQ-fallback", "prompt_submitted", map[string]string{"display_message": "Fallback prompt"}); err != nil {
+		t.Fatal(err)
+	}
+	event, err := json.Marshal(acp.Event{
+		Type: "agent_message_chunk", RequestID: "REQ-fallback",
+		Raw: json.RawMessage(`{"params":{"update":{"content":{"type":"text","text":"Fallback answer"}}},"auth":"MUST-NOT-LEAK"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Append("REQ-fallback", "acp", json.RawMessage(event)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Append("REQ-fallback", "turn_completed", map[string]string{"stopReason": "end_turn"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Append("", "worker_error", map[string]string{"message": "TOKEN=private /private/provider/path"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	response := performRequest(t, fixture.handler, http.MethodGet, "/api/v1/sessions/"+current.ID+"/conversation", nil, nil)
+	assertStatus(t, response, http.StatusOK)
+	var snapshot ConversationDTO
+	decodeResponse(t, response, &snapshot)
+	if snapshot.Source != "gateway-log" || snapshot.GatewayCursor != 4 || len(snapshot.Turns) != 1 || snapshot.Warning == "" {
+		t.Fatalf("gateway fallback DTO = %#v", snapshot)
+	}
+	if snapshot.Turns[0].Committed || snapshot.Turns[0].Key != "REQ-fallback" || len(snapshot.Turns[0].Activities) != 3 {
+		t.Fatalf("gateway fallback turn = %#v", snapshot.Turns[0])
+	}
+	encoded := response.Body.String()
+	for _, forbidden := range []string{"MUST-NOT-LEAK", "TOKEN=private", "/private/provider/path", `"auth"`} {
+		if strings.Contains(encoded, forbidden) {
+			t.Fatalf("gateway fallback API leaked %q: %s", forbidden, encoded)
+		}
+	}
+}
+
+func TestConversationDTOExposesAggregateGatewayTruncation(t *testing.T) {
+	dto := makeConversationDTO(appservice.ConversationSnapshot{
+		Source: appservice.ConversationSourceGateway, GatewayCursor: 900, Truncated: true,
+	})
+	if !dto.Truncated || dto.GatewayCursor != 900 || dto.Source != "gateway-log" {
+		t.Fatalf("aggregate gateway truncation DTO = %#v", dto)
+	}
+}
+
 func TestAbandonedPermissionDTOHidesTransportError(t *testing.T) {
 	line := sessionlog.Line{
 		Seq: 5, RequestID: "REQ", Type: "permission_abandoned",

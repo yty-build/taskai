@@ -395,11 +395,16 @@ function applyOptimisticPromptState(turn, acceptedState) {
   return true;
 }
 
-const transcriptState = {
-  turns: [], byRequest: new Map(), permissions: new Map(), diagnostics: [],
-  renderTimer: 0, shouldStick: true, newUpdates: 0, lastPosition: 0, historyClipped: false,
-  permissionOverflow: false, retainedBytes: 0
-};
+function newTranscriptState() {
+  return {
+    turns: [], byRequest: new Map(), permissions: new Map(), diagnostics: [],
+    renderTimer: 0, shouldStick: true, newUpdates: 0, lastPosition: 0, historyClipped: false,
+    permissionOverflow: false, retainedBytes: 0, source: "gateway-log", checkpoint: "",
+    sourceWarning: "", snapshotTruncated: false
+  };
+}
+
+let transcriptState = newTranscriptState();
 
 let streamAnnouncementsReady = false;
 let conversationAnnouncementTimer = 0;
@@ -550,7 +555,7 @@ function turnFor(activity) {
     id: requestID, firstPosition: activityPosition(activity), state: "", stopReason: "", blocks: [],
     tools: new Map(), plan: null, error: null, permissionIDs: new Set(),
     assistantBytes: 0, thoughtBytes: 0, toolBytes: 0, retainedBytes: 0, assistantSeen: false, reasoningSeen: false,
-    lifecycleSeen: false, contentClipped: false, dirty: true, element: null
+    lifecycleSeen: false, committed: false, contentClipped: false, dirty: true, element: null
   };
   transcriptState.byRequest.set(requestID, turn);
   transcriptState.turns.push(turn);
@@ -596,8 +601,9 @@ function applyDisplay(activity, turn) {
     const incoming = truncateUTF8Tail(display.text || "", LIMITS.assistant);
     makeRollingTextRoom(turn, "assistant", "assistantBytes", incoming.bytes, LIMITS.assistant);
     const previous = turn.blocks[turn.blocks.length - 1];
-    const compatible = previous?.type === "assistant" && (previous.messageID === display.message_id || !previous.messageID || !display.message_id);
-    const block = compatible ? previous : { type: "assistant", text: "", bytes: 0, clipped: false, leadingClipped: false, trailingClipped: false, messageID: display.message_id || "", key: activity.position };
+    const source = activity.kind === "provider_transcript" ? "provider" : "acp";
+    const compatible = previous?.type === "assistant" && previous.source === source && (previous.messageID === display.message_id || !previous.messageID || !display.message_id);
+    const block = compatible ? previous : { type: "assistant", source, text: "", bytes: 0, clipped: false, leadingClipped: false, trailingClipped: false, messageID: display.message_id || "", key: activity.position };
     if (!compatible && (!makeTextBlockSlot(turn) || !appendTurnBlock(turn, block))) break;
     block.text += incoming.text;
     block.bytes += incoming.bytes;
@@ -613,8 +619,9 @@ function applyDisplay(activity, turn) {
     if (String(display.text || "").trim()) turn.reasoningSeen = true;
     const incoming = truncateUTF8Tail(display.text || "", LIMITS.thought);
     makeRollingTextRoom(turn, "thought", "thoughtBytes", incoming.bytes, LIMITS.thought);
+    const source = activity.kind === "provider_transcript" ? "provider" : "acp";
     const previous = turn.blocks[turn.blocks.length - 1];
-    const block = previous?.type === "thought" ? previous : { type: "thought", text: "", bytes: 0, clipped: false, leadingClipped: false, trailingClipped: false, key: activity.position };
+    const block = previous?.type === "thought" && previous.source === source ? previous : { type: "thought", source, text: "", bytes: 0, clipped: false, leadingClipped: false, trailingClipped: false, key: activity.position };
     if (block !== previous && (!makeTextBlockSlot(turn) || !appendTurnBlock(turn, block))) break;
     block.text += incoming.text;
     block.bytes += incoming.bytes;
@@ -781,6 +788,256 @@ function applyActivity(activity) {
   return true;
 }
 
+function applySnapshotActivity(activity) {
+  const turn = turnFor(activity);
+  rememberPermission(activity, turn);
+  applyDisplay(activity, turn);
+  updateTurnRetention(turn);
+  trimTurns();
+  return turn;
+}
+
+function buildConversationSnapshot(snapshot, buffered = []) {
+  const candidate = newTranscriptState();
+  candidate.source = snapshot.source || "gateway-log";
+  candidate.checkpoint = snapshot.checkpoint || "";
+  candidate.sourceWarning = snapshot.warning || "";
+  candidate.snapshotTruncated = Boolean(snapshot.truncated);
+  candidate.historyClipped = candidate.snapshotTruncated;
+  const previous = transcriptState;
+  transcriptState = candidate;
+  try {
+    let snapshotPosition = 0;
+    for (const [turnIndex, snapshotTurn] of (snapshot.turns || []).entries()) {
+      const requestID = snapshotTurn.key || `snapshot:${turnIndex + 1}`;
+      for (const activity of (snapshotTurn.activities || [])) {
+        snapshotPosition += 1;
+        applySnapshotActivity({ ...activity, position: snapshotPosition, request_id: requestID });
+      }
+      const turn = candidate.byRequest.get(requestID);
+      if (turn) turn.committed = Boolean(snapshotTurn.committed);
+      if (turn && snapshotTurn.committed && !turn.lifecycleSeen) {
+        turn.state = "complete";
+        turn.lifecycleSeen = true;
+        turn.dirty = true;
+      }
+    }
+    candidate.diagnostics = Array.isArray(snapshot.diagnostics) ? snapshot.diagnostics.slice(-LIMITS.diagnostics) : candidate.diagnostics;
+    candidate.lastPosition = Math.max(candidate.lastPosition, Number(snapshot.gateway_cursor) || 0);
+    for (const activity of buffered) {
+      if ((Number(activity.position) || 0) > candidate.lastPosition) applyActivity(activity);
+    }
+    return candidate;
+  } finally {
+    transcriptState = previous;
+  }
+}
+
+function turnUserText(turn) {
+  return turn.blocks.find((block) => block.type === "user")?.text?.trim() || "";
+}
+
+function turnAssistantText(turn) {
+  return turn.blocks.filter((block) => block.type === "assistant").map((block) => block.text || "").join("\n").trim();
+}
+
+function normalizedPresentationText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function matchingOldTurn(turn, oldTurns, used) {
+  const exact = oldTurns.find((item) => !used.has(item) && item.id === turn.id);
+  if (exact) return exact;
+  const user = normalizedPresentationText(turnUserText(turn));
+  const assistant = normalizedPresentationText(turnAssistantText(turn));
+  const matches = oldTurns.filter((item) => {
+    if (used.has(item)) return false;
+    const oldUser = normalizedPresentationText(turnUserText(item));
+    const oldAssistant = normalizedPresentationText(turnAssistantText(item));
+    if (user && oldUser && user !== oldUser) return false;
+    if (!assistant || !oldAssistant) return Boolean(user && oldUser && user === oldUser);
+    return assistant === oldAssistant || assistant.endsWith(oldAssistant) || oldAssistant.endsWith(assistant);
+  });
+  // Fuzzy ACP-to-provider matching only preserves presentation state. If
+  // repeated turns make it ambiguous, replace the nodes atomically instead
+  // of attaching focus or selection to the wrong turn.
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function matchingOldBlock(block, oldBlocks, used) {
+  const matches = oldBlocks.filter((item) => {
+    if (used.has(item) || item.type !== block.type) return false;
+    if (block.type === "tool") return item.id === block.id;
+    if (["assistant", "thought", "user"].includes(block.type)) {
+      const nextText = normalizedPresentationText(block.text);
+      const oldText = normalizedPresentationText(item.text);
+      return Boolean(nextText && oldText) && (nextText === oldText || nextText.endsWith(oldText) || oldText.endsWith(nextText));
+    }
+    return true;
+  });
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function blockPresentationMatches(left, right) {
+  if (!left || !right || left.type !== right.type) return false;
+  if (["assistant", "thought", "user", "error"].includes(left.type)) {
+    return left.text === right.text && blockWasClipped(left) === blockWasClipped(right);
+  }
+  if (left.type === "tool") {
+    return ["id", "title", "kind", "status", "metadata", "preview", "detail", "detailLabel", "clipped", "sensitive"]
+      .every((field) => left[field] === right[field]);
+  }
+  if (left.type === "plan") return JSON.stringify(left.entries || []) === JSON.stringify(right.entries || []);
+  return false;
+}
+
+function adoptConversationPresentation(previous, candidate) {
+  candidate.shouldStick = previous.shouldStick;
+  candidate.newUpdates = previous.newUpdates;
+  const usedTurns = new Set();
+  for (const turn of candidate.turns) {
+    const oldTurn = matchingOldTurn(turn, previous.turns, usedTurns);
+    if (!oldTurn) continue;
+    usedTurns.add(oldTurn);
+    turn.element = oldTurn.element;
+    const usedBlocks = new Set();
+    for (const block of turn.blocks) {
+      const oldBlock = matchingOldBlock(block, oldTurn.blocks, usedBlocks);
+      if (!oldBlock) continue;
+      usedBlocks.add(oldBlock);
+      block.element = oldBlock.element;
+      // Reuse the stable DOM node so open/focus/selection state survives, but
+      // force a patch when the provider-committed text differs from the
+      // provisional ACP block. Equal revision counters are not content IDs.
+      block.renderedRevision = blockPresentationMatches(block, oldBlock) ? oldBlock.renderedRevision : -1;
+      block.renderedContext = oldBlock.renderedContext;
+    }
+  }
+  for (const [id, permission] of previous.permissions) {
+    if (permission.state !== "waiting" || candidate.permissions.has(id)) continue;
+    if (candidate.permissions.size >= LIMITS.permissions) {
+      candidate.permissionOverflow = true;
+      candidate.historyClipped = true;
+      continue;
+    }
+    candidate.permissions.set(id, permission);
+  }
+}
+
+let conversationSnapshotSignature = "";
+let conversationReconcileInFlight = false;
+let conversationReconcilePending = false;
+let conversationReconcileBuffer = [];
+let conversationReconcileTimer = 0;
+let conversationReconcileAttempts = 0;
+
+function hasUncommittedTerminalTurns(state = transcriptState) {
+  // Cancelled and failed turns are intentionally never committed as provider
+  // conversation history, so only successful completed turns need polling.
+  return state.turns.some((turn) => !turn.committed && turn.state === "complete");
+}
+
+function scheduleProviderCommitRetry(sessionID) {
+  if (!hasUncommittedTerminalTurns()) return;
+  // Provider stores normally commit within the first few attempts. Keep a
+  // low-frequency tail retry while the viewer remains open so a slow fsync,
+  // WAL checkpoint, or provider-side compaction cannot leave a completed ACP
+  // turn permanently provisional.
+  const delay = conversationReconcileAttempts < 6
+    ? Math.min(3000, 220 * (2 ** conversationReconcileAttempts))
+    : 10000;
+  conversationReconcileAttempts = Math.min(conversationReconcileAttempts + 1, 6);
+  scheduleConversationReconcile(sessionID, delay);
+}
+
+function updateHistorySource(source, warning = "") {
+  const label = document.querySelector("#history-source");
+  if (!label) return;
+  label.textContent = source === "provider-store"
+    ? "Committed provider history + live ACP stream"
+    : warning || "Gateway JSONL fallback + live ACP stream";
+}
+
+function snapshotSignature(snapshot) {
+  return JSON.stringify([
+    snapshot.source, snapshot.checkpoint, snapshot.gateway_cursor, snapshot.warning, snapshot.truncated,
+    (snapshot.turns || []).map((turn) => [turn.key, turn.committed, (turn.activities || []).map((item) => [item.position, item.kind, item.request_id])]),
+  ]);
+}
+
+function applySuccessfulConversationMetadata(snapshot) {
+  const nextWarning = snapshot.warning || "";
+  const changed = transcriptState.source !== snapshot.source || transcriptState.sourceWarning !== nextWarning;
+  transcriptState.source = snapshot.source;
+  transcriptState.sourceWarning = nextWarning;
+  updateHistorySource(snapshot.source, nextWarning);
+  return changed;
+}
+
+async function reconcileConversation(sessionID, { initial = false } = {}) {
+  if (conversationReconcileInFlight) {
+    conversationReconcilePending = true;
+    return false;
+  }
+  conversationReconcileInFlight = true;
+  conversationReconcileBuffer = [];
+  try {
+    const snapshot = await apiRequest(`/api/v1/sessions/${encodeURIComponent(sessionID)}/conversation`);
+    const signature = snapshotSignature(snapshot);
+    // A gateway snapshot is authoritative enough to bootstrap one atomic,
+    // bounded view and seed SSE from its captured cursor. On later refreshes,
+    // however, it represents a transient loss of provider-store authority;
+    // keep the already-rendered provider/live state instead of replacing it
+    // with an older or differently-clipped fallback projection.
+    if (snapshot.source !== "provider-store" && !initial) {
+      transcriptState.sourceWarning = snapshot.warning || "Provider history is unavailable; showing gateway history.";
+      updateHistorySource(snapshot.source, transcriptState.sourceWarning);
+      scheduleTranscriptRender();
+      scheduleProviderCommitRetry(sessionID);
+      return false;
+    }
+    if (!initial && signature === conversationSnapshotSignature && conversationReconcileBuffer.length === 0) {
+      if (applySuccessfulConversationMetadata(snapshot)) scheduleTranscriptRender();
+      scheduleProviderCommitRetry(sessionID);
+      return false;
+    }
+    const previous = transcriptState;
+    const candidate = buildConversationSnapshot(snapshot, conversationReconcileBuffer);
+    adoptConversationPresentation(previous, candidate);
+    if (previous.renderTimer) window.clearTimeout?.(previous.renderTimer);
+    transcriptState = candidate;
+    conversationSnapshotSignature = signature;
+    updateHistorySource(candidate.source, candidate.sourceWarning);
+    renderConversation();
+    if (hasUncommittedTerminalTurns(candidate)) scheduleProviderCommitRetry(sessionID);
+    else conversationReconcileAttempts = 0;
+    return true;
+  } catch (_) {
+    transcriptState.sourceWarning = "Provider history refresh is delayed; live ACP output remains current.";
+    updateHistorySource(transcriptState.source, transcriptState.sourceWarning);
+    if (!initial) {
+      scheduleTranscriptRender();
+    }
+    scheduleProviderCommitRetry(sessionID);
+    return false;
+  } finally {
+    conversationReconcileBuffer = [];
+    conversationReconcileInFlight = false;
+    if (conversationReconcilePending) {
+      conversationReconcilePending = false;
+      scheduleConversationReconcile(sessionID, 120);
+    }
+  }
+}
+
+function scheduleConversationReconcile(sessionID, delay = 140) {
+  window.clearTimeout?.(conversationReconcileTimer);
+  conversationReconcileTimer = window.setTimeout(() => {
+    conversationReconcileTimer = 0;
+    reconcileConversation(sessionID).catch(() => {});
+  }, delay);
+}
+
 function nearBottom(element) {
   return !element || element.scrollHeight - element.scrollTop - element.clientHeight < 90;
 }
@@ -908,7 +1165,9 @@ function messageElement(block, assistantName, context = {}) {
   const author = document.createElement("strong");
   author.textContent = assistantName;
   const phase = document.createElement("span");
-  phase.textContent = context.final ? "Response · turn complete" : context.streaming ? "Streaming over ACP" : "ACP update";
+  phase.textContent = context.final
+    ? (block.source === "provider" ? "Response · committed provider history" : "Response · turn complete")
+    : block.source === "provider" ? "Stored provider history" : context.streaming ? "Streaming over ACP" : "ACP update";
   meta.append(author, phase);
   const body = document.createElement("div");
   body.className = "message-body";
@@ -946,7 +1205,7 @@ function thoughtElement(block, context = {}) {
   const title = document.createElement("strong");
   title.textContent = "Reasoning";
   const state = document.createElement("span");
-  state.textContent = context.streaming ? "Streaming from ACP" : "Captured from ACP";
+  state.textContent = block.source === "provider" ? "Stored provider history" : context.streaming ? "Streaming from ACP" : "Captured from ACP";
   summary.append(title, state);
   const content = document.createElement("div");
   content.className = "thought-content";
@@ -1045,7 +1304,7 @@ function completedResponseBlock(turn) {
   return assistant[assistant.length - 1] || null;
 }
 
-function turnHasACPReasoning(turn) {
+function turnHasReasoning(turn) {
   return turn.reasoningSeen;
 }
 
@@ -1071,26 +1330,26 @@ function renderTurnTail(turn) {
   if (turn.state === "complete") {
     const retainedResponse = completedResponseBlock(turn);
     const retainedReasoning = turn.blocks.some((block) => block.type === "thought" && block.text.trim());
-    if (!turnHasACPReasoning(turn)) {
+    if (!turnHasReasoning(turn)) {
       const unavailable = document.createElement("div");
       unavailable.className = "reasoning-unavailable";
-      unavailable.textContent = "No separate reasoning was exposed over ACP for this turn.";
+      unavailable.textContent = "No separate reasoning was exposed by ACP or the provider store for this turn.";
       tail.append(unavailable);
     } else if (!retainedReasoning) {
       const unavailable = document.createElement("div");
       unavailable.className = "reasoning-unavailable";
-      unavailable.textContent = "Earlier ACP reasoning is outside this bounded view; the Session log remains authoritative.";
+      unavailable.textContent = "Earlier reasoning is outside this bounded view; committed provider history remains unchanged.";
       tail.append(unavailable);
     }
     if (!turn.assistantSeen) {
       const missing = document.createElement("div");
       missing.className = "response-missing";
-      missing.textContent = "The turn completed without an ACP assistant message. Check Diagnostics or open the native provider CLI.";
+      missing.textContent = "The turn completed without a retained assistant response. Check Diagnostics or open the native provider CLI.";
       tail.append(missing);
     } else if (!retainedResponse) {
       const missing = document.createElement("div");
       missing.className = "response-missing";
-      missing.textContent = "ACP assistant output is outside this bounded view; inspect the local Session log for the retained transcript.";
+      missing.textContent = "Assistant output is outside this bounded view; open the native provider CLI or local diagnostics for more detail.";
       tail.append(missing);
     }
   }
@@ -1235,7 +1494,7 @@ function focusIndex(root) {
 
 function patchBlockElement(block, assistantName, context = {}) {
   const previous = block.element;
-  const contextKey = `${context.streaming ? "streaming" : "stored"}:${context.final ? "final" : "update"}`;
+  const contextKey = `${block.source || "acp"}:${context.streaming ? "streaming" : "stored"}:${context.final ? "final" : "update"}`;
   if (previous && block.renderedRevision === block.revision && block.renderedContext === contextKey) return previous;
   const selection = previous ? selectionOffsets(previous) : null;
   const focusedIndex = previous ? focusIndex(previous) : -1;
@@ -1295,11 +1554,50 @@ function patchTurnElement(turn, assistantName) {
   return article;
 }
 
+function captureConversationScrollAnchor(scroller, container) {
+  if (!scroller || !container || transcriptState.shouldStick || typeof scroller.getBoundingClientRect !== "function") return null;
+  const scrollerTop = scroller.getBoundingClientRect().top;
+  // Prefer a semantic block over its containing turn. Reconciliation can add
+  // stored reasoning above a reused response inside the same turn; anchoring
+  // only the article would let the response jump even though its own viewer
+  // block survives. Keeping the block object lets patchBlockElement replace
+  // its DOM node while this anchor follows block.element to the replacement.
+  for (const turn of orderedTurns()) {
+    for (const block of turn.blocks) {
+      const element = block.element;
+      if (!element?.isConnected || typeof element.getBoundingClientRect !== "function") continue;
+      const rect = element.getBoundingClientRect();
+      if (rect.bottom > scrollerTop + 1) return { owner: block, element, offset: rect.top - scrollerTop };
+    }
+  }
+  for (const element of Array.from(container.children || [])) {
+    if (typeof element.getBoundingClientRect !== "function") continue;
+    const rect = element.getBoundingClientRect();
+    if (rect.bottom > scrollerTop + 1) return { element, offset: rect.top - scrollerTop };
+  }
+  return null;
+}
+
+function restoreConversationScrollAnchor(scroller, anchor, fallbackTop) {
+  if (!scroller) return;
+  const previousBehavior = scroller.style?.scrollBehavior || "";
+  if (scroller.style) scroller.style.scrollBehavior = "auto";
+  const element = anchor?.owner?.element || anchor?.element;
+  if (element?.isConnected && typeof element.getBoundingClientRect === "function" && typeof scroller.getBoundingClientRect === "function") {
+    const currentOffset = element.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+    scroller.scrollTop += currentOffset - anchor.offset;
+  } else {
+    scroller.scrollTop = fallbackTop;
+  }
+  if (scroller.style) scroller.style.scrollBehavior = previousBehavior;
+}
+
 function renderConversation() {
   const container = document.querySelector("#conversation");
   const scroller = document.querySelector("#conversation-scroll");
   if (!container || !scroller) return;
   const priorTop = scroller.scrollTop;
+  const scrollAnchor = captureConversationScrollAnchor(scroller, container);
   const assistantName = document.querySelector(".session-title h1")?.firstChild?.textContent?.trim() || "Agent";
   if (transcriptState.turns.length === 0) {
     if (!container.querySelector(".conversation-empty")) {
@@ -1313,18 +1611,38 @@ function renderConversation() {
       const copy = document.createElement("p");
       copy.textContent = "Send a message below. This structured ACP view remains linked to the provider's canonical conversation.";
       empty.append(icon, heading, copy);
+      if (transcriptState.sourceWarning) {
+        const source = document.createElement("p");
+        source.className = "muted";
+        source.textContent = transcriptState.sourceWarning;
+        empty.append(source);
+      }
       container.replaceChildren(empty);
     }
   } else {
     const desired = [];
+    if (transcriptState.sourceWarning || transcriptState.snapshotTruncated) {
+      let sourceNotice = container.querySelector("#conversation-source-note");
+      if (!sourceNotice) {
+        sourceNotice = document.createElement("div");
+        sourceNotice.id = "conversation-source-note";
+        sourceNotice.className = "history-limit-note";
+      }
+      sourceNotice.textContent = transcriptState.sourceWarning || (transcriptState.source === "provider-store"
+        ? "Older provider history is outside this bounded view."
+        : "Earlier gateway history is outside this bounded view.");
+      desired.push(sourceNotice);
+    }
     if (transcriptState.historyClipped) {
       let notice = container.querySelector("#history-limit-note");
       if (!notice) {
         notice = document.createElement("div");
         notice.id = "history-limit-note";
         notice.className = "history-limit-note";
-        notice.textContent = "Earlier conversation is hidden in this browser view. The Session log remains authoritative.";
       }
+      notice.textContent = transcriptState.source === "provider-store"
+        ? "Earlier conversation is outside this bounded browser view; committed provider history remains unchanged."
+        : "Earlier conversation is outside this bounded browser view; the private gateway JSONL remains unchanged.";
       desired.push(notice);
     }
     for (const turn of orderedTurns()) {
@@ -1344,7 +1662,7 @@ function renderConversation() {
     transcriptState.newUpdates = 0;
     if (jump) jump.hidden = true;
   } else {
-    scroller.scrollTop = priorTop;
+    restoreConversationScrollAnchor(scroller, scrollAnchor, priorTop);
     if (jump) {
       jump.hidden = false;
       jump.textContent = `${transcriptState.newUpdates} new update${transcriptState.newUpdates === 1 ? "" : "s"} ↓`;
@@ -1553,8 +1871,13 @@ function attachActivityStream(path) {
   source.addEventListener("activity", (event) => {
     try {
       const activity = JSON.parse(event.data);
+      if (conversationReconcileInFlight) conversationReconcileBuffer.push(activity);
       noteStreamActivity(activity);
       if (applyActivity(activity)) scheduleTranscriptRender();
+      if (["turn_completed", "turn_error", "native_refreshed", "native_refresh_recovered"].includes(activity.kind)) {
+        conversationReconcileAttempts = 0;
+        scheduleConversationReconcile(document.body.dataset.sessionId, activity.kind === "turn_completed" ? 100 : 180);
+      }
     } catch (_) {
       state?.classList.remove("connected");
       const label = state?.querySelector("span");
@@ -1783,8 +2106,11 @@ if (page === "session") {
   bindComposer(sessionID);
   bindSessionControls(sessionID);
   updateActionVisibility(document.body.dataset.sessionStatus);
-  attachActivityStream(`/api/v1/sessions/${encodeURIComponent(sessionID)}/stream`);
-  refreshPermissions().then(scheduleTranscriptRender).catch(() => {});
+  (async () => {
+    await reconcileConversation(sessionID, { initial: true });
+    attachActivityStream(`/api/v1/sessions/${encodeURIComponent(sessionID)}/stream`);
+    refreshPermissions().then(scheduleTranscriptRender).catch(() => {});
+  })();
   window.setInterval(() => {
     if (document.hidden) return;
     refreshSession(sessionID).catch(() => {});

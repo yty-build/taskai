@@ -82,6 +82,24 @@ func TestProjectBuildsSemanticConversationActivity(t *testing.T) {
 	}
 }
 
+func TestCleanUserMessageRequiresKnownTaskEnvelope(t *testing.T) {
+	arbitrary := "Task note: this is user-authored\nRole: not an injected envelope\nKeep every line."
+	if got := CleanUserMessage(arbitrary); got != arbitrary {
+		t.Fatalf("arbitrary user text was rewritten: %q", got)
+	}
+	envelope := "Task T-private: Visible title\nDescription: Visible description\nSession: S-private\nRole: reviewer\n" +
+		"Repository: /private/repo\nWorktree: /private/worktree\nBranch: private/branch\n\nSession-specific instructions:\nVisible instruction"
+	got := CleanUserMessage(envelope)
+	if got != "Start work on \"Visible title\" as reviewer.\n\nVisible description\n\nVisible instruction" {
+		t.Fatalf("clean envelope = %q", got)
+	}
+	for _, secret := range []string{"T-private", "S-private", "/private/repo", "/private/worktree", "private/branch"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("clean envelope leaked %q: %q", secret, got)
+		}
+	}
+}
+
 func TestProjectBoundsLocationMetadataAndPlanEntries(t *testing.T) {
 	locations := make([]map[string]string, 0, 20)
 	for index := 0; index < 20; index++ {

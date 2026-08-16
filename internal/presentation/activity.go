@@ -181,7 +181,7 @@ func projectACP(data json.RawMessage) *Activity {
 	switch event.Type {
 	case "session_prompt":
 		prompt, sourceClipped := sessionPromptText(params["prompt"])
-		text := legacyDisplayMessage(prompt)
+		text := CleanUserMessage(prompt)
 		text, clipped := boundedDisplay(text, maxMessageBytes)
 		if text == "" {
 			return nil
@@ -412,25 +412,41 @@ func sessionPromptText(value any) (string, bool) {
 	return output.String(), output.clipped
 }
 
-func legacyDisplayMessage(value string) string {
+// CleanUserMessage converts only the Agent Task Console's known injected
+// Task/Session envelope into its human-facing prompt. Arbitrary provider user
+// text is returned unchanged. This keeps Session IDs, checkout paths, and
+// branches out of provider-backed UI history without weakening the provider
+// record used internally for exact reconciliation.
+func CleanUserMessage(value string) string {
 	value = cleanDisplay(value)
-	lines := strings.Split(value, "\n")
+	header, extra, hasExtra := strings.Cut(value, "\nSession-specific instructions:\n")
+	lines := strings.Split(header, "\n")
 	if len(lines) == 0 || !strings.HasPrefix(lines[0], "Task ") || !strings.Contains(lines[0], ":") {
 		return value
 	}
 	title := strings.TrimSpace(strings.SplitN(lines[0], ":", 2)[1])
 	description, role := "", "worker"
+	seenSession, seenRole, seenRepository := false, false, false
 	for _, line := range lines[1:] {
 		switch {
 		case strings.HasPrefix(line, "Description: "):
 			description = strings.TrimSpace(strings.TrimPrefix(line, "Description: "))
+		case strings.HasPrefix(line, "Session: "):
+			seenSession = strings.TrimSpace(strings.TrimPrefix(line, "Session: ")) != ""
 		case strings.HasPrefix(line, "Role: "):
 			role = strings.TrimSpace(strings.TrimPrefix(line, "Role: "))
+			seenRole = role != ""
+		case strings.HasPrefix(line, "Repository: "):
+			seenRepository = strings.TrimSpace(strings.TrimPrefix(line, "Repository: ")) != ""
 		}
 	}
-	extra := ""
-	if _, tail, found := strings.Cut(value, "\nSession-specific instructions:\n"); found {
-		extra = strings.TrimSpace(tail)
+	if title == "" || !seenSession || !seenRole || !seenRepository {
+		return value
+	}
+	if hasExtra {
+		extra = strings.TrimSpace(extra)
+	} else {
+		extra = ""
 	}
 	var builder strings.Builder
 	fmt.Fprintf(&builder, "Start work on %q as %s.", title, firstNonEmpty(role, "worker"))

@@ -58,6 +58,22 @@ type ActivityDTO struct {
 	Display    *presentation.Activity `json:"display,omitempty"`
 }
 
+type ConversationDTO struct {
+	Source        string                `json:"source"`
+	Checkpoint    string                `json:"checkpoint,omitempty"`
+	Turns         []ConversationTurnDTO `json:"turns"`
+	Diagnostics   []ActivityDTO         `json:"diagnostics,omitempty"`
+	GatewayCursor uint64                `json:"gateway_cursor"`
+	Truncated     bool                  `json:"truncated,omitempty"`
+	Warning       string                `json:"warning,omitempty"`
+}
+
+type ConversationTurnDTO struct {
+	Key        string        `json:"key"`
+	Committed  bool          `json:"committed"`
+	Activities []ActivityDTO `json:"activities"`
+}
+
 type PermissionOptionDTO struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
@@ -118,6 +134,54 @@ func makeActivityPermissionDTO(line sessionlog.Line) *PermissionDTO {
 	default:
 		return nil
 	}
+}
+
+func makeConversationDTO(snapshot appservice.ConversationSnapshot) ConversationDTO {
+	result := ConversationDTO{
+		Source: string(snapshot.Source), Checkpoint: snapshot.Provider.Checkpoint,
+		GatewayCursor: snapshot.GatewayCursor, Truncated: snapshot.Truncated || snapshot.Provider.Truncated,
+		Warning:     snapshot.Warning,
+		Turns:       make([]ConversationTurnDTO, 0, len(snapshot.Turns)),
+		Diagnostics: make([]ActivityDTO, 0, len(snapshot.Diagnostics)),
+	}
+	for _, turn := range snapshot.Turns {
+		current := ConversationTurnDTO{Key: turn.Key, Committed: turn.Committed, Activities: make([]ActivityDTO, 0, len(turn.Activities))}
+		for _, activity := range turn.Activities {
+			current.Activities = append(current.Activities, makeConversationActivityDTO(activity))
+		}
+		result.Turns = append(result.Turns, current)
+	}
+	for _, activity := range snapshot.Diagnostics {
+		result.Diagnostics = append(result.Diagnostics, makeConversationActivityDTO(activity))
+	}
+	return result
+}
+
+func makeConversationActivityDTO(activity appservice.ConversationActivity) ActivityDTO {
+	result := ActivityDTO{
+		Position: activity.Position, RequestID: activity.RequestID, Kind: activity.Kind,
+		Timestamp: formatTime(activity.Timestamp), Activity: conversationActivitySummary(activity), Display: activity.Display,
+	}
+	if permission := activity.Permission; permission != nil {
+		if permission.Pending != nil {
+			value := makePendingPermissionDTO(*permission.Pending)
+			result.Permission = &value
+		} else {
+			result.Permission = &PermissionDTO{
+				ID: permission.ID, RequestID: activity.RequestID, State: permission.State,
+				Decision: safePermissionText(permission.Decision, 1024),
+			}
+		}
+	}
+	return result
+}
+
+func conversationActivitySummary(activity appservice.ConversationActivity) string {
+	if activity.Summary != "" {
+		return activity.Summary
+	}
+	line := sessionlog.Line{Type: activity.Kind}
+	return presentation.Summary(line, activity.Display)
 }
 
 func safePermissionText(value string, limit int) string {
