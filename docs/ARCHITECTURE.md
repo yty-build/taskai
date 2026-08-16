@@ -13,10 +13,11 @@ A Task stores title, description, status, optional external reference, and metad
 Everything else is infrastructure or operational data:
 
 - request ID — correlation field for one submitted prompt;
-- JSONL record — append-only Session history with a monotonic position;
+- JSONL record — append-only Session lifecycle/audit and provisional-overlay
+  journal with a monotonic position;
 - review — another Session with role `reviewer`;
 - output — owned by Git and the filesystem;
-- Task activity — a computed aggregate over child Session history.
+- Task activity — a computed aggregate over child Session gateway journals.
 
 SQLite migrations are guarded to create only `tasks` and `sessions`. There is no Run, Event, Artifact, workflow, broker, or daemon persistence model.
 
@@ -28,27 +29,29 @@ CLI commands       terminal console       local web / JSON+SSE
      └────────────────────┼───────────────────────┘
                           ▼
               TaskService / SessionService
-                       SessionStream
-                 ┌────────┼───────────┐
-                 ▼        ▼           ▼
-            SQLite store  │     internal/native
-                          │           │ exact store verification
-                    worker runtime    ▼
-                          │     provider-native CLI
-                   private socket     │
-                          │           │
-                 detached worker      │
-                          │           │
-             internal/acp → acpx      │
-                          └─────┬─────┘
-                                ▼
-                 canonical provider conversation
+           SessionStream + conversation projection
+              ┌───────────┼─────────────┐
+              ▼           ▼             ▼
+         SQLite store     │       internal/native
+                          │        ┌─────┴───────────┐
+                    worker runtime │                 │
+                          │        ▼                 ▼
+                   private socket  exact provider   provider-native CLI
+                          │        store reader      │
+                 detached worker   │                 │
+                          │        │                 │
+             internal/acp → acpx   │                 │
+                          └────────┴────────┬────────┘
+                                          ▼
+                           canonical provider conversation
 ```
 
 Transport handlers do not reimplement Task or Session behavior:
 
 - `internal/task` and `internal/service` are shared application services;
-- `internal/service.SessionStream` defines Session history/follow and Task aggregate history/follow;
+- `internal/service.SessionStream` defines Session journal follow and Task
+  aggregate follow; the shared conversation projection joins verified provider
+  history with gateway-only overlay state for structured clients;
 - `internal/store` owns SQLite and embedded migrations;
 - `internal/worker` is the only long-lived runtime primitive;
 - `internal/acp` is the only package that knows `acpx` grammar or output;
@@ -82,29 +85,69 @@ The worker:
 - creates or resumes the same ACP Session;
 - allows at most one active ACP turn;
 - serializes later prompts in a visible queue;
+- participates in the per-Session provider-writer gate, so an ACP turn and the
+  provider-native process can never send input concurrently;
 - gives every prompt a request ID;
 - appends every visible transition/output with a monotonic position;
 - broadcasts the same correlated lines to multiple subscribers;
 - supports prompt, status/ping, exact permission decision, cancel, stop, subscribe, and idle ACP refresh commands;
 - clears worker ownership on orderly stop.
 
-Pending permissions are runtime state plus append-only Session history, not another entity or table. A viewer detach has no permission or turn side effect. The first valid viewer decision wins; cancel/stop/bridge failure abandons the request safely.
+Pending permissions are runtime state plus append-only Session journal records,
+not another entity or table. A viewer detach has no permission or turn side
+effect. The first valid viewer decision wins; cancel/stop/bridge failure
+abandons the request safely.
 
 The runtime bridge uses a bounded NDJSON control pipe on child fd 3. Child stdin is reserved for the pinned runtime's own one-shot filesystem/terminal host prompt, allowing structured `client_operation` events to become normal permission cards without mixing provider terminal text into the protocol. Provider-specific restrictive modes/configuration prevent silent internal writes before this boundary.
 
 The spawning CLI is not the worker's parent lifecycle owner. Terminal and web connections may exit without affecting it. Every normal CLI invocation reconciles stale persisted PID/socket state and removes stale runtime files.
 
-## History and reconnect
+## Conversation sources, projection, and reconnect
 
-Session JSONL is the recovery boundary for ACP-visible activity. Each line contains:
+One canonical provider conversation has three distinct data paths:
+
+| Source | Role |
+| --- | --- |
+| Verified provider-owned store | Committed, authoritative user-visible conversation history |
+| Live ACP | Provisional reasoning, output, tools, permissions, and turn state while work is happening |
+| Session JSONL | Gateway lifecycle/audit record, missed-stream recovery, provisional overlay, and explicit fallback |
+
+The provider store may itself be JSONL, SQLite, or another provider format; it
+is accessed only through verified provider adapters in `internal/native`.
+Gateway JSONL is not promoted into a canonical transcript merely because a
+provider snapshot is temporarily unavailable.
+
+Session JSONL is the recovery boundary for gateway-visible activity. Each line contains:
 
 ```text
 seq, timestamp, optional request_id, type, raw internal data
 ```
 
-Session replay reads positions greater than a numeric cursor. An active worker subscription replays missed positions before live delivery. Clients deduplicate by Session ID and position.
+Session replay reads positions greater than a numeric cursor. An active worker
+subscription replays missed positions before live delivery. Clients deduplicate
+gateway deltas by Session ID and position.
 
-A Task stream is a computed merge of every child Session's durable history. Its cursor is a component-wise map:
+A structured load verifies the immutable provider conversation ID and checkout,
+reads a bounded provider snapshot, joins the gateway-only overlay through the
+returned gateway cursor, and only then follows ACP after that boundary. If the
+provider snapshot cannot be read on initial load, the service returns a bounded
+gateway-history projection with an explicit fallback warning. On a transient
+refresh failure, an already-open viewer retains its current in-memory
+presentation and marks the refresh as delayed. HTTP, terminal, web, and future
+mobile clients consume this shared projection; they do not parse provider
+stores or join JSONL themselves.
+
+After each settled ACP turn and after provider-native process exit/stop, a
+structured viewer requests a fresh projection. The service prepares and
+validates that bounded snapshot; the viewer then replaces its local
+presentation atomically. Reconciliation does not blank or visibly reload the
+transcript and cannot duplicate the provisional turn it commits. Presentation
+keys remain stable so clients preserve scroll anchor/live-follow, focus,
+composer draft/cursor, row/text selection, pending-approval focus, selected
+Session/tool, and expanded reasoning/tool state.
+
+A Task stream is a computed merge of every child Session's durable gateway
+journal. Its cursor is a component-wise map:
 
 ```text
 Session A → last position
@@ -112,16 +155,25 @@ Session B → last position
 ...
 ```
 
-The HTTP transport encodes that map as an opaque URL-safe token. This preserves lossless reconnect without introducing a global Event table or synthetic Task stream entity. `FollowTask` polls durable history, so it also discovers Sessions added after attachment.
+The HTTP transport encodes that map as an opaque URL-safe token. This preserves
+lossless reconnect without introducing a global Event table or synthetic Task
+stream entity. `FollowTask` polls durable gateway journals, so it also discovers
+Sessions added after attachment.
 
-Native provider transcripts remain authoritative for details ACP does not emit. Session JSONL is authoritative for Task Console replay and operational correlation.
+Task aggregate activity remains a computed merge over child Session gateway
+journals. It is an operational/attention feed, not the committed conversation
+projection and not another persistent entity.
 
 ## Attachment
 
-Task attachment is a gateway navigator. Direct Session attachment is provider-native by default; `--acp` selects the structured gateway console.
+Task attachment is a responsive gateway cockpit. Direct Session attachment is
+provider-native by default; `--acp` selects the structured gateway console.
 
-- Task attachment loads the Task and all Sessions, replays every history, then subscribes. Enter opens the selected native provider harness and `a` opens its structured ACP view.
-- Structured ACP attachment replays that Session, then subscribes from its last position.
+- Task attachment loads the Task and all Sessions, replays their operational
+  activity, then subscribes. Enter opens the selected native provider harness
+  and `a` opens its reconciled structured ACP view.
+- Structured ACP attachment loads the shared provider-snapshot-plus-overlay
+  projection, then follows ACP from the captured gateway cursor.
 - Multiple viewers may subscribe safely.
 - A Task prompt is never broadcast; the user must select its target Session.
 - In Task/structured ACP views, `q`, `Ctrl-C`, browser close, network loss, or `acpctl serve` exit detaches only the viewer. Native keys belong to the provider; tmux uses `Ctrl-B d` to detach while leaving it running.
@@ -138,28 +190,47 @@ Before native attachment, `internal/native` verifies that exact canonical ID aga
 ```text
 canonical provider ID ── exact local-store verification ── native CLI resume
           │                                                │
-          └──────── ACP worker remains independent ────────┘
-                                                           │ native process exits
+          └────────── per-Session exclusive writer gate ───┘
+                                                           │ process exits/stops
                                                            ▼
-                                            request exact ACP refresh at idle
+                                      refresh + provider-store reconciliation
+                                                           │
+                                                           ▼
+                                              release queued ACP write
 ```
 
 When tmux is available, the native CLI runs in a stable per-Session tmux session; detaching the viewer leaves it running. The gateway tags that tmux session with a hash of the canonical state root plus Session identity, explicitly passes the selected `AGENT_HOME` and current `PATH` to defeat stale tmux-server environment, and refuses an unowned name collision. A direct execution fallback is used outside a TTY, inside tmux, or when tmux is unavailable.
 
-ACP and native access are intentionally not mutually exclusive. Native attachment never pauses, cancels, queues, or blocks ACP work, and ACP work never seizes a native terminal. Concurrent writes to one provider conversation may be unsafe; V1 shows an advisory and leaves coordination to the user. After the native process actually exits, the worker defers an exact ACP refresh until active and queued ACP turns are idle. Refresh, prompt-transport failure, and post-turn identity inspection reload persisted verification state and are time-bounded. An uncertain bridge and its provider process group are terminated and awaited before exact ACP resume is attempted. Queued work proceeds only after identity recovery succeeds; otherwise queued requests receive correlated errors and the worker stops for explicit resume. No failure creates a lock or replacement identity.
+Viewer connections are non-exclusive, but provider writes are exclusive per
+Session. If an ACP turn owns the writer gate, native attach waits or fails
+visibly without cancelling that turn. While a provider-native process owns the
+gate, ACP prompts remain visibly queued and do not reach the provider. A tmux
+viewer detach is not process exit and does not release native ownership.
+
+Native process exit/stop requests an exact ACP refresh plus provider-store
+reconciliation while native ownership and the boundary remain closed to queued
+writes. Ownership releases only after that reconciliation succeeds. Refresh,
+prompt-transport failure, and post-turn identity inspection reload persisted
+verification state and are time-bounded. An uncertain bridge and its provider
+process group are terminated and awaited before exact ACP resume is attempted.
+Queued work crosses the boundary only after identity recovery and atomic
+reconciliation succeed; otherwise requests receive correlated errors and the
+worker stops for explicit resume. Recovery never substitutes a different
+conversation identity.
 
 ## Review
 
 Review is an independent Session under the producer's Task. By default, the producer must be stopped or terminal so evidence is not changing. The review prompt includes:
 
 - original Task context;
-- producer Session ID and read-only JSONL path;
+- producer Session ID and read-only JSONL audit path;
 - repository/worktree and branch;
 - captured Git status, staged diff, and unstaged diff;
 - instructions to rerun critical verification;
 - the specification's suspicious-behavior checklist.
 
-The producer transcript is evidence, not imported conversational context. Review creation moves the Task to `review` status.
+The producer journal is evidence, not imported conversational context. Review
+creation moves the Task to `review` status.
 
 ## HTTP and web process
 
@@ -172,13 +243,24 @@ Browser hardening includes loopback Host enforcement, cross-origin mutation reje
 ## Failure and recovery rules
 
 - **Viewer exits:** no worker change.
-- **Worker exits:** later CLI reconciliation clears stale ownership; JSONL remains replayable.
+- **Worker exits:** later CLI reconciliation clears stale worker ownership;
+  provider history remains committed and JSONL remains usable as disclosed
+  gateway fallback.
 - **CLI process exits after spawn:** worker continues.
 - **Malformed/non-monotonic JSONL:** replay fails closed with an actionable error.
-- **Malformed/partial/nonzero acpx output:** the adapter returns a typed protocol/command error; valid prefixes already emitted remain in history.
+- **Malformed/partial/nonzero acpx output:** the adapter returns a typed
+  protocol/command error; valid prefixes already emitted remain in the gateway
+  journal/overlay.
 - **Prompt client disconnects:** worker continues and records the request-correlated response for cursor replay.
 - **Native verification fails:** no native process starts; the ACP worker is unchanged.
-- **Post-native refresh or post-turn identity recovery fails:** warnings and correlated queued-request errors are recorded, the suspect process tree is terminated, and the worker stops for explicit exact resume; no lock is held.
+- **Provider snapshot is temporarily unreadable:** an already-open viewer keeps
+  its current in-memory presentation and discloses the delayed refresh; an
+  initial load uses the bounded gateway-history fallback. Never swap in a
+  partial candidate.
+- **Post-native refresh, reconciliation, or post-turn identity recovery fails:**
+  warnings and correlated queued-request errors are recorded, the suspect
+  process tree is terminated, and the worker stops for explicit exact resume;
+  queued writes do not cross the unresolved ownership boundary.
 - **SQLite contention:** busy timeout and per-repository locking protect local concurrency.
 - **Existing checkout collision:** fail before a second writer unless explicitly overridden.
 

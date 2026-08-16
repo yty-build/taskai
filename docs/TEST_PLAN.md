@@ -46,7 +46,9 @@ Using the fake ACP/acpx fixtures:
 - Connect multiple viewers.
 - Prove one active turn and ordered queued prompts.
 - Verify request IDs and response routing.
-- Verify JSONL validity, monotonic positions, and replay.
+- Verify JSONL validity, monotonic positions, replay, and its role as
+  lifecycle/audit/provisional-overlay/fallback data rather than committed
+  provider conversation history.
 - Cancel active/idle turns, stop, resume, crash, and recover.
 - Exercise malformed/partial adapter output and missing native IDs.
 - Verify socket, state, and log permissions.
@@ -59,14 +61,30 @@ For `acpctl task attach`:
 
 - Every Task Session appears with correct state and activity.
 - A new Session appears without restarting.
-- Keyboard and mouse selection work.
+- Keyboard and mouse selection work, with a keyboard-complete path that does
+  not require a mouse or special font.
+- The cohesive two-pane cockpit works at 80x24 and 120x40, collapses to a
+  stacked layout at 60x16, and keeps the Session navigator plus core actions at
+  the supported 40x16 minimum. Smaller terminals show an actionable warning.
+- Status, selection, attention, and focus use words/glyphs as well as color.
+- Contextual help and the searchable substring command palette expose the
+  shared action registry; unavailable native continuation and invalid current
+  actions produce explicit notices.
 - Session drill-down and return work.
 - Task-level input cannot silently broadcast.
 - Detaching does not affect workers.
+- Enter opens the selected provider-native harness and `a` opens structured
+  ACP; neither action silently substitutes the other.
 
 For `acpctl session attach --acp`:
 
-- Stored history loads before live output and does not duplicate.
+- The exact verified provider snapshot loads as committed history; gateway
+  JSONL contributes only lifecycle/audit and unmatched provisional overlay;
+  live ACP starts after the captured gateway cursor with no gap or duplicate.
+- Missing/unreadable provider history on initial load is returned as a bounded,
+  disclosed gateway fallback. A transient refresh failure leaves an already-open
+  viewer's current in-memory presentation visible with a delayed-refresh notice.
+  JSONL is never labelled canonical provider history.
 - Prompts reach the correct Session.
 - Busy steering is queued visibly.
 - `Esc` cancels the current turn and a follow-up continues the same Session.
@@ -78,19 +96,39 @@ For `acpctl session attach --acp`:
 - A permission remains pending across detach; a reattached viewer can decide it.
 - Two viewers racing a permission yield one accepted decision and one deterministic conflict.
 - `allow_always`/`reject_always` are visibly persistent and require confirmation.
+- Settled ACP turns reconcile against the provider store off-screen and publish
+  atomically without a blank frame, visible reload, duplicate turn, or content
+  jump.
+- Live updates and reconciliation preserve scroll anchor/live-follow, focus,
+  composer draft/cursor, row/text selection, pending-approval focus, selected
+  Session/tool, and expanded reasoning/tool state.
+- When scrolled away from the bottom, streaming does not steal the reader's
+  position and exposes a deterministic new-activity indicator.
 
 ## T06 — Git, review, and native mode
 
 - Create multiple isolated worktrees and branches.
 - Verify shared-checkout protection and non-destructive cleanup behavior.
-- Verify reviewer Session independence and complete producer evidence.
+- Verify reviewer Session independence and its producer JSONL, checkout, branch,
+  status, and Git-diff evidence.
 - Prove the first exact provider identity becomes immutable canonical Session state while acpx/ACP/native IDs remain evidence.
 - Test exact Codex, Claude, Grok, and OpenCode local-store verification plus ambiguous/missing/check-out mismatch rejection.
 - Prove `session attach <id>` and Task Enter invoke the exact real provider-native resume command; `--acp` and Task `a` open the structured gateway console.
 - Prove tmux detach/reattach leaves the native process running and does not request an early refresh.
-- Prove native attachment never pauses, cancels, or blocks ACP activity; concurrency is an advisory owned by the user.
-- Prove actual native exit requests an exact ACP refresh and defers behind work already queued at that boundary. A prompt submitted later must remain behind refresh.
-- Inject post-turn and post-native identity drift. Prove bounded exact recovery completes before later work; if recovery fails, queued requests receive correlated errors, no later prompt reaches the suspect bridge, the entire old process group exits, and the worker stops without a lock.
+- Prove an active ACP turn exclusively owns provider writes: native attach waits
+  or fails visibly and never cancels that turn.
+- Prove a running provider-native process exclusively owns provider writes:
+  ACP prompts remain visibly queued and no input reaches ACP/the provider.
+- Prove tmux viewer detach does not release ownership while the native process
+  continues; reattachment reaches that same process and conversation.
+- Prove actual native exit/stop requests exact ACP refresh and provider-store
+  reconciliation while retaining native ownership and keeping queued ACP
+  prompts behind the boundary. Only a successful atomic reconciliation may
+  release ownership and the next queued prompt.
+- Inject post-turn and post-native identity drift. Prove bounded exact recovery
+  completes before later work; if recovery fails, queued requests receive
+  correlated errors, no later prompt reaches the suspect bridge, the entire old
+  process group exits, and the worker stops with the write boundary unresolved.
 - Start tmux with stale `AGENT_HOME`/`PATH`, then prove native attach passes the invoking state root/environment and rejects an unowned name collision.
 - Run the serialized ACP → native → ACP nonce smoke against all four authenticated providers.
 
@@ -99,11 +137,18 @@ For `acpctl session attach --acp`:
 - Exercise every `/api/v1` endpoint and `/healthz`.
 - Verify CLI, TUI, API, and web show consistent state.
 - Verify Task aggregate SSE and Session replay/reconnect, including the Session `ready` replay/live boundary without gaps or duplicate positions.
+- Verify `GET /api/v1/sessions/{id}/conversation` is a bounded, sanitized,
+  server-joined provider snapshot plus gateway overlay with an explicit source,
+  checkpoint, gateway cursor, committed/provisional flags, and fallback state.
+- Prove HTTP/web/mobile clients never receive provider file paths or implement
+  provider-file/JSONL joining themselves.
 - Verify request/response correlation and invalid cursor handling.
 - Verify loopback-only binding and no socket/ACP leakage.
 - Verify web prompt/cancel/resume/stop and Session drill-down.
 - Verify responsive desktop/mobile ordering and the safe linked/verified conversation indicators without exposing any provider ID.
-- Verify semantic user/assistant reconstruction, cumulative transcript bounds, merged tool/plan updates, and diagnostic-only records creating no blank turns.
+- Verify semantic user/assistant reconstruction from committed provider history
+  plus provisional ACP, cumulative transcript bounds, merged tool/plan updates,
+  and diagnostic-only records creating no blank turns.
 - Verify reconnect after stop/resume does not pin a stale query cursor, rapid Enter cannot duplicate a prompt, and late replay remains ordered before an optimistic prompt.
 - Verify streaming preserves expanded tool/reasoning state, focus, text selection, and a reader's scroll anchor; verify mobile keeps named cancel/resume actions and announces conversation/approval updates.
 - Stop the web server and confirm workers continue.
@@ -118,7 +163,8 @@ For every provider:
 - Send the Task-derived initial prompt.
 - Require a provider-specific proof file and `go test ./...`.
 - Require the provider to commit only its proof change on its Session branch.
-- Confirm structured ACP history, IDs, status, and response routing.
+- Confirm committed provider history, provisional ACP overlay/stream, explicit
+  source state, IDs, status, and response routing.
 - Detach the UI while work continues.
 - Send a short follow-up prompt.
 - Stop and resume the same Session.
@@ -126,7 +172,21 @@ For every provider:
 - Exercise one harmless write permission in `read-approval`: the file must not exist before allow, must appear after allow, and must remain absent after reject.
 - Record whether each provider uses `session/request_permission` or the one-shot host broker for `fs/write_text_file`/`terminal/create`; unknown host paths must fail closed.
 
-For Codex, Claude, Grok, and OpenCode, additionally wait for ACP idle, verify the canonical ID in the provider's exact local store, enter the real native harness, prove it remembers an ACP-only nonce, add a native-only nonce, exit the provider process, wait for exact idle ACP refresh, and prove ACP remembers the native-only nonce. Never overlap the two turns; product concurrency remains advisory rather than enforced. Gemini is ACP-only in V1 until an exact provider-store verifier is implemented.
+For Codex, Claude, Grok, and OpenCode, additionally verify the canonical ID in
+the provider's exact local store and prove this sequence:
+
+1. During an active ACP turn, native attach waits/fails without cancellation.
+2. After ACP settles and reconciles, the real native harness remembers an
+   ACP-only nonce.
+3. While native owns the conversation, an ACP prompt stays visibly queued and
+   does not dispatch, including after tmux viewer detach.
+4. Add a native-only nonce, exit the provider process, and wait for exact ACP
+   refresh plus atomic provider-store reconciliation.
+5. Only then may the queued ACP prompt run; it must remember the native-only
+   nonce and the structured projection must contain one committed copy of each
+   turn.
+
+Gemini is ACP-only in V1 until an exact provider-store verifier is implemented.
 
 Do not edit authentication configuration. Report an unexpected login prompt as a blocker for that provider.
 

@@ -83,6 +83,53 @@ For an end user, the same Task can later be rendered more simply:
 
 The underlying model remains identical.
 
+## 2.3 Conversation source contract
+
+Every surface presents one provider conversation, but the three available
+sources have deliberately different responsibilities:
+
+- The provider-owned conversation store is the committed, authoritative source
+  for user-visible conversation history. It is always resolved by the
+  Session's canonical provider conversation ID; the gateway never selects a
+  transcript by recency.
+- ACP is the live control and provisional streaming path. Structured terminal,
+  web, mobile, automation, and agent-to-agent prompts go through the Session
+  worker over ACP and appear immediately while the provider is still working.
+  ACP is not treated as the durable transcript database.
+- Session JSONL is the gateway's append-only lifecycle, correlation,
+  permission, audit, and recovery journal. It supplies the live overlay and an
+  explicit fallback when the provider store cannot be read, but it does not
+  replace the provider transcript as committed conversation history.
+
+Opening a Session therefore means: load a normalized snapshot of the exact
+provider conversation, overlay gateway-only lifecycle state plus any ACP
+activity not yet represented by that snapshot, and then continue applying live
+ACP activity. After an ACP turn settles, and after provider-native activity,
+an open structured viewer asks the shared service for a fresh joined projection
+and reconciles it with its live overlay in the background.
+
+ACP and provider-native continuations share one exclusive per-Session provider
+write gate. This gate is operational state, not a persistent entity. It
+serializes writers without changing the source roles above: viewers may remain
+open simultaneously, but an ACP turn and a native CLI must never send provider
+input concurrently.
+
+Reconciliation is an atomic presentation update. It must not blank or visibly
+reload the transcript, duplicate a turn, move a reader who has scrolled away
+from the live edge, steal keyboard focus, alter a composer draft or cursor,
+clear text or row selection, or collapse an expanded reasoning/tool surface.
+An ACP item remains visible until an equivalent committed provider item is
+present in the replacement snapshot. If a transient refresh fails, an
+already-open viewer keeps its current in-memory presentation and gives a
+concise delay disclosure. If provider history is unavailable on initial load,
+the shared service returns a bounded gateway-history fallback with an explicit
+source warning.
+
+Provider snapshots, ACP overlays, reconciliation boundaries, and presentation
+revisions are in-memory or transport concepts. They do not add a persistent
+Run, Event, Artifact, transcript, or other first-class entity. The persistent
+product model remains exactly Task and Session.
+
 ---
 
 # 3. Non-Goals
@@ -158,7 +205,7 @@ Reviewer receives:
 
 - original Task,
 - repository/worktree,
-- producer session transcript/log reference,
+- producer Session gateway JSONL audit-log reference,
 - current Git diff/commit.
 
 The reviewer independently inspects the work and can rerun tests.
@@ -634,7 +681,30 @@ Responses:
 
 Closing a subscriber connection only detaches that viewer. It must not cancel a turn, stop the worker, or close the ACP Session.
 
-Provider-native attachment does not acquire a worker lease. It must not pause or cancel an ACP turn, change Session state, or hold the prompt queue. A `refresh` request made after native activity reconnects immediately when the worker is idle, or defers until work already queued at that boundary completes. Prompts submitted after the boundary remain behind refresh. Refresh and post-turn inspection reload persisted identity verification; uncertain transport is terminated and awaited before bounded exact recovery. If recovery fails, later queued prompts are rejected with correlated errors and the worker stops rather than using an unproven conversation. Cross-surface concurrency warnings remain advisory because the user owns coordination.
+Provider-native continuation and ACP continuation share one exclusive provider
+write gate per Session. Acquiring that gate does not make the viewer own the
+worker and never cancels an active turn. If ACP is writing, native attach must
+wait in the serialized queue or fail with an actionable busy response. Once the
+native CLI owns the gate, ACP prompts may be accepted only as visibly queued
+work and must not reach the provider until the native process releases
+ownership. Detaching a viewer from a tmux-backed native harness leaves the
+native process and its ownership intact. Native process exit/stop begins the
+release sequence, but ownership remains held through exact refresh and
+provider-snapshot reconciliation.
+
+A `refresh` request made after native process exit/stop runs before native
+ownership ends and before the next queued ACP provider write. Refresh and
+post-turn inspection reload persisted identity
+verification and trigger the provider-snapshot reconciliation defined in
+Section 11; the projection is prepared in the background and published
+atomically without resetting any viewer. Uncertain ACP transport is terminated
+and awaited before bounded exact recovery. If transport recovery fails, later
+queued prompts are rejected with correlated errors and the worker stops rather
+than using an unproven conversation. If only provider-snapshot refresh fails,
+the worker may continue on a still-verified ACP transport only when doing so
+cannot cross an unreconciled native-write boundary; otherwise queued prompts
+remain blocked with a visible recovery error. Viewers may coexist, but ACP and
+native provider writes never overlap.
 
 Use newline-delimited JSON over Unix sockets.
 
@@ -644,7 +714,7 @@ No message broker.
 
 ---
 
-# 11. Session Logs
+# 11. Session Logs and Conversation Projection
 
 Each Session gets an append-only JSONL log.
 
@@ -654,16 +724,20 @@ Example:
 ~/.agent/logs/S102.jsonl
 ```
 
-This is **not** an Event database.
+This is **not** an Event database or the canonical conversation transcript.
 
-It is session scrollback / forensic history.
+It is the gateway lifecycle/audit journal, live projection overlay, and
+provider-history fallback.
 
 Store the raw structured output received from ACP/acpx with minimal normalization.
 
 Purposes:
 
-- `acpctl task attach`
-- `acpctl session attach --acp`
+- request/response correlation,
+- queued/active/cancelled/failed turn lifecycle,
+- pending and resolved permission state,
+- the provisional ACP overlay used by every structured viewer,
+- explicit fallback history if the provider snapshot is unavailable,
 - `acpctl session logs --follow`
 - reviewer inspection
 - debugging
@@ -671,11 +745,96 @@ Purposes:
 - auditing commands/tool output
 - recovering recent UI history
 
-Each stored record should carry a monotonic stream position and, when applicable, a request ID. These are fields in append-only session history, not separate database entities.
+Each stored record should carry a monotonic stream position and, when
+applicable, a request ID. These are fields in the append-only gateway Session
+journal, not separate database entities.
 
-Native Codex / Claude / Gemini / Grok / OpenCode transcript storage remains authoritative for provider-specific conversation history.
+Native Codex / Claude / Gemini / Grok / OpenCode transcript storage remains
+authoritative for committed provider conversation history. A provider store may
+use JSONL, SQLite, or another provider-specific format; no UI may assume that
+all providers share one file schema. Each provider adapter reads only the exact
+canonical conversation and projects allowlisted user-visible content. It must
+not expose provider authentication, hidden internal state, or unrelated
+conversations.
 
 The Task Console should not attempt to replace it.
+
+## 11.1 Source roles
+
+| Source | Role | Viewer behavior |
+|---|---|---|
+| Provider conversation store | Committed user-visible conversation history | Load first as the base snapshot for the exact canonical provider conversation. |
+| ACP worker stream | Live provisional messages, reasoning, tools, plans, permissions, and turn state | Apply immediately as a keyed overlay while work is active. |
+| Session JSONL | Gateway lifecycle/audit record, missed-stream recovery, and fallback | Restore gateway-only state, recover provisional activity, and disclose when it is being used instead of a provider snapshot. |
+| SQLite | Task/Session identity, status, checkout, and canonical provider identity | Never use it as a conversation body store. |
+
+"Provisional" describes source lifecycle, not inferior UI treatment. Live ACP
+content must be readable immediately and may include the best information
+available while the provider has not committed its transcript. Once a refreshed
+provider snapshot contains the equivalent turn, the projection replaces the
+duplicate ACP conversation fragments while retaining gateway-only lifecycle,
+permission, and diagnostic facts.
+
+## 11.2 Initial load
+
+A structured Session load uses the shared service to:
+
+1. Load the Session and verify its canonical provider conversation identity.
+2. Read and normalize a bounded snapshot of that exact provider-owned
+   conversation.
+3. Capture the gateway stream high-water position while reading Session JSONL
+   and derive gateway-only lifecycle state plus ACP activity not represented in
+   the provider snapshot.
+4. Reduce the two sources into one semantic conversation projection off the
+   render path.
+5. Publish the projection once and subscribe after the returned gateway stream
+   position so no activity is lost or duplicated across the load boundary.
+
+If the Session has not yet acquired a provider conversation identity, the
+provider has not committed its first turn, or a verified provider snapshot is
+temporarily unavailable, loading must still succeed from gateway JSONL/live ACP
+when possible. The viewer labels this state, for example:
+
+- `Live ACP · provider history not committed yet`,
+- `Gateway history fallback · provider transcript unavailable`, or
+- `Provider history refresh delayed · current view retained`.
+
+A provider without a verified store adapter, including a V1 custom ACP command
+and Gemini until its store contract is implemented, uses the disclosed gateway
+fallback. The gateway must not guess a provider-store location or apply another
+provider's parser.
+
+The disclosure is visible but does not replace the transcript with an error
+screen. A new Session with no provider or gateway conversation activity shows a
+specific empty state rather than implying that a completed transcript exists.
+
+## 11.3 Background reconciliation
+
+Reconcile after every settled ACP turn (completed, cancelled, or failed when
+the provider may have persisted output) and after provider-native activity.
+Native process exit/stop requests reconciliation at the next safe boundary.
+Detaching a viewer alone does not release a still-running native process.
+Native ownership remains held after process exit/stop until exact refresh and
+reconciliation complete; only then may the next queued ACP prompt write.
+
+Reconciliation must:
+
+1. read and normalize a fresh provider snapshot without mutating the active
+   presentation,
+2. combine it with gateway-only records and still-uncommitted ACP activity,
+3. reject a partial, malformed, wrong-conversation, or wrong-checkout snapshot,
+4. atomically publish the bounded replacement projection only after it passes
+   validation, and
+5. leave an already-open viewer's current in-memory projection in place and
+   surface a bounded diagnostic if any step fails.
+
+The replacement uses stable presentation keys rather than array position so
+clients can preserve the selected Session/tool, transcript anchor and live-tail
+mode, keyboard focus, composer value and cursor, text selection, pending
+approval focus, and expanded/collapsed reasoning and tool state. A reader at
+the live edge continues following; a reader inspecting older content remains
+anchored and receives a new-activity indicator. Reconciliation must never show
+an intermediate empty transcript or force a page/console reload.
 
 ---
 
@@ -793,7 +952,11 @@ Attach to the live Task console:
 acpctl task attach PM-42
 ```
 
-The Task console shows every Session, current status, latest activity, and an aggregate activity stream. Selecting a Session with Enter or the mouse opens its real provider-native harness; the explicit ACP action opens its complete ACP-visible history and live output.
+The Task console shows every Session, current status, latest activity, and an
+aggregate activity stream. Keyboard navigation or a mouse click selects a
+Session; Enter opens its real provider-native harness. The explicit ACP action
+opens the reconciled provider snapshot plus gateway overlay and continues with
+live provisional ACP output.
 
 Follow Task activity without an interactive terminal UI:
 
@@ -903,10 +1066,34 @@ Attachment is the primary way a human observes and steers work. It is a client c
 3. updates when Sessions are added or change state,
 4. accepts keyboard and mouse selection,
 5. opens the selected Session in its real provider-native harness on Enter,
-6. provides an explicit ACP view plus controls for prompt, cancel, resume, stop, and review,
+6. provides an explicit ACP view plus controls for prompt, cancel, resume, and stop,
 7. returns from Session detail to the Task overview.
 
-The terminal Task console uses a two-pane Session navigator and selected-Session preview at normal widths, with a stacked layout for narrow terminals. A single action registry drives keyboard shortcuts, contextual footer hints, help, and command-palette entries. Filtering and a command palette make larger Tasks quick to navigate. Returning from a native harness restores the Task console.
+The terminal Task console is a compact developer cockpit, not another agent
+harness. At normal widths it uses one cohesive two-pane surface: a scannable
+Session navigator and a larger selected-Session preview separated by a single
+shared seam. A slim header shows Task identity and status; attention is visible
+in Session status and selected-Session context. Each Session row pairs its
+status color with a glyph and word, gives agent/role priority over opaque IDs,
+and keeps status/activity context aligned for scanning. The preview emphasizes
+latest activity, checkout, canonical-conversation readiness, and the primary
+actions: `Enter` opens the real provider CLI, `a` opens Structured ACP, and `p`
+targets an ACP message.
+
+Narrow terminals use a stacked navigator/preview. At the supported minimum of
+40 columns by 16 rows, the console keeps a useful Session navigator and its
+core Native, ACP, New Session, and Detach actions instead of requiring a desktop
+viewport. Smaller terminals receive an actionable size warning while Session
+work continues. Keyboard interaction is complete; mouse support is additive.
+Status is never conveyed by color alone, and the core UI does not require a
+Nerd Font or truecolor.
+
+A single action registry drives keyboard shortcuts, the footer, help, filter,
+and a searchable substring command palette. Unavailable native continuation is
+labelled explicitly, and invoking an action that is not valid for the current
+Session produces an actionable notice. Returning from a native harness restores
+the Task console, its selected Session, filter, scroll position, and other
+disposable viewer state.
 
 A Task is not itself an agent. A message entered at Task scope must target an explicitly selected Session. V1 must not silently broadcast a prompt to every Session.
 
@@ -914,7 +1101,39 @@ A Task is not itself an agent. A message entered at Task scope must target an ex
 
 `acpctl session attach <session-id> --acp` opens the structured ACP Session console directly. Web and mobile Session selection always opens this same structured ACP view because those clients cannot embed a local provider terminal.
 
-The console first replays stored ACP-visible history and then subscribes to live output. It should render agent messages, tool calls, command results, diffs, permission requests, errors, and reasoning information when the provider exposes them through ACP. Reasoning segments stay in event order and are visible while streaming. When a turn completes, the last assistant segment may be labeled as the completed response; this is a presentation inference because ACP does not promise a separate final-answer channel. If no reasoning segment was exposed, the UI states that explicitly. A raw/debug gateway-envelope view is available as an advanced toggle; with the public runtime bridge it is not an exact JSON-RPC packet capture.
+The console loads the reconciled projection defined in Section 11: committed
+provider history first, gateway lifecycle/uncommitted ACP activity as an
+overlay, and then the live ACP stream from the captured position. It renders
+agent messages, tool calls, command results, diffs, permission requests,
+errors, and reasoning information when the provider exposes them. Reasoning
+segments stay in event order and are visible while streaming. When a turn
+completes, the last assistant segment may be labeled as the completed response;
+this is a presentation inference because ACP does not promise a separate
+final-answer channel. If no reasoning segment was exposed, the UI states that
+explicitly. A raw/debug gateway-envelope view is available as an advanced
+toggle; with the public runtime bridge it is not an exact JSON-RPC packet
+capture and it does not replace the committed provider snapshot.
+
+The Structured ACP console is conversation-first. A compact identity/status
+line sits above a transcript rendered directly on the terminal background.
+User and agent turns use distinct gutters. Successful tool calls collapse to a
+one-line summary; running and failed calls retain their status and bounded
+preview; detailed tool output and reasoning use progressive disclosure through
+the `d` and `o` controls. The latest plan summary may stay pinned without
+duplicating every plan update. Only modal decisions, especially a pending
+permission, receive a prominent bordered shelf above the multi-line composer.
+
+Live streaming follows only while the reader is at the bottom. Scrolling away
+freezes the viewport and shows a new-activity/return-to-live control instead of
+moving text underneath the reader. Background reconciliation uses the same
+keyed update path, so it preserves scroll anchor, focus, draft/cursor, text or
+row selection, selected tool, and expanded reasoning/tool cards. An initial
+gateway-history fallback or delayed refresh uses the disclosures in Section 11
+rather than a blank screen or full console reload.
+
+Export to native scrollback or a configured pager/editor is a post-V1 terminal
+enhancement. V1 retains trusted raw gateway inspection through
+`acpctl session logs <id> --raw` and the provider-native harness.
 
 While an ACP turn is active:
 
@@ -923,15 +1142,44 @@ While an ACP turn is active:
 - after cancellation, steering starts a new turn in the same Session,
 - detaching does not cancel or stop anything.
 
+Messages submitted from structured terminal, web, or mobile surfaces always go
+through the Session worker over ACP and stream provisionally. Input typed in a
+provider-native harness goes directly through that provider. Both paths target
+the same canonical provider conversation, but they never write it concurrently.
+If native ownership is active, an ACP prompt remains visibly queued until
+reconciliation succeeds and ownership ends. If an ACP turn is active, native
+attach waits in the Session's serialization order or fails with an actionable
+busy explanation; it never interrupts the turn. The next background
+reconciliation makes committed native or ACP turns visible to every structured
+surface before the other writer continues.
+
+While the native process owns the Session, structured viewers keep the last
+validated provider snapshot. V1 does not expose the active writer identity in
+Session detail, so a later structured prompt shows only its ordinary queued
+request state. Structured viewers do not invent live ACP frames for native-only
+work or swap in a provider file while it may be mid-write. The provider's real
+harness is the live native view; structured viewers receive the new committed
+turn through the atomic post-native reconciliation.
+
 When a permission card is pending, numbered choices map directly to the exact offered option IDs. Persistent `allow_always`/`reject_always` choices are visually distinct and require confirmation. Closing the console leaves the agent waiting; attaching again restores the actionable card.
 
-The complete ACP-visible history is not necessarily the provider's complete hidden internal state. The native runtime transcript remains authoritative for provider-specific details that ACP does not emit.
+The normalized provider snapshot is limited to user-visible committed history
+and may still omit hidden provider state. ACP can expose provisional reasoning,
+tool, or lifecycle detail that the provider transcript does not persist, which
+is why the gateway overlay remains part of the projection. Neither structured
+surface attempts to expose hidden provider internals.
 
 ## 14.3 Detach and response routing
 
 Detaching a Task or Session console closes only that viewer connection.
 
 The active turn continues, JSONL continues to append, and all remaining viewers continue to receive activity. The client that submitted a prompt receives its correlated response while connected. A disconnected client can reconnect using its last stream position and replay the missed response.
+
+Detaching from a provider-native viewer likewise leaves a tmux-backed native
+process running. Because that process can still write the provider
+conversation, its exclusive provider-write ownership remains active until the
+process exits or is explicitly stopped and the resulting exact refresh plus
+provider reconciliation succeeds; ACP prompts stay queued in the meantime.
 
 This behavior applies equally to terminal, web, mobile, automation, and agent-to-agent callers.
 
@@ -971,14 +1219,26 @@ Behavior:
 
 1. resolve the canonical provider conversation ID persisted for the Session,
 2. verify the exact ID exists in the provider's local store and belongs to the same repo/worktree,
-3. launch the documented native resume command in that repo/worktree,
-4. preferably host it in a tmux session derived from the Task Console Session ID so terminal detach/reattach preserves the native process,
-5. leave any active ACP turn and queued prompts untouched,
-6. after native exit, request a best-effort ACP refresh at the next idle boundary.
+3. acquire the Session's exclusive provider-write gate; wait in serialization
+   order or fail visibly if an ACP turn currently owns it,
+4. launch the documented native resume command in that repo/worktree,
+5. preferably host it in a tmux session derived from the Task Console Session
+   ID so terminal detach/reattach preserves the native process and its
+   ownership,
+6. keep later ACP prompts visibly queued without sending them to the provider,
+7. on native process exit/stop, refresh and atomically reconcile the provider
+   snapshot before releasing native ownership and queued ACP work.
 
 If the canonical ID is missing, cannot be verified, or the provider cannot resume it, fail with an actionable explanation. Never choose the newest provider transcript, guess that two IDs represent the same conversation, or silently open a replacement conversation.
 
-The gateway may display that ACP and native clients could both be active, but it does not enforce a lock. Concurrent writes are a provider/user concern: the user is responsible for avoiding conflicting conversations when the provider does not serialize them safely.
+Several viewers may observe the Session at once, but only one provider-writing
+surface may own it. The exclusivity boundary covers ACP prompt dispatch and the
+provider-native process, not disposable viewers. Closing a Task, ACP, web, or
+mobile viewer never releases native ownership, stops a worker, or cancels a
+turn. V1 surfaces the request's ordinary `queued` lifecycle state while it
+waits. The Session detail does not yet identify the current provider-writing
+surface or distinguish why a request is queued; those richer ownership states
+are a future UI refinement.
 
 ---
 
@@ -1007,7 +1267,7 @@ The generated reviewer prompt should include:
 
 1. original Task title/description,
 2. producer Session ID,
-3. producer session log path,
+3. producer Session JSONL path as read-only gateway lifecycle/audit evidence,
 4. repo/worktree,
 5. current Git branch/diff,
 6. instruction to independently rerun critical verification.
@@ -1028,7 +1288,9 @@ The reviewer should explicitly look for:
 - repeated broken approaches,
 - security regressions.
 
-Do not import the producer's conversation into the reviewer as the reviewer's own Session.
+Do not import the producer's conversation into the reviewer as the reviewer's
+own Session. It is read-only evidence and does not change either Session's
+provider conversation identity.
 
 The reviewer gets read-only access to evidence.
 
@@ -1120,6 +1382,17 @@ The browser is a conversation-first structured ACP client over the same Task/Ses
 
 Desktop keeps Task/Session navigation visible. Mobile uses a focus-managed navigation drawer and one full-height conversation pane, but retains response cancel/resume controls and an explicit Send action. Streamed updates preserve reader position, expanded tool/reasoning state, focus, and text selection. The transcript and approval shelf expose live-region/author semantics for assistive technology.
 
+Initial browser load receives the same provider-snapshot-plus-gateway-overlay
+projection as the terminal console, followed by live provisional ACP updates.
+After a turn or native process finishes, the browser fetches one validated
+semantic replacement and swaps it into its local presentation rather than
+reloading the page. The browser preserves its stable-block scroll anchor,
+live-follow mode, navigation and tool selection, keyboard focus, composer
+draft/cursor, DOM text selection, and disclosure state across that replacement. If provider history
+cannot be loaded initially, the conversation remains usable from the bounded
+gateway fallback. A transient refresh failure keeps the current in-memory view
+and shows the delayed-refresh disclosure from Section 11.
+
 The public browser projection is semantic, sanitized, and cumulatively bounded. It coalesces assistant chunks, merges tool updates, replaces plans, and exposes only safe labels plus opaque IDs needed for display or a permission decision. Provider/worker errors, commands derived from raw input, raw tool objects, structured environment/auth fields, ACP envelopes, sockets, native identifiers, and JSONL paths stay below the browser boundary. Allowlisted provider-visible text, diffs, and terminal output remain visible and can contain sensitive repository or tool-produced content; the local browser is a same-trusted-user surface, not a secret scanner. Trusted forensic inspection remains a terminal `--raw` operation.
 
 No channels.
@@ -1148,6 +1421,7 @@ GET    /api/v1/tasks/{id}/sessions
 GET    /api/v1/tasks/{id}/stream
 
 GET    /api/v1/sessions/{id}
+GET    /api/v1/sessions/{id}/conversation
 POST   /api/v1/tasks/{id}/sessions
 
 POST   /api/v1/sessions/{id}/prompt
@@ -1162,6 +1436,18 @@ GET    /healthz
 ```
 
 Prompt submission returns a request ID. Task and Session streams carry monotonic positions and request IDs so a client can correlate responses and reconnect without losing output. Server-Sent Events should support `Last-Event-ID` or an equivalent cursor.
+
+`GET /api/v1/sessions/{id}/conversation` exposes the shared semantic
+conversation projection rather than making HTTP clients join provider files
+and gateway JSONL themselves. The
+initial projection contains the normalized provider snapshot plus its derived
+gateway overlay and a captured live-stream cursor. Live stream messages add
+provisional ACP activity. A successful reconciliation publishes an atomic
+projection replacement or stable-keyed equivalent; its opaque revision is
+transport metadata, not a persistent Event or transcript entity. Failed initial
+provider loading publishes a bounded gateway fallback; a transient refresh
+failure updates an already-open viewer's warning without exposing a provider
+path or canonical provider conversation ID.
 
 This allows future:
 
@@ -1205,10 +1491,19 @@ Required categories:
 
 1. SQLite driver.
 2. YAML parser for agent registry.
-3. One focused terminal UI library for keyboard, mouse, and streaming console behavior.
+3. Bubble Tea as the focused Go terminal UI framework, with compatible Charm
+   components/styling where they reduce hand-written viewport, composer, help,
+   and ANSI behavior.
 4. Optional small CLI helper library if useful.
 
 Avoid adding a framework merely for aesthetics.
+
+The terminal redesign stays in Go and does not require a Rust/ratatui rewrite.
+Its quality comes from information architecture, semantic style tokens,
+component focus, responsive layout, and stable streaming behavior. Preserve the
+repository's declared Go compatibility; treat any future Bubble Tea major
+upgrade that raises the Go baseline as a separate platform decision rather than
+mixing it into the cockpit redesign.
 
 Prefer standard library for:
 
@@ -1381,15 +1676,28 @@ subscribe to live Session streams
        │
        ▼
 select S201 (keyboard or single click)
-       ├── Enter ──► verify canonical provider ID ──► real native harness
+       ├── Enter ──► verify canonical provider ID
+       │             └── acquire exclusive provider-write gate
+       │                  └── real native harness
        │
-       └── `a` / ACP action ──► replay stored history, then receive live ACP output
+       └── `a` / ACP action ──► provider snapshot + gateway overlay
+                                └── receive live provisional ACP output
 ```
 
-If worker is not available:
+If the provider snapshot is not available:
 
 ```text
-show stored JSONL history
+show gateway JSONL fallback with a visible disclosure
++
+continue live ACP when the worker is available
+```
+
+If the worker is not available:
+
+```text
+load a fresh bounded provider snapshot plus gateway JSONL overlay when available
++
+otherwise show the bounded gateway JSONL fallback with a disclosure
 +
 offer acpctl session resume S201
 ```
@@ -1403,7 +1711,8 @@ viewer disconnects
 
 worker completes the turn
 JSONL stores the correlated result
-reconnecting viewer resumes from its last stream position
+provider store commits the conversation
+reconnecting viewer loads a fresh joined projection and follows after its returned cursor
 ```
 
 ---
@@ -1506,6 +1815,18 @@ The canonical provider conversation ID is the only ID used for subsequent provid
 12. Never require a terminal or web UI to keep Sessions alive.
 13. A Task-scoped message must target a selected Session; never silently broadcast.
 14. Keyboard interaction must always work; mouse selection is an additional convenience.
+15. Structured Session load starts from the exact provider-owned committed
+    snapshot, overlays gateway lifecycle/uncommitted ACP activity, and then
+    streams live ACP; never present gateway JSONL as the provider's canonical
+    transcript without a fallback disclosure.
+16. Post-turn and post-native reconciliation is background and atomic. It must
+    preserve scroll/follow state, focus, draft/cursor, selection, and expanded
+    disclosure state without a visible blank/reload.
+17. ACP and provider-native writes are exclusive per Session. Viewers may
+    coexist, but a native process and an ACP turn never send provider input at
+    the same time.
+18. The terminal cockpit remains Go/Bubble Tea, is usable without mouse,
+    truecolor, or Nerd Fonts, and remains actionable at 40x16 or larger.
 
 ---
 
@@ -1616,9 +1937,9 @@ Do not build a tracing platform in V1.
 Use:
 
 ```text
-Session JSONL log
+native provider transcript for committed conversation history
 +
-native runtime transcript
+Session JSONL for lifecycle/audit/fallback
 +
 Git history
 ```
@@ -1732,7 +2053,11 @@ V1 is complete when all of these work.
 - [ ] Attach to a Task and see all of its Sessions update live.
 - [ ] Select a Session from the Task console with keyboard or mouse.
 - [ ] Attach directly to a Session and resume the exact provider conversation in its native harness.
-- [ ] Use `session attach --acp` and see stored history followed by live ACP output.
+- [ ] Use `session attach --acp` and see the exact provider snapshot plus
+      gateway overlay followed by live provisional ACP output.
+- [ ] When the provider store is unavailable, see usable gateway JSONL fallback
+      history with an explicit disclosure rather than a blank or falsely
+      complete transcript.
 - [ ] Queue a steering prompt while a turn is active.
 - [ ] Cancel an active turn with `Esc` and continue in the same Session.
 - [ ] Detach without interrupting the active turn.
@@ -1747,8 +2072,18 @@ V1 is complete when all of these work.
 - [ ] Create isolated worktrees on request.
 - [ ] Enter on a Task Session and `session attach <id>` both open the real provider-native harness.
 - [ ] Codex, Claude, Grok, and OpenCode resume the exact verified conversation ID; no recency fallback is used.
-- [ ] Native attach never pauses/cancels ACP or holds queued prompts, and any concurrency warning is advisory.
-- [ ] Exiting native mode requests a nonblocking ACP refresh at the next idle boundary.
+- [ ] Native attach waits/fails without cancelling when an ACP turn owns the
+      provider-write gate; ACP prompts remain visibly queued while native owns
+      it, and ACP/native writes never overlap.
+- [ ] Detaching a native viewer preserves a still-running native process and its
+      exclusive ownership; process exit/stop triggers reconciliation before
+      queued ACP work resumes.
+- [ ] Post-turn and post-native refresh loads committed provider history and
+      atomically reconciles it with the ACP/JSONL overlay without duplication,
+      blanking, or visible reload.
+- [ ] Terminal reconciliation preserves selected Session/tool, scroll anchor
+      and follow state, focus, composer draft/cursor, selection, and expanded
+      reasoning/tool state.
 
 ## Review
 
@@ -1763,12 +2098,16 @@ V1 is complete when all of these work.
 - [ ] `acpctl serve` starts local web UI.
 - [ ] Web lists Tasks.
 - [ ] Web shows Task Sessions.
-- [ ] Selecting a web Session shows the same stored and live history as terminal attachment.
+- [ ] Selecting a web Session shows the same provider snapshot, gateway
+      overlay/fallback, and live ACP activity as terminal attachment.
 - [ ] Web streams live Session output.
 - [ ] Web can send a prompt.
 - [ ] Web can cancel/resume/stop.
 - [ ] Web renders a conversation-first semantic transcript with bounded assistant, reasoning, tool, plan, permission, and diagnostic state.
 - [ ] Streaming preserves scroll anchor, expanded disclosure state, focus, and text selection.
+- [ ] Background projection replacement preserves live-follow mode, composer
+      draft/cursor, navigation/tool selection, and DOM text selection without
+      flicker or a page reload.
 - [ ] Mobile retains named cancel/resume controls, a focus-managed Task/Session drawer, and explicit Send behavior.
 - [ ] Transcript authors and approval changes are announced through accessible semantics.
 - [ ] Browser projection omits provider/worker errors, raw tool objects, commands derived from raw input, structured environment/auth fields, ACP envelopes, and runtime paths; allowlisted tool text/output is explicitly treated as trusted-user sensitive content.
@@ -1779,6 +2118,9 @@ V1 is complete when all of these work.
 - [ ] `/api/v1` exposes Task and Session DTOs rather than database rows.
 - [ ] Task streams aggregate activity from all Sessions.
 - [ ] Session streams expose monotonic replay positions and request IDs.
+- [ ] Session reads expose one semantic provider-snapshot-plus-overlay
+      projection, and reconciliation publishes an atomic replacement without
+      exposing provider paths or identities.
 - [ ] A disconnected client can reconnect without losing completed output.
 - [ ] CLI, terminal console, API, and web use the same application services.
 - [ ] Raw worker sockets and ACP protocol details remain below the client boundary.
@@ -1810,16 +2152,20 @@ Build in this order.
 
 11. Detached `_worker` subcommand.
 12. multi-subscriber Unix socket protocol.
-13. serialized prompt queue.
-14. correlated JSONL session logs.
-15. stale worker detection.
+13. serialized ACP prompt queue plus an exclusive per-Session provider-write
+    gate shared with native mode.
+14. correlated JSONL lifecycle/audit/overlay/fallback journal.
+15. stale worker and stale native-owner detection.
 
 ## Phase 4 — interactive attachment
 
-16. `acpctl task attach` Task console.
-17. `acpctl session attach --acp` structured Session console.
+16. Go/Bubble Tea `acpctl task attach` developer cockpit with responsive
+    navigator/preview, contextual actions, and native-default handoff.
+17. conversation-first `acpctl session attach --acp` structured Session
+    console.
 18. keyboard/mouse Session selection.
-19. history replay followed by live stream.
+19. source-agnostic semantic projection fixtures: provider snapshot + gateway
+    overlay/fallback followed by live provisional ACP.
 20. prompt/cancel/resume/stop controls.
 21. noninteractive `logs --follow` commands.
 
@@ -1828,23 +2174,32 @@ Build in this order.
 22. repo validation.
 23. optional worktree creation.
 24. branch naming.
-25. canonical provider identity verification and native-by-default attachment.
+25. verified exact-conversation provider-store snapshot adapters for Codex,
+    Claude, Grok, and OpenCode.
+26. canonical provider identity verification and exclusive native-by-default
+    attachment.
+27. background atomic post-turn/post-native reconciliation before writer
+    handoff.
 
 ## Phase 6 — review helper
 
-26. `acpctl session review`.
-27. transcript + repo evidence prompt.
+28. `acpctl session review`.
+29. gateway JSONL audit-log + repo evidence prompt.
 
 ## Phase 7 — versioned API and optional local web
 
-28. shared Task/Session/SessionStream service boundary.
-29. `/api/v1` Task and Session endpoints.
-30. reconnectable Task and Session event streams.
-31. `acpctl serve`.
-32. Tasks page.
-33. Task detail and clickable Session drill-down.
-34. stored history plus live Session stream.
-35. prompt/cancel/resume/stop.
+30. shared Task/Session/SessionStream and conversation-projection service
+    boundary.
+31. `/api/v1` Task and Session endpoints.
+32. reconnectable Task and Session activity streams plus atomic projection
+    replacement.
+33. `acpctl serve`.
+34. Tasks page.
+35. Task detail and clickable Session drill-down.
+36. provider snapshot plus gateway overlay/fallback and live Session stream.
+37. no-flicker reconciliation preserving scroll/focus/draft/selection/disclosure
+    state.
+38. prompt/cancel/resume/stop with visible queued request state.
 
 Do not start Phase 7 before the CLI and terminal attachment flow is pleasant.
 
@@ -1888,7 +2243,9 @@ Select `S102` from the Task console or attach directly to its real provider harn
 acpctl session attach S102
 ```
 
-To observe stored ACP-visible history, continue receiving live ACP work, or submit an ACP steering prompt explicitly:
+To observe the committed provider snapshot with its gateway overlay/fallback,
+continue receiving live provisional ACP work, or submit an ACP steering prompt
+explicitly:
 
 ```bash
 acpctl session attach S102 --acp
@@ -1925,10 +2282,13 @@ The product should stay deliberately small.
 ```text
 Task
   └── Sessions
-        └── detached worker
-              └── ACP
-                    └── Codex / Claude / Gemini / Grok / OpenCode / custom agent
-                          └── repo/worktree
+        ├── detached worker ──► gateway JSONL lifecycle/audit/overlay/fallback
+        │        │
+        │        └── exclusive provider-write gate ──► ACP live provisional path
+        │                                             └── provider runtime
+        ├── native harness ── exclusive provider-write gate ──► same provider runtime
+        ├── provider-owned committed conversation store
+        └── repo/worktree
 ```
 
 Everything else is optional.

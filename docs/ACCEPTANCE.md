@@ -16,7 +16,7 @@ The command:
 4. builds the real `cmd/acpctl` binary with fixed version/commit/date values and verifies exact `acpctl version` output;
 5. runs tracked-file, credential-pattern, ignore-rule, fixture-mode, and two-table entity-boundary checks.
 
-The black-box lifecycle test builds `acpctl`, uses an isolated temporary `AGENT_HOME` and Git repository, launches a genuinely detached hidden worker against deterministic fake `acpx`, prompts/follows/stops/resumes it, uses fake provider-native resume, creates an independent review, and validates persisted/logged behavior. No network or provider credential is required.
+The black-box lifecycle test builds `acpctl`, uses an isolated temporary `AGENT_HOME` and Git repository, launches a genuinely detached hidden worker against deterministic fake `acpx`, prompts/follows/stops/resumes it, uses fake provider-store history and provider-native resume, creates an independent review, and validates persisted/journaled behavior. No network or provider credential is required.
 
 Primary end-to-end evidence:
 
@@ -42,9 +42,11 @@ Primary end-to-end evidence:
 | Prompt existing Session | lifecycle test, API test | Provider follow-up |
 | Initial prompt contains Task, role, repo/worktree | `TestStartPersistsPermissionAndSendsCompleteInitialPrompt`, lifecycle argv log | Provider matrix |
 | Explicit unattended write permission | `TestPrepareDefaultsToReadApprovalAndValidatesProfileAndDirectory`, `TestPermissionMetadataDefaultsReadAndRequiresExplicitApproveAll` | Inspect live Session detail |
-| Task attach shows all Sessions and updates live | `TestTaskConsoleShowsEverySessionAndDetachesOnlyViewer`, `TestRefreshAddsNewTaskSessionWithoutRestart` | Interactive terminal smoke |
+| Modern responsive Task cockpit shows all Sessions and updates live | Task cockpit layout/visual-contract tests, `TestTaskConsoleShowsEverySessionAndDetachesOnlyViewer`, `TestRefreshAddsNewTaskSessionWithoutRestart` | 40x16, 60x16, 80x24, and 120x40 interactive smoke |
 | Keyboard and mouse Session selection | `TestTaskConsoleKeyboardMouseAndExplicitPromptTarget` | Interactive terminal smoke |
-| Structured `session attach --acp`: stored then live, no duplicate | `TestSessionConsoleReplaysThenDeduplicatesLiveAndTogglesRaw` | Interactive provider smoke |
+| Structured `session attach --acp`: committed provider snapshot + gateway overlay + live ACP, no duplicate | `TestSessionConsoleLoadsProviderHistoryAndKeepsLiveACPEventsAcrossReconcile`, `TestConversationUsesProviderHistoryAndOnlyUncommittedGatewayOverlay` | Interactive provider smoke |
+| Provider store is committed history; gateway JSONL is disclosed fallback only | provider transcript reader tests, `TestConversationFallsBackToGatewayReplayWithoutCanonicalProviderHistory`, conversation API tests | Disconnect/move provider-store smoke |
+| Reconciliation is atomic and preserves viewer state | console/browser reconcile and state-preservation tests | Stream while scrolled, drafting, selecting, and expanding tool/reasoning surfaces |
 | Busy steering is queued | `TestWorkerSerializesPromptsBroadcastsAndReplays` | Provider matrix |
 | Composer escape and explicit cancellation preserve the Session | `TestEscapeLeavesComposerWithoutCancellingAndExplicitCancelPreservesDraft`, worker tests | Interactive provider smoke |
 | Detach does not interrupt turn | `TestAttachSessionProgramCanDetachWithoutWorkerMutation`, Task console test | Terminal/browser close smoke |
@@ -56,11 +58,12 @@ Primary end-to-end evidence:
 | Resume stopped Session | lifecycle test, service/API tests | Provider matrix |
 | Persist one immutable canonical provider identity plus adapter evidence | `TestMigrationBackfillsCanonicalProviderConversation`, store round-trip, adapter, lifecycle tests | Provider metadata inspection |
 | Associate and create Git worktrees | repository and service worktree tests, CLI test | Provider matrix branches |
-| Direct attach and Task Enter open the real native harness | `TestTaskConsoleNativeDefaultACPActionFilterHelpAndPalette`, lifecycle fake-native test | Four-provider native smoke |
+| Direct attach and Task Enter open the real native harness; `a`/`--acp` are explicit | Task cockpit action/palette tests, lifecycle fake-native test | Four-provider native smoke |
 | Exact provider-store verification fails closed | `TestStoreVerifierExactProviderStores`, `TestStoreVerifierRejectsUnsafeAndUnknownConversation` | Four-provider native smoke |
-| Native attach never pauses or cancels ACP | `TestNativeAttachRunsVerifiedCanonicalConversationWithoutPausingACP` | Serialized live continuity smoke |
+| Native and ACP writes are exclusive without cancelling the current owner | per-Session writer-gate service/worker tests | Attempt native attach during ACP, then ACP prompt during native ownership |
 | tmux viewer detach leaves the provider running | `TestDetachedTmuxViewerLeavesRefreshToNativeProcessOwner`, `TestTmuxHarnessUsesDerivedNameAndShellQuotesOnlyPrivateEntrypoint` | Detach/reattach native smoke |
-| Native exit refreshes exact ACP identity at idle without indefinite queue blocking | `TestNativeRefreshDefersUntilActiveAndQueuedPromptsFinish`, `TestStalledNativeRefreshTimesOutRecoversAndReleasesQueuedPrompt`, `TestRuntimeRefreshTimeoutDiscardsBridgeAndAllowsExactResume` | Native-to-ACP nonce smoke |
+| tmux viewer detach retains native writer ownership | native owner and tmux lifecycle tests | Queue ACP while detached; prove no dispatch until provider process exits and reconciliation succeeds |
+| Native exit refreshes exact ACP identity and reconciles before queued ACP dispatch | writer-gate/reconciliation worker tests, runtime timeout/recovery tests | Native-to-ACP nonce smoke |
 | Transport failure or identity drift never reaches later queued work | `TestPromptFailureRecoversOrQuarantinesBeforeQueuedPrompt`, `TestPostTurnIdentityDriftQuarantinesTransportBeforeQueuedPrompt`, `TestRuntimeInspectQuarantinesIdentityDriftBeforeExactResume`, provider-store drift tests | Deliberate local-store mismatch smoke |
 | Unsafe bridge replacement cannot overlap its provider tree | `TestTerminateRuntimeBridgeAwaitsProviderProcessGroup`, `TestTerminateRuntimeBridgeKillsDescendantAfterLeaderExited`, `TestBlockedRuntimeBridgeReplacementFailsClosed` | Process inspection during forced recovery |
 
@@ -69,7 +72,7 @@ Primary end-to-end evidence:
 | Specification criterion | Deterministic evidence | Manual evidence |
 | --- | --- | --- |
 | Create reviewer Session from producer | lifecycle test, `TestReviewCreatesIndependentSessionWithCompleteEvidence`, API review route | CLI/web smoke |
-| Reviewer reads producer JSONL | generated prompt assertion includes exact read-only path | Reviewer provider inspects file |
+| Reviewer receives producer JSONL as read-only behavioral evidence | generated prompt assertion includes exact read-only path | Reviewer provider inspects file |
 | Same repo/worktree | service and lifecycle assertions | Git inspection |
 | Git branch/status/diff evidence | `TestCaptureReviewSnapshotIncludesBranchStatusAndDiffs`, review prompt assertions | Reviewer reruns Git commands |
 | Independent verification instruction/checklist | review prompt exact assertions | Review output audit |
@@ -82,7 +85,7 @@ Primary end-to-end evidence:
 | `acpctl serve` starts local UI | `TestServeUsesLoopbackAndStopsOnlyTheViewer` | Open printed URL |
 | Web lists Tasks and shows Task Sessions | `TestServerRenderedPagesAndVersionedBrowserBoundary` | Visual smoke |
 | Clickable Session detail | server-render test asserts links/control page | Click smoke |
-| Stored and live Session history | embedded EventSource client plus versioned API SSE replay test | Provider browser smoke |
+| Provider snapshot, gateway overlay, and live ACP | conversation endpoint/service tests plus versioned API SSE replay test | Provider browser smoke |
 | Web streams output | EventSource asset assertion and API SSE tests | Observe live turn |
 | Prompt/cancel/resume/stop | versioned API route test plus browser client control bindings | Click controls |
 | Review and bounded sanitized diagnostics | API review test, rendered controls/asset assertions, semantic projection/error/tool redaction tests | Click controls |
@@ -100,6 +103,8 @@ Primary end-to-end evidence:
 | Session monotonic positions/request IDs | Session SSE assertions and cursor validation |
 | Disconnected client loses no completed output | Session and component-wise Task `Last-Event-ID` replay assertions |
 | CLI/TUI/API/web share services | compile-time `SessionStream` conformance; transports invoke `task.Service`/`SessionService` |
+| Conversation endpoint returns one server-joined projection | provider reader, conversation service, and API DTO tests; clients never read provider files or merge JSONL |
+| Projection source and initial-load fallback are explicit | provider-store and bounded gateway-fallback fixtures; viewer refresh tests retain the current in-memory presentation on transient failure |
 | Socket/raw ACP remain internal | API and web redaction assertions, sanitized activity test |
 | Loopback-only and unsupported public exposure rejected | listener/API/CLI tests, Host/origin web tests |
 
@@ -127,9 +132,13 @@ Deterministic fixtures prove product logic but cannot prove that a user's curren
 - Grok (`grok`; acpx resolves its `grok-build` built-in)
 - OpenCode
 
-Each provider gets its own worktree under one acceptance Task, produces a harmless proof change, streams structured ACP history, survives viewer detach, handles a correlated follow-up, and stops/resumes the same Session. Unexpected login prompts are external-environment blockers, not silently skipped passes.
+Each provider gets its own worktree under one acceptance Task, produces a
+harmless proof change, loads committed provider history plus live provisional
+ACP, survives viewer detach, handles a correlated follow-up, and stops/resumes
+the same Session. Unexpected login prompts are external-environment blockers,
+not silently skipped passes.
 
-Provider-native live smoke requires a canonical identity that passes exact local-store verification. Follow [CODEX_NATIVE_SMOKE.md](CODEX_NATIVE_SMOKE.md) and repeat the serialized ACP → native → ACP nonce proof for Claude, Grok, and OpenCode. If identity or verification is unavailable, record that provider as blocked; never create or conflate a second conversation.
+Provider-native live smoke requires a canonical identity that passes exact local-store verification. Follow [CODEX_NATIVE_SMOKE.md](CODEX_NATIVE_SMOKE.md) and repeat the serialized ACP → native → ACP nonce proof for Claude, Grok, and OpenCode. In each direction, deliberately submit a competing write and prove it stays behind the per-Session writer gate without cancelling the active owner. After native exit, prove reconciliation commits the native-only turn before queued ACP dispatch. If identity or verification is unavailable, record that provider as blocked; never create or conflate a second conversation.
 
 ### Historical ACP baseline — 2026-08-15
 

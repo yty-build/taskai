@@ -1,6 +1,6 @@
 # Agent Task Console
 
-Agent Task Console is a local-first control plane for persistent AI-agent work. It groups independent agent conversations under durable Tasks, runs each Session through ACP with a detached worker, and lets a human reconnect from the CLI, terminal console, local web UI, or versioned API without owning the worker process.
+Agent Task Console is a local-first control plane for persistent AI-agent work. It groups independent agent conversations under durable Tasks, runs each Session through ACP with a detached worker, and lets a human reconnect from the CLI, terminal console, local web UI, or versioned API without owning the worker process. The provider's own conversation store supplies committed history; ACP supplies the live provisional stream; and the gateway JSONL journal supplies lifecycle/audit evidence, provisional overlay, and an explicitly labelled fallback.
 
 The V1 product has exactly two first-class entities:
 
@@ -93,7 +93,9 @@ acpctl session resume <session-id>
 
 ## Attachment semantics
 
-Task attachment is a disposable navigator over every child Session. Direct Session attachment opens the real provider-native terminal by default; `--acp` opens the gateway's structured transcript and permission console:
+Task attachment is a disposable developer cockpit over every child Session.
+Direct Session attachment opens the real provider-native terminal by default;
+`--acp` opens the gateway's structured transcript and permission console:
 
 ```bash
 acpctl task attach <task-id>
@@ -101,13 +103,15 @@ acpctl session attach <session-id>
 acpctl session attach <session-id> --acp
 ```
 
-The Task console aggregates every child Session, discovers new Sessions without restart, and opens the selected provider's real native harness on Enter. Press `a` for the selected Session's structured ACP view. That view replays complete stored ACP-visible history, deduplicates it against live output, and reconnects from the last Session position; it renders user/assistant turns, provider-exposed reasoning in event order, merged tool cards, a multiline composer, and actionable permission cards. The last assistant segment is identified as the completed response when the ACP turn completes; if the provider exposes no separate reasoning, the view says so instead of implying that data was lost.
+The Task console is a responsive Go/Bubble Tea developer cockpit over every child Session. It discovers new Sessions without restart, keeps attention states scannable, uses a two-pane layout at wide widths and stacked/single-pane layouts as space narrows, and offers contextual help plus a searchable action palette. Enter opens the selected provider's real native harness; `a` opens the structured ACP view.
+
+The structured view loads a verified, bounded snapshot of the exact provider-owned conversation, overlays gateway-only provisional and lifecycle state through one captured JSONL cursor, then follows live ACP from that boundary without duplication. It renders user/assistant turns, provider-exposed reasoning in event order, merged tool cards, a multiline composer, and actionable permission cards. After settled ACP turns and provider-native process exit, an open structured viewer fetches a fresh joined projection in the background and publishes it atomically, without a visible reload or flicker, while preserving scroll/follow state, focus, composer draft/cursor, selection, pending-approval focus, and expanded reasoning/tool state. If the provider store is unavailable on initial load, the service returns a bounded gateway-history fallback with an explicit warning. If a transient refresh fails in an already-open viewer, that viewer keeps its existing in-memory presentation and discloses the delay; it never presents JSONL as the provider's committed transcript.
 
 Task and structured ACP console controls (provider-native keys remain owned by that provider):
 
 | Key | Effect |
 | --- | --- |
-| `↑`/`↓`, `j`/`k`, click | Select a Session; mouse wheel scrolls the pane under it |
+| `↑`/`↓`, `j`/`k`, click | Select a Session |
 | `Enter` | Open the selected Session in its real provider-native harness |
 | `a` (Task screen) | Open the selected Session's structured ACP console |
 | `n` (Task screen) | Open the in-console New Session wizard; choose agent, role, repository, worktree, permission mode, and optional prompt |
@@ -120,10 +124,10 @@ Task and structured ACP console controls (provider-native keys remain owned by t
 | `x` or `s` | Stop the worker |
 | `r` | Toggle normalized/raw debug rendering |
 | `1`–`9` | Choose an exact offered permission option, then confirm |
-| `b` or `Backspace` | Return to Task view |
+| `b` or `Backspace` | Return to Task view when opened from Task attachment |
 | `q` or `Ctrl-C` | Detach the viewer |
 
-Detaching either view never cancels a turn, stops a worker, or resolves a permission. `Esc` requests cancellation only in the structured ACP console when the composer is not active; inside the composer it closes editing and preserves the draft. A prompt submitted while an ACP turn is busy is queued as the next ACP turn.
+Detaching either view never cancels a turn, stops a worker, resolves a permission, or changes provider-write ownership. `Esc` requests cancellation only in the structured ACP console when the composer is not active; inside the composer it closes editing and preserves the draft. A prompt submitted while an ACP turn is busy is queued as the next ACP turn.
 
 Native attachment resumes one immutable canonical provider conversation ID after verifying that exact ID in the provider's local store:
 
@@ -131,11 +135,11 @@ Native attachment resumes one immutable canonical provider conversation ID after
 acpctl session attach <session-id>
 ```
 
-With tmux installed, `Ctrl-B d` detaches the terminal while the provider continues running; attaching again reopens the same tmux session. ACP and native access are deliberately advisory rather than locked: the gateway never pauses or cancels ACP work merely because a native viewer opened. The user must avoid sending concurrent turns through both transports. After the native process actually exits, the worker requests an exact ACP refresh at its next idle boundary. See [native operations](docs/OPERATIONS.md#provider-native-mode) and the [real Codex smoke procedure](docs/CODEX_NATIVE_SMOKE.md).
+With tmux installed, `Ctrl-B d` detaches the terminal while the provider continues running; attaching again reopens the same tmux session. Viewers may coexist, but writes to one provider conversation are exclusive. Native attach waits or fails visibly while an ACP turn owns the writer gate and never cancels that turn. While the provider-native process owns the gate, ACP prompts remain visibly queued and do not reach the provider. Detaching tmux leaves both the native process and its ownership intact. Process exit/stop releases ownership only after the provider snapshot is reconciled, before queued ACP work crosses the boundary. See [native operations](docs/OPERATIONS.md#provider-native-mode) and the [real Codex smoke procedure](docs/CODEX_NATIVE_SMOKE.md).
 
 ## Logs and review
 
-Session history is append-only JSONL with monotonic per-Session positions and request IDs:
+The gateway lifecycle/audit journal is append-only JSONL with monotonic per-Session positions and request IDs:
 
 ```bash
 acpctl session logs <session-id>
@@ -150,7 +154,10 @@ Create an independent reviewer Session after stopping or completing the producer
 acpctl session review <producer-session-id> --agent claude
 ```
 
-The reviewer receives a read-only producer log path, repository/worktree, branch, status and diff snapshot, plus explicit skeptical verification instructions. The producer conversation is not imported as the reviewer's conversation.
+The reviewer receives the producer's gateway audit-log path as read-only
+evidence, plus its repository/worktree, branch, status and diff snapshot, and
+explicit skeptical verification instructions. The producer conversation is not
+imported as the reviewer's own provider conversation.
 
 ## Local web UI and API
 
@@ -163,7 +170,7 @@ acpctl serve
 
 Use `--listen 127.0.0.1:0` for an automatically selected port. Only explicit loopback IPs are accepted; wildcard, hostname, and public bindings are rejected. Stopping `acpctl serve` does not stop Session workers.
 
-The responsive web UI is a conversation-first structured ACP client: a persistent Task/Session rail, user and assistant turns, live provider-exposed reasoning, clearly marked completed responses, bounded tool and plan cards, a pinned approval shelf, and a sticky multiline composer. It supports prompt/cancel/resume/stop and reviewer creation, preserves reading position during streaming, and becomes a single-pane drawer layout on mobile. Session IDs, checkout details, continuity state, and bounded sanitized diagnostics live behind Details instead of competing with the conversation.
+The responsive web UI is a conversation-first structured ACP client: a persistent Task/Session rail, committed user and assistant turns from the provider store, live provisional ACP reasoning/output, bounded tool and plan cards, a pinned approval shelf, and a sticky multiline composer. It supports prompt/cancel/resume/stop and reviewer creation, preserves all viewer state during live updates and atomic reconciliation, and becomes a single-pane drawer layout on mobile. Session IDs, checkout details, source/fallback state, continuity state, and bounded sanitized diagnostics live behind Details instead of competing with the conversation.
 
 The browser shows whether the same canonical provider conversation is linked and provider-store verified without exposing that identifier. Raw worker/provider errors, sockets, JSONL paths, provider identifiers, structured environment/auth fields, commands derived from raw input, raw tool objects, and ACP wire payloads do not cross the browser API boundary. Allowlisted provider-visible text, diffs, and terminal output are intentionally rendered and can contain sensitive repository or tool-produced content; this loopback console is for the same trusted OS user and is not a secret scanner. Trusted local forensic inspection remains available through terminal `--raw` logs.
 
@@ -173,7 +180,7 @@ The JSON/SSE API is rooted at `/api/v1`, with `/healthz` for local health checks
 
 Sessions default to `read-approval`. Read-like work may resolve automatically; write/execute/unknown ACP permission requests stay pending and are shown in the Session harness. Codex, Claude, and OpenCode are launched with restrictive provider settings so their defaults cannot silently write, while acpx host filesystem/terminal prompts are brokered as one-shot cards. A pending request survives detach, and concurrent viewers use first-valid-decision-wins. Persistent `allow_always`/`reject_always` choices are visibly marked and require confirmation. Use `--approve-all` only when unattended writes are intentional; the choice is persisted and visible in Session detail.
 
-The pinned public runtime exposes interactive ACP `session/request_permission` requests. The bridge additionally brokers its known `fs/write_text_file` and `terminal/create` host prompts with one-shot choices; unknown host operations fail closed. The `r` view shows complete gateway envelopes and normalized runtime payloads, not an exact underlying JSON-RPC packet capture.
+The pinned public runtime exposes interactive ACP `session/request_permission` requests. The bridge additionally brokers its known `fs/write_text_file` and `terminal/create` host prompts with one-shot choices; unknown host operations fail closed. The `r` view shows the bounded gateway envelopes retained by that viewer and their normalized runtime payloads, not an exact underlying JSON-RPC packet capture. Use `acpctl session logs <id> --raw` for the full persisted gateway journal.
 
 Without `--worktree`, Agent Task Console refuses another active Session in the same checkout. Prefer isolated worktrees:
 
@@ -207,13 +214,13 @@ Only `name`, `provider`, `command`, `args`, and `environment` are accepted. Comm
 $AGENT_HOME/
 ├── agent.db          # SQLite Task and Session rows only
 ├── agents/           # profile overlays
-├── logs/             # correlated Session JSONL
+├── logs/             # Session lifecycle/audit/overlay/fallback JSONL
 ├── workers/          # private Unix sockets and runtime state
 ├── acpx-runtime/     # private per-Session public-runtime bridge state
 └── worktrees/        # optional persistent Git worktrees
 ```
 
-Every normal CLI invocation reconciles stale worker PID/socket state. Workers are detached per Session, serialize prompts, support multiple subscribers, and outlive CLI, terminal, and web viewers. Provider-native transcripts remain authoritative for provider-specific state ACP does not expose.
+Every normal CLI invocation reconciles stale worker PID/socket state. Workers are detached per Session, serialize prompts, support multiple subscribers, and outlive CLI, terminal, and web viewers. One verified provider-owned conversation is the committed history for each Session. ACP activity remains provisional until provider-store reconciliation; gateway JSONL remains lifecycle/audit evidence and fallback rather than the canonical transcript.
 
 See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for component boundaries and failure behavior.
 
@@ -232,10 +239,16 @@ Do not place provider authentication files, credentials, databases, sockets, log
 - **Agent profile not found** — run `acpctl agents`; ensure the YAML filename ends in `.yaml` and its schema has no unknown fields.
 - **Checkout already used** — use `--worktree`, stop the existing Session, or use `--allow-shared-checkout` only when concurrent writers are intentional.
 - **Session has no live worker** — inspect `acpctl session <id>`, then run `acpctl session resume <id>`.
-- **Legacy CLI transport Session** — stored history remains attachable, but the new binary refuses a blind resume while an old detached acpx queue owner may exist. Create a fresh runtime-backed Session unless the old owner is independently proven gone and a deliberate migration path is added.
+- **Legacy CLI transport Session** — available provider history and gateway
+  journal remain readable, but the new binary refuses a blind resume while an
+  old detached acpx queue owner may exist. Create a fresh runtime-backed Session
+  unless the old owner is independently proven gone and a deliberate migration
+  path is added.
 - **Canonical provider conversation unavailable** — wait for the first ACP turn to establish one exact identity. Continue through `--acp`; never guess or substitute another ID.
 - **Native verification failed** — the exact canonical ID was not found in that provider's local store for the Session checkout. Continue through `--acp` and diagnose provider state; the gateway will not open a replacement conversation.
-- **ACP refresh/recovery warning after native exit** — native work is already complete and no lock is held. If bounded exact recovery failed, queued prompts were rejected and the worker stopped; run `acpctl session resume <id>` before sending more work.
+- **Native attach is waiting/busy** — an ACP turn currently owns the Session's provider-writer gate. Let it settle or cancel it explicitly; native attach never cancels it on your behalf.
+- **ACP prompt says queued behind native** — the provider-native process still owns the writer gate. Detaching its tmux viewer is not process exit. Exit/stop the native process, then allow exact provider reconciliation to finish before the queued prompt dispatches.
+- **ACP refresh/recovery warning after native exit** — the ownership boundary remains closed to queued writes until exact reconciliation/recovery succeeds. If bounded exact recovery failed, queued prompts receive correlated errors and the worker stops; run `acpctl session resume <id>` before sending more work.
 - **Web server refuses address/Host** — use the exact `http://127.0.0.1:<port>` URL printed by `acpctl serve`.
 - **Corrupt/non-monotonic JSONL** — preserve the file for diagnosis. The reader fails closed instead of skipping records.
 
@@ -253,7 +266,7 @@ make security-check
 make acceptance
 ```
 
-`make acceptance` uses isolated temporary state plus deterministic fake `acpx` and native CLIs. It exercises the built CLI, detached worker lifecycle, Task/Session persistence, worktrees, review, canonical identity verification, native attachment and idle ACP refresh, API/SSE reconnect, web lifecycle, concurrency, build metadata, and repository safety without provider credentials or network access.
+`make acceptance` uses isolated temporary state plus deterministic fake `acpx` and native CLIs. It exercises the built CLI, detached worker lifecycle, Task/Session persistence, worktrees, review, canonical identity and provider-history verification, native attachment, exclusive writer ownership, atomic reconciliation, API/SSE reconnect, web lifecycle, build metadata, and repository safety without provider credentials or network access.
 
 Authenticated live-provider verification is intentionally separate because it depends on local provider accounts. See [ACCEPTANCE.md](docs/ACCEPTANCE.md) for the exact specification mapping and [TEST_PLAN.md](docs/TEST_PLAN.md) for independent tester instructions.
 

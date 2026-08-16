@@ -84,7 +84,61 @@ Activity:
 
 `activity` is a short, backward-compatible sanitized summary. `display` is an optional semantic delta for structured clients. Its `type` is one of `user_message`, `legacy_user_message`, `assistant_chunk`, `thought_chunk`, `tool_upsert`, `plan_replace`, `permission`, `error_upsert`, or `turn_state`. Clients merge deltas by request ID and monotonic position; tool IDs and assistant message IDs are opaque display-grouping keys, not provider identifiers.
 
-The projection is deliberately bounded. A single assistant message is at most 128 KiB, thought text 32 KiB, tool detail 64 KiB, plan text 128 KiB/128 entries, and preview text 2 KiB/three lines. Tool output uses an allowlist of normalized text/diff/terminal fields. Paths become basenames; commands, queries, URLs, raw input/output objects, arbitrary metadata, provider/worker error detail, and structured credential/environment fields are omitted. Allowlisted text, diffs, and terminal output are content rather than a secret-scanning boundary and may contain sensitive repository or tool-produced values. `truncated: true` tells clients that the authoritative local Session log contains more.
+Conversation projection:
+
+```json
+{
+  "source": "provider-store",
+  "checkpoint": "opaque-provider-generation",
+  "gateway_cursor": 17,
+  "turns": [
+    {
+      "key": "opaque-presentation-key",
+      "committed": true,
+      "activities": []
+    },
+    {
+      "key": "REQ-…",
+      "committed": false,
+      "activities": []
+    }
+  ],
+  "diagnostics": [],
+  "truncated": false
+}
+```
+
+`source: "provider-store"` means the committed base came from the exact
+canonical provider conversation after identity and checkout verification.
+`source: "gateway-log"` is an explicit fallback and includes a safe `warning`;
+it never claims that gateway JSONL is the provider's committed transcript.
+`committed: false` identifies a provisional ACP turn that has not yet matched a
+provider-store commit. `checkpoint`, turn `key`, and activity IDs are opaque
+presentation/reconnect values, not new domain entities or provider IDs.
+
+The service reads one bounded provider snapshot, joins gateway activity through
+the returned `gateway_cursor`, and returns the result as one bounded object. If
+provider history is unavailable on initial load, the same endpoint returns a
+bounded gateway-history projection with `source: "gateway-log"` and a warning.
+Clients fetch it before opening the Session stream after `gateway_cursor`. A
+successful post-turn or post-native reconciliation produces a replacement
+projection that clients publish atomically; it does not require a page clear or
+provider-file access.
+
+The projection is deliberately bounded. Each provider-store transcript record,
+including reasoning, is at most 128 KiB; gateway assistant text is at most
+128 KiB and gateway thought text at most 32 KiB. Tool detail is at most 64 KiB,
+plan text 128 KiB/128 entries, and preview text 2 KiB/three lines. The browser
+applies its own 32 KiB per-turn reasoning bound when reducing either source.
+Tool output uses an allowlist of normalized text/diff/terminal fields. Paths
+become basenames; commands, queries, URLs, raw input/output objects, arbitrary
+metadata, provider/worker error detail, and structured credential/environment
+fields are omitted. Allowlisted text, diffs, and terminal output are content
+rather than a secret-scanning boundary and may contain sensitive repository or
+tool-produced values. `truncated: true` reports that provider history or the
+gateway overlay/fallback was omitted or clipped by the shared-service bounds;
+activity-level `truncated` flags identify clipped display records where one is
+still present. Truncation does not change the provider/gateway source role.
 
 For `permission_requested`, Activity may additionally include a sanitized actionable permission object:
 
@@ -120,6 +174,7 @@ The three `conversation_*` fields expose only safe continuity state. Database/ru
 | `POST` | `/api/v1/tasks/{id}/sessions` | Start Session and initial request |
 | `GET` | `/api/v1/tasks/{id}/stream` | Aggregate Task SSE |
 | `GET` | `/api/v1/sessions/{id}` | Session DTO |
+| `GET` | `/api/v1/sessions/{id}/conversation` | Bounded committed provider snapshot + gateway overlay and cursor |
 | `POST` | `/api/v1/sessions/{id}/prompt` | Queue prompt; return request ID |
 | `GET` | `/api/v1/sessions/{id}/permissions` | Current actionable permission list |
 | `POST` | `/api/v1/sessions/{id}/permissions/decision` | Select an exact offered option |
@@ -163,7 +218,10 @@ curl -sS http://127.0.0.1:8080/api/v1/sessions/S-…/prompt \
   -d '{"message":"Check the one-hour case"}'
 ```
 
-Successful submission is `202 Accepted` with a new `request_id` and `state`. If another turn is active, the worker queues this request; the API does not inject it into the active turn.
+Successful submission is `202 Accepted` with a new `request_id` and `state`. If
+another ACP turn is active, or the provider-native process owns the Session's
+writer gate, the worker queues this request; the API does not inject it into the
+active owner or send it to the provider early.
 
 Permission decision:
 
@@ -216,11 +274,18 @@ Browser EventSource clients that need a one-time resume point may use `?seed=17`
 
 After the connection's stored replay, the Session stream emits an unnumbered `event: ready` with `data: {}`. Activity received after that marker belongs to the live side of this connection; clients may use the boundary to suppress assistive announcements during history hydration. Every reconnect receives its own marker, and the marker does not advance the activity cursor.
 
-For a stopped Session, the server sends all stored records after the cursor, emits `ready`, and closes. For an active Session, records committed after the replay snapshot are delivered after `ready` through the worker subscription without a cursor gap.
+For a stopped Session, the server sends all gateway journal records after the
+cursor, emits `ready`, and closes. For an active Session, records appended after
+the replay snapshot are delivered after `ready` through the worker subscription
+without a cursor gap. This stream-append meaning is distinct from a turn being
+committed in the provider-owned conversation store.
 
 ## Task stream
 
-Task activity has no synthetic global row or Event entity. It merges each child Session's durable history. Its SSE `id` is an opaque URL-safe cursor representing the last delivered position for each Session:
+Task activity has no synthetic global row or Event entity. It merges each child
+Session's durable gateway journal as an operational attention feed. It is not
+the committed conversation projection. Its SSE `id` is an opaque URL-safe
+cursor representing the last delivered position for each Session:
 
 ```text
 id: eyJTLTEiOjE3LCJTLTIiOjl9
@@ -261,6 +326,14 @@ Common statuses:
 - Treat IDs and Task cursor tokens as opaque strings.
 - Persist the last successfully processed SSE `id`, not merely the last received bytes.
 - Deduplicate activities by `(session_id, position)`.
+- Hydrate structured conversation from `/conversation`, then follow the Session
+  stream after its returned `gateway_cursor`. Treat the provider-store snapshot
+  as committed and unmatched ACP deltas as provisional.
+- Publish a refreshed bounded conversation projection atomically while
+  preserving local scroll/focus/draft/selection/disclosure state. Never clear
+  the visible transcript while fetching it.
+- Display `source`, `warning`, delayed-refresh/fallback state, and `committed` honestly;
+  never promote gateway fallback to canonical provider history.
 - Route Task-scoped input only after a user/client selects a Session.
 - A disconnected prompt client must reconnect using its cursor to receive completed correlated output.
 - Do not infer permission from noninteractive use; set `approve_all` explicitly.

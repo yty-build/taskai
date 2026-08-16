@@ -35,7 +35,7 @@ Default state root: `~/.agent`.
 | --- | --- | --- |
 | `agent.db` plus SQLite sidecars | Task/Session persistence | current user only |
 | `agents/*.yaml` | profile overlays | private configuration |
-| `logs/<session>.jsonl` | correlated ACP-visible history | `0600` |
+| `logs/<session>.jsonl` | lifecycle/audit journal, provisional overlay, and disclosed fallback | `0600` |
 | `workers/<session>.sock` | local worker command/subscription transport | `0600` |
 | `acpx-runtime/<session>/` | private public-runtime bridge state | current user only |
 | `worktrees/<task>-<session>` | optional persistent Git checkout | normal user-owned Git tree |
@@ -113,7 +113,7 @@ Prefer provider-native credential stores or the launching process environment ov
 | `acpctl session <id>` | Show full local Session/runtime detail |
 | `acpctl session prompt <id> <message>` | Submit/queue a correlated prompt |
 | `acpctl session cancel <id>` | Request cancellation of active turn |
-| `acpctl session stop <id>` | Stop worker without deleting history/worktree |
+| `acpctl session stop <id>` | Stop worker without deleting provider history, gateway journal, or worktree |
 | `acpctl session resume <id>` | Resume persisted ACP conversation; optional shared-checkout override |
 | `acpctl session logs <id>` | Replay/follow; supports `--follow`, `--raw`, `--from <position>` |
 | `acpctl task logs <id>` | Aggregate child histories; supports `--follow`, `--raw` |
@@ -178,18 +178,28 @@ acpctl session resume <id>
 
 - `cancel` affects the active ACP turn and leaves the conversation resumable.
 - `stop` asks the worker to stop and waits for persisted ownership to clear.
-- `resume` starts a new detached worker that resumes the persisted ACP Session ID.
+- `resume` starts a new detached worker that resumes the persisted ACP Session ID
+  for the same canonical provider conversation.
 - a worker accepts one turn at a time and queues later prompts.
+- the per-Session provider-writer gate prevents ACP and the provider-native
+  process from sending input concurrently.
 - multiple subscribers receive the same lines.
 - a worker stop/crash does not delete JSONL.
 
 Every normal CLI command checks persisted active Sessions. If a PID is dead or its private socket is unreachable, it clears stale ownership, marks the Session stopped, and removes stale runtime files. It does not auto-resume work.
 
-New Sessions record `acp_transport=acpx-runtime-v1` in `metadata_json`. A Session with an existing ACP ID but no runtime marker is treated as a legacy CLI-backed conversation and is not blindly resumed: its old detached queue owner may still be alive. Stored history remains readable. Create a fresh Session for normal use; do not run both transports against the same provider conversation.
+New Sessions record `acp_transport=acpx-runtime-v1` in `metadata_json`. A
+Session with an existing ACP ID but no runtime marker is treated as a legacy
+CLI-backed conversation and is not blindly resumed: its old detached queue
+owner may still be alive. Its provider history and gateway journal remain
+readable when their sources are available. Create a fresh Session for normal
+use; do not run both transports against the same provider conversation.
 
 ## Terminal attachment
 
-Task attachment is a Session navigator. Direct Session attachment opens the provider's real native terminal by default; use `--acp` for the structured gateway console:
+Task attachment is a modern developer cockpit over the Task's Sessions. Direct
+Session attachment opens the provider's real native terminal by default; use
+`--acp` for the structured gateway console:
 
 ```bash
 acpctl task attach <task-id>
@@ -197,15 +207,66 @@ acpctl session attach <session-id>
 acpctl session attach <session-id> --acp
 ```
 
-Use `q`/`Ctrl-C` to detach a gateway view. With a tmux-backed native terminal, use `Ctrl-B d`; the provider keeps running and `acpctl session attach <id>` reconnects to it. Detaching either view never stops the worker or cancels an ACP turn. Do not use `stop` merely to close a UI.
+Use `q`/`Ctrl-C` to detach a gateway view. With a tmux-backed native terminal,
+use `Ctrl-B d`; the provider keeps running and `acpctl session attach <id>`
+reconnects to it. Detaching either view never stops the worker, cancels an ACP
+turn, or releases provider-write ownership held by a still-running native
+process. Do not use `stop` merely to close a UI.
 
-Task attach targets one selected Session for every prompt or control action; there is no broadcast. Stored history appears before live output, and positions prevent duplicate replay.
+Task attach targets one selected Session for every prompt or control action;
+there is no broadcast. At wide widths it uses one cohesive two-pane cockpit
+with a slim Task status/title header, scannable Session rows, and
+selected-Session preview. It stacks cleanly at narrow widths and keeps a useful Session navigator
+with the core actions at its supported 40x16 minimum. Smaller terminals show an
+actionable size warning while Session work continues. It does not require a
+mouse, Nerd Font, or truecolor; status and focus use words/glyphs as well as
+color.
 
 From the Task screen, press `n` to add a Session without leaving the console. The wizard chooses the agent, role, repository, isolated worktree setting, permission mode, and optional initial prompt; `Ctrl+S` starts it and opens the new Session automatically.
 
-A mouse click selects a Session without leaving the Task navigator. Press Enter to open the selected real native harness, `a` to open its structured ACP view, `n` to add a Session, `p` to compose an ACP prompt, `/` to filter Sessions, `:` for the searchable action palette, and `?` for contextual help.
+A mouse click selects a Session without leaving the Task navigator. Press Enter
+to open the selected real native harness, `a` to open its structured ACP view,
+`n` to add a Session, `p` to compose an ACP prompt, `/` to filter Sessions, `:`
+for the searchable substring action palette, and `?` for contextual help. The
+help, palette, footer, and actions share one registry. Unavailable native
+continuation is labelled, and invoking an action that is not valid for the
+current Session produces an actionable notice.
 
-The `--acp` view renders user/assistant turns, provider-exposed reasoning in event order, merged tool cards, plans, errors, and permission cards. A completed turn marks its last assistant segment as the response; a turn with no ACP reasoning says that none was exposed. Press `r` for the bounded gateway raw/debug envelope view; the public runtime does not provide an exact JSON-RPC packet capture.
+The `--acp` view renders the reconciled conversation projection described in
+the next section: committed provider turns plus provisional ACP reasoning,
+output, tools, plans, errors, and permission cards. A completed turn marks its
+last assistant segment as the response; a turn with no exposed reasoning says
+so. Successful tools collapse by default while running/failed tools and
+actionable approvals remain prominent. Live-follow occurs only while already at
+the bottom; scrolling away freezes the reader and shows a new-activity count.
+Press `r` for the bounded gateway raw/debug envelope view; the public runtime
+does not provide an exact JSON-RPC packet capture.
+
+## Conversation history and live stream
+
+Structured terminal, web, API, and future mobile clients use one shared
+server-side projection. They do not read provider files or merge JSONL locally.
+
+| Source | Operational meaning |
+| --- | --- |
+| Provider-owned store | Committed user-visible history for the exact verified canonical conversation |
+| ACP | Live provisional chunks, reasoning, tools, approvals, and turn state |
+| Gateway Session JSONL | Lifecycle/audit evidence, missed-stream recovery, provisional overlay, and fallback |
+
+Initial load reads and verifies a bounded provider snapshot, joins unmatched
+gateway activity through the returned journal cursor, and then follows ACP
+after it. After every settled ACP turn and provider-native process exit/stop, a
+fresh bounded provider snapshot is prepared in the background and atomically
+replaces the old projection. There is no visible
+clear/reload step. Scroll anchor/live-follow, focus, composer draft/cursor,
+row/text selection, pending-approval focus, selected Session/tool, and expanded
+reasoning/tool state survive the swap.
+
+The UI always discloses when it is showing live provisional content or the
+bounded gateway-history fallback. If a transient refresh fails, an already-open
+viewer keeps its current in-memory presentation and marks the refresh as
+delayed. A new Session with no conversation activity shows an explicit empty
+state rather than a partial or invented conversation.
 
 ## Provider-native mode
 
@@ -232,20 +293,37 @@ With tmux installed, the command creates or reconnects to a stable `agent-<sessi
 Ctrl-B d
 ```
 
-Native and ACP are two transports to the same provider conversation:
+Native and ACP are two transports to the same provider conversation. Multiple
+read-only viewers may coexist, but writes are exclusive per Session:
 
-- native attachment does not pause, cancel, or block the ACP worker;
-- ACP activity does not terminate or seize the native terminal;
-- native attachment emits an advisory when it detects active, queued, or refreshing ACP work because concurrent turns may interleave unpredictably;
-- the user is responsible for not sending simultaneous turns through both transports.
+- an active ACP turn owns the provider-writer gate; native attach waits or
+  fails visibly without pausing or cancelling that turn;
+- a running provider-native process owns the gate; ACP prompts remain visibly
+  queued and no ACP input reaches the provider;
+- detaching a tmux viewer leaves the provider process and native ownership
+  intact;
+- native process exit/stop begins exact refresh and provider-store
+  reconciliation while native ownership remains held; ownership releases and
+  queued ACP dispatch resumes only after that boundary is complete.
 
-Detaching tmux is not provider exit, so no refresh is requested. When the provider process actually exits, the hidden native owner asks the worker to refresh its exact persisted ACP Session. The tmux Session receives the invoking `AGENT_HOME` and `PATH`, rather than inheriting stale values from an older tmux server. If an ACP turn is active or queued, refresh waits for the next idle boundary. Refresh is time-bounded; on an uncertain result the complete bridge/provider process group is terminated and awaited before bounded exact resume recovery. If recovery fails, queued prompts receive correlated `turn_error` records and the worker stops instead of using an uncertain conversation. Warnings use `native_refresh_warning` or `native_refresh_recovery_warning`; no path creates a lock.
+The tmux Session receives the invoking `AGENT_HOME` and `PATH`, rather than
+inheriting stale values from an older tmux server. Refresh and reconciliation
+are time-bounded. On an uncertain result the complete bridge/provider process
+group is terminated and awaited before bounded exact resume recovery. If
+recovery fails, queued prompts receive correlated `turn_error` records and the
+worker stops instead of using an uncertain conversation. Warnings use
+`native_refresh_warning` or `native_refresh_recovery_warning`; the writer gate
+remains closed to new provider input until the outcome is safe.
 
 ```bash
 acpctl session logs <id> --raw
 ```
 
-Look for `native_refresh_started`, then `native_refreshed` or an actionable warning. Continue through `--acp` if native verification is unavailable; never substitute another identifier.
+Look for `native_refresh_started`, then `native_refreshed` (or
+`native_refresh_recovered`), or an actionable warning. The success event is
+published only after exact provider transcript reconciliation completes and
+native ownership is safe to release. Continue through `--acp` if native
+verification is unavailable; never substitute another identifier.
 
 ## Review operations
 
@@ -258,7 +336,9 @@ acpctl session review <producer-id> --agent claude
 
 `--allow-active-producer` is an explicit unsafe-state override when concurrent review is intentional. It also permits the shared checkout needed for that case. The review snapshot may become stale immediately, so the reviewer prompt tells the agent to rerun Git inspection.
 
-Review evidence includes the producer's JSONL path. Treat it as read-only; repair work belongs in another implementer Session.
+Review evidence includes the producer's JSONL audit path plus its repository,
+worktree, branch, status, and captured Git diff. Treat the evidence as read-only;
+repair work belongs in another implementer Session.
 
 ## Local web server
 
@@ -269,9 +349,30 @@ acpctl serve --listen 127.0.0.1:0
 
 Use the exact URL printed. The handler rejects arbitrary Host headers; `localhost` may therefore be rejected even though it resolves locally. Browser mutations must be same-origin. Closing the browser or sending SIGINT/SIGTERM to `acpctl serve` has no worker lifecycle effect.
 
-The browser Session page is a conversation-first structured ACP view. It coalesces assistant chunks, shows provider-exposed reasoning live and in event order, marks completed responses, merges bounded tool cards, pins actionable permissions above the composer, and keeps IDs/checkouts plus bounded sanitized activity summaries in Details and Diagnostics. Reasoning is collapsible but open by default; if an adapter emits none, the page says so. It intentionally does not reveal provider errors, ACP JSON-RPC, worker sockets, native identifiers, JSONL paths, commands derived from raw input, raw tool objects, or structured environment/auth fields. Allowlisted provider-visible text, diffs, and terminal output may still contain sensitive repository or tool-produced content, so the loopback browser remains a same-trusted-user surface. Use the local terminal `--raw` log view for forensic inspection.
+The browser Session page is a conversation-first structured ACP view over the
+same server-joined projection as the terminal: committed provider history,
+gateway-only overlay, then live ACP. It coalesces assistant chunks, shows
+provider-exposed reasoning live and in event order, marks provisional versus
+committed turns, merges bounded tool cards, pins actionable permissions above
+the composer, and keeps IDs/checkouts, source/fallback state, and bounded
+sanitized activity summaries in Details and Diagnostics. Reconciliation is an
+atomic background swap and preserves scroll/follow position, focus, draft,
+selection, approval focus, and expanded disclosures. Reasoning is collapsible
+but open by default; if an adapter emits none, the page says so. It
+intentionally does not reveal provider errors, ACP JSON-RPC, worker sockets,
+native identifiers, provider/JSONL paths, commands derived from raw input, raw
+tool objects, or structured environment/auth fields. Allowlisted
+provider-visible text, diffs, and terminal output may still contain sensitive
+repository or tool-produced content, so the loopback browser remains a
+same-trusted-user surface. Use the local terminal `--raw` log view for forensic
+inspection.
 
-On mobile, Task/Session navigation becomes a focus-managed drawer while response cancel/resume controls remain next to the composer. Closing the page only detaches the viewer. The browser replays stored activity on connection and deduplicates by monotonically increasing Session position; native EventSource reconnects advance with `Last-Event-ID`.
+On mobile, Task/Session navigation becomes a focus-managed drawer while
+response cancel/resume controls remain next to the composer. Closing the page
+only detaches the viewer. The browser hydrates the conversation endpoint,
+follows ACP from its returned gateway cursor, and deduplicates gateway deltas by
+monotonically increasing Session position; native EventSource reconnects
+advance with `Last-Event-ID`.
 
 ## Public-service boundary
 
@@ -318,7 +419,11 @@ To remove disposable state, first verify the exact `AGENT_HOME`, stop its Sessio
 
 **Stop timeout:** inspect Session detail and process state. A later normal CLI command will reconcile a dead PID/socket; do not delete a live socket blindly.
 
-**Prompt says queued:** another ACP turn owns execution. Native attachment does not participate in the ACP queue. Follow logs for its request ID.
+**Prompt says queued:** another ACP turn may own execution, or the
+provider-native process may own the Session's writer gate. V1 exposes the
+request's queued state but does not yet distinguish the current writer in
+Session detail. Follow the request ID; queued input does not reach the provider
+early.
 
 **Cancel says no active turn:** the Session is idle; send the next prompt normally.
 
@@ -340,11 +445,26 @@ To remove disposable state, first verify the exact `AGENT_HOME`, stop its Sessio
 
 **tmux name collision:** an existing `agent-<session-id>` tmux Session lacks the private owner tag for this `AGENT_HOME`. The gateway refuses to attach. Inspect that tmux Session and close or rename it deliberately; never attach by name alone.
 
-**Refresh/recovery warning after native exit:** no lease exists. Inspect raw logs. If exact recovery failed, the worker drains queued work with correlated errors and stops; run `acpctl session resume <id>` to establish the exact persisted identity before sending another prompt.
+**Refresh/recovery warning after native exit:** inspect raw logs and the
+conversation source state. The writer gate remains closed to queued provider
+input until exact recovery and reconciliation succeed. If they fail, the
+worker drains queued work with correlated errors and stops; run
+`acpctl session resume <id>` to establish the exact persisted identity before
+sending another prompt.
 
 ### Logs and streams
 
 **Replay fails on corrupt JSONL:** copy the file for diagnosis. Records are not skipped because doing so could mis-correlate later positions.
+
+**Gateway-history fallback is shown:** provider-store verification or reading
+failed, so the UI is intentionally using the gateway lifecycle/provisional
+journal. Preserve the provider store and inspect diagnostics; do not describe
+the fallback as the canonical provider transcript.
+
+**Provider history refresh is delayed:** an already-open viewer keeps its
+current in-memory presentation while refresh is retried. Continue reading
+without reloading; do not expect provisional turns to become committed until
+reconciliation succeeds.
 
 **SSE reconnect is rejected:** send either the exact prior `Last-Event-ID` or the identical `cursor` query, not conflicting values. Task cursors are opaque.
 

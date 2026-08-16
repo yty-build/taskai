@@ -38,7 +38,14 @@ The public runtime does not expose callbacks for client-side `fs/write_text_file
 
 ## Event fidelity
 
-The public runtime provides rich normalized output/thought text, tool calls and updates, status, usage, and permission data. It does not expose the exact underlying JSON-RPC packet stream. Session JSONL and the advanced raw/debug view preserve the complete gateway envelope and normalized payload available to this integration; they are not described as a wire packet capture.
+The public runtime provides rich normalized output/thought text, tool calls and
+updates, status, usage, and permission data. It does not expose the exact
+underlying JSON-RPC packet stream. This ACP output is provisional until the
+provider-owned conversation store commits it. Session JSONL and the advanced
+raw/debug view preserve the complete gateway envelope and normalized payload
+available to this integration as lifecycle/audit, overlay, recovery, and
+fallback data; neither is the committed provider transcript or a wire packet
+capture.
 
 The legacy CLI adapter remains covered by focused compatibility tests, but new Session workers use the public runtime bridge.
 
@@ -48,4 +55,17 @@ Task Console Session ID, acpx record ID, ACP/backend Session ID, and native adap
 
 Do not run a new runtime bridge concurrently with an old CLI queue owner for the same provider conversation. For demonstrations and provider acceptance, create fresh runtime-backed Sessions. A legacy Session may be resumed only after the prior worker/queue owner is known to be gone and exact identity can be proven.
 
-Provider-native mappings and exact local-store verification remain isolated in `internal/native`: Codex uses `resume <id>`, Claude uses `--resume <id>`, Grok's ACP-friendly `grok-build` profile maps to `grok --resume <id>`, and OpenCode reuses the same pinned npm CLI without its `acp` subcommand and adds `--session <id>`. Unknown profiles, missing identities, ambiguous records, and checkout mismatches fail closed. Native attachment never pauses ACP; when the provider process exits, the worker refreshes the exact ACP identity at its next idle boundary. See [CODEX_NATIVE_SMOKE.md](CODEX_NATIVE_SMOKE.md).
+Provider-native mappings, exact local-store verification, and read-only
+provider transcript adapters remain isolated in `internal/native`: Codex uses
+`resume <id>`, Claude uses `--resume <id>`, Grok's ACP-friendly `grok-build`
+profile maps to `grok --resume <id>`, and OpenCode reuses the same pinned npm
+CLI without its `acp` subcommand and adds `--session <id>`. Unknown profiles,
+missing identities, ambiguous records, and checkout mismatches fail closed.
+
+The worker enforces one per-Session provider writer: native attach waits/fails
+while an ACP turn owns it, and ACP prompts remain queued while the native
+process owns it. A tmux viewer detach does not release a running process's
+ownership. Native exit/stop refreshes exact ACP identity and atomically
+reconciles the provider snapshot while retaining native ownership; only then
+does ownership release and queued ACP input dispatch. See
+[CODEX_NATIVE_SMOKE.md](CODEX_NATIVE_SMOKE.md).
