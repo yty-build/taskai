@@ -116,6 +116,32 @@ testAssert(rollingThoughts.some((block) => block.text.endsWith("TAIL-REASONING")
 testAssert(transcriptState.turns[0].thoughtBytes <= LIMITS.thought && transcriptState.turns[0].contentClipped, "rolling reasoning budget exceeded its bound or hid truncation");
 
 resetTranscript();
+for (let index = 0; index < LIMITS.blocksPerTurn / 2; index += 1) {
+  applyActivity(activity((index * 2) + 1, "acp", {type:"assistant_chunk", message_id:"progress-" + index, text:"progress"}));
+  applyActivity(activity((index * 2) + 2, "acp", {type:"thought_chunk", text:"reasoning"}));
+}
+applyActivity(activity(LIMITS.blocksPerTurn + 1, "acp", {type:"assistant_chunk", message_id:"response", text:"UNIQUE-FINAL"}));
+applyActivity(activity(LIMITS.blocksPerTurn + 2, "turn_completed", {type:"turn_state", state:"complete", stop_reason:"end_turn"}));
+const saturated = transcriptState.turns[0];
+testAssert(saturated.blocks.length <= LIMITS.blocksPerTurn, "rolling text slot exceeded the per-turn block cap");
+testAssert(completedResponseBlock(saturated)?.text === "UNIQUE-FINAL", "block cap discarded or misidentified the newest completed response");
+testAssert(saturated.contentClipped, "block-cap eviction was not disclosed");
+
+resetTranscript();
+applyActivity(activity(1, "acp", {type:"thought_chunk", text:"ONLY-REASONING"}));
+for (let index = 0; index < 255; index += 1) {
+  applyActivity(activity((index * 2) + 2, "acp", {type:"assistant_chunk", message_id:"progress-" + index, text:"progress"}));
+  applyActivity(activity((index * 2) + 3, "acp", {type:"tool_upsert", tool:{id:"saturation-tool-" + index, title:"Inspect", status:"completed"}}));
+}
+applyActivity(activity(512, "acp", {type:"plan_replace", plan:[{content:"Saturate display slots",status:"completed"}]}));
+applyActivity(activity(513, "acp", {type:"assistant_chunk", message_id:"response", text:"FINAL"}));
+applyActivity(activity(514, "turn_completed", {type:"turn_state", state:"complete", stop_reason:"end_turn"}));
+const evictedReasoning = transcriptState.turns[0];
+testAssert(!evictedReasoning.blocks.some((block) => block.type === "thought"), "reasoning saturation fixture did not evict its oldest thought block");
+testAssert(turnHasACPReasoning(evictedReasoning), "bounded eviction falsely claimed ACP exposed no reasoning");
+testAssert(evictedReasoning.assistantSeen && completedResponseBlock(evictedReasoning)?.text === "FINAL", "assistant-seen state or final response was lost at saturation");
+
+resetTranscript();
 applyActivity(activity(1, "acp", {type:"assistant_chunk", message_id:"plain", text:"answer"}));
 applyActivity(activity(2, "turn_completed", {type:"turn_state", state:"complete", stop_reason:"end_turn"}));
 testAssert(!turnHasACPReasoning(transcriptState.turns[0]), "provider-without-thought turn falsely advertised reasoning");

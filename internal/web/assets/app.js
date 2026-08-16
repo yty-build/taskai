@@ -520,6 +520,21 @@ function appendTurnBlock(turn, block) {
   return true;
 }
 
+function makeTextBlockSlot(turn) {
+  if (turn.blocks.length < LIMITS.blocksPerTurn) return true;
+  const index = turn.blocks.findIndex((block) => block.type === "assistant" || block.type === "thought");
+  if (index < 0) {
+    turn.contentClipped = true;
+    return false;
+  }
+  const [removed] = turn.blocks.splice(index, 1);
+  if (removed.type === "assistant") turn.assistantBytes = Math.max(0, turn.assistantBytes - (removed.bytes || 0));
+  if (removed.type === "thought") turn.thoughtBytes = Math.max(0, turn.thoughtBytes - (removed.bytes || 0));
+  turn.contentClipped = true;
+  turn.dirty = true;
+  return true;
+}
+
 function touchBlock(block) {
   block.revision = (block.revision || 0) + 1;
 }
@@ -534,7 +549,8 @@ function turnFor(activity) {
   turn = {
     id: requestID, firstPosition: activityPosition(activity), state: "", stopReason: "", blocks: [],
     tools: new Map(), plan: null, error: null, permissionIDs: new Set(),
-    assistantBytes: 0, thoughtBytes: 0, toolBytes: 0, retainedBytes: 0, lifecycleSeen: false, contentClipped: false, dirty: true, element: null
+    assistantBytes: 0, thoughtBytes: 0, toolBytes: 0, retainedBytes: 0, assistantSeen: false, reasoningSeen: false,
+    lifecycleSeen: false, contentClipped: false, dirty: true, element: null
   };
   transcriptState.byRequest.set(requestID, turn);
   transcriptState.turns.push(turn);
@@ -576,12 +592,13 @@ function applyDisplay(activity, turn) {
     break;
   }
   case "assistant_chunk": {
+    if (String(display.text || "").trim()) turn.assistantSeen = true;
     const incoming = truncateUTF8Tail(display.text || "", LIMITS.assistant);
     makeRollingTextRoom(turn, "assistant", "assistantBytes", incoming.bytes, LIMITS.assistant);
     const previous = turn.blocks[turn.blocks.length - 1];
     const compatible = previous?.type === "assistant" && (previous.messageID === display.message_id || !previous.messageID || !display.message_id);
     const block = compatible ? previous : { type: "assistant", text: "", bytes: 0, clipped: false, leadingClipped: false, trailingClipped: false, messageID: display.message_id || "", key: activity.position };
-    if (!compatible && !appendTurnBlock(turn, block)) break;
+    if (!compatible && (!makeTextBlockSlot(turn) || !appendTurnBlock(turn, block))) break;
     block.text += incoming.text;
     block.bytes += incoming.bytes;
     turn.assistantBytes += incoming.bytes;
@@ -593,11 +610,12 @@ function applyDisplay(activity, turn) {
     break;
   }
   case "thought_chunk": {
+    if (String(display.text || "").trim()) turn.reasoningSeen = true;
     const incoming = truncateUTF8Tail(display.text || "", LIMITS.thought);
     makeRollingTextRoom(turn, "thought", "thoughtBytes", incoming.bytes, LIMITS.thought);
     const previous = turn.blocks[turn.blocks.length - 1];
     const block = previous?.type === "thought" ? previous : { type: "thought", text: "", bytes: 0, clipped: false, leadingClipped: false, trailingClipped: false, key: activity.position };
-    if (block !== previous && !appendTurnBlock(turn, block)) break;
+    if (block !== previous && (!makeTextBlockSlot(turn) || !appendTurnBlock(turn, block))) break;
     block.text += incoming.text;
     block.bytes += incoming.bytes;
     turn.thoughtBytes += incoming.bytes;
@@ -1028,7 +1046,7 @@ function completedResponseBlock(turn) {
 }
 
 function turnHasACPReasoning(turn) {
-  return turn.blocks.some((block) => block.type === "thought" && block.text.trim());
+  return turn.reasoningSeen;
 }
 
 function renderTurnTail(turn) {
@@ -1051,17 +1069,28 @@ function renderTurnTail(turn) {
     tail.append(state);
   }
   if (turn.state === "complete") {
-    const hasAssistant = Boolean(completedResponseBlock(turn));
+    const retainedResponse = completedResponseBlock(turn);
+    const retainedReasoning = turn.blocks.some((block) => block.type === "thought" && block.text.trim());
     if (!turnHasACPReasoning(turn)) {
       const unavailable = document.createElement("div");
       unavailable.className = "reasoning-unavailable";
       unavailable.textContent = "No separate reasoning was exposed over ACP for this turn.";
       tail.append(unavailable);
+    } else if (!retainedReasoning) {
+      const unavailable = document.createElement("div");
+      unavailable.className = "reasoning-unavailable";
+      unavailable.textContent = "Earlier ACP reasoning is outside this bounded view; the Session log remains authoritative.";
+      tail.append(unavailable);
     }
-    if (!hasAssistant) {
+    if (!turn.assistantSeen) {
       const missing = document.createElement("div");
       missing.className = "response-missing";
       missing.textContent = "The turn completed without an ACP assistant message. Check Diagnostics or open the native provider CLI.";
+      tail.append(missing);
+    } else if (!retainedResponse) {
+      const missing = document.createElement("div");
+      missing.className = "response-missing";
+      missing.textContent = "ACP assistant output is outside this bounded view; inspect the local Session log for the retained transcript.";
       tail.append(missing);
     }
   }
