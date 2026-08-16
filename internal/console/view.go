@@ -44,10 +44,9 @@ func (m Model) View() string {
 func (m Model) renderSessionWizard(width, height int) string {
 	wizard := m.wizard
 	header := []string{
-		frameTop("NEW SESSION", "Task "+safeText(m.task.Task.ID), width),
-		frameLine("Add one persistent ACP agent Session to "+safeText(m.task.Task.Title), width),
-		frameLine("Fields are preserved if validation or launch fails.", width),
-		frameBottom(width),
+		topBar("NEW SESSION", "Task "+safeText(m.task.Task.ID), width),
+		fitLine("  Add one persistent agent Session to "+safeText(m.task.Task.Title), width),
+		horizontalRule(width),
 	}
 	profile := wizard.agents[wizard.agentIndex]
 	permission := "read approval"
@@ -105,7 +104,7 @@ func wizardEditorValue(editor composerState, active bool, placeholder string) st
 
 func compactSizeWarning(width, height int) string {
 	lines := []string{
-		"Agent Task Console",
+		"◆ AGENT TASK CONSOLE",
 		fmt.Sprintf("Terminal too small: %d×%d", width, height),
 		fmt.Sprintf("Resize to at least %d×%d. The Session continues in the background.", minimumConsoleWidth, minimumConsoleHeight),
 		"q detach",
@@ -116,22 +115,21 @@ func compactSizeWarning(width, height int) string {
 func (m Model) renderTask(width, height int) string {
 	item := m.task.Task
 	header := []string{
-		frameTop("AGENT TASK CONSOLE · TASK "+safeText(item.ID), statusBadge(string(item.Status)), width),
-		frameLine(safeText(item.Title), width),
-		frameLine(taskSubtitle(item.Description, len(m.task.Sessions)), width),
-		frameBottom(width),
+		topBar("AGENT TASK CONSOLE · TASK "+safeText(item.ID), statusBadge(string(item.Status)), width),
+		fitLine("  "+safeText(item.Title)+" · "+taskSubtitle(item.Description, len(m.task.Sessions)), width),
+		horizontalRule(width),
 	}
 
 	bodyHeight := max(1, height-len(header)-2)
 	var body []string
 	if width >= 92 {
 		navigatorWidth := taskNavigatorWidth(width)
-		previewWidth := width - navigatorWidth - 1
+		previewWidth := width - navigatorWidth - 3
 		navigator := m.renderTaskNavigator(navigatorWidth, bodyHeight)
 		preview := m.renderTaskPreview(previewWidth, bodyHeight)
 		body = joinColumns(navigator, preview, navigatorWidth, previewWidth)
 	} else {
-		navigatorHeight := max(7, bodyHeight/2)
+		navigatorHeight := max(6, bodyHeight/2)
 		previewHeight := max(1, bodyHeight-navigatorHeight)
 		body = append(m.renderTaskNavigator(width, navigatorHeight), m.renderTaskPreview(width, previewHeight)...)
 	}
@@ -143,21 +141,21 @@ func (m Model) renderTask(width, height int) string {
 func taskNavigatorWidth(width int) int {
 	navigator := width * 42 / 100
 	navigator = min(52, max(36, navigator))
-	return min(navigator, max(1, width-37))
+	return min(navigator, max(1, width-40))
 }
 
 func (m Model) renderTaskNavigator(width, height int) []string {
 	indices, start, visible := m.taskSessionWindow(height)
-	filterLabel := fmt.Sprintf("%d/%d", len(indices), len(m.task.Sessions))
-	lines := []string{frameTop("SESSIONS", filterLabel, width)}
+	filterLabel := fmt.Sprintf("%d of %d", len(indices), len(m.task.Sessions))
+	lines := []string{sectionHeading("SESSIONS", filterLabel, width), sectionRule(width)}
 	innerHeight := max(1, height-2)
 	if len(m.task.Sessions) == 0 {
 		lines = append(lines, padLines([]string{"", centerLine("No Sessions yet", width), centerLine("Press n to add one", width)}, innerHeight, width)...)
-		return append(lines, frameBottom(width))
+		return lines
 	}
 	if len(indices) == 0 {
 		lines = append(lines, padLines([]string{"", centerLine("No Sessions match /"+safeText(m.filter), width), centerLine("Esc clears the filter", width)}, innerHeight, width)...)
-		return append(lines, frameBottom(width))
+		return lines
 	}
 	var entries []string
 	for position := start; position < len(indices) && position < start+visible; position++ {
@@ -165,7 +163,7 @@ func (m Model) renderTaskNavigator(width, height int) []string {
 		current := m.task.Sessions[actual]
 		marker := "  "
 		if actual == m.selected {
-			marker = "› "
+			marker = "▌ "
 		}
 		name := marker + strings.ToUpper(valueOr(current.Agent, "agent")) + " · " + valueOr(current.Role, "worker")
 		entries = append(entries, fitWithRight(name, statusBadge(string(current.Status)), width))
@@ -176,10 +174,10 @@ func (m Model) renderTaskNavigator(width, height int) []string {
 	}
 	remaining := len(indices) - (start + visible)
 	if remaining > 0 && len(entries) > 0 {
-		entries[len(entries)-1] = fitLine(entries[len(entries)-1]+fmt.Sprintf(" · %d more ↓", remaining), width)
+		entries[len(entries)-1] = fitWithRight(entries[len(entries)-1], fmt.Sprintf("%d more ↓", remaining), width)
 	}
 	lines = append(lines, padLines(entries, innerHeight, width)...)
-	return append(lines, frameBottom(width))
+	return lines
 }
 
 func (m Model) taskSessionWindow(navigatorHeight int) (indices []int, start, visible int) {
@@ -198,38 +196,40 @@ func (m Model) taskSessionWindow(navigatorHeight int) (indices []int, start, vis
 }
 
 func taskNavigatorHeight(width, height int) int {
-	bodyHeight := max(1, height-6)
+	bodyHeight := max(1, height-5)
 	if width >= 92 {
 		return bodyHeight
 	}
-	return max(7, bodyHeight/2)
+	return max(6, bodyHeight/2)
 }
 
 func (m Model) renderTaskPreview(width, height int) []string {
 	if len(m.task.Sessions) == 0 || len(m.filteredSessionIndices()) == 0 {
-		lines := []string{frameTop("SESSION PREVIEW", "", width)}
+		lines := []string{sectionHeading("SELECTED SESSION", "", width), sectionRule(width)}
 		lines = append(lines, padLines([]string{"", centerLine("Select or create a Session", width)}, max(1, height-2), width)...)
-		return append(lines, frameBottom(width))
+		return lines
 	}
 	current := m.task.Sessions[m.selected]
-	lines := []string{frameTop("SESSION PREVIEW", statusBadge(string(current.Status)), width)}
+	lines := []string{sectionHeading("SELECTED SESSION", statusBadge(string(current.Status)), width), sectionRule(width)}
 	capability := nativeCapability(current)
 	content := []string{
-		strings.ToUpper(valueOr(current.Agent, "agent")) + " · " + valueOr(current.Role, "worker") + " · " + appservice.PermissionLabel(current),
-		current.ID + " · " + compactSessionPath(current),
-		"",
-		"SURFACES",
+		strings.ToUpper(valueOr(current.Agent, "agent")) + " · " + valueOr(current.Role, "worker") + " · " + humanizeLabel(appservice.PermissionLabel(current)),
 	}
-	nativeLine := "Enter  " + capability.label + " · " + capability.status
+	nativeLine := "↵ Enter  " + capability.label + " · " + capability.status
 	if capability.reason != "" {
 		nativeLine += ": " + capability.reason
 	}
-	content = append(content, indentWrapped(nativeLine, max(10, width), "")...)
-	content = append(content, "a      Structured ACP · ready for transcript, tools, and approvals", "", "LATEST ACTIVITY")
+	content = append(content,
+		fitLine(nativeLine, width),
+		fitLine("a        Structured ACP · transcript, tools, and approvals", width),
+		current.ID+" · "+compactSessionPath(current),
+		"",
+		"LATEST",
+	)
 	content = append(content, indentWrapped(m.sessionSummary(current.ID), max(10, width-4), "  ")...)
 	innerHeight := max(1, height-2)
 	lines = append(lines, padLines(content, innerHeight, width)...)
-	return append(lines, frameBottom(width))
+	return lines
 }
 
 func joinColumns(left, right []string, leftWidth, rightWidth int) []string {
@@ -243,7 +243,7 @@ func joinColumns(left, right []string, leftWidth, rightWidth int) []string {
 		if index < len(right) {
 			rightLine = right[index]
 		}
-		result = append(result, padRight(fitLine(leftLine, leftWidth), leftWidth)+" "+fitLine(rightLine, rightWidth))
+		result = append(result, padRight(fitLine(leftLine, leftWidth), leftWidth)+" │ "+fitLine(rightLine, rightWidth))
 	}
 	return result
 }
@@ -312,7 +312,7 @@ func (m Model) taskFooter(width int) string {
 		} else {
 			enabled[candidate.id] = true
 		}
-		if ansi.StringWidth(strings.Join(items(), " · ")) > width {
+		if ansi.StringWidth(strings.Join(items(), "  ")) > width {
 			if candidate.id == "" {
 				includeNavigation = false
 			} else {
@@ -320,9 +320,9 @@ func (m Model) taskFooter(width int) string {
 			}
 		}
 	}
-	footer := strings.Join(items(), " · ")
+	footer := strings.Join(items(), "  ")
 	if filter := strings.TrimSpace(m.filter); filter != "" {
-		filtered := "FILTER /" + safeText(filter) + " · " + footer
+		filtered := "FILTER /" + safeText(filter) + "  " + footer
 		if ansi.StringWidth(filtered) <= width {
 			footer = filtered
 		}
@@ -370,7 +370,7 @@ func (m Model) renderOverlay(width, height int) string {
 			body = append(body, fmt.Sprintf("  %-24s %-12s %-14s %s", current.ID, current.Agent, current.Role, current.Status))
 		}
 	}
-	header := []string{frameTop(title, "", width), frameLine(subtitle, width), frameBottom(width)}
+	header := []string{topBar(title, "", width), fitLine("  "+subtitle, width), horizontalRule(width)}
 	bodyHeight := max(1, height-len(header)-1)
 	return renderScreen(append(append(header, padLines(body, bodyHeight, width)...), fitLine(footer, width)), width, height)
 }
@@ -398,11 +398,17 @@ func (m Model) sessionSummary(sessionID string) string {
 func (m Model) renderSession(width, height int) string {
 	current := m.current
 	provider := strings.ToUpper(valueOr(current.Agent, "agent"))
+	metadata := provider + " · " + valueOr(current.Role, "worker") + " · " + humanizeLabel(appservice.PermissionLabel(current))
+	location := "Task " + safeText(current.TaskID) + " · " + compactSessionPath(current)
+	if width >= 92 {
+		metadata = fitSplitMetadata("  "+metadata, location, width)
+	} else {
+		metadata = "  " + metadata + " · " + location
+	}
 	header := []string{
-		frameTop("STRUCTURED ACP · SESSION "+safeText(current.ID), statusBadge(string(current.Status)), width),
-		frameLine(provider+" · "+valueOr(current.Role, "worker")+" · "+appservice.PermissionLabel(current), width),
-		frameLine("Task "+safeText(current.TaskID)+" · "+compactSessionPath(current), width),
-		frameBottom(width),
+		topBar("STRUCTURED ACP · SESSION "+safeText(current.ID), statusBadge(string(current.Status)), width),
+		fitLine(metadata, width),
+		horizontalRule(width),
 	}
 
 	composer := renderComposer(m.composer, provider, width)
@@ -439,21 +445,34 @@ func (m Model) sessionNotice(width int) string {
 }
 
 func (m Model) sessionFooter(width int) string {
-	back := ""
-	if !m.direct {
-		back = " · b back"
-	}
-	mode := "r raw"
+	mode := "r Raw"
 	if m.raw {
-		mode = "r conversation"
+		mode = "r Conversation"
 	}
 	approval := ""
 	if projection := m.projections[m.current.ID]; projection != nil {
 		if _, card := projection.pendingPermission(); card != nil && len(card.options) > 0 {
-			approval = fmt.Sprintf("1-%d choose approval · ", min(9, len(card.options)))
+			approval = fmt.Sprintf("1-%d choose approval", min(9, len(card.options)))
 		}
 	}
-	return fitLine(approval+"p message · ↑/↓ scroll · End follow · d tool · o reasoning · Esc cancel · x stop · "+mode+back+" · q detach", width)
+	required := []string{"p Message", "Esc Cancel", "q Detach"}
+	if approval != "" {
+		required = append([]string{approval}, required...)
+	} else {
+		required = append([]string{"p Message", "o Reasoning"}, required[1:]...)
+	}
+	if !m.direct {
+		required = append(required, "b Back")
+	}
+	optional := []string{mode, "↑/↓ Scroll", "End Follow", "d Tool", "x Stop"}
+	items := append([]string(nil), required...)
+	for _, item := range optional {
+		candidate := strings.Join(append(items, item), "  ")
+		if ansi.StringWidth(candidate) <= width {
+			items = append(items, item)
+		}
+	}
+	return fitLine(strings.Join(items, "  "), width)
 }
 
 type conversationOptions struct {
@@ -470,15 +489,15 @@ func renderConversation(projection *transcript, agent string, width int, options
 	var lines []string
 	for requestIndex, request := range projection.requests {
 		if requestIndex > 0 {
-			lines = append(lines, "")
+			lines = append(lines, "", sectionRule(width))
 		}
 		for _, block := range request.blocks {
 			switch block.kind {
 			case blockUser:
-				lines = append(lines, "YOU")
+				lines = append(lines, "❯ YOU")
 				lines = append(lines, indentWrapped(block.text, contentWidth, "  ")...)
 			case blockAssistant:
-				lines = append(lines, agent)
+				lines = append(lines, "● "+agent)
 				lines = append(lines, indentWrapped(block.text, contentWidth, "  ")...)
 				if block.truncated {
 					lines = append(lines, "  … message clipped in the viewer; raw history is preserved")
@@ -492,7 +511,7 @@ func renderConversation(projection *transcript, agent string, width int, options
 			case blockPermission:
 				lines = append(lines, renderPermission(block.permission, width)...)
 			case blockError:
-				lines = append(lines, "ERROR")
+				lines = append(lines, "! ERROR")
 				lines = append(lines, indentWrapped(block.text, contentWidth, "  ")...)
 			}
 		}
@@ -506,12 +525,12 @@ func renderConversation(projection *transcript, agent string, width int, options
 func renderThought(block *transcriptBlock, width int, expanded bool) []string {
 	count := logicalLines(block.text)
 	if !expanded {
-		return []string{fmt.Sprintf("◇ Reasoning · %d line(s) (collapsed; press o to show)", count)}
+		return []string{fmt.Sprintf("  ▸ Reasoning · %d line(s) · o expand", count)}
 	}
-	lines := []string{"◇ REASONING"}
-	wrapped := indentWrapped(block.text, width, "  ")
+	lines := []string{"  ▾ Reasoning"}
+	wrapped := indentWrapped(block.text, width, "  │ ")
 	if len(wrapped) > 10 {
-		wrapped = append(wrapped[:10], "  … reasoning clipped in this view")
+		wrapped = append(wrapped[:10], "  ╰ … reasoning clipped in this view")
 	}
 	return append(lines, wrapped...)
 }
@@ -522,10 +541,10 @@ func renderTool(tool *toolCard, width int, options conversationOptions) []string
 	}
 	selected := ""
 	if options.selectedTool == tool.id {
-		selected = " ›"
+		selected = " · selected"
 	}
-	title := toolStatusGlyph(tool.status) + " TOOL · " + toolDisplayTitle(tool) + selected
-	lines := []string{"╭─ " + fitLine(title, max(1, width-3))}
+	title := "  ├─ " + toolStatusGlyph(tool.status) + " TOOL · " + toolDisplayTitle(tool) + selected
+	lines := []string{fitLine(title, width)}
 	var metadata []string
 	if tool.status != "" {
 		metadata = append(metadata, strings.ReplaceAll(tool.status, "_", " "))
@@ -539,21 +558,21 @@ func renderTool(tool *toolCard, width int, options conversationOptions) []string
 	if tool.outputLines > 0 {
 		metadata = append(metadata, fmt.Sprintf("%d lines", tool.outputLines))
 	}
-	lines = append(lines, "│  "+fitLine(strings.Join(metadata, " · "), max(1, width-4)))
+	lines = append(lines, "  │  "+fitLine(strings.Join(metadata, " · "), max(1, width-5)))
 	if tool.preview != "" {
-		preview := indentWrapped(tool.preview, max(10, width-6), "│  ")
+		preview := indentWrapped(tool.preview, max(10, width-7), "  │  ")
 		if len(preview) > 3 {
 			preview = preview[:3]
 		}
 		lines = append(lines, preview...)
 	}
 	if options.expandedTool == tool.id {
-		detail := indentWrapped(tool.detail, max(10, width-6), "│  ")
+		detail := indentWrapped(tool.detail, max(10, width-7), "  │  ")
 		if len(detail) > 6 {
-			detail = append(detail[:6], "│  … details clipped; press r for complete raw events")
+			detail = append(detail[:6], "  │  … details clipped; press r for complete raw events")
 		}
 		if len(detail) == 0 {
-			detail = []string{"│  No provider output was attached to this tool call."}
+			detail = []string{"  │  No provider output was attached to this tool call."}
 		}
 		lines = append(lines, detail...)
 	}
@@ -561,7 +580,7 @@ func renderTool(tool *toolCard, width int, options conversationOptions) []string
 	if options.expandedTool == tool.id {
 		hint = "d collapse"
 	}
-	lines = append(lines, "╰─ "+hint+" · [/] select tool")
+	lines = append(lines, "  ╰─ "+hint+" · [/] select")
 	return lines
 }
 
@@ -569,9 +588,13 @@ func renderPlan(entries []planEntry, width int) []string {
 	if len(entries) == 0 {
 		return nil
 	}
-	lines := []string{"PLAN"}
-	for _, entry := range entries {
-		line := "  " + planStatusGlyph(entry.status) + " " + entry.content
+	lines := []string{"  ▾ Plan"}
+	for index, entry := range entries {
+		branch := "├─"
+		if index == len(entries)-1 {
+			branch = "╰─"
+		}
+		line := "  " + branch + " " + planStatusGlyph(entry.status) + " " + entry.content
 		lines = append(lines, indentWrapped(line, width, "")...)
 	}
 	return lines
@@ -584,38 +607,39 @@ func renderPermission(card *permissionCard, width int) []string {
 	title := valueOr(card.title, "Tool permission")
 	if card.state != "waiting" {
 		return []string{
-			"╭─ APPROVAL · " + fitLine(title, max(1, width-15)),
-			"│  resolved · " + valueOr(card.decision, "decision recorded"),
-			"╰─",
+			"  ├─ ✓ Approval · " + fitLine(title, max(1, width-19)),
+			"  ╰─ resolved · " + valueOr(card.decision, "decision recorded"),
 		}
 	}
 	lines := []string{
-		"╭─ APPROVAL REQUIRED · " + fitLine(title, max(1, width-27)),
-		"│  The agent is waiting; detaching will not dismiss this request.",
+		"  ╭─ APPROVAL REQUIRED · " + fitLine(title, max(1, width-29)),
+		"  │  The agent is waiting; detach safely leaves this request open.",
 	}
 	for index, option := range card.options {
 		label := valueOr(option.name, strings.ReplaceAll(option.kind, "_", " "))
 		if option.kind == "allow_always" || option.kind == "reject_always" {
 			label += " · PERSISTENT"
 		}
-		lines = append(lines, fmt.Sprintf("│  [%d] %s", index+1, label))
+		lines = append(lines, fmt.Sprintf("  │  [%d] %s", index+1, label))
 	}
-	lines = append(lines, "╰─ choose an offered option")
+	lines = append(lines, "  ╰─ choose an offered option")
 	return lines
 }
 
 func renderTurnState(state turnState) string {
 	switch state {
 	case turnQueued:
-		return "◌ Message queued"
+		return "  ◌ Message queued"
 	case turnLive:
-		return "● Agent is working…"
+		return "  ● Agent is working…"
 	case turnCancelling:
-		return "◌ Cancellation requested…"
+		return "  ◌ Cancellation requested…"
 	case turnCancelled:
-		return "× Turn cancelled · Session remains available"
+		return "  × Turn cancelled · Session remains available"
 	case turnFailed:
-		return "! Turn failed"
+		return "  ! Turn failed"
+	case turnComplete:
+		return "  ✓ Turn complete"
 	default:
 		return ""
 	}
@@ -637,9 +661,9 @@ func renderRawHistory(history []sessionlog.Line, width int) []string {
 func renderComposer(composer composerState, agent string, width int) []string {
 	title := "MESSAGE " + agent
 	if composer.focused {
-		title += " · EDITING"
+		title += " · editing"
 	} else if len(composer.value) > 0 {
-		title += " · DRAFT"
+		title += " · draft saved"
 	}
 	content := composer.text()
 	if composer.focused {
@@ -647,20 +671,20 @@ func renderComposer(composer composerState, agent string, width int) []string {
 		content = string(composer.value[:cursor]) + "▌" + string(composer.value[cursor:])
 	}
 	if content == "" {
-		content = "Press p to write a message"
+		content = "Press p to write a message…"
 	}
-	wrapped := indentWrapped(content, max(10, width-4), "│ ")
+	wrapped := indentWrapped(content, max(10, width-5), "│  ")
 	if len(wrapped) > 2 {
 		wrapped = wrapped[len(wrapped)-2:]
 	}
 	for len(wrapped) < 2 {
-		wrapped = append(wrapped, "│ ")
+		wrapped = append(wrapped, "│  ")
 	}
 	return []string{
-		frameTop(title, "", width),
+		composerTop(title, width),
 		fitLine(wrapped[0], width),
 		fitLine(wrapped[1], width),
-		frameBottom(width),
+		composerBottom(composer.focused, width),
 	}
 }
 
@@ -675,8 +699,48 @@ func renderScreen(lines []string, width, height int) string {
 	}
 	for index := range lines {
 		lines[index] = fitLine(lines[index], width)
+		lines[index] = decorateLine(lines[index], index == len(lines)-1)
 	}
 	return strings.Join(lines, "\n")
+}
+
+func decorateLine(line string, footer bool) string {
+	if strings.TrimSpace(line) == "" {
+		return line
+	}
+	style := ""
+	switch {
+	case strings.HasPrefix(line, "◆ "):
+		style = "1;38;5;81"
+	case strings.HasPrefix(line, "  SESSIONS"), strings.HasPrefix(line, "  SELECTED SESSION"):
+		style = "1;38;5;252"
+	case strings.HasPrefix(line, "▌ "):
+		style = "1;38;5;81"
+	case strings.HasPrefix(line, "❯ YOU"):
+		style = "1;38;5;222"
+	case strings.HasPrefix(line, "● "):
+		style = "1;38;5;117"
+	case strings.HasPrefix(line, "  ▸ Reasoning"), strings.HasPrefix(line, "  ▾ Reasoning"):
+		style = "38;5;245"
+	case strings.HasPrefix(line, "  ├─ ✓ TOOL"):
+		style = "38;5;114"
+	case strings.HasPrefix(line, "  ✓ Turn complete"):
+		style = "38;5;114"
+	case strings.HasPrefix(line, "  ╭─ APPROVAL REQUIRED"):
+		style = "1;38;5;214"
+	case strings.HasPrefix(line, "╭─ MESSAGE"):
+		style = "1;38;5;252"
+	case strings.HasPrefix(line, "╰─ "), strings.HasPrefix(line, "│  "):
+		style = "38;5;245"
+	case strings.Trim(line, "─ │") == "":
+		style = "38;5;238"
+	case footer:
+		style = "38;5;245"
+	}
+	if style == "" {
+		return line
+	}
+	return "\x1b[" + style + "m" + line + "\x1b[0m"
 }
 
 func viewportLines(lines []string, count, scroll, width int) []string {
@@ -728,35 +792,56 @@ func indentWrapped(value string, width int, indent string) []string {
 	return result
 }
 
-func frameTop(left, right string, width int) string {
-	if width < 4 {
-		return strings.Repeat("─", width)
+func topBar(left, right string, width int) string {
+	left = "◆ " + safeText(left)
+	if strings.TrimSpace(right) == "" {
+		return fitLine(left, width)
 	}
-	left, right = safeText(left), safeText(right)
-	prefix := "╭─ " + left + " "
-	suffix := "╮"
-	if right != "" {
-		suffix = " " + right + " ─╮"
-	}
-	available := width - ansi.StringWidth(suffix)
-	prefix = ansi.Truncate(prefix, max(1, available), "…")
-	fill := max(1, width-ansi.StringWidth(prefix)-ansi.StringWidth(suffix))
-	return fitLine(prefix+strings.Repeat("─", fill)+suffix, width)
+	return fitWithRight(left, safeText(right), width)
 }
 
-func frameLine(value string, width int) string {
-	if width < 4 {
-		return fitLine(value, width)
+func horizontalRule(width int) string {
+	if width <= 0 {
+		return ""
 	}
-	inner := ansi.Truncate(safeText(value), width-4, "…")
-	return "│ " + padRight(inner, width-4) + " │"
+	return strings.Repeat("─", width)
 }
 
-func frameBottom(width int) string {
-	if width < 2 {
-		return strings.Repeat("─", width)
+func sectionHeading(left, right string, width int) string {
+	left = "  " + safeText(left)
+	if strings.TrimSpace(right) == "" {
+		return fitLine(left, width)
 	}
-	return "╰" + strings.Repeat("─", width-2) + "╯"
+	return fitWithRight(left, safeText(right), width)
+}
+
+func sectionRule(width int) string {
+	if width <= 0 {
+		return ""
+	}
+	return strings.Repeat("─", width)
+}
+
+func composerTop(title string, width int) string {
+	if width < 5 {
+		return horizontalRule(width)
+	}
+	prefix := "╭─ " + safeText(title) + " "
+	prefix = ansi.Truncate(prefix, width-1, "…")
+	return fitLine(prefix+strings.Repeat("─", max(1, width-ansi.StringWidth(prefix)-1))+"╮", width)
+}
+
+func composerBottom(focused bool, width int) string {
+	if width < 5 {
+		return horizontalRule(width)
+	}
+	hint := "p compose"
+	if focused {
+		hint = "Enter send · Ctrl+J newline · Esc keep draft"
+	}
+	prefix := "╰─ " + hint + " "
+	prefix = ansi.Truncate(prefix, width-1, "…")
+	return fitLine(prefix+strings.Repeat("─", max(1, width-ansi.StringWidth(prefix)-1))+"╯", width)
 }
 
 func fitWithRight(left, right string, width int) string {
@@ -766,6 +851,19 @@ func fitWithRight(left, right string, width int) string {
 	}
 	left = ansi.Truncate(left, width-rightWidth-1, "…")
 	return left + strings.Repeat(" ", max(1, width-ansi.StringWidth(left)-rightWidth)) + right
+}
+
+func fitSplitMetadata(left, right string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	left = safeText(left)
+	right = safeText(right)
+	leftBudget := min(ansi.StringWidth(left), max(28, width*45/100))
+	rightBudget := max(1, width-leftBudget-2)
+	left = ansi.Truncate(left, leftBudget, "…")
+	right = ansi.Truncate(right, rightBudget, "…")
+	return fitWithRight(left, right, width)
 }
 
 func fitLine(value string, width int) string {
@@ -795,7 +893,10 @@ func noticeLine(value string, width int) string {
 }
 
 func taskSubtitle(description string, sessions int) string {
-	label := fmt.Sprintf("%d Session(s)", sessions)
+	label := fmt.Sprintf("%d Sessions", sessions)
+	if sessions == 1 {
+		label = "1 Session"
+	}
 	if strings.TrimSpace(description) == "" {
 		return label
 	}
@@ -909,4 +1010,8 @@ func valueOr(value, fallback string) string {
 		return fallback
 	}
 	return safeText(value)
+}
+
+func humanizeLabel(value string) string {
+	return strings.ReplaceAll(safeText(value), "-", " ")
 }
