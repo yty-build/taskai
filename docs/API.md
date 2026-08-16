@@ -48,6 +48,9 @@ Session:
   "status": "waiting",
   "permission": "read-approval",
   "worker_running": true,
+  "conversation_ready": true,
+  "conversation_verified": true,
+  "conversation_verified_at": "2026-08-14T20:01:30Z",
   "created_at": "2026-08-14T20:00:00Z",
   "updated_at": "2026-08-14T20:02:00Z",
   "last_activity_at": "2026-08-14T20:02:00Z"
@@ -89,7 +92,7 @@ For `permission_requested`, Activity may additionally include a sanitized action
 
 Only safe labels and exact opaque IDs needed to decide are exposed. Raw tool input, provider environment/auth, ACP wire data, and worker paths remain private.
 
-Database/runtime-only fields are intentionally absent: worker PID, Unix socket, JSONL path, metadata JSON storage representation, acpx record ID, ACP Session ID, provider-native Session ID, and raw ACP data.
+The three `conversation_*` fields expose only safe continuity state. Database/runtime-only values remain intentionally absent: worker PID, Unix socket, JSONL path, metadata JSON storage representation, the canonical provider conversation ID, acpx record ID, ACP Session ID, native adapter ID, and raw ACP data.
 
 ## Routes
 

@@ -126,6 +126,16 @@ func (p CreateParams) Validate() error {
 		if err := p.ConversationIDSource.Validate(); err != nil {
 			return err
 		}
+		providerStore := p.ConversationIDSource == ConversationSourceProviderStore
+		if providerStore && p.ConversationIDVerifiedAt == nil {
+			return fmt.Errorf("provider-store conversation identity requires a verification timestamp")
+		}
+		if !providerStore && p.ConversationIDVerifiedAt != nil {
+			return fmt.Errorf("conversation verification timestamp requires provider-store identity source")
+		}
+		if providerStore && strings.TrimSpace(p.NativeSessionID) != "" && strings.TrimSpace(p.NativeSessionID) != strings.TrimSpace(p.ProviderConversationID) {
+			return fmt.Errorf("native adapter ID must match the provider-store verified canonical conversation")
+		}
 	}
 	return nil
 }

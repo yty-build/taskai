@@ -25,9 +25,17 @@ type Runner interface {
 	Run(context.Context, Invocation, io.Reader, io.Writer, io.Writer) error
 }
 
-type ExecRunner struct{}
+// ExecRunner launches the provider directly and records whether the process
+// actually started. Callers use that distinction to avoid refreshing ACP after
+// a command lookup, working-directory, or pre-start context failure.
+type ExecRunner struct {
+	activityOccurred bool
+}
 
-func (ExecRunner) Run(ctx context.Context, invocation Invocation, input io.Reader, output, errorOutput io.Writer) error {
+func (r *ExecRunner) NativeActivityOccurred() bool { return r.activityOccurred }
+
+func (r *ExecRunner) Run(ctx context.Context, invocation Invocation, input io.Reader, output, errorOutput io.Writer) error {
+	r.activityOccurred = false
 	if strings.TrimSpace(invocation.Command) == "" {
 		return fmt.Errorf("native command is required")
 	}
@@ -35,7 +43,11 @@ func (ExecRunner) Run(ctx context.Context, invocation Invocation, input io.Reade
 	command.Dir = invocation.WorkingDirectory
 	command.Env = mergeEnvironment(invocation.Environment)
 	command.Stdin, command.Stdout, command.Stderr = input, output, errorOutput
-	if err := command.Run(); err != nil {
+	if err := command.Start(); err != nil {
+		return fmt.Errorf("native %s process: %w", invocation.Command, err)
+	}
+	r.activityOccurred = true
+	if err := command.Wait(); err != nil {
 		return fmt.Errorf("native %s process: %w", invocation.Command, err)
 	}
 	return nil
@@ -60,7 +72,7 @@ func BuildResume(profile agents.Profile, conversationID, workingDirectory string
 	switch profile.Name {
 	case "codex":
 		arguments = append(arguments, "resume", conversationID)
-	case "claude", "gemini":
+	case "claude":
 		arguments = append(arguments, "--resume", conversationID)
 	case "grok", "grok-build":
 		if filepathBase(command) == "grok-build" {
@@ -68,14 +80,15 @@ func BuildResume(profile agents.Profile, conversationID, workingDirectory string
 		}
 		arguments = append(arguments, "--resume", conversationID)
 	case "opencode":
-		// The built-in ACP profile invokes `npx ... opencode ... acp`; those
-		// arguments are not valid in the interactive harness. Native continuation
-		// always uses the provider's installed `opencode` command.
-		if filepathBase(command) != "opencode" {
-			command = "opencode"
-			arguments = nil
-		} else if len(arguments) > 0 && arguments[len(arguments)-1] == "acp" {
+		// Keep the same pinned OpenCode executable used by the ACP profile, but
+		// remove its ACP subcommand when opening the real interactive harness.
+		// This avoids resuming one conversation through two CLI versions.
+		if filepathBase(command) == "npx" && isOpenCodeNPX(arguments) {
 			arguments = arguments[:len(arguments)-1]
+		} else if filepathBase(command) == "opencode" && len(arguments) > 0 && arguments[len(arguments)-1] == "acp" {
+			arguments = arguments[:len(arguments)-1]
+		} else if filepathBase(command) != "opencode" {
+			command, arguments = "opencode", nil
 		}
 		arguments = append(arguments, "--session", conversationID)
 	default:
@@ -85,6 +98,18 @@ func BuildResume(profile agents.Profile, conversationID, workingDirectory string
 		Command: command, Args: arguments, WorkingDirectory: workingDirectory,
 		Environment: cloneEnvironment(profile.Environment),
 	}, nil
+}
+
+func isOpenCodeNPX(arguments []string) bool {
+	if len(arguments) < 2 || arguments[len(arguments)-1] != "acp" {
+		return false
+	}
+	for _, argument := range arguments[:len(arguments)-1] {
+		if argument == "opencode-ai" || strings.HasPrefix(argument, "opencode-ai@") {
+			return true
+		}
+	}
+	return false
 }
 
 func filepathBase(command string) string {

@@ -537,6 +537,28 @@ func TestNativeProcessFailureStillSchedulesNonBlockingRefresh(t *testing.T) {
 	}
 }
 
+type prelaunchNativeRunner struct{}
+
+func (*prelaunchNativeRunner) Run(context.Context, native.Invocation, io.Reader, io.Writer, io.Writer) error {
+	return errors.New("unowned tmux collision")
+}
+
+func (*prelaunchNativeRunner) ProcessMayContinue() bool     { return false }
+func (*prelaunchNativeRunner) NativeActivityOccurred() bool { return false }
+
+func TestNativePrelaunchFailureDoesNotRefreshACP(t *testing.T) {
+	service, runtime, current := nativeServiceHarness(t, "codex", "native-exact")
+	err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{Runner: &prelaunchNativeRunner{}, Verifier: &acceptingNativeVerifier{}})
+	if err == nil || !strings.Contains(err.Error(), "unowned tmux collision") {
+		t.Fatalf("prelaunch error = %v", err)
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if !reflect.DeepEqual(runtime.calls, []string{"status"}) {
+		t.Fatalf("prelaunch failure worker calls=%v", runtime.calls)
+	}
+}
+
 type continuingNativeRunner struct{ recordingNativeRunner }
 
 func (*continuingNativeRunner) ProcessMayContinue() bool { return true }

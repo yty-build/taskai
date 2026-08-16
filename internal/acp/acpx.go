@@ -59,7 +59,10 @@ func (t Target) validate() error {
 
 type StartSpec struct {
 	Target
-	ResumeACPSessionID string
+	ResumeACPSessionID             string
+	ExpectedProviderConversationID string
+	ExpectedNativeSessionID        string
+	ProviderStoreVerified          bool
 }
 
 type SessionInfo struct {
@@ -68,6 +71,82 @@ type SessionInfo struct {
 	ACPSessionID     string          `json:"acpSessionId"`
 	NativeSessionID  string          `json:"nativeSessionId,omitempty"`
 	Raw              json.RawMessage `json:"raw"`
+}
+
+// IdentityError means a transport observation cannot be proven to belong to
+// the immutable provider conversation recorded for a Task Console Session.
+// Callers must quarantine that transport rather than continue optimistically.
+type IdentityError struct {
+	Operation string
+	Message   string
+}
+
+func (e *IdentityError) Error() string {
+	operation := strings.TrimSpace(e.Operation)
+	if operation == "" {
+		operation = "provider conversation"
+	}
+	return fmt.Sprintf("acpx %s identity error: %s", operation, e.Message)
+}
+
+func identityError(operation, format string, arguments ...any) error {
+	return &IdentityError{Operation: operation, Message: fmt.Sprintf(format, arguments...)}
+}
+
+// ValidateProviderConversation proves that adapter metadata still names the
+// immutable provider conversation recorded by the Task Console Session. ACP
+// and provider-native identifiers are distinct protocol concepts, so either
+// exact identifier may carry the canonical value.
+func ValidateProviderConversation(operation string, info SessionInfo, expected string) error {
+	expected = strings.TrimSpace(expected)
+	if expected == "" {
+		return nil
+	}
+	if strings.TrimSpace(info.ACPSessionID) == expected || strings.TrimSpace(info.NativeSessionID) == expected {
+		return nil
+	}
+	if strings.TrimSpace(operation) == "" {
+		operation = "provider conversation"
+	}
+	return identityError(operation, "expected canonical provider conversation %q, received ACP %q and native %q", expected, info.ACPSessionID, info.NativeSessionID)
+}
+
+// ValidateNativeSessionEvidence prevents an adapter from silently replacing
+// a previously observed native identifier while retaining the same ACP ID.
+func ValidateNativeSessionEvidence(operation string, info SessionInfo, expected string) error {
+	expected = strings.TrimSpace(expected)
+	if expected == "" {
+		return nil
+	}
+	if strings.TrimSpace(info.NativeSessionID) == expected {
+		return nil
+	}
+	if strings.TrimSpace(operation) == "" {
+		operation = "native Session evidence"
+	}
+	return identityError(operation, "expected native adapter ID %q, received %q", expected, info.NativeSessionID)
+}
+
+// ValidateSessionIdentity checks every stable identity field together. Once a
+// provider-store lookup has verified the canonical ID, a newly observed native
+// ID must equal that canonical ID; matching ACP evidence cannot mask drift.
+func ValidateSessionIdentity(operation string, info SessionInfo, expectedACP, expectedNative, canonical string, providerStoreVerified bool) error {
+	expectedACP = strings.TrimSpace(expectedACP)
+	if expectedACP != "" && strings.TrimSpace(info.ACPSessionID) != expectedACP {
+		return identityError(operation, "expected ACP Session ID %q, received %q", expectedACP, info.ACPSessionID)
+	}
+	if err := ValidateProviderConversation(operation, info, canonical); err != nil {
+		return err
+	}
+	if err := ValidateNativeSessionEvidence(operation, info, expectedNative); err != nil {
+		return err
+	}
+	canonical = strings.TrimSpace(canonical)
+	nativeID := strings.TrimSpace(info.NativeSessionID)
+	if providerStoreVerified && canonical != "" && nativeID != "" && nativeID != canonical {
+		return identityError(operation, "provider-store verified canonical conversation %q, received native adapter ID %q", canonical, nativeID)
+	}
+	return nil
 }
 
 type PromptSpec struct {

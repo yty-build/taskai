@@ -601,9 +601,9 @@ func (s *SessionService) AttachNative(ctx context.Context, id string, options Na
 	}
 	if options.Runner == nil {
 		if strings.TrimSpace(s.executable) != "" {
-			options.Runner = &native.TmuxRunner{Executable: s.executable, ConsoleSessionID: current.ID}
+			options.Runner = &native.TmuxRunner{Executable: s.executable, ConsoleSessionID: current.ID, StateRoot: s.home.Root}
 		} else {
-			options.Runner = native.ExecRunner{}
+			options.Runner = &native.ExecRunner{}
 		}
 	}
 	s.writeNativeConcurrencyNotice(ctx, current, options.ErrorOutput)
@@ -612,7 +612,11 @@ func (s *SessionService) AttachNative(ctx context.Context, id string, options Na
 	if aware, ok := options.Runner.(native.MayContinueRunner); ok {
 		mayContinue = aware.ProcessMayContinue()
 	}
-	if !mayContinue {
+	activityOccurred := true
+	if aware, ok := options.Runner.(native.ActivityAwareRunner); ok {
+		activityOccurred = aware.NativeActivityOccurred()
+	}
+	if activityOccurred && !mayContinue {
 		s.requestNativeRefresh(current, options.ErrorOutput)
 	}
 	if runErr != nil {
@@ -645,7 +649,9 @@ func (s *SessionService) requestNativeRefresh(current session.Session, notices i
 		fmt.Fprintf(notices, "Agent Task Console: native process exited, but ACP refresh could not be scheduled: %v\n", err)
 		return
 	}
-	if message.State == "deferred" {
+	if message.State == "unavailable" {
+		fmt.Fprintln(notices, "Agent Task Console: ACP refresh was not scheduled because the exact transport is unavailable; resume the stopped Session before sending more work.")
+	} else if message.State == "deferred" {
 		fmt.Fprintln(notices, "Agent Task Console: ACP refresh is deferred until the active turn and queued prompts finish.")
 	} else {
 		fmt.Fprintln(notices, "Agent Task Console: ACP refresh scheduled at the idle boundary.")

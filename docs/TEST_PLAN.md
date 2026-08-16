@@ -64,7 +64,7 @@ For `acpctl task attach`:
 - Task-level input cannot silently broadcast.
 - Detaching does not affect workers.
 
-For `acpctl session attach`:
+For `acpctl session attach --acp`:
 
 - Stored history loads before live output and does not duplicate.
 - Prompts reach the correct Session.
@@ -84,9 +84,15 @@ For `acpctl session attach`:
 - Create multiple isolated worktrees and branches.
 - Verify shared-checkout protection and non-destructive cleanup behavior.
 - Verify reviewer Session independence and complete producer evidence.
-- Test native attachment with a fake provider CLI.
-- Smoke-test real Codex native attachment when a native ID is available.
-- Prove ACP/native mutual exclusion, held prompt queue, and reconciliation before ACP resumes.
+- Prove the first exact provider identity becomes immutable canonical Session state while acpx/ACP/native IDs remain evidence.
+- Test exact Codex, Claude, Grok, and OpenCode local-store verification plus ambiguous/missing/check-out mismatch rejection.
+- Prove `session attach <id>` and Task Enter invoke the exact real provider-native resume command; `--acp` and Task `a` open the structured gateway console.
+- Prove tmux detach/reattach leaves the native process running and does not request an early refresh.
+- Prove native attachment never pauses, cancels, or blocks ACP activity; concurrency is an advisory owned by the user.
+- Prove actual native exit requests an exact ACP refresh and defers behind work already queued at that boundary. A prompt submitted later must remain behind refresh.
+- Inject post-turn and post-native identity drift. Prove bounded exact recovery completes before later work; if recovery fails, queued requests receive correlated errors, no later prompt reaches the suspect bridge, the entire old process group exits, and the worker stops without a lock.
+- Start tmux with stale `AGENT_HOME`/`PATH`, then prove native attach passes the invoking state root/environment and rejects an unowned name collision.
+- Run the serialized ACP → native → ACP nonce smoke against all four authenticated providers.
 
 ## T07 — API and web
 
@@ -96,11 +102,12 @@ For `acpctl session attach`:
 - Verify request/response correlation and invalid cursor handling.
 - Verify loopback-only binding and no socket/ACP leakage.
 - Verify web prompt/cancel/resume/stop and Session drill-down.
+- Verify responsive desktop/mobile ordering and the safe linked/verified conversation indicators without exposing any provider ID.
 - Stop the web server and confirm workers continue.
 
 ## T08 — Authenticated live provider matrix
 
-Use real `acpx` sessions for `codex`, `claude`, `grok-build`, `opencode`, and `gemini`.
+Use real `acpx` sessions for `codex`, `claude`, `grok` (resolved through acpx's `grok-build` built-in), `opencode`, and `gemini`.
 
 For every provider:
 
@@ -115,6 +122,8 @@ For every provider:
 - Verify it appears and drills down correctly in `acpctl task attach`.
 - Exercise one harmless write permission in `read-approval`: the file must not exist before allow, must appear after allow, and must remain absent after reject.
 - Record whether each provider uses `session/request_permission` or the one-shot host broker for `fs/write_text_file`/`terminal/create`; unknown host paths must fail closed.
+
+For Codex, Claude, Grok, and OpenCode, additionally wait for ACP idle, verify the canonical ID in the provider's exact local store, enter the real native harness, prove it remembers an ACP-only nonce, add a native-only nonce, exit the provider process, wait for exact idle ACP refresh, and prove ACP remembers the native-only nonce. Never overlap the two turns; product concurrency remains advisory rather than enforced. Gemini is ACP-only in V1 until an exact provider-store verifier is implemented.
 
 Do not edit authentication configuration. Report an unexpected login prompt as a blocker for that provider.
 

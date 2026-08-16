@@ -37,6 +37,7 @@ Default state root: `~/.agent`.
 | `agents/*.yaml` | profile overlays | private configuration |
 | `logs/<session>.jsonl` | correlated ACP-visible history | `0600` |
 | `workers/<session>.sock` | local worker command/subscription transport | `0600` |
+| `acpx-runtime/<session>/` | private public-runtime bridge state | current user only |
 | `worktrees/<task>-<session>` | optional persistent Git checkout | normal user-owned Git tree |
 
 The root and state subdirectories are forced to `0700`. JSONL and sockets are forced to `0600`. Provider authentication stays wherever each provider CLI owns it; it is not copied into this tree or SQLite.
@@ -58,7 +59,8 @@ Embedded profiles:
 | `codex` | `openai` | `codex` |
 | `claude` | `anthropic` | `claude` |
 | `gemini` | `google` | `gemini --experimental-acp` |
-| `grok-build` | `xai` | `grok-build` |
+| `grok` | `xai` | `grok-build` (acpx friendly profile; native executable is `grok`) |
+| `grok-build` | `xai` | `grok-build` (compatibility profile name) |
 | `opencode` | `opencode` | `npx -y opencode-ai@1.18.18 acp` |
 
 Place overrides or custom profiles in `$AGENT_HOME/agents/*.yaml`:
@@ -116,8 +118,8 @@ Prefer provider-native credential stores or the launching process environment ov
 | `acpctl session logs <id>` | Replay/follow; supports `--follow`, `--raw`, `--from <position>` |
 | `acpctl task logs <id>` | Aggregate child histories; supports `--follow`, `--raw` |
 | `acpctl task attach <id>` | Interactive aggregate Task viewer/controller |
-| `acpctl session attach <id>` | Interactive Session viewer/controller |
-| `acpctl session attach <id> --native` | Exclusive exact provider-native resume; optional `--cancel-active` or `--reconcile-only` |
+| `acpctl session attach <id>` | Resume the exact canonical conversation in the real provider-native terminal |
+| `acpctl session attach <id> --acp` | Open the structured gateway transcript/permission console; `--native` remains a compatibility alias for the default |
 | `acpctl session review <producer-id>` | Requires `--agent`; optional `--allow-active-producer` |
 | `acpctl serve` | Local HTML/JSON/SSE server; optional `--listen <explicit-loopback-ip:port>` |
 
@@ -187,20 +189,23 @@ New Sessions record `acp_transport=acpx-runtime-v1` in `metadata_json`. A Sessio
 
 ## Terminal attachment
 
-Normal attach is through ACP:
+Task attachment is a Session navigator. Direct Session attachment opens the provider's real native terminal by default; use `--acp` for the structured gateway console:
 
 ```bash
 acpctl task attach <task-id>
 acpctl session attach <session-id>
+acpctl session attach <session-id> --acp
 ```
 
-Use `q`/`Ctrl-C` to detach. This cancels only viewer subscriptions. Do not use `stop` merely to close a UI.
+Use `q`/`Ctrl-C` to detach a gateway view. With a tmux-backed native terminal, use `Ctrl-B d`; the provider keeps running and `acpctl session attach <id>` reconnects to it. Detaching either view never stops the worker or cancels an ACP turn. Do not use `stop` merely to close a UI.
 
 Task attach targets one selected Session for every prompt or control action; there is no broadcast. Stored history appears before live output, and positions prevent duplicate replay.
 
 From the Task screen, press `n` to add a Session without leaving the console. The wizard chooses the agent, role, repository, isolated worktree setting, permission mode, and optional initial prompt; `Ctrl+S` starts it and opens the new Session automatically.
 
-Session attach renders a native conversation harness by default: user/assistant turns, collapsed reasoning, merged tool cards, plans, errors, and permission cards. Press `r` for the bounded gateway raw/debug envelope view; the public runtime does not provide an exact JSON-RPC packet capture.
+Enter or a mouse click on the Task screen opens the selected real native harness. Press `a` to open the selected structured ACP view, `p` to compose an ACP prompt, `/` to filter Sessions, `:` for the searchable action palette, and `?` for contextual help.
+
+The `--acp` view renders user/assistant turns, collapsed reasoning, merged tool cards, plans, errors, and permission cards. Press `r` for the bounded gateway raw/debug envelope view; the public runtime does not provide an exact JSON-RPC packet capture.
 
 ## Provider-native mode
 
@@ -208,39 +213,39 @@ Supported exact resume mappings:
 
 | Profile | Invocation suffix |
 | --- | --- |
-| `codex` | `resume <native-id>` |
-| `claude` | `--resume <native-id>` |
-| `gemini` | `--resume <native-id>` |
-| `opencode` | `--session <native-id>` |
+| `codex` | `resume <provider-conversation-id>` |
+| `claude` | `--resume <provider-conversation-id>` |
+| `grok` / `grok-build` | `grok --resume <provider-conversation-id>` |
+| `opencode` | pinned `npx -y opencode-ai@1.18.18 --session <provider-conversation-id>` |
 
-`grok-build` and custom profiles have no V1 native mapping. They remain usable through ACP.
+Gemini and custom profiles remain usable through ACP but do not have V1 provider-store verification for native attachment.
 
-Before native attach, `acpctl session <id>` must show both ACP and Native Session IDs. If either is absent, native mode fails without starting another conversation.
-
-```bash
-acpctl session attach <id> --native
-```
-
-Default behavior waits for an active turn. To request cancellation explicitly:
+`acpctl session <id>` shows the Task Console ID, immutable canonical provider conversation, identity source, and adapter evidence. Native attach requires a canonical ID and verifies that exact ID plus checkout in the provider's local store. It never picks the most recent conversation and never starts a replacement when verification fails.
 
 ```bash
-acpctl session attach <id> --native --cancel-active
+acpctl session attach <id>
 ```
 
-While leased:
-
-- the worker remains live and Session status is waiting;
-- new prompts are accepted into the queue but not executed;
-- the native CLI runs in the persisted repo/worktree;
-- no ACP prompt touches the provider conversation.
-
-On native exit the worker reconciles the exact ACP/provider conversation. It releases the lease only after successful reconciliation. If reconciliation fails, confirm the native process is closed, fix the external problem, then run:
+With tmux installed, the command creates or reconnects to a stable `agent-<session-id>` tmux session. Detach it without stopping the provider:
 
 ```bash
-acpctl session attach <id> --native --reconcile-only
+Ctrl-B d
 ```
 
-Never run reconciliation while a native CLI still owns the Session.
+Native and ACP are two transports to the same provider conversation:
+
+- native attachment does not pause, cancel, or block the ACP worker;
+- ACP activity does not terminate or seize the native terminal;
+- native attachment emits an advisory when it detects active, queued, or refreshing ACP work because concurrent turns may interleave unpredictably;
+- the user is responsible for not sending simultaneous turns through both transports.
+
+Detaching tmux is not provider exit, so no refresh is requested. When the provider process actually exits, the hidden native owner asks the worker to refresh its exact persisted ACP Session. The tmux Session receives the invoking `AGENT_HOME` and `PATH`, rather than inheriting stale values from an older tmux server. If an ACP turn is active or queued, refresh waits for the next idle boundary. Refresh is time-bounded; on an uncertain result the complete bridge/provider process group is terminated and awaited before bounded exact resume recovery. If recovery fails, queued prompts receive correlated `turn_error` records and the worker stops instead of using an uncertain conversation. Warnings use `native_refresh_warning` or `native_refresh_recovery_warning`; no path creates a lock.
+
+```bash
+acpctl session logs <id> --raw
+```
+
+Look for `native_refresh_started`, then `native_refreshed` or an actionable warning. Continue through `--acp` if native verification is unavailable; never substitute another identifier.
 
 ## Review operations
 
@@ -311,7 +316,7 @@ To remove disposable state, first verify the exact `AGENT_HOME`, stop its Sessio
 
 **Stop timeout:** inspect Session detail and process state. A later normal CLI command will reconcile a dead PID/socket; do not delete a live socket blindly.
 
-**Prompt says queued:** another turn or native lease owns execution. Follow logs for its request ID.
+**Prompt says queued:** another ACP turn owns execution. Native attachment does not participate in the ACP queue. Follow logs for its request ID.
 
 **Cancel says no active turn:** the Session is idle; send the next prompt normally.
 
@@ -325,11 +330,15 @@ To remove disposable state, first verify the exact `AGENT_HOME`, stop its Sessio
 
 ### Native mode
 
-**Native ID missing:** continue with ACP. Current provider metadata did not support exact resume.
+**Canonical provider conversation missing:** continue with `--acp` until the provider establishes an exact identity. Do not invent one.
 
 **Unsupported profile:** use ACP; do not invent provider flags.
 
-**Lease remains after failure:** ensure the native process exited, then use `--reconcile-only`. Held prompts are a safety mechanism.
+**Provider-store verification fails:** the gateway found no exact canonical-ID/check-out match and intentionally did not launch native mode. Diagnose the provider's local state or continue with `--acp`.
+
+**tmux name collision:** an existing `agent-<session-id>` tmux Session lacks the private owner tag for this `AGENT_HOME`. The gateway refuses to attach. Inspect that tmux Session and close or rename it deliberately; never attach by name alone.
+
+**Refresh/recovery warning after native exit:** no lease exists. Inspect raw logs. If exact recovery failed, the worker drains queued work with correlated errors and stops; run `acpctl session resume <id>` to establish the exact persisted identity before sending another prompt.
 
 ### Logs and streams
 

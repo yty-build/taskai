@@ -36,6 +36,13 @@ func TestLoadEmbeddedProfiles(t *testing.T) {
 	if got, want := gemini.Argv(), []string{"gemini", "--experimental-acp"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("gemini Argv() = %q, want installed CLI-compatible profile %q", got, want)
 	}
+	grok, err := registry.Get("grok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := grok.Argv(), []string{"grok-build"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("grok Argv() = %q, want acpx built-in profile %q", got, want)
+	}
 }
 
 func TestUserProfilesOverlayDefaultsAndAddCustomCommands(t *testing.T) {

@@ -615,16 +615,20 @@ func (m Model) handleMouse(event tea.MouseEvent) (tea.Model, tea.Cmd) {
 	if m.mode != taskView || event.Action != tea.MouseActionPress || event.Button != tea.MouseButtonLeft {
 		return m, nil
 	}
+	if m.width < minimumConsoleWidth || m.height < minimumConsoleHeight {
+		return m, nil
+	}
 	const firstSessionRow = 5
 	if m.width >= 92 && event.X >= taskNavigatorWidth(m.width) {
 		return m, nil
 	}
 	position := (event.Y - firstSessionRow) / 2
-	indices := m.filteredSessionIndices()
-	if event.Y < firstSessionRow || position < 0 || position >= len(indices) {
+	indices, start, visible := m.taskSessionWindow(taskNavigatorHeight(m.width, m.height))
+	actualPosition := start + position
+	if event.Y < firstSessionRow || position < 0 || position >= visible || actualPosition >= len(indices) {
 		return m, nil
 	}
-	m.selected = indices[position]
+	m.selected = indices[actualPosition]
 	return m.attachSelectedNative()
 }
 

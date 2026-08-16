@@ -147,7 +147,7 @@ func taskNavigatorWidth(width int) int {
 }
 
 func (m Model) renderTaskNavigator(width, height int) []string {
-	indices := m.filteredSessionIndices()
+	indices, start, visible := m.taskSessionWindow(height)
 	filterLabel := fmt.Sprintf("%d/%d", len(indices), len(m.task.Sessions))
 	lines := []string{frameTop("SESSIONS", filterLabel, width)}
 	innerHeight := max(1, height-2)
@@ -159,16 +159,6 @@ func (m Model) renderTaskNavigator(width, height int) []string {
 		lines = append(lines, padLines([]string{"", centerLine("No Sessions match /"+safeText(m.filter), width), centerLine("Esc clears the filter", width)}, innerHeight, width)...)
 		return append(lines, frameBottom(width))
 	}
-	visible := max(1, innerHeight/2)
-	selectedPosition := 0
-	for position, actual := range indices {
-		if actual == m.selected {
-			selectedPosition = position
-			break
-		}
-	}
-	start := max(0, selectedPosition-visible+1)
-	start = min(start, max(0, len(indices)-visible))
 	var entries []string
 	for position := start; position < len(indices) && position < start+visible; position++ {
 		actual := indices[position]
@@ -190,6 +180,29 @@ func (m Model) renderTaskNavigator(width, height int) []string {
 	}
 	lines = append(lines, padLines(entries, innerHeight, width)...)
 	return append(lines, frameBottom(width))
+}
+
+func (m Model) taskSessionWindow(navigatorHeight int) (indices []int, start, visible int) {
+	indices = m.filteredSessionIndices()
+	visible = max(1, max(1, navigatorHeight-2)/2)
+	selectedPosition := 0
+	for position, actual := range indices {
+		if actual == m.selected {
+			selectedPosition = position
+			break
+		}
+	}
+	start = max(0, selectedPosition-visible+1)
+	start = min(start, max(0, len(indices)-visible))
+	return indices, start, visible
+}
+
+func taskNavigatorHeight(width, height int) int {
+	bodyHeight := max(1, height-6)
+	if width >= 92 {
+		return bodyHeight
+	}
+	return max(7, bodyHeight/2)
 }
 
 func (m Model) renderTaskPreview(width, height int) []string {

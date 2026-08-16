@@ -38,15 +38,15 @@ Primary end-to-end evidence:
 | Associate Session with agent and repo | `TestStartPersistsPermissionAndSendsCompleteInitialPrompt`, lifecycle test | Provider matrix |
 | Start Codex/Claude/Gemini/Grok/OpenCode through acpx | `TestLoadEmbeddedProfiles` verifies exact profiles; adapter/worker fixtures verify common ACP contract | Required T08 live matrix for each authenticated CLI |
 | Start custom ACP-compatible command | `TestUserProfilesOverlayDefaultsAndAddCustomCommands`, `TestCustomCommandIsPassedAsOneLiteralAgentArgument` | Optional local custom-agent smoke |
-| Session survives parent CLI exit | `TestDetachedHiddenWorkerBecomesReachableAndStopsCleanly`, lifecycle test | Provider matrix detach |
+| Session survives parent CLI exit | `TestDetachedHiddenWorkerStartupLifecycleAndDiagnostics`, lifecycle test | Provider matrix detach |
 | Prompt existing Session | lifecycle test, API test | Provider follow-up |
 | Initial prompt contains Task, role, repo/worktree | `TestStartPersistsPermissionAndSendsCompleteInitialPrompt`, lifecycle argv log | Provider matrix |
 | Explicit unattended write permission | `TestPrepareDefaultsToReadApprovalAndValidatesProfileAndDirectory`, `TestPermissionMetadataDefaultsReadAndRequiresExplicitApproveAll` | Inspect live Session detail |
 | Task attach shows all Sessions and updates live | `TestTaskConsoleShowsEverySessionAndDetachesOnlyViewer`, `TestRefreshAddsNewTaskSessionWithoutRestart` | Interactive terminal smoke |
 | Keyboard and mouse Session selection | `TestTaskConsoleKeyboardMouseAndExplicitPromptTarget` | Interactive terminal smoke |
-| Direct Session attach: stored then live, no duplicate | `TestSessionConsoleReplaysThenDeduplicatesLiveAndTogglesRaw` | Interactive provider smoke |
+| Structured `session attach --acp`: stored then live, no duplicate | `TestSessionConsoleReplaysThenDeduplicatesLiveAndTogglesRaw` | Interactive provider smoke |
 | Busy steering is queued | `TestWorkerSerializesPromptsBroadcastsAndReplays` | Provider matrix |
-| `Esc` cancellation and same-Session continuation | `TestEscapeCancelsActiveTurnAndPreservesTypedSteering`, worker tests | Interactive provider smoke |
+| Composer escape and explicit cancellation preserve the Session | `TestEscapeLeavesComposerWithoutCancellingAndExplicitCancelPreservesDraft`, worker tests | Interactive provider smoke |
 | Detach does not interrupt turn | `TestAttachSessionProgramCanDetachWithoutWorkerMutation`, Task console test | Terminal/browser close smoke |
 | Cursor reconnect recovers missed output | API test, `TestWorkerSerializesPromptsBroadcastsAndReplays`, console replay test | Provider disconnect/reconnect |
 | Request/response correlation | adapter request test, worker test, lifecycle raw JSONL test, API test | Provider matrix |
@@ -54,11 +54,15 @@ Primary end-to-end evidence:
 | Aggregate Task logs | lifecycle test, `TestTaskHistoryUsesIndependentSessionCursors` | Multi-provider Task |
 | Cancel Session | adapter, worker, console, and API tests | Provider matrix |
 | Resume stopped Session | lifecycle test, service/API tests | Provider matrix |
-| Persist distinct acpx/ACP/native IDs | store migration/round-trip, adapter, lifecycle tests | Provider metadata inspection |
+| Persist one immutable canonical provider identity plus adapter evidence | `TestMigrationBackfillsCanonicalProviderConversation`, store round-trip, adapter, lifecycle tests | Provider metadata inspection |
 | Associate and create Git worktrees | repository and service worktree tests, CLI test | Provider matrix branches |
-| Exclusive provider-native mode | lifecycle fake-native test; service/native/worker tests | Conditional real Codex smoke |
-| ACP/native never write concurrently | `TestNativeLeaseHoldsQueueUntilSuccessfulReconciliation`, native attach tests | Real native queue smoke |
-| Reconcile before queued prompts continue | worker/native reconciliation tests, lifecycle test | Real native exit smoke |
+| Direct attach and Task Enter open the real native harness | `TestTaskConsoleNativeDefaultACPActionFilterHelpAndPalette`, lifecycle fake-native test | Four-provider native smoke |
+| Exact provider-store verification fails closed | `TestStoreVerifierExactProviderStores`, `TestStoreVerifierRejectsUnsafeAndUnknownConversation` | Four-provider native smoke |
+| Native attach never pauses or cancels ACP | `TestNativeAttachRunsVerifiedCanonicalConversationWithoutPausingACP` | Serialized live continuity smoke |
+| tmux viewer detach leaves the provider running | `TestDetachedTmuxViewerLeavesRefreshToNativeProcessOwner`, `TestTmuxHarnessUsesDerivedNameAndShellQuotesOnlyPrivateEntrypoint` | Detach/reattach native smoke |
+| Native exit refreshes exact ACP identity at idle without indefinite queue blocking | `TestNativeRefreshDefersUntilActiveAndQueuedPromptsFinish`, `TestStalledNativeRefreshTimesOutRecoversAndReleasesQueuedPrompt`, `TestRuntimeRefreshTimeoutDiscardsBridgeAndAllowsExactResume` | Native-to-ACP nonce smoke |
+| Transport failure or identity drift never reaches later queued work | `TestPromptFailureRecoversOrQuarantinesBeforeQueuedPrompt`, `TestPostTurnIdentityDriftQuarantinesTransportBeforeQueuedPrompt`, `TestRuntimeInspectQuarantinesIdentityDriftBeforeExactResume`, provider-store drift tests | Deliberate local-store mismatch smoke |
+| Unsafe bridge replacement cannot overlap its provider tree | `TestTerminateRuntimeBridgeAwaitsProviderProcessGroup`, `TestTerminateRuntimeBridgeKillsDescendantAfterLeaderExited`, `TestBlockedRuntimeBridgeReplacementFailsClosed` | Process inspection during forced recovery |
 
 ## Review checklist
 
@@ -82,6 +86,7 @@ Primary end-to-end evidence:
 | Web streams output | EventSource asset assertion and API SSE tests | Observe live turn |
 | Prompt/cancel/resume/stop | versioned API route test plus browser client control bindings | Click controls |
 | Review and sanitized raw execution view | API review test, rendered controls/asset assertions, raw-data redaction test | Click controls |
+| Responsive structured ACP view exposes only linked/verified continuity state | web rendering/DTO tests | Narrow desktop and mobile visual smoke |
 | Web shutdown leaves workers running | `TestStoppingWebServerLeavesSessionWorkerUntouched` proves unchanged PID/socket/status and zero runtime commands | Stop server during live turn |
 | Browser hardening | DNS-rebinding/cross-origin test, CSP/escaping assertions | Inspect response headers |
 
@@ -118,16 +123,16 @@ Deterministic fixtures prove product logic but cannot prove that a user's curren
 - Codex
 - Claude
 - Gemini
-- Grok (`grok-build`)
+- Grok (`grok`; acpx resolves its `grok-build` built-in)
 - OpenCode
 
 Each provider gets its own worktree under one acceptance Task, produces a harmless proof change, streams structured ACP history, survives viewer detach, handles a correlated follow-up, and stops/resumes the same Session. Unexpected login prompts are external-environment blockers, not silently skipped passes.
 
-Provider-native live smoke is conditional on an exact native ID. Follow [CODEX_NATIVE_SMOKE.md](CODEX_NATIVE_SMOKE.md). If the ID is absent, record native attachment as unavailable for that adapter version; never create or conflate a second conversation.
+Provider-native live smoke requires a canonical identity that passes exact local-store verification. Follow [CODEX_NATIVE_SMOKE.md](CODEX_NATIVE_SMOKE.md) and repeat the serialized ACP → native → ACP nonce proof for Claude, Grok, and OpenCode. If identity or verification is unavailable, record that provider as blocked; never create or conflate a second conversation.
 
-### Local authenticated matrix — 2026-08-15
+### Historical ACP baseline — 2026-08-15
 
-The current macOS installation was exercised with `acpx` 0.13.0 and Node.js 26.0.0 under Task `T-01M036XX78-H1JYYAJ4NN`. These are live-provider observations, not substitutes for the deterministic suite above.
+Before the native-first commits, this macOS installation was exercised with `acpx` 0.13.0 and Node.js 26.0.0 under Task `T-01M036XX78-H1JYYAJ4NN`. These observations establish the structured ACP/permission baseline only; they are not current native-continuity release evidence and do not substitute for the deterministic suite above.
 
 | Provider | Live ACP result | Read-approval result |
 | --- | --- | --- |
@@ -137,7 +142,7 @@ The current macOS installation was exercised with `acpx` 0.13.0 and Node.js 26.0
 | OpenCode | Authenticated response succeeded; stop/resume preserved the exact ACP/native ID | The inline `edit`/`bash: ask` override produced a native console card; reject kept the marker absent |
 | Gemini | ACP startup reached the installed Gemini adapter | External cached Google authentication required `GOOGLE_CLOUD_PROJECT` or `GOOGLE_CLOUD_PROJECT_ID`; no project value was invented, so the live turn remains an environment blocker |
 
-Task attachment listed every child Session, Enter opened the selected full native Session harness, and `b` returned to the Task without interrupting workers. The real Grok terminal rejection additionally verified that the marker was absent both while the card was pending and after rejection.
+The historical Task attachment listed every child Session and the real Grok permission rejection kept its marker absent both while the card was pending and after rejection. Native-first Task selection and ACP/native identity continuity must be recorded in a new release sign-off below.
 
 ## Release sign-off record
 

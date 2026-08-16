@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -217,6 +218,57 @@ func TestRepositoriesValidateAndRoundTrip(t *testing.T) {
 	}
 	if _, err := store.UpdateSessionConversation(ctx, loaded.ID, "different-session", session.ConversationSourceProviderStore, &verifiedAt); err == nil {
 		t.Fatal("canonical provider conversation replacement was accepted")
+	}
+	if _, err := store.UpdateSessionConversation(ctx, loaded.ID, "native-session", session.ConversationSourceProviderStore, nil); err == nil {
+		t.Fatal("provider-store identity without verification time was accepted")
+	}
+	if _, err := store.UpdateSessionConversation(ctx, loaded.ID, "native-session", session.ConversationSourceACP, &verifiedAt); err == nil {
+		t.Fatal("non-provider identity with verification time was accepted")
+	}
+	if _, err := store.UpdateSessionConversation(ctx, loaded.ID, "native-session", session.ConversationSourceACP, nil); err == nil || !strings.Contains(err.Error(), "cannot be downgraded") {
+		t.Fatalf("provider-store verification downgrade error = %v", err)
+	}
+	if _, err := store.UpdateSessionRuntimeIDs(ctx, loaded.ID, "acpx-new", "acp-replacement", "native-session"); err == nil {
+		t.Fatal("ACP adapter evidence replacement was accepted")
+	}
+	if _, err := store.UpdateSessionRuntimeIDs(ctx, loaded.ID, "acpx-new", "acp-session", "native-replacement"); err == nil {
+		t.Fatal("native adapter evidence replacement was accepted")
+	}
+	preserved, err := store.UpdateSessionRuntimeIDs(ctx, loaded.ID, "acpx-refreshed", "", "")
+	if err != nil || preserved.ACPXRecordID != "acpx-refreshed" || preserved.ACPSessionID != "acp-session" || preserved.NativeSessionID != "native-session" || preserved.ProviderConversationID != "native-session" {
+		t.Fatalf("blank runtime evidence did not preserve canonical IDs: %#v, %v", preserved, err)
+	}
+	providerStoreACPOnly, err := store.CreateSession(ctx, session.CreateParams{
+		ID: "S-provider-store-acp", TaskID: createdTask.ID, Agent: "codex", Provider: "openai", RepoPath: t.TempDir(),
+		ACPSessionID: "canonical-acp", ProviderConversationID: "canonical-acp",
+		ConversationIDSource: session.ConversationSourceProviderStore, ConversationIDVerifiedAt: &verifiedAt,
+		Status: session.StatusWaiting,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateSessionRuntimeIDs(ctx, providerStoreACPOnly.ID, "acpx-provider", "canonical-acp", "native-drift"); err == nil || !strings.Contains(err.Error(), "provider-store verified") {
+		t.Fatalf("provider-store native drift error = %v", err)
+	}
+	providerStoreACPOnly, err = store.GetSession(ctx, providerStoreACPOnly.ID)
+	if err != nil || providerStoreACPOnly.NativeSessionID != "" {
+		t.Fatalf("provider-store drift changed native evidence: %#v, %v", providerStoreACPOnly, err)
+	}
+	driftBeforeVerification, err := store.CreateSession(ctx, session.CreateParams{
+		ID: "S-drift-before-verification", TaskID: createdTask.ID, Agent: "codex", Provider: "openai", RepoPath: t.TempDir(),
+		ACPSessionID: "canonical-before-verification", NativeSessionID: "unverified-native",
+		ProviderConversationID: "canonical-before-verification", ConversationIDSource: session.ConversationSourceACP,
+		Status: session.StatusWaiting,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateSessionConversation(ctx, driftBeforeVerification.ID, "canonical-before-verification", session.ConversationSourceProviderStore, &verifiedAt); err == nil || !strings.Contains(err.Error(), "does not match provider-store verified") {
+		t.Fatalf("provider-store verification accepted prior native drift: %v", err)
+	}
+	unchanged, err := store.GetSession(ctx, loaded.ID)
+	if err != nil || unchanged.ACPSessionID != "acp-session" || unchanged.NativeSessionID != "native-session" || unchanged.ProviderConversationID != "native-session" {
+		t.Fatalf("runtime identity changed after rejected evidence: %#v, %v", unchanged, err)
 	}
 	if _, err := store.GetTask(ctx, "T-nope"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("GetTask missing error = %v", err)

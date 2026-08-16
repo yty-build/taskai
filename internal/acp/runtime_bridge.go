@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/yty-build/acp-gateway/internal/agents"
@@ -39,6 +40,7 @@ type runtimeBridge struct {
 	mu      sync.Mutex
 	pending map[string]chan bridgeMessage
 	closed  chan struct{}
+	exited  chan struct{}
 	err     error
 	stderr  string
 	nextID  atomic.Uint64
@@ -129,6 +131,7 @@ func startRuntimeBridge(ctx context.Context, binary, stateDirectory string) (*ru
 	// bridge command so pending permission callbacks are cancelled cleanly;
 	// stdin EOF is the crash fallback.
 	command := exec.Command(node, scriptPath, packageRoot, stateDirectory)
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	promptInput, err := command.StdinPipe()
 	if err != nil {
 		return nil, fmt.Errorf("open acpx runtime permission input: %w", err)
@@ -162,7 +165,7 @@ func startRuntimeBridge(ctx context.Context, binary, stateDirectory string) (*ru
 	_ = controlRead.Close()
 	bridge := &runtimeBridge{
 		command: command, stdin: controlWrite, promptInput: promptInput,
-		pending: make(map[string]chan bridgeMessage), closed: make(chan struct{}),
+		pending: make(map[string]chan bridgeMessage), closed: make(chan struct{}), exited: make(chan struct{}),
 	}
 	ready := make(chan error, 1)
 	go bridge.read(stdout, ready)
@@ -327,6 +330,7 @@ func (b *runtimeBridge) captureStderr(reader io.Reader) {
 
 func (b *runtimeBridge) wait() {
 	err := b.command.Wait()
+	close(b.exited)
 	_ = b.stdin.Close()
 	_ = b.promptInput.Close()
 	if err == nil {
@@ -447,16 +451,39 @@ func (b *runtimeBridge) closeProcess() error {
 	_ = b.promptInput.Close()
 	if err == nil {
 		select {
-		case <-b.closed:
+		case <-b.exited:
 			return nil
 		case <-ctx.Done():
 			err = ctx.Err()
 		}
 	}
-	if b.command.Process != nil {
-		_ = b.command.Process.Kill()
+	if terminateErr := b.terminateProcess(); err == nil {
+		err = terminateErr
 	}
 	return err
+}
+
+func (b *runtimeBridge) terminateProcess() error {
+	_ = b.stdin.Close()
+	_ = b.promptInput.Close()
+	if b.command.Process == nil {
+		return nil
+	}
+	pid := b.command.Process.Pid
+	// startRuntimeBridge establishes PGID=PID. Signal that group even when the
+	// Node leader has already exited: surviving provider descendants retain the
+	// group and remain addressable as -PID after Getpgid(PID) returns ESRCH.
+	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return fmt.Errorf("terminate acpx runtime process group %d: %w", pid, err)
+	}
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-b.exited:
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("acpx runtime process group %d did not exit within 3s", pid)
+	}
 }
 
 func bridgeRemoteError(message bridgeMessage) error {

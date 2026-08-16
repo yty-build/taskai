@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"reflect"
 	"strings"
@@ -281,6 +282,31 @@ func TestTaskConsoleNativeDefaultACPActionFilterHelpAndPalette(t *testing.T) {
 	model = updated.(Model)
 	if model.overlay != paletteOverlay || !strings.Contains(model.View(), "New Session") || strings.Contains(model.View(), "Cancel turn") {
 		t.Fatalf("filtered command palette:\n%s", model.View())
+	}
+}
+
+func TestTaskConsoleMouseUsesScrolledNavigatorWindow(t *testing.T) {
+	backend := newConsoleBackend()
+	model, cancel, err := newTaskModel(context.Background(), backend, "T-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	for index := 3; index <= 9; index++ {
+		model.task.Sessions = append(model.task.Sessions, session.Session{
+			ID: fmt.Sprintf("S-%d", index), TaskID: "T-1", Agent: "codex", Role: "worker", Status: session.StatusWaiting,
+		})
+	}
+	model.width, model.height = 100, 16
+	model.selected = len(model.task.Sessions) - 1
+	indices, start, visible := model.taskSessionWindow(taskNavigatorHeight(model.width, model.height))
+	if start == 0 || visible >= len(indices) {
+		t.Fatalf("test did not create a scrolled window: start=%d visible=%d total=%d", start, visible, len(indices))
+	}
+	updated, command := model.Update(tea.MouseMsg(tea.MouseEvent{X: 2, Y: 5, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft}))
+	model = updated.(Model)
+	if command == nil || model.selected != indices[start] {
+		t.Fatalf("scrolled mouse selected index %d, want %d; command=%v", model.selected, indices[start], command)
 	}
 }
 

@@ -9,12 +9,12 @@ function appendArguments(values) {
   fs.appendFileSync(destination, `---\n${values.join("\n")}\n`, { mode: 0o600 });
 }
 
-function identifiers(resumeSessionId) {
+function identifiers(resumeSessionId, nativeSessionId) {
   const acpSessionId = resumeSessionId || "acp-reconnected";
   return {
     acpxRecordId: "acpx-record",
     backendSessionId: acpSessionId,
-    agentSessionId: "native-reconnected",
+    agentSessionId: nativeSessionId || process.env.FAKE_ACPX_NATIVE_ID || "native-reconnected",
   };
 }
 
@@ -36,6 +36,8 @@ export function createRuntimeStore(options = {}) {
 export function createAcpRuntime(options = {}) {
   let handle;
   let active;
+  let ensureCount = 0;
+  let statusCount = 0;
 
   return {
     async ensureSession(session) {
@@ -74,7 +76,12 @@ export function createAcpRuntime(options = {}) {
           throw new Error(`OpenCode deny rules were not preserved: ${JSON.stringify(config)}`);
         }
       }
-      const ids = identifiers(session.resumeSessionId);
+      ensureCount += 1;
+      const nativeSessionId =
+        process.env.FAKE_ACPX_SCENARIO === "identity-drift-on-refresh" && ensureCount > 1
+          ? "native-replacement"
+          : undefined;
+      const ids = identifiers(session.resumeSessionId, nativeSessionId);
       handle = {
         sessionKey: session.sessionKey,
         runtimeSessionName: session.sessionKey,
@@ -185,7 +192,17 @@ export function createAcpRuntime(options = {}) {
     },
 
     async getStatus() {
-      return { summary: active ? "working" : "ready", ...identifiers(handle?.backendSessionId) };
+	  statusCount += 1;
+	  const inspectedNativeId =
+	    process.env.FAKE_ACPX_SCENARIO === "identity-drift-on-inspect" && statusCount > 1
+	      ? "native-replacement"
+	      : handle?.agentSessionId;
+      return {
+        summary: active ? "working" : "ready",
+        acpxRecordId: handle?.acpxRecordId,
+        backendSessionId: handle?.backendSessionId,
+	    agentSessionId: inspectedNativeId,
+      };
     },
 
     async setMode({ mode }) {
@@ -204,6 +221,9 @@ export function createAcpRuntime(options = {}) {
 
     async close() {
       await active?.cancel();
+      if (process.env.FAKE_ACPX_SCENARIO === "refresh-hang") {
+        await new Promise(() => {});
+      }
     },
   };
 }

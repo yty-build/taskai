@@ -70,7 +70,7 @@ For a developer, it should feel like:
 - explicit task grouping,
 - live Task and Session consoles,
 - raw execution visibility,
-- optional native CLI access,
+- real provider-native CLI access as the default terminal Session experience,
 - no large agent platform.
 
 For an end user, the same Task can later be rendered more simply:
@@ -289,7 +289,7 @@ acpx_record_id
 acp_session_id                 # adapter evidence / resume transport
 native_session_id              # optional adapter evidence / compatibility
 provider_conversation_id       # canonical provider identity used by native attach
-conversation_id_source         # acp, native, or verified-provider-store
+conversation_id_source         # acp, native, or provider-store
 conversation_id_verified_at
 
 status
@@ -505,7 +505,7 @@ Each submitted prompt receives a request ID used for correlation in the live str
 
 A Session has at most one active ACP turn. If a human or another client submits a message while a turn is active, the worker queues it as the next prompt. ACP does not guarantee injection into an already-running turn.
 
-Pressing `Esc` in an attached console requests ACP cancellation of the active turn. This is cancellation, not suspension at an exact token or tool-execution position. The Session and its conversation remain resumable, and the steering instruction begins as a new turn.
+Pressing `Esc` in the structured ACP console requests ACP cancellation of the active turn when its composer is not active. This is cancellation, not suspension at an exact token or tool-execution position. The Session and its conversation remain resumable, and the steering instruction begins as a new turn. The real provider-native harness owns its own keys.
 
 If the submitting client remains connected, it receives the correlated response live. If it disconnects, work continues, the result is persisted, and the client can replay it from its last stream position after reconnecting.
 
@@ -634,7 +634,7 @@ Responses:
 
 Closing a subscriber connection only detaches that viewer. It must not cancel a turn, stop the worker, or close the ACP Session.
 
-Provider-native attachment does not acquire a worker lease. It must not pause or cancel an ACP turn, change Session state, or hold the prompt queue. A `refresh` request made after native activity is best effort: reconnect immediately when the worker is idle, or defer it until the active turn and queued prompts complete. Cross-surface concurrency warnings are advisory because the user owns coordination.
+Provider-native attachment does not acquire a worker lease. It must not pause or cancel an ACP turn, change Session state, or hold the prompt queue. A `refresh` request made after native activity reconnects immediately when the worker is idle, or defers until work already queued at that boundary completes. Prompts submitted after the boundary remain behind refresh. Refresh and post-turn inspection reload persisted identity verification; uncertain transport is terminated and awaited before bounded exact recovery. If recovery fails, later queued prompts are rejected with correlated errors and the worker stops rather than using an unproven conversation. Cross-surface concurrency warnings remain advisory because the user owns coordination.
 
 Use newline-delimited JSON over Unix sockets.
 
@@ -663,7 +663,7 @@ Store the raw structured output received from ACP/acpx with minimal normalizatio
 Purposes:
 
 - `acpctl task attach`
-- `acpctl session attach`
+- `acpctl session attach --acp`
 - `acpctl session logs --follow`
 - reviewer inspection
 - debugging
@@ -793,7 +793,7 @@ Attach to the live Task console:
 acpctl task attach PM-42
 ```
 
-The Task console shows every Session, current status, latest activity, and an aggregate activity stream. A user may select a Session with the keyboard or mouse and drill into its complete ACP-visible history and live output.
+The Task console shows every Session, current status, latest activity, and an aggregate activity stream. Selecting a Session with Enter or the mouse opens its real provider-native harness; the explicit ACP action opens its complete ACP-visible history and live output.
 
 Follow Task activity without an interactive terminal UI:
 
@@ -953,12 +953,6 @@ Claude:
 claude --resume <provider_conversation_id>
 ```
 
-Gemini:
-
-```bash
-gemini --resume <provider_conversation_id>
-```
-
 Grok:
 
 ```bash
@@ -968,8 +962,10 @@ grok --resume <provider_conversation_id>
 OpenCode:
 
 ```bash
-opencode --session <provider_conversation_id>
+npx -y opencode-ai@1.18.18 --session <provider_conversation_id>
 ```
+
+Gemini remains available through structured ACP in V1. Native attachment stays disabled until an exact Gemini provider-store verifier is implemented.
 
 Behavior:
 
@@ -1383,9 +1379,9 @@ subscribe to live Session streams
        │
        ▼
 select S201
+       ├── Enter/click ──► verify canonical provider ID ──► real native harness
        │
-       ▼
-replay stored history, then receive live ACP output
+       └── ACP action ──► replay stored history, then receive live ACP output
 ```
 
 If worker is not available:
@@ -1421,7 +1417,7 @@ acpctl session resume S201
 spawn new detached worker
        │
        ▼
-worker asks acpx/runtime to resume native Session
+worker asks acpx/runtime to resume the exact persisted ACP Session
 ```
 
 Still the same Task Console Session.

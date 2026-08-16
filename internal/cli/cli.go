@@ -196,7 +196,7 @@ func runHiddenNative(ctx context.Context, args []string, stdout, stderr io.Write
 		return usagef("usage: acpctl _native --session <session-id>")
 	}
 	return service.AttachNative(ctx, options.values["--session"], appservice.NativeAttachOptions{
-		Runner: native.ExecRunner{}, Input: os.Stdin, Output: stdout, ErrorOutput: stderr,
+		Runner: &native.ExecRunner{}, Input: os.Stdin, Output: stdout, ErrorOutput: stderr,
 	})
 }
 

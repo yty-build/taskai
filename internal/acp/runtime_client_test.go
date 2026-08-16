@@ -79,6 +79,7 @@ func TestRuntimeAgentConfigurationExpandsFriendlyBuiltinsOnly(t *testing.T) {
 	}{
 		{name: "friendly codex", profile: agents.Profile{Name: "codex", Command: "codex"}, wantAgent: "codex", wantBuiltin: true},
 		{name: "friendly alias", profile: agents.Profile{Name: "team-codex", Command: "codex"}, wantAgent: "codex", wantBuiltin: true},
+		{name: "friendly grok alias", profile: agents.Profile{Name: "grok", Command: "grok-build"}, wantAgent: "grok-build", wantBuiltin: true},
 		{name: "gemini compatibility override", profile: agents.Profile{Name: "gemini", Command: "gemini", Args: []string{"--experimental-acp"}}, wantAgent: "gemini"},
 		{name: "raw custom", profile: agents.Profile{Name: "custom", Command: "/opt/acp/custom", Args: []string{"--stdio"}}, wantAgent: "custom"},
 		{name: "built-in name with raw args", profile: agents.Profile{Name: "codex", Command: "codex", Args: []string{"--stdio"}}, wantAgent: "codex"},
@@ -466,6 +467,95 @@ func TestRuntimeRefreshResumesExactACPIdentity(t *testing.T) {
 	refreshed, err := client.Refresh(context.Background(), StartSpec{Target: target, ResumeACPSessionID: started.ACPSessionID})
 	if err != nil || refreshed.ACPSessionID != started.ACPSessionID {
 		t.Fatalf("Refresh() = %#v, %v", refreshed, err)
+	}
+}
+
+func TestRuntimeResumeAndRefreshRejectCanonicalProviderIdentityDrift(t *testing.T) {
+	client, target, _ := runtimeFixture(t, "identity-drift-on-refresh")
+	target.Profile.Environment["FAKE_ACPX_NATIVE_ID"] = "native-canonical"
+	started, err := client.Resume(context.Background(), StartSpec{
+		Target: target, ResumeACPSessionID: "acp-canonical", ExpectedProviderConversationID: "acp-canonical", ExpectedNativeSessionID: "native-canonical",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Refresh(context.Background(), StartSpec{
+		Target: target, ResumeACPSessionID: started.ACPSessionID, ExpectedProviderConversationID: "acp-canonical", ExpectedNativeSessionID: "native-canonical",
+	}); err == nil || !strings.Contains(err.Error(), "expected native adapter ID") {
+		t.Fatalf("Refresh() identity error = %v", err)
+	}
+	if _, err := client.Resume(context.Background(), StartSpec{
+		Target: target, ResumeACPSessionID: started.ACPSessionID, ExpectedProviderConversationID: "acp-canonical", ExpectedNativeSessionID: "native-canonical",
+	}); err != nil {
+		t.Fatalf("Resume() after discarded mismatched bridge = %v", err)
+	}
+	mismatchedClient, mismatchedTarget, _ := runtimeFixture(t, "success")
+	mismatchedTarget.Profile.Environment["FAKE_ACPX_NATIVE_ID"] = "native-replacement"
+	if _, err := mismatchedClient.Resume(context.Background(), StartSpec{
+		Target: mismatchedTarget, ResumeACPSessionID: started.ACPSessionID, ExpectedProviderConversationID: "acp-canonical", ExpectedNativeSessionID: "native-canonical",
+	}); err == nil || !strings.Contains(err.Error(), "expected native adapter ID") {
+		t.Fatalf("Resume() identity error = %v", err)
+	}
+}
+
+func TestRuntimeProviderStoreVerificationRejectsNativeDriftMaskedByACP(t *testing.T) {
+	client, target, _ := runtimeFixture(t, "success")
+	target.Profile.Environment["FAKE_ACPX_NATIVE_ID"] = "native-replacement"
+	_, err := client.Resume(context.Background(), StartSpec{
+		Target: target, ResumeACPSessionID: "canonical-acp",
+		ExpectedProviderConversationID: "canonical-acp", ProviderStoreVerified: true,
+	})
+	var identityErr *IdentityError
+	if !errors.As(err, &identityErr) || !strings.Contains(err.Error(), "provider-store verified") {
+		t.Fatalf("provider-store drift error = %T %v", err, err)
+	}
+}
+
+func TestRuntimeInspectQuarantinesIdentityDriftBeforeExactResume(t *testing.T) {
+	client, target, _ := runtimeFixture(t, "identity-drift-on-inspect")
+	target.Profile.Environment["FAKE_ACPX_NATIVE_ID"] = "native-canonical"
+	started, err := client.Start(context.Background(), StartSpec{Target: target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Inspect(context.Background(), target); err == nil {
+		t.Fatal("Inspect() accepted identity drift")
+	} else {
+		var identityErr *IdentityError
+		if !errors.As(err, &identityErr) {
+			t.Fatalf("Inspect() identity drift error = %T %v", err, err)
+		}
+	}
+	target.Profile.Environment["FAKE_ACPX_SCENARIO"] = "success"
+	if _, err := client.Resume(context.Background(), StartSpec{
+		Target: target, ResumeACPSessionID: started.ACPSessionID,
+		ExpectedProviderConversationID: started.NativeSessionID, ExpectedNativeSessionID: started.NativeSessionID,
+	}); err != nil {
+		t.Fatalf("exact Resume() after inspect quarantine = %v", err)
+	}
+}
+
+func TestRuntimeRefreshTimeoutDiscardsBridgeAndAllowsExactResume(t *testing.T) {
+	client, target, _ := runtimeFixture(t, "refresh-hang")
+	started, err := client.Resume(context.Background(), StartSpec{
+		Target: target, ResumeACPSessionID: "acp-timeout", ExpectedProviderConversationID: "native-reconnected",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshContext, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	_, err = client.Refresh(refreshContext, StartSpec{
+		Target: target, ResumeACPSessionID: started.ACPSessionID, ExpectedProviderConversationID: "native-reconnected",
+	})
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Refresh() timeout error = %v", err)
+	}
+	target.Profile.Environment["FAKE_ACPX_SCENARIO"] = "success"
+	if _, err := client.Resume(context.Background(), StartSpec{
+		Target: target, ResumeACPSessionID: started.ACPSessionID, ExpectedProviderConversationID: "native-reconnected",
+	}); err != nil {
+		t.Fatalf("exact Resume() after timed-out refresh = %v", err)
 	}
 }
 

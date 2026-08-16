@@ -21,7 +21,6 @@ func TestBuildResumeUsesExactProviderArgv(t *testing.T) {
 	}{
 		{name: "codex", command: "/opt/codex", args: []string{"--global", "resume", "native-123"}},
 		{name: "claude", command: "/opt/claude", args: []string{"--global", "--resume", "native-123"}},
-		{name: "gemini", command: "/opt/gemini", args: []string{"--global", "--resume", "native-123"}},
 		{name: "grok", command: "/opt/grok", args: []string{"--global", "--resume", "native-123"}},
 		{name: "opencode", command: "/opt/opencode", args: []string{"--global", "--session", "native-123"}},
 	}
@@ -61,8 +60,12 @@ func TestBuildResumeMapsLegacyGrokAndACPOpenCodeProfiles(t *testing.T) {
 		t.Fatalf("legacy Grok invocation = %#v, %v", grok, err)
 	}
 	opencode, err := BuildResume(agents.Profile{Name: "opencode", Provider: "opencode", Command: "npx", Args: []string{"-y", "opencode-ai@1.18.18", "acp"}}, "open-id", "/repo")
-	if err != nil || opencode.Command != "opencode" || !reflect.DeepEqual(opencode.Args, []string{"--session", "open-id"}) {
+	if err != nil || opencode.Command != "npx" || !reflect.DeepEqual(opencode.Args, []string{"-y", "opencode-ai@1.18.18", "--session", "open-id"}) {
 		t.Fatalf("ACP OpenCode invocation = %#v, %v", opencode, err)
+	}
+	custom, err := BuildResume(agents.Profile{Name: "opencode", Provider: "custom", Command: "/opt/custom-acp", Args: []string{"--stdio"}}, "open-id", "/repo")
+	if err != nil || custom.Command != "opencode" || !reflect.DeepEqual(custom.Args, []string{"--session", "open-id"}) {
+		t.Fatalf("custom OpenCode ACP profile native invocation = %#v, %v", custom, err)
 	}
 }
 
@@ -77,17 +80,17 @@ func TestExecRunnerLaunchesFakeNativeCLIWithExactContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	profile := agents.Profile{
-		Name: "codex", Provider: "openai", Command: fixture, Args: []string{"--profile-arg"},
+	invocation := Invocation{
+		Command: fixture, Args: []string{"--profile-arg", "resume", "native-exact"}, WorkingDirectory: workingDirectory,
 		Environment: map[string]string{"FAKE_NATIVE_RECORD": record, "FAKE_NATIVE_MARKER": "profile-environment"},
 	}
-	invocation, err := BuildResume(profile, "native-exact", workingDirectory)
-	if err != nil {
+	var stdout, stderr bytes.Buffer
+	runner := &ExecRunner{}
+	if err := runner.Run(context.Background(), invocation, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatal(err)
 	}
-	var stdout, stderr bytes.Buffer
-	if err := (ExecRunner{}).Run(context.Background(), invocation, strings.NewReader(""), &stdout, &stderr); err != nil {
-		t.Fatal(err)
+	if !runner.NativeActivityOccurred() {
+		t.Fatal("successful native process was not recorded as activity")
 	}
 	body, err := os.ReadFile(record)
 	if err != nil {
@@ -102,6 +105,29 @@ func TestExecRunnerLaunchesFakeNativeCLIWithExactContext(t *testing.T) {
 	}
 	if stdout.String() != "fake native attached\n" || stderr.Len() != 0 {
 		t.Fatalf("native output: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
+func TestExecRunnerDistinguishesPreStartFailureFromProcessExit(t *testing.T) {
+	preStart := &ExecRunner{}
+	err := preStart.Run(context.Background(), Invocation{
+		Command: filepath.Join(t.TempDir(), "missing-native"), WorkingDirectory: t.TempDir(),
+	}, strings.NewReader(""), io.Discard, io.Discard)
+	if err == nil || preStart.NativeActivityOccurred() {
+		t.Fatalf("pre-start error=%v activity=%t", err, preStart.NativeActivityOccurred())
+	}
+
+	fixture, err := filepath.Abs(filepath.Join("testdata", "fake-native"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	exited := &ExecRunner{}
+	err = exited.Run(context.Background(), Invocation{
+		Command: fixture, WorkingDirectory: t.TempDir(),
+		Environment: map[string]string{"FAKE_NATIVE_EXIT": "7"},
+	}, strings.NewReader(""), io.Discard, io.Discard)
+	if err == nil || !exited.NativeActivityOccurred() {
+		t.Fatalf("process-exit error=%v activity=%t", err, exited.NativeActivityOccurred())
 	}
 }
 

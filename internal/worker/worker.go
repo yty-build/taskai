@@ -52,6 +52,7 @@ type Config struct {
 	WorkersDirectory string
 	LogsDirectory    string
 	PID              int
+	RefreshTimeout   time.Duration
 }
 
 type queuedPrompt struct {
@@ -70,18 +71,22 @@ type Worker struct {
 	config Config
 	target acp.Target
 
-	mu             sync.Mutex
-	status         session.Status
-	acpSessionID   string
-	queue          []queuedPrompt
-	active         *queuedPrompt
-	activeCancel   context.CancelFunc
-	refreshPending bool
-	refreshing     bool
-	seenRequestIDs map[string]struct{}
-	permissions    map[string]*pendingPermission
-	wake           chan struct{}
-	stop           context.CancelFunc
+	mu                     sync.Mutex
+	status                 session.Status
+	acpSessionID           string
+	nativeSessionID        string
+	providerConversationID string
+	queue                  []queuedPrompt
+	active                 *queuedPrompt
+	activeCancel           context.CancelFunc
+	refreshPending         bool
+	refreshQueueRemaining  int
+	refreshing             bool
+	transportError         string
+	seenRequestIDs         map[string]struct{}
+	permissions            map[string]*pendingPermission
+	wake                   chan struct{}
+	stop                   context.CancelFunc
 
 	publishMu sync.Mutex
 	log       *sessionlog.Log
@@ -121,7 +126,9 @@ func New(config Config) (*Worker, error) {
 	}
 	return &Worker{
 		config: config, target: target, status: config.Session.Status, acpSessionID: config.Session.ACPSessionID,
-		seenRequestIDs: make(map[string]struct{}), permissions: make(map[string]*pendingPermission), wake: make(chan struct{}, 1),
+		nativeSessionID:        config.Session.NativeSessionID,
+		providerConversationID: config.Session.ProviderConversationID,
+		seenRequestIDs:         make(map[string]struct{}), permissions: make(map[string]*pendingPermission), wake: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -248,9 +255,24 @@ func (w *Worker) Run(ctx context.Context) error {
 }
 
 func (w *Worker) connectACP(ctx context.Context) (acp.SessionInfo, error) {
-	spec := acp.StartSpec{Target: w.target, ResumeACPSessionID: w.config.Session.ACPSessionID}
+	spec := acp.StartSpec{
+		Target: w.target, ResumeACPSessionID: w.config.Session.ACPSessionID,
+		ExpectedProviderConversationID: w.config.Session.ProviderConversationID,
+		ExpectedNativeSessionID:        w.config.Session.NativeSessionID,
+		ProviderStoreVerified:          providerStoreVerified(w.config.Session),
+	}
 	if spec.ResumeACPSessionID != "" {
-		return w.config.ACP.Resume(ctx, spec)
+		info, err := w.config.ACP.Resume(ctx, spec)
+		if err != nil {
+			return acp.SessionInfo{}, err
+		}
+		if err := acp.ValidateSessionIdentity("worker resume", info, spec.ResumeACPSessionID, spec.ExpectedNativeSessionID, spec.ExpectedProviderConversationID, spec.ProviderStoreVerified); err != nil {
+			return acp.SessionInfo{}, err
+		}
+		return info, nil
+	}
+	if strings.TrimSpace(spec.ExpectedProviderConversationID) != "" {
+		return acp.SessionInfo{}, fmt.Errorf("Session %s has canonical provider conversation %q but no ACP Session ID; refusing to start a replacement conversation", w.config.Session.ID, spec.ExpectedProviderConversationID)
 	}
 	return w.config.ACP.Start(ctx, spec)
 }
@@ -331,12 +353,17 @@ func (w *Worker) enqueue(requestID, message, displayMessage string) (string, err
 		return "", fmt.Errorf("prompt message is required")
 	}
 	w.mu.Lock()
+	if w.transportError != "" {
+		message := w.transportError
+		w.mu.Unlock()
+		return "", fmt.Errorf("ACP transport is unavailable for Session %s: %s; resume the stopped Session to retry exact continuity", w.config.Session.ID, message)
+	}
 	if _, exists := w.seenRequestIDs[requestID]; exists {
 		w.mu.Unlock()
 		return "", fmt.Errorf("request_id %q is already active or queued", requestID)
 	}
 	state := "ready"
-	if w.active != nil || w.refreshing || len(w.queue) > 0 {
+	if w.active != nil || w.refreshPending || w.refreshing || len(w.queue) > 0 {
 		state = "queued"
 	}
 	if strings.TrimSpace(displayMessage) == "" {
@@ -377,11 +404,14 @@ func (w *Worker) processPrompts(ctx context.Context) {
 func (w *Worker) nextPrompt(ctx context.Context) (queuedPrompt, context.Context, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.active != nil || w.refreshing || len(w.queue) == 0 {
+	if w.transportError != "" || w.active != nil || w.refreshing || len(w.queue) == 0 || (w.refreshPending && w.refreshQueueRemaining == 0) {
 		return queuedPrompt{}, nil, false
 	}
 	prompt := w.queue[0]
 	w.queue = w.queue[1:]
+	if w.refreshPending && w.refreshQueueRemaining > 0 {
+		w.refreshQueueRemaining--
+	}
 	w.active = &prompt
 	promptContext, cancel := context.WithCancel(ctx)
 	w.activeCancel = cancel
@@ -415,18 +445,61 @@ func (w *Worker) executePrompt(ctx context.Context, prompt queuedPrompt) {
 	if err != nil {
 		_, _ = w.publish(prompt.RequestID, "turn_error", map[string]string{"message": err.Error()})
 		_ = w.updateStatus(session.StatusFailed)
+		w.recoverAfterPromptError(ctx, prompt.RequestID, err)
 	} else {
 		_, _ = w.publish(prompt.RequestID, "turn_completed", receipt)
 		_ = w.updateStatus(session.StatusWaiting)
-		if info, inspectErr := w.config.ACP.Inspect(ctx, w.target); inspectErr != nil {
-			_, _ = w.publish(prompt.RequestID, "metadata_warning", map[string]string{"message": inspectErr.Error()})
-		} else if persistErr := w.persistRuntimeInfo(ctx, info); persistErr != nil {
-			_, _ = w.publish(prompt.RequestID, "metadata_warning", map[string]string{"message": persistErr.Error()})
-		} else {
-			_ = w.writeMetadata(info)
-		}
+		w.reconcileAfterTurn(ctx, prompt.RequestID)
 	}
 	w.finishPrompt(prompt.RequestID)
+}
+
+func (w *Worker) recoverAfterPromptError(ctx context.Context, requestID string, promptErr error) {
+	current, err := w.currentIdentity(ctx)
+	if err == nil {
+		var info acp.SessionInfo
+		info, err = w.resumeExact(ctx, current)
+		if err == nil {
+			_, _ = w.publish(requestID, "transport_recovered", map[string]string{
+				"acp_session_id": info.ACPSessionID, "after": "prompt_error",
+			})
+			_ = w.updateStatus(session.StatusWaiting)
+			return
+		}
+	}
+	w.quarantineTransport(fmt.Errorf("exact recovery after prompt failure %q: %w", promptErr.Error(), err))
+}
+
+func (w *Worker) reconcileAfterTurn(ctx context.Context, requestID string) {
+	current, err := w.currentIdentity(ctx)
+	if err == nil {
+		var info acp.SessionInfo
+		info, err = w.config.ACP.Inspect(ctx, w.target)
+		if err == nil {
+			err = validateObservedIdentity("post-turn inspect", info, current)
+		}
+		if err == nil {
+			err = w.persistRuntimeInfo(ctx, info)
+		}
+		if err == nil {
+			if metadataErr := w.writeMetadata(info); metadataErr != nil {
+				_, _ = w.publish(requestID, "metadata_warning", map[string]string{"message": metadataErr.Error()})
+			}
+			return
+		}
+	}
+	_, _ = w.publish(requestID, "metadata_warning", map[string]string{"message": err.Error()})
+	current, loadErr := w.currentIdentity(ctx)
+	if loadErr != nil {
+		w.quarantineTransport(fmt.Errorf("reload exact Session identity after metadata failure: %w", loadErr))
+		return
+	}
+	info, recoveryErr := w.resumeExact(ctx, current)
+	if recoveryErr != nil {
+		w.quarantineTransport(fmt.Errorf("exact recovery after metadata failure: %w", recoveryErr))
+		return
+	}
+	_, _ = w.publish(requestID, "metadata_recovered", map[string]string{"acp_session_id": info.ACPSessionID})
 }
 
 func (w *Worker) finishPrompt(requestID string) {
@@ -465,8 +538,15 @@ func (w *Worker) cancel(ctx context.Context, requestID string) error {
 
 func (w *Worker) scheduleRefresh() string {
 	w.mu.Lock()
+	if w.transportError != "" {
+		w.mu.Unlock()
+		return "unavailable"
+	}
+	if !w.refreshPending {
+		w.refreshQueueRemaining = len(w.queue)
+	}
 	w.refreshPending = true
-	deferred := w.active != nil || w.refreshing || len(w.queue) > 0
+	deferred := w.active != nil || w.refreshing || w.refreshQueueRemaining > 0
 	w.mu.Unlock()
 	w.signalWake()
 	if deferred {
@@ -477,18 +557,18 @@ func (w *Worker) scheduleRefresh() string {
 
 func (w *Worker) refreshIfIdle(ctx context.Context) {
 	w.mu.Lock()
-	if !w.refreshPending || w.refreshing || w.active != nil || len(w.queue) > 0 {
+	if !w.refreshPending || w.refreshing || w.active != nil || w.refreshQueueRemaining > 0 {
 		w.mu.Unlock()
 		return
 	}
 	w.refreshPending = false
+	w.refreshQueueRemaining = 0
 	w.refreshing = true
-	acpSessionID := w.acpSessionID
 	w.mu.Unlock()
 	defer func() {
 		w.mu.Lock()
 		w.refreshing = false
-		hasQueue := len(w.queue) > 0
+		hasQueue := len(w.queue) > 0 || w.refreshPending
 		w.mu.Unlock()
 		if hasQueue {
 			w.signalWake()
@@ -497,28 +577,145 @@ func (w *Worker) refreshIfIdle(ctx context.Context) {
 
 	refresher, ok := w.config.ACP.(refreshableACPClient)
 	if !ok {
-		_, _ = w.publish("", "native_refresh_warning", map[string]string{"message": "ACP transport does not support idle refresh"})
+		err := errors.New("ACP transport does not support idle refresh")
+		_, _ = w.publish("", "native_refresh_warning", map[string]string{"message": err.Error()})
+		w.quarantineTransport(err)
 		return
 	}
-	if strings.TrimSpace(acpSessionID) == "" {
-		_, _ = w.publish("", "native_refresh_warning", map[string]string{"message": "ACP Session ID is unavailable"})
-		return
-	}
-	_, _ = w.publish("", "native_refresh_started", map[string]string{"acp_session_id": acpSessionID})
-	info, err := refresher.Refresh(ctx, acp.StartSpec{Target: w.target, ResumeACPSessionID: acpSessionID})
+	current, err := w.currentIdentity(ctx)
 	if err != nil {
 		_, _ = w.publish("", "native_refresh_warning", map[string]string{"message": err.Error()})
+		w.quarantineTransport(err)
 		return
 	}
-	if err := w.persistRuntimeInfo(ctx, info); err != nil {
+	if strings.TrimSpace(current.ACPSessionID) == "" {
+		err := errors.New("ACP Session ID is unavailable")
 		_, _ = w.publish("", "native_refresh_warning", map[string]string{"message": err.Error()})
+		w.quarantineTransport(err)
+		return
+	}
+	_, _ = w.publish("", "native_refresh_started", map[string]string{"acp_session_id": current.ACPSessionID})
+	refreshContext, cancelRefresh := context.WithTimeout(ctx, w.refreshTimeout())
+	info, err := refresher.Refresh(refreshContext, acp.StartSpec{
+		Target: w.target, ResumeACPSessionID: current.ACPSessionID,
+		ExpectedProviderConversationID: current.ProviderConversationID,
+		ExpectedNativeSessionID:        current.NativeSessionID,
+		ProviderStoreVerified:          providerStoreVerified(current),
+	})
+	cancelRefresh()
+	if err == nil {
+		err = validateObservedIdentity("worker refresh", info, current)
+	}
+	if err == nil {
+		err = w.persistRuntimeInfo(ctx, info)
+	}
+	if err != nil {
+		_, _ = w.publish("", "native_refresh_warning", map[string]string{"message": err.Error()})
+		recovered, recoveryErr := w.resumeExact(ctx, current)
+		if recoveryErr != nil {
+			_, _ = w.publish("", "native_refresh_recovery_warning", map[string]string{"message": recoveryErr.Error()})
+			w.quarantineTransport(fmt.Errorf("exact recovery after native refresh failure: %w", recoveryErr))
+			return
+		}
+		_, _ = w.publish("", "native_refresh_recovered", map[string]string{"acp_session_id": recovered.ACPSessionID})
 		return
 	}
 	if err := w.writeMetadata(info); err != nil {
 		_, _ = w.publish("", "native_refresh_warning", map[string]string{"message": err.Error()})
-		return
 	}
 	_, _ = w.publish("", "native_refreshed", map[string]string{"acp_session_id": info.ACPSessionID})
+}
+
+func (w *Worker) refreshTimeout() time.Duration {
+	if w.config.RefreshTimeout > 0 {
+		return w.config.RefreshTimeout
+	}
+	return 15 * time.Second
+}
+
+func (w *Worker) resumeExact(ctx context.Context, current session.Session) (acp.SessionInfo, error) {
+	recoveryContext, cancelRecovery := context.WithTimeout(ctx, w.refreshTimeout())
+	defer cancelRecovery()
+	spec := acp.StartSpec{
+		Target: w.target, ResumeACPSessionID: current.ACPSessionID,
+		ExpectedProviderConversationID: current.ProviderConversationID,
+		ExpectedNativeSessionID:        current.NativeSessionID,
+		ProviderStoreVerified:          providerStoreVerified(current),
+	}
+	var lastErr error
+	for attempt := 0; attempt < 2 && recoveryContext.Err() == nil; attempt++ {
+		info, err := w.config.ACP.Resume(recoveryContext, spec)
+		if err == nil {
+			err = validateObservedIdentity("exact recovery", info, current)
+		}
+		if err == nil {
+			err = w.persistRuntimeInfo(recoveryContext, info)
+		}
+		if err == nil {
+			err = w.writeMetadata(info)
+		}
+		if err == nil {
+			return info, nil
+		}
+		lastErr = err
+	}
+	if recoveryContext.Err() != nil {
+		return acp.SessionInfo{}, recoveryContext.Err()
+	}
+	return acp.SessionInfo{}, lastErr
+}
+
+func (w *Worker) currentIdentity(ctx context.Context) (session.Session, error) {
+	current, err := w.config.Repository.GetSession(ctx, w.config.Session.ID)
+	if err != nil {
+		return session.Session{}, fmt.Errorf("load current Session identity: %w", err)
+	}
+	w.mu.Lock()
+	w.acpSessionID = current.ACPSessionID
+	w.nativeSessionID = current.NativeSessionID
+	w.providerConversationID = current.ProviderConversationID
+	w.mu.Unlock()
+	return current, nil
+}
+
+func providerStoreVerified(current session.Session) bool {
+	return current.ConversationIDSource == session.ConversationSourceProviderStore && current.ConversationIDVerifiedAt != nil
+}
+
+func validateObservedIdentity(operation string, info acp.SessionInfo, current session.Session) error {
+	return acp.ValidateSessionIdentity(
+		operation, info, current.ACPSessionID, current.NativeSessionID,
+		current.ProviderConversationID, providerStoreVerified(current),
+	)
+}
+
+func (w *Worker) quarantineTransport(cause error) {
+	message := strings.TrimSpace(cause.Error())
+	if message == "" {
+		message = "exact provider conversation continuity could not be proven"
+	}
+	w.mu.Lock()
+	if w.transportError != "" {
+		w.mu.Unlock()
+		return
+	}
+	w.transportError = message
+	w.refreshPending = false
+	w.refreshQueueRemaining = 0
+	queued := append([]queuedPrompt(nil), w.queue...)
+	w.queue = nil
+	for _, prompt := range queued {
+		delete(w.seenRequestIDs, prompt.RequestID)
+	}
+	w.mu.Unlock()
+	_, _ = w.publish("", "transport_unavailable", map[string]string{"message": message})
+	for _, prompt := range queued {
+		_, _ = w.publish(prompt.RequestID, "turn_error", map[string]string{
+			"message": "prompt was not sent because exact provider conversation continuity could not be recovered",
+		})
+	}
+	_ = w.updateStatus(session.StatusFailed)
+	w.requestStop()
 }
 
 func (w *Worker) subscribe(ctx context.Context, connection net.Conn, from uint64) {
@@ -575,6 +772,7 @@ func (w *Worker) statusMessage() Message {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	message := Message{Type: "status", Status: string(w.status), Queued: len(w.queue), RefreshPending: w.refreshPending, Refreshing: w.refreshing}
+	message.Message = w.transportError
 	if w.active != nil {
 		message.ActiveRequestID = w.active.RequestID
 	}
@@ -619,6 +817,8 @@ func (w *Worker) persistRuntimeInfo(ctx context.Context, info acp.SessionInfo) e
 	}
 	w.mu.Lock()
 	w.acpSessionID = updated.ACPSessionID
+	w.nativeSessionID = updated.NativeSessionID
+	w.providerConversationID = updated.ProviderConversationID
 	w.mu.Unlock()
 	return nil
 }

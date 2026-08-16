@@ -28,10 +28,15 @@ type fakeACP struct {
 	started        chan string
 	concurrent     int
 	maxConcurrent  int
+	startCount     int
 	resumeCount    int
 	resumeErr      error
 	resumeNativeID string
+	inspectACP     string
+	inspectNative  string
+	promptErr      error
 	refreshCount   int
+	refreshWait    bool
 }
 
 func newFakeACP() *fakeACP {
@@ -39,10 +44,13 @@ func newFakeACP() *fakeACP {
 }
 
 func (f *fakeACP) Start(context.Context, acp.StartSpec) (acp.SessionInfo, error) {
+	f.mu.Lock()
+	f.startCount++
+	f.mu.Unlock()
 	return acp.SessionInfo{ACPXRecordID: "acpx-start", ACPSessionID: "acp-start", NativeSessionID: "native-start"}, nil
 }
 
-func (f *fakeACP) Resume(context.Context, acp.StartSpec) (acp.SessionInfo, error) {
+func (f *fakeACP) Resume(_ context.Context, spec acp.StartSpec) (acp.SessionInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.resumeCount++
@@ -53,15 +61,21 @@ func (f *fakeACP) Resume(context.Context, acp.StartSpec) (acp.SessionInfo, error
 	if nativeID == "" {
 		nativeID = "native-start"
 	}
-	return acp.SessionInfo{ACPXRecordID: "acpx-resumed", ACPSessionID: "acp-resumed", NativeSessionID: nativeID}, nil
+	return acp.SessionInfo{ACPXRecordID: "acpx-resumed", ACPSessionID: spec.ResumeACPSessionID, NativeSessionID: nativeID}, nil
 }
 
-func (f *fakeACP) Refresh(_ context.Context, spec acp.StartSpec) (acp.SessionInfo, error) {
+func (f *fakeACP) Refresh(ctx context.Context, spec acp.StartSpec) (acp.SessionInfo, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.refreshCount++
-	if f.resumeErr != nil {
-		return acp.SessionInfo{}, f.resumeErr
+	refreshWait := f.refreshWait
+	refreshErr := f.resumeErr
+	f.mu.Unlock()
+	if refreshWait {
+		<-ctx.Done()
+		return acp.SessionInfo{}, ctx.Err()
+	}
+	if refreshErr != nil {
+		return acp.SessionInfo{}, refreshErr
 	}
 	return acp.SessionInfo{ACPXRecordID: "acpx-refreshed", ACPSessionID: spec.ResumeACPSessionID, NativeSessionID: "native-start"}, nil
 }
@@ -87,8 +101,12 @@ func (f *fakeACP) Prompt(ctx context.Context, spec acp.PromptSpec, emit func(acp
 	}
 	f.mu.Lock()
 	cancelled := f.cancelled[spec.RequestID]
+	promptErr := f.promptErr
 	f.mu.Unlock()
 	f.finish(spec.RequestID)
+	if promptErr != nil {
+		return acp.PromptReceipt{RequestID: spec.RequestID, LastSeq: 1}, promptErr
+	}
 	reason := "end_turn"
 	if cancelled {
 		reason = "cancelled"
@@ -116,7 +134,17 @@ func (f *fakeACP) Cancel(context.Context, acp.Target) error {
 }
 
 func (f *fakeACP) Inspect(context.Context, acp.Target) (acp.SessionInfo, error) {
-	return acp.SessionInfo{ACPXRecordID: "acpx-inspected", ACPSessionID: "acp-inspected", NativeSessionID: "native-start"}, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	acpID := f.inspectACP
+	if acpID == "" {
+		acpID = "acp-start"
+	}
+	nativeID := f.inspectNative
+	if nativeID == "" {
+		nativeID = "native-start"
+	}
+	return acp.SessionInfo{ACPXRecordID: "acpx-inspected", ACPSessionID: acpID, NativeSessionID: nativeID}, nil
 }
 
 func (f *fakeACP) Complete(requestID string) {
@@ -324,6 +352,7 @@ func startWorkerHarness(t *testing.T) *workerHarness {
 	runtime, err := New(Config{
 		Session: createdSession, Profile: agents.Profile{Name: "codex", Provider: "openai", Command: "codex"},
 		Repository: repository, ACP: fake, WorkersDirectory: filepath.Join(root, "workers"), LogsDirectory: filepath.Join(root, "logs"),
+		RefreshTimeout: 250 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -662,6 +691,215 @@ func TestNativeRefreshDefersUntilActiveAndQueuedPromptsFinish(t *testing.T) {
 		latest, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
 		return statusErr == nil && !latest.RefreshPending && !latest.Refreshing && latest.Queued == 0 && latest.ActiveRequestID == ""
 	})
+}
+
+func TestScheduledRefreshKeepsItsQueueBoundaryAheadOfNewPrompts(t *testing.T) {
+	worker := &Worker{wake: make(chan struct{}, 1)}
+	if state := worker.scheduleRefresh(); state != "scheduled" {
+		t.Fatalf("idle refresh state = %q", state)
+	}
+	worker.mu.Lock()
+	worker.queue = append(worker.queue, queuedPrompt{RequestID: "new-after-refresh"})
+	worker.mu.Unlock()
+	if prompt, _, ok := worker.nextPrompt(context.Background()); ok {
+		t.Fatalf("new prompt %q beat the scheduled refresh", prompt.RequestID)
+	}
+
+	worker = &Worker{
+		wake:  make(chan struct{}, 1),
+		queue: []queuedPrompt{{RequestID: "already-queued"}},
+	}
+	if state := worker.scheduleRefresh(); state != "deferred" {
+		t.Fatalf("queued refresh state = %q", state)
+	}
+	worker.mu.Lock()
+	worker.queue = append(worker.queue, queuedPrompt{RequestID: "new-after-barrier"})
+	worker.mu.Unlock()
+	prompt, _, ok := worker.nextPrompt(context.Background())
+	if !ok || prompt.RequestID != "already-queued" {
+		t.Fatalf("pre-existing queued prompt = %#v, %t", prompt, ok)
+	}
+	worker.mu.Lock()
+	worker.activeCancel()
+	worker.active, worker.activeCancel = nil, nil
+	worker.mu.Unlock()
+	if prompt, _, ok := worker.nextPrompt(context.Background()); ok {
+		t.Fatalf("post-barrier prompt %q ran before refresh", prompt.RequestID)
+	}
+}
+
+func TestStalledNativeRefreshTimesOutRecoversAndReleasesQueuedPrompt(t *testing.T) {
+	harness := startWorkerHarness(t)
+	harness.acp.mu.Lock()
+	harness.acp.refreshWait = true
+	harness.acp.mu.Unlock()
+	refresh, err := harness.client.Send(context.Background(), Command{Type: "refresh"})
+	if err != nil || refresh.Type != "refresh_scheduled" {
+		t.Fatalf("refresh = %#v, %v", refresh, err)
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		status, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
+		return statusErr == nil && status.Refreshing
+	})
+	accepted, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-stalled-refresh", Message: "continue"})
+	if err != nil || accepted.State != "queued" {
+		t.Fatalf("prompt during refresh = %#v, %v", accepted, err)
+	}
+	waitStarted(t, harness.acp.started, "req-after-stalled-refresh")
+	harness.acp.mu.Lock()
+	resumeCount := harness.acp.resumeCount
+	harness.acp.mu.Unlock()
+	if resumeCount != 1 {
+		t.Fatalf("exact recovery Resume calls = %d, want 1", resumeCount)
+	}
+	harness.acp.Complete("req-after-stalled-refresh")
+	waitFor(t, 2*time.Second, func() bool {
+		status, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
+		return statusErr == nil && !status.Refreshing && status.Queued == 0 && status.ActiveRequestID == ""
+	})
+	lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var warned, recovered bool
+	for _, line := range lines {
+		warned = warned || line.Type == "native_refresh_warning"
+		recovered = recovered || line.Type == "native_refresh_recovered"
+	}
+	if !warned || !recovered {
+		t.Fatalf("refresh history warned=%t recovered=%t: %#v", warned, recovered, lines)
+	}
+}
+
+func TestPostTurnIdentityDriftQuarantinesTransportBeforeQueuedPrompt(t *testing.T) {
+	harness := startWorkerHarness(t)
+	harness.acp.mu.Lock()
+	harness.acp.inspectNative = "native-replacement"
+	harness.acp.resumeNativeID = "native-replacement"
+	harness.acp.mu.Unlock()
+	if _, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-before-drift", Message: "first"}); err != nil {
+		t.Fatal(err)
+	}
+	waitStarted(t, harness.acp.started, "req-before-drift")
+	if queued, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-must-not-run", Message: "second"}); err != nil || queued.State != "queued" {
+		t.Fatalf("queued prompt = %#v, %v", queued, err)
+	}
+	harness.acp.Complete("req-before-drift")
+
+	waitFor(t, 3*time.Second, func() bool {
+		current, err := harness.repository.GetSession(context.Background(), "S-worker")
+		return err == nil && current.WorkerPID == 0 && current.Status == session.StatusStopped
+	})
+	select {
+	case requestID := <-harness.acp.started:
+		t.Fatalf("queued prompt reached drifted ACP handle: %s", requestID)
+	case <-time.After(250 * time.Millisecond):
+	}
+	lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var unavailable, rejected bool
+	for _, line := range lines {
+		unavailable = unavailable || line.Type == "transport_unavailable"
+		rejected = rejected || (line.Type == "turn_error" && line.RequestID == "req-must-not-run")
+	}
+	if !unavailable || !rejected {
+		t.Fatalf("quarantine history unavailable=%t rejected=%t: %#v", unavailable, rejected, lines)
+	}
+}
+
+func TestPromptFailureRecoversOrQuarantinesBeforeQueuedPrompt(t *testing.T) {
+	harness := startWorkerHarness(t)
+	harness.acp.mu.Lock()
+	harness.acp.promptErr = errors.New("bridge disconnected")
+	harness.acp.resumeNativeID = "native-replacement"
+	harness.acp.mu.Unlock()
+	if _, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-bridge-failure", Message: "first"}); err != nil {
+		t.Fatal(err)
+	}
+	waitStarted(t, harness.acp.started, "req-bridge-failure")
+	if queued, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-bridge-failure", Message: "second"}); err != nil || queued.State != "queued" {
+		t.Fatalf("queued prompt = %#v, %v", queued, err)
+	}
+	harness.acp.Complete("req-bridge-failure")
+	waitFor(t, 3*time.Second, func() bool {
+		current, err := harness.repository.GetSession(context.Background(), "S-worker")
+		return err == nil && current.WorkerPID == 0 && current.Status == session.StatusStopped
+	})
+	select {
+	case requestID := <-harness.acp.started:
+		t.Fatalf("queued prompt reached failed ACP handle: %s", requestID)
+	case <-time.After(250 * time.Millisecond):
+	}
+	lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rejected bool
+	for _, line := range lines {
+		rejected = rejected || (line.Type == "turn_error" && line.RequestID == "req-after-bridge-failure")
+	}
+	if !rejected {
+		t.Fatalf("queued prompt was not rejected after bridge failure: %#v", lines)
+	}
+}
+
+func TestCanonicalConversationCannotStartWithoutACPTransportIdentity(t *testing.T) {
+	runtime, fake := disconnectedIdentityWorker(t, "", "native-canonical")
+	if _, err := runtime.connectACP(context.Background()); err == nil || !strings.Contains(err.Error(), "refusing to start a replacement conversation") {
+		t.Fatalf("connectACP() error = %v", err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.startCount != 0 || fake.resumeCount != 0 {
+		t.Fatalf("Start=%d Resume=%d, want neither called", fake.startCount, fake.resumeCount)
+	}
+}
+
+func TestResumeRejectsProviderIdentityDrift(t *testing.T) {
+	runtime, fake := disconnectedIdentityWorker(t, "acp-canonical-transport", "native-canonical")
+	fake.resumeNativeID = "native-replacement"
+	if _, err := runtime.connectACP(context.Background()); err == nil || !strings.Contains(err.Error(), "expected canonical provider conversation") {
+		t.Fatalf("connectACP() error = %v", err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.startCount != 0 || fake.resumeCount != 1 {
+		t.Fatalf("Start=%d Resume=%d, want exact Resume only", fake.startCount, fake.resumeCount)
+	}
+}
+
+func disconnectedIdentityWorker(t *testing.T, acpSessionID, canonicalID string) (*Worker, *fakeACP) {
+	t.Helper()
+	root := t.TempDir()
+	repository, err := store.Open(context.Background(), filepath.Join(root, "agent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repository.Close() })
+	createdTask, err := repository.CreateTask(context.Background(), task.CreateParams{ID: "T-identity", Title: "Identity test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdSession, err := repository.CreateSession(context.Background(), session.CreateParams{
+		ID: "S-identity", TaskID: createdTask.ID, Agent: "codex", Provider: "openai", RepoPath: root,
+		ACPSessionID: acpSessionID, NativeSessionID: canonicalID, ProviderConversationID: canonicalID,
+		ConversationIDSource: session.ConversationSourceNative, Status: session.StatusWaiting,
+		MetadataJSON: json.RawMessage(`{"permission":"read-approval"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := newFakeACP()
+	runtime, err := New(Config{
+		Session: createdSession, Profile: agents.Profile{Name: "codex", Provider: "openai", Command: "codex"},
+		Repository: repository, ACP: fake, WorkersDirectory: filepath.Join(root, "workers"), LogsDirectory: filepath.Join(root, "logs"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return runtime, fake
 }
 
 func TestWorkerRejectsDuplicateAndUsesPrivateRuntimeFiles(t *testing.T) {

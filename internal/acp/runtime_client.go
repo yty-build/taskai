@@ -28,11 +28,22 @@ type RuntimeClient struct {
 	stateDirectory string
 	verified       atomic.Bool
 
-	mu     sync.Mutex
-	bridge *runtimeBridge
-	target *Target
-	closed bool
+	mu       sync.Mutex
+	bridge   *runtimeBridge
+	target   *Target
+	identity runtimeIdentityExpectation
+	blocked  error
+	closed   bool
 }
+
+type runtimeIdentityExpectation struct {
+	ACP                   string
+	Native                string
+	Canonical             string
+	ProviderStoreVerified bool
+}
+
+var errBridgeTeardownInProgress = fmt.Errorf("previous acpx runtime process tree is still terminating")
 
 func NewRuntimeClient(binary, stateDirectory string) *RuntimeClient {
 	return &RuntimeClient{binary: binary, stateDirectory: stateDirectory}
@@ -51,7 +62,12 @@ func (c *RuntimeClient) Probe(ctx context.Context) error {
 }
 
 func (c *RuntimeClient) Start(ctx context.Context, spec StartSpec) (SessionInfo, error) {
-	return c.ensure(ctx, spec)
+	info, err := c.ensure(ctx, spec)
+	if err != nil {
+		return SessionInfo{}, err
+	}
+	c.bindIdentity(spec, info)
+	return info, nil
 }
 
 func (c *RuntimeClient) Resume(ctx context.Context, spec StartSpec) (SessionInfo, error) {
@@ -60,14 +76,18 @@ func (c *RuntimeClient) Resume(ctx context.Context, spec StartSpec) (SessionInfo
 	}
 	info, err := c.ensure(ctx, spec)
 	if err != nil {
+		c.discardBridge()
 		return SessionInfo{}, err
 	}
-	if info.ACPSessionID == "" || info.ACPSessionID != spec.ResumeACPSessionID {
-		return SessionInfo{}, &ProtocolError{
-			Operation: "runtime resume",
-			Message:   fmt.Sprintf("expected ACP Session ID %q, received %q", spec.ResumeACPSessionID, info.ACPSessionID),
-		}
+	if info.ACPSessionID == "" {
+		c.discardBridge()
+		return SessionInfo{}, identityError("runtime resume", "expected ACP Session ID %q, received %q", spec.ResumeACPSessionID, info.ACPSessionID)
 	}
+	if err := ValidateSessionIdentity("runtime resume", info, spec.ResumeACPSessionID, spec.ExpectedNativeSessionID, spec.ExpectedProviderConversationID, spec.ProviderStoreVerified); err != nil {
+		c.discardBridge()
+		return SessionInfo{}, err
+	}
+	c.bindIdentity(spec, info)
 	return info, nil
 }
 
@@ -94,18 +114,19 @@ func (c *RuntimeClient) Refresh(ctx context.Context, spec StartSpec) (SessionInf
 		CWD: target.WorkingDirectory, PermissionMode: target.Permission, ResumeSessionID: spec.ResumeACPSessionID,
 	}, &payload)
 	if err != nil {
+		c.discardBridge()
 		return SessionInfo{}, err
 	}
 	info, err := bridgeSessionInfo(target, payload)
 	if err != nil {
+		c.discardBridge()
 		return SessionInfo{}, err
 	}
-	if info.ACPSessionID != spec.ResumeACPSessionID {
-		return SessionInfo{}, &ProtocolError{
-			Operation: "runtime refresh",
-			Message:   fmt.Sprintf("expected ACP Session ID %q, received %q", spec.ResumeACPSessionID, info.ACPSessionID),
-		}
+	if err := ValidateSessionIdentity("runtime refresh", info, spec.ResumeACPSessionID, spec.ExpectedNativeSessionID, spec.ExpectedProviderConversationID, spec.ProviderStoreVerified); err != nil {
+		c.discardBridge()
+		return SessionInfo{}, err
 	}
+	c.bindIdentity(spec, info)
 	return info, nil
 }
 
@@ -246,7 +267,17 @@ func (c *RuntimeClient) Inspect(ctx context.Context, target Target) (SessionInfo
 	if err := bridge.call(ctx, bridgeCommand{Type: "inspect"}, &payload); err != nil {
 		return SessionInfo{}, err
 	}
-	return bridgeSessionInfo(target, payload)
+	info, err := bridgeSessionInfo(target, payload)
+	if err != nil {
+		c.discardBridge()
+		return SessionInfo{}, err
+	}
+	expected := c.identityExpectation()
+	if err := ValidateSessionIdentity("runtime inspect", info, expected.ACP, expected.Native, expected.Canonical, expected.ProviderStoreVerified); err != nil {
+		c.discardBridge()
+		return SessionInfo{}, err
+	}
+	return info, nil
 }
 
 func (c *RuntimeClient) DecidePermission(ctx context.Context, permissionID, optionID string, cancelled bool) error {
@@ -304,6 +335,9 @@ func (c *RuntimeClient) bridgeFor(ctx context.Context, target Target) (*runtimeB
 	if c.closed {
 		return nil, fmt.Errorf("acpx runtime client is closed")
 	}
+	if c.blocked != nil {
+		return nil, fmt.Errorf("acpx runtime bridge replacement is blocked after unsafe teardown: %w", c.blocked)
+	}
 	if c.target != nil && !sameRuntimeTarget(*c.target, target) {
 		return nil, fmt.Errorf("acpx runtime client is already bound to Session %s", c.target.ConsoleSessionID)
 	}
@@ -329,6 +363,51 @@ func (c *RuntimeClient) existingBridge(target Target) (*runtimeBridge, error) {
 		return nil, fmt.Errorf("acpx runtime client is bound to a different Session")
 	}
 	return c.bridge, nil
+}
+
+// discardBridge tears down a bridge whose provider identity or refresh state
+// can no longer be trusted. It deliberately keeps the client reusable so an
+// exact Resume can establish a fresh bridge before later ACP work.
+func (c *RuntimeClient) discardBridge() {
+	c.mu.Lock()
+	bridge := c.bridge
+	c.bridge = nil
+	if bridge != nil {
+		c.blocked = errBridgeTeardownInProgress
+	}
+	c.mu.Unlock()
+	if bridge != nil {
+		err := bridge.terminateProcess()
+		c.mu.Lock()
+		if err != nil {
+			c.blocked = err
+		} else if c.blocked == errBridgeTeardownInProgress {
+			c.blocked = nil
+		}
+		c.mu.Unlock()
+	}
+}
+
+func (c *RuntimeClient) bindIdentity(spec StartSpec, info SessionInfo) {
+	canonical := strings.TrimSpace(spec.ExpectedProviderConversationID)
+	if canonical == "" {
+		canonical = strings.TrimSpace(info.NativeSessionID)
+	}
+	if canonical == "" {
+		canonical = strings.TrimSpace(info.ACPSessionID)
+	}
+	c.mu.Lock()
+	c.identity = runtimeIdentityExpectation{
+		ACP: strings.TrimSpace(info.ACPSessionID), Native: strings.TrimSpace(info.NativeSessionID),
+		Canonical: canonical, ProviderStoreVerified: spec.ProviderStoreVerified,
+	}
+	c.mu.Unlock()
+}
+
+func (c *RuntimeClient) identityExpectation() runtimeIdentityExpectation {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.identity
 }
 
 func sameRuntimeTarget(left, right Target) bool {

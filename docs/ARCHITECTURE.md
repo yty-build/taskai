@@ -8,7 +8,7 @@ Agent Task Console persists exactly two first-class entities:
 Task 1 ─────────────── 0..n Session
 ```
 
-A Task stores title, description, status, optional external reference, and metadata. A Session stores its parent Task, role, agent/provider, repository/worktree/branch, distinct Task Console/acpx/ACP/provider-native identifiers, permission metadata, worker location, status, and timestamps.
+A Task stores title, description, status, optional external reference, and metadata. A Session stores its parent Task, role, agent/provider, repository/worktree/branch, one immutable canonical provider conversation identity plus adapter evidence, permission metadata, worker location, status, and timestamps.
 
 Everything else is infrastructure or operational data:
 
@@ -29,17 +29,20 @@ CLI commands       terminal console       local web / JSON+SSE
                           ▼
               TaskService / SessionService
                        SessionStream
-                    ┌─────┴─────┐
-                    ▼           ▼
-               SQLite store   worker runtime
-                                  │
-                           private Unix socket
-                                  │
-                          detached Session worker
-                                  │
-                    internal/acp → acpx 0.13.0
-                                  │
-                           ACP-compatible agent
+                 ┌────────┼───────────┐
+                 ▼        ▼           ▼
+            SQLite store  │     internal/native
+                          │           │ exact store verification
+                    worker runtime    ▼
+                          │     provider-native CLI
+                   private socket     │
+                          │           │
+                 detached worker      │
+                          │           │
+             internal/acp → acpx      │
+                          └─────┬─────┘
+                                ▼
+                 canonical provider conversation
 ```
 
 Transport handlers do not reimplement Task or Session behavior:
@@ -82,7 +85,7 @@ The worker:
 - gives every prompt a request ID;
 - appends every visible transition/output with a monotonic position;
 - broadcasts the same correlated lines to multiple subscribers;
-- supports prompt, status/ping, exact permission decision, cancel, stop, subscribe, and native-lease commands;
+- supports prompt, status/ping, exact permission decision, cancel, stop, subscribe, and idle ACP refresh commands;
 - clears worker ownership on orderly stop.
 
 Pending permissions are runtime state plus append-only Session history, not another entity or table. A viewer detach has no permission or turn side effect. The first valid viewer decision wins; cancel/stop/bridge failure abandons the request safely.
@@ -115,38 +118,35 @@ Native provider transcripts remain authoritative for details ACP does not emit. 
 
 ## Attachment
 
-Attachment always means a viewer/controller connection unless `--native` is explicit.
+Task attachment is a gateway navigator. Direct Session attachment is provider-native by default; `--acp` selects the structured gateway console.
 
-- Task attachment loads the Task and all Sessions, replays every history, then subscribes.
-- Session attachment replays that Session, then subscribes from its last position.
+- Task attachment loads the Task and all Sessions, replays every history, then subscribes. Enter opens the selected native provider harness and `a` opens its structured ACP view.
+- Structured ACP attachment replays that Session, then subscribes from its last position.
 - Multiple viewers may subscribe safely.
 - A Task prompt is never broadcast; the user must select its target Session.
-- `q`, `Ctrl-C`, browser close, network loss, or `acpctl serve` exit detaches only the viewer.
-- `Esc` requests cancellation of the current ACP turn. It does not suspend an exact token/tool state.
+- In Task/structured ACP views, `q`, `Ctrl-C`, browser close, network loss, or `acpctl serve` exit detaches only the viewer. Native keys belong to the provider; tmux uses `Ctrl-B d` to detach while leaving it running.
+- In the structured ACP view, `Esc` requests cancellation of the current ACP turn. It does not suspend an exact token/tool state.
 - numbered permission choices select the exact option offered by the provider; persistent choices require confirmation;
 - detaching while permission is pending leaves the agent waiting so another attachment can decide it.
 
-## Provider-native ownership
+## Canonical provider conversation and native attachment
 
-Native mode requires both an ACP Session ID for reconciliation and a provider-native Session ID for exact CLI resume. Unknown providers and missing IDs fail closed.
+The first exact identity returned by the provider adapter becomes the Session's immutable canonical provider conversation ID. Adapter-specific acpx, ACP, and native IDs remain evidence fields. A later observation may verify but may not silently replace the canonical value.
+
+Before native attachment, `internal/native` verifies that exact canonical ID against the provider's local conversation store and the Session checkout. Unknown providers, missing IDs, ambiguous records, checkout mismatches, and unsupported mappings fail closed without opening a replacement conversation.
 
 ```text
-ACP worker active
-      │ wait for turn or explicitly cancel
-      ▼
-worker acquires exclusive native lease; prompt queue pauses
-      │
-      ▼
-native CLI resumes exact provider conversation in persisted checkout
-      │ native process exits
-      ▼
-worker reconciles same conversation through acpx
-      │ success only
-      ▼
-lease releases; queued ACP prompts continue
+canonical provider ID ── exact local-store verification ── native CLI resume
+          │                                                │
+          └──────── ACP worker remains independent ────────┘
+                                                           │ native process exits
+                                                           ▼
+                                            request exact ACP refresh at idle
 ```
 
-If native execution or reconciliation fails, the worker remains alive and holds the lease. The operator must ensure the native CLI exited, fix the cause, and run `--reconcile-only`. The system never guesses an identifier or starts a replacement conversation.
+When tmux is available, the native CLI runs in a stable per-Session tmux session; detaching the viewer leaves it running. The gateway tags that tmux session with a hash of the canonical state root plus Session identity, explicitly passes the selected `AGENT_HOME` and current `PATH` to defeat stale tmux-server environment, and refuses an unowned name collision. A direct execution fallback is used outside a TTY, inside tmux, or when tmux is unavailable.
+
+ACP and native access are intentionally not mutually exclusive. Native attachment never pauses, cancels, queues, or blocks ACP work, and ACP work never seizes a native terminal. Concurrent writes to one provider conversation may be unsafe; V1 shows an advisory and leaves coordination to the user. After the native process actually exits, the worker defers an exact ACP refresh until active and queued ACP turns are idle. Refresh, prompt-transport failure, and post-turn identity inspection reload persisted verification state and are time-bounded. An uncertain bridge and its provider process group are terminated and awaited before exact ACP resume is attempted. Queued work proceeds only after identity recovery succeeds; otherwise queued requests receive correlated errors and the worker stops for explicit resume. No failure creates a lock or replacement identity.
 
 ## Review
 
@@ -177,7 +177,8 @@ Browser hardening includes loopback Host enforcement, cross-origin mutation reje
 - **Malformed/non-monotonic JSONL:** replay fails closed with an actionable error.
 - **Malformed/partial/nonzero acpx output:** the adapter returns a typed protocol/command error; valid prefixes already emitted remain in history.
 - **Prompt client disconnects:** worker continues and records the request-correlated response for cursor replay.
-- **Native reconciliation fails:** lease and queue remain held.
+- **Native verification fails:** no native process starts; the ACP worker is unchanged.
+- **Post-native refresh or post-turn identity recovery fails:** warnings and correlated queued-request errors are recorded, the suspect process tree is terminated, and the worker stops for explicit exact resume; no lock is held.
 - **SQLite contention:** busy timeout and per-repository locking protect local concurrency.
 - **Existing checkout collision:** fail before a second writer unless explicitly overridden.
 

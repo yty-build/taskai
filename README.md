@@ -14,11 +14,12 @@ Request IDs and append-only stream records are operational metadata. Reviews are
 - macOS or Linux
 - Go 1.23 or newer
 - Git
+- tmux (recommended for detachable provider-native terminal sessions)
 - Node/npm only to install the pinned `acpx` executable
 - `acpx` exactly 0.13.0
 - at least one ACP-compatible agent CLI, authenticated independently
 
-The embedded registry includes Codex, Claude, Gemini, Grok (`grok-build`), and OpenCode profiles. Agent Task Console never copies provider credentials into its database.
+The embedded registry includes Codex, Claude, Gemini, Grok (`grok`, with `grok-build` compatibility), and OpenCode profiles. Grok uses acpx's `grok-build` profile over ACP and the installed `grok` executable for its native terminal. Agent Task Console never copies provider credentials into its database.
 
 ## Install
 
@@ -92,23 +93,28 @@ acpctl session resume <session-id>
 
 ## Attachment semantics
 
-Normal attachment is a disposable viewer/controller connection through the gateway and ACP:
+Task attachment is a disposable navigator over every child Session. Direct Session attachment opens the real provider-native terminal by default; `--acp` opens the gateway's structured transcript and permission console:
 
 ```bash
 acpctl task attach <task-id>
 acpctl session attach <session-id>
+acpctl session attach <session-id> --acp
 ```
 
-The terminal console replays complete stored ACP-visible history, deduplicates it against live output, and reconnects from the last Session position. A Task console aggregates every child Session and discovers new Sessions without restart. The default Session screen is a native conversation harness with user/assistant turns, collapsed reasoning, merged tool cards, a multiline composer, and actionable permission cards.
+The Task console aggregates every child Session, discovers new Sessions without restart, and opens the selected provider's real native harness on Enter. Press `a` for the selected Session's structured ACP view. That view replays complete stored ACP-visible history, deduplicates it against live output, and reconnects from the last Session position; it renders user/assistant turns, collapsed reasoning, merged tool cards, a multiline composer, and actionable permission cards.
 
-Controls:
+Task and structured ACP console controls (provider-native keys remain owned by that provider):
 
 | Key | Effect |
 | --- | --- |
 | `↑`/`↓`, `j`/`k`, mouse | Select or scroll |
-| `Enter` or click | Open selected Session |
+| `Enter` or click | Open selected Session in its real provider-native harness |
+| `a` (Task screen) | Open the selected Session's structured ACP console |
 | `n` (Task screen) | Open the in-console New Session wizard; choose agent, role, repository, worktree, permission mode, and optional prompt |
 | `p` | Prompt the selected/current Session only |
+| `/` | Filter the Session list |
+| `:` | Open the searchable command palette |
+| `?` | Show contextual help |
 | `Esc` or `c` | Request cancellation of the active turn |
 | `u` | Resume a stopped Session |
 | `x` or `s` | Stop the worker |
@@ -117,15 +123,15 @@ Controls:
 | `b` or `Backspace` | Return to Task view |
 | `q` or `Ctrl-C` | Detach the viewer |
 
-Detaching never cancels a turn, stops a worker, resolves a permission, or releases another viewer. `Esc` requests cancellation when the composer is not active; inside the composer it closes editing and preserves the draft. A prompt submitted while busy is queued as the next ACP turn.
+Detaching either view never cancels a turn, stops a worker, or resolves a permission. `Esc` requests cancellation only in the structured ACP console when the composer is not active; inside the composer it closes editing and preserves the draft. A prompt submitted while an ACP turn is busy is queued as the next ACP turn.
 
-Provider-native attachment is an explicit, exclusive escape hatch:
+Native attachment resumes one immutable canonical provider conversation ID after verifying that exact ID in the provider's local store:
 
 ```bash
-acpctl session attach <session-id> --native
+acpctl session attach <session-id>
 ```
 
-It is available only when the provider exposed a native Session ID and V1 has an exact resume mapping. The worker holds queued prompts while the native CLI owns the conversation. ACP resumes only after native exit and successful reconciliation. See [native operations](docs/OPERATIONS.md#provider-native-mode) and the [real Codex smoke procedure](docs/CODEX_NATIVE_SMOKE.md).
+With tmux installed, `Ctrl-B d` detaches the terminal while the provider continues running; attaching again reopens the same tmux session. ACP and native access are deliberately advisory rather than locked: the gateway never pauses or cancels ACP work merely because a native viewer opened. The user must avoid sending concurrent turns through both transports. After the native process actually exits, the worker requests an exact ACP refresh at its next idle boundary. See [native operations](docs/OPERATIONS.md#provider-native-mode) and the [real Codex smoke procedure](docs/CODEX_NATIVE_SMOKE.md).
 
 ## Logs and review
 
@@ -157,7 +163,7 @@ acpctl serve
 
 Use `--listen 127.0.0.1:0` for an automatically selected port. Only explicit loopback IPs are accepted; wildcard, hostname, and public bindings are rejected. Stopping `acpctl serve` does not stop Session workers.
 
-The web UI provides Task creation/list/detail, Session creation/detail, stored and live activity, prompt/cancel/resume/stop, review creation, and a sanitized raw execution DTO view. Raw worker sockets, JSONL paths, and ACP wire payloads do not cross the browser API boundary.
+The responsive web UI provides Task creation/list/detail, Session creation/detail, stored and live structured ACP activity, prompt/cancel/resume/stop, review creation, and a sanitized raw execution DTO view. It shows whether the same canonical provider conversation is linked and provider-store verified without exposing that identifier. Raw worker sockets, JSONL paths, provider identifiers, and ACP wire payloads do not cross the browser API boundary.
 
 The JSON/SSE API is rooted at `/api/v1`, with `/healthz` for local health checks. Session streams use numeric per-Session positions. Task streams use opaque cursors containing independent positions for every Session. Both accept `Last-Event-ID` or `?cursor=` for lossless replay. See [API.md](docs/API.md).
 
@@ -225,8 +231,9 @@ Do not place provider authentication files, credentials, databases, sockets, log
 - **Checkout already used** — use `--worktree`, stop the existing Session, or use `--allow-shared-checkout` only when concurrent writers are intentional.
 - **Session has no live worker** — inspect `acpctl session <id>`, then run `acpctl session resume <id>`.
 - **Legacy CLI transport Session** — stored history remains attachable, but the new binary refuses a blind resume while an old detached acpx queue owner may exist. Create a fresh runtime-backed Session unless the old owner is independently proven gone and a deliberate migration path is added.
-- **Native ID unavailable** — the provider/acpx adapter did not expose an exact native conversation ID. Continue through ACP; never substitute a different ID.
-- **Native reconciliation failed** — keep the native CLI closed, correct the provider/acpx issue, then use `--native --reconcile-only`. Queued prompts remain held until reconciliation succeeds.
+- **Canonical provider conversation unavailable** — wait for the first ACP turn to establish one exact identity. Continue through `--acp`; never guess or substitute another ID.
+- **Native verification failed** — the exact canonical ID was not found in that provider's local store for the Session checkout. Continue through `--acp` and diagnose provider state; the gateway will not open a replacement conversation.
+- **ACP refresh/recovery warning after native exit** — native work is already complete and no lock is held. If bounded exact recovery failed, queued prompts were rejected and the worker stopped; run `acpctl session resume <id>` before sending more work.
 - **Web server refuses address/Host** — use the exact `http://127.0.0.1:<port>` URL printed by `acpctl serve`.
 - **Corrupt/non-monotonic JSONL** — preserve the file for diagnosis. The reader fails closed instead of skipping records.
 
@@ -244,7 +251,7 @@ make security-check
 make acceptance
 ```
 
-`make acceptance` uses isolated temporary state plus deterministic fake `acpx` and native CLIs. It exercises the built CLI, detached worker lifecycle, Task/Session persistence, worktrees, review, native lease/reconciliation, API/SSE reconnect, web lifecycle, concurrency, build metadata, and repository safety without provider credentials or network access.
+`make acceptance` uses isolated temporary state plus deterministic fake `acpx` and native CLIs. It exercises the built CLI, detached worker lifecycle, Task/Session persistence, worktrees, review, canonical identity verification, native attachment and idle ACP refresh, API/SSE reconnect, web lifecycle, concurrency, build metadata, and repository safety without provider credentials or network access.
 
 Authenticated live-provider verification is intentionally separate because it depends on local provider accounts. See [ACCEPTANCE.md](docs/ACCEPTANCE.md) for the exact specification mapping and [TEST_PLAN.md](docs/TEST_PLAN.md) for independent tester instructions.
 

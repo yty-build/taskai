@@ -401,21 +401,43 @@ func (s *Store) UpdateSessionStatus(ctx context.Context, id string, status sessi
 // canonical provider conversation identity once. It never silently replaces an
 // identity that has already been established for the Session.
 func (s *Store) UpdateSessionRuntimeIDs(ctx context.Context, id, acpxRecordID, acpSessionID, nativeSessionID string) (session.Session, error) {
-	conversationID := strings.TrimSpace(nativeSessionID)
-	var source session.ConversationIDSource
-	if conversationID != "" {
-		source = session.ConversationSourceNative
-	} else if strings.TrimSpace(acpSessionID) != "" {
-		conversationID = strings.TrimSpace(acpSessionID)
-		source = session.ConversationSourceACP
+	acpxRecordID = strings.TrimSpace(acpxRecordID)
+	acpSessionID = strings.TrimSpace(acpSessionID)
+	nativeSessionID = strings.TrimSpace(nativeSessionID)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return session.Session{}, fmt.Errorf("begin Session %s runtime ID update: %w", id, err)
+	}
+	defer tx.Rollback()
+	current, err := scanSession(tx.QueryRowContext(ctx, sessionSelect+" WHERE id = ?", id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return session.Session{}, fmt.Errorf("Session %s: %w", id, ErrNotFound)
+	}
+	if err != nil {
+		return session.Session{}, fmt.Errorf("read Session %s before runtime ID update: %w", id, err)
+	}
+	if err := validateRuntimeEvidence(current, acpSessionID, nativeSessionID); err != nil {
+		return session.Session{}, err
+	}
+	conversationID := current.ProviderConversationID
+	source := current.ConversationIDSource
+	if conversationID == "" {
+		conversationID = nativeSessionID
+		if conversationID != "" {
+			source = session.ConversationSourceNative
+		} else if acpSessionID != "" {
+			conversationID = acpSessionID
+			source = session.ConversationSourceACP
+		}
 	}
 	now := s.now().UTC()
-	result, err := s.db.ExecContext(ctx, `UPDATE sessions
-		SET acpx_record_id = ?, acp_session_id = ?, native_session_id = ?,
-			provider_conversation_id = CASE WHEN COALESCE(provider_conversation_id, '') = '' THEN ? ELSE provider_conversation_id END,
-			conversation_id_source = CASE WHEN COALESCE(provider_conversation_id, '') = '' THEN ? ELSE conversation_id_source END,
+	result, err := tx.ExecContext(ctx, `UPDATE sessions
+		SET acpx_record_id = COALESCE(NULLIF(?, ''), acpx_record_id),
+			acp_session_id = COALESCE(NULLIF(?, ''), acp_session_id),
+			native_session_id = COALESCE(NULLIF(?, ''), native_session_id),
+			provider_conversation_id = ?, conversation_id_source = ?,
 			updated_at = ?, last_activity_at = ?
-		WHERE id = ?`, nullString(acpxRecordID), nullString(acpSessionID), nullString(nativeSessionID), nullString(conversationID),
+		WHERE id = ?`, acpxRecordID, acpSessionID, nativeSessionID, nullString(conversationID),
 		nullString(string(source)), formatTime(now), formatTime(now), id)
 	if err != nil {
 		return session.Session{}, fmt.Errorf("update Session %s runtime IDs: %w", id, err)
@@ -425,7 +447,41 @@ func (s *Store) UpdateSessionRuntimeIDs(ctx context.Context, id, acpxRecordID, a
 	} else if count == 0 {
 		return session.Session{}, fmt.Errorf("Session %s: %w", id, ErrNotFound)
 	}
+	if err := tx.Commit(); err != nil {
+		return session.Session{}, fmt.Errorf("commit Session %s runtime ID update: %w", id, err)
+	}
 	return s.GetSession(ctx, id)
+}
+
+func validateRuntimeEvidence(current session.Session, acpSessionID, nativeSessionID string) error {
+	if current.ACPSessionID != "" && acpSessionID != "" && current.ACPSessionID != acpSessionID {
+		return fmt.Errorf("Session %s already uses ACP Session ID %q; refusing replacement with %q", current.ID, current.ACPSessionID, acpSessionID)
+	}
+	if current.NativeSessionID != "" && nativeSessionID != "" && current.NativeSessionID != nativeSessionID {
+		return fmt.Errorf("Session %s already uses native adapter ID %q; refusing replacement with %q", current.ID, current.NativeSessionID, nativeSessionID)
+	}
+	canonical := strings.TrimSpace(current.ProviderConversationID)
+	if canonical == "" {
+		return nil
+	}
+	effectiveACP := firstNonBlank(acpSessionID, current.ACPSessionID)
+	effectiveNative := firstNonBlank(nativeSessionID, current.NativeSessionID)
+	if current.ConversationIDSource == session.ConversationSourceProviderStore && current.ConversationIDVerifiedAt != nil && effectiveNative != "" && effectiveNative != canonical {
+		return fmt.Errorf("Session %s provider-store verified canonical conversation %q; refusing native adapter ID %q", current.ID, canonical, effectiveNative)
+	}
+	if effectiveACP == canonical || effectiveNative == canonical {
+		return nil
+	}
+	return fmt.Errorf("Session %s runtime evidence does not match canonical provider conversation %q (ACP %q, native %q)", current.ID, canonical, effectiveACP, effectiveNative)
+}
+
+func firstNonBlank(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 // UpdateSessionConversation records or verifies the canonical provider
@@ -438,11 +494,33 @@ func (s *Store) UpdateSessionConversation(ctx context.Context, id, conversationI
 	if err := source.Validate(); err != nil {
 		return session.Session{}, err
 	}
+	if source == session.ConversationSourceProviderStore && verifiedAt == nil {
+		return session.Session{}, fmt.Errorf("provider-store conversation identity requires a verification timestamp")
+	}
+	if source != session.ConversationSourceProviderStore && verifiedAt != nil {
+		return session.Session{}, fmt.Errorf("conversation verification timestamp requires provider-store identity source")
+	}
+	current, err := s.GetSession(ctx, id)
+	if err != nil {
+		return session.Session{}, err
+	}
+	if providerStoreVerifiedSession(current) && source != session.ConversationSourceProviderStore {
+		return session.Session{}, fmt.Errorf("Session %s provider-store verification is immutable and cannot be downgraded to %q", id, source)
+	}
 	now := s.now().UTC()
+	requireCanonicalNative := source == session.ConversationSourceProviderStore && verifiedAt != nil
+	if requireCanonicalNative && current.NativeSessionID != "" && current.NativeSessionID != conversationID {
+		return session.Session{}, fmt.Errorf("Session %s native adapter ID %q does not match provider-store verified canonical conversation %q", id, current.NativeSessionID, conversationID)
+	}
 	result, err := s.db.ExecContext(ctx, `UPDATE sessions
 		SET provider_conversation_id = ?, conversation_id_source = ?, conversation_id_verified_at = ?, updated_at = ?, last_activity_at = ?
-		WHERE id = ? AND (COALESCE(provider_conversation_id, '') = '' OR provider_conversation_id = ?)`,
-		conversationID, string(source), nullTime(verifiedAt), formatTime(now), formatTime(now), id, conversationID)
+		WHERE id = ? AND (COALESCE(provider_conversation_id, '') = '' OR provider_conversation_id = ?)
+			AND (? = 0 OR COALESCE(native_session_id, '') = '' OR native_session_id = ?)
+			AND (COALESCE(conversation_id_source, '') != ? OR ? = ?)
+			AND (conversation_id_verified_at IS NULL OR ? IS NOT NULL)`,
+		conversationID, string(source), nullTime(verifiedAt), formatTime(now), formatTime(now), id, conversationID,
+		requireCanonicalNative, conversationID,
+		string(session.ConversationSourceProviderStore), string(source), string(session.ConversationSourceProviderStore), nullTime(verifiedAt))
 	if err != nil {
 		return session.Session{}, fmt.Errorf("update Session %s provider conversation: %w", id, err)
 	}
@@ -455,9 +533,19 @@ func (s *Store) UpdateSessionConversation(ctx context.Context, id, conversationI
 		if lookupErr != nil {
 			return session.Session{}, lookupErr
 		}
-		return session.Session{}, fmt.Errorf("Session %s already uses canonical provider conversation %q; refusing replacement with %q", id, current.ProviderConversationID, conversationID)
+		if current.ProviderConversationID != "" && current.ProviderConversationID != conversationID {
+			return session.Session{}, fmt.Errorf("Session %s already uses canonical provider conversation %q; refusing replacement with %q", id, current.ProviderConversationID, conversationID)
+		}
+		if requireCanonicalNative && current.NativeSessionID != "" && current.NativeSessionID != conversationID {
+			return session.Session{}, fmt.Errorf("Session %s native adapter ID %q does not match provider-store verified canonical conversation %q", id, current.NativeSessionID, conversationID)
+		}
+		return session.Session{}, fmt.Errorf("Session %s provider conversation could not be updated", id)
 	}
 	return s.GetSession(ctx, id)
+}
+
+func providerStoreVerifiedSession(current session.Session) bool {
+	return current.ConversationIDSource == session.ConversationSourceProviderStore && current.ConversationIDVerifiedAt != nil
 }
 
 func (s *Store) UpdateSessionWorker(ctx context.Context, id string, pid int, socket, logPath string, status session.Status) (session.Session, error) {
