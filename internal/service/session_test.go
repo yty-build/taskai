@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -401,6 +402,8 @@ type nativeTestRuntime struct {
 	mu           sync.Mutex
 	active       string
 	queued       int
+	refreshing   bool
+	owner        string
 	calls        []string
 	refreshState string
 	refreshErr   error
@@ -426,6 +429,31 @@ func (r *nativeTestRuntime) Send(_ context.Context, _ string, command worker.Com
 			state = "scheduled"
 		}
 		return worker.Message{Type: "refresh_scheduled", State: state}, nil
+	case "native_acquire":
+		if r.active != "" {
+			return worker.Message{}, fmt.Errorf("provider writer is busy: ACP request %s is active", r.active)
+		}
+		if r.refreshing {
+			return worker.Message{}, errors.New("provider writer is busy: exact ACP identity refresh is active")
+		}
+		if r.owner == "" {
+			r.owner = command.OwnerToken
+			return worker.Message{Type: "native_acquired", State: "acquired", NativeOwned: true, ProviderWriter: "native"}, nil
+		}
+		if r.owner == command.OwnerToken {
+			return worker.Message{Type: "native_acquired", State: "already_acquired", NativeOwned: true, ProviderWriter: "native"}, nil
+		}
+		return worker.Message{}, errors.New("another native provider process owns this Session")
+	case "native_release":
+		if r.owner != command.OwnerToken {
+			return worker.Message{}, errors.New("native owner token mismatch")
+		}
+		r.owner = ""
+		state := "released"
+		if command.NativeActivity {
+			state = "refresh_scheduled"
+		}
+		return worker.Message{Type: "native_released", State: state}, nil
 	default:
 		return worker.Message{}, errors.New("unexpected worker command " + command.Type)
 	}
@@ -458,11 +486,34 @@ func (r *recordingNativeRunner) Run(_ context.Context, invocation native.Invocat
 	return r.err
 }
 
-func TestNativeAttachRunsVerifiedCanonicalConversationWithoutPausingACP(t *testing.T) {
+func TestNativeAttachRejectsWhileACPProviderWriterIsActive(t *testing.T) {
 	service, runtime, current := nativeServiceHarness(t, "codex", "native-exact")
 	runtime.active = "req-active"
 	runtime.queued = 2
-	runtime.refreshState = "deferred"
+	runner := &recordingNativeRunner{}
+	verifier := &acceptingNativeVerifier{}
+	err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{
+		Runner: runner, Verifier: verifier, Input: strings.NewReader(""), Output: io.Discard, ErrorOutput: io.Discard,
+	})
+	if err == nil || !strings.Contains(err.Error(), "ACP request req-active is active") {
+		t.Fatalf("active ACP attach error = %v", err)
+	}
+	if runner.invocation.Command != "" {
+		t.Fatalf("native provider started while ACP owned the writer: %#v", runner.invocation)
+	}
+	runtime.mu.Lock()
+	calls, active, queued := append([]string(nil), runtime.calls...), runtime.active, runtime.queued
+	runtime.mu.Unlock()
+	if !reflect.DeepEqual(calls, []string{"native_acquire"}) || active != "req-active" || queued != 2 {
+		t.Fatalf("native worker calls=%v active=%q queued=%d", calls, active, queued)
+	}
+	if len(verifier.calls) != 1 {
+		t.Fatalf("verification calls = %v", verifier.calls)
+	}
+}
+
+func TestNativeAttachRunsVerifiedCanonicalConversationAndReleasesToRefresh(t *testing.T) {
+	service, runtime, current := nativeServiceHarness(t, "codex", "native-exact")
 	runner := &recordingNativeRunner{}
 	verifier := &acceptingNativeVerifier{}
 	var notices bytes.Buffer
@@ -475,15 +526,13 @@ func TestNativeAttachRunsVerifiedCanonicalConversationWithoutPausingACP(t *testi
 		t.Fatalf("native invocation = %#v", runner.invocation)
 	}
 	runtime.mu.Lock()
-	calls, active, queued := append([]string(nil), runtime.calls...), runtime.active, runtime.queued
+	calls, owner := append([]string(nil), runtime.calls...), runtime.owner
 	runtime.mu.Unlock()
-	if !reflect.DeepEqual(calls, []string{"status", "refresh"}) || active != "req-active" || queued != 2 {
-		t.Fatalf("native worker calls=%v active=%q queued=%d", calls, active, queued)
+	if !reflect.DeepEqual(calls, []string{"native_acquire", "native_release"}) || owner != "" {
+		t.Fatalf("native worker calls=%v owner=%q", calls, owner)
 	}
-	for _, expected := range []string{"ACP activity is also live", "refresh is deferred"} {
-		if !strings.Contains(notices.String(), expected) {
-			t.Errorf("notices missing %q: %s", expected, notices.String())
-		}
+	if !strings.Contains(notices.String(), "exact ACP refresh scheduled before queued prompts") {
+		t.Fatalf("release notice = %q", notices.String())
 	}
 	verified, err := service.Get(context.Background(), current.ID)
 	if err != nil || verified.ProviderConversationID != "native-exact" || verified.ConversationIDSource != session.ConversationSourceProviderStore || verified.ConversationIDVerifiedAt == nil {
@@ -532,7 +581,7 @@ func TestNativeProcessFailureStillSchedulesNonBlockingRefresh(t *testing.T) {
 	}
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
-	if !reflect.DeepEqual(runtime.calls, []string{"status", "refresh"}) {
+	if !reflect.DeepEqual(runtime.calls, []string{"native_acquire", "native_release"}) || runtime.owner != "" {
 		t.Fatalf("process failure refresh calls=%v", runtime.calls)
 	}
 }
@@ -554,7 +603,7 @@ func TestNativePrelaunchFailureDoesNotRefreshACP(t *testing.T) {
 	}
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
-	if !reflect.DeepEqual(runtime.calls, []string{"status"}) {
+	if !reflect.DeepEqual(runtime.calls, []string{"native_acquire", "native_release"}) || runtime.owner != "" {
 		t.Fatalf("prelaunch failure worker calls=%v", runtime.calls)
 	}
 }
@@ -562,6 +611,11 @@ func TestNativePrelaunchFailureDoesNotRefreshACP(t *testing.T) {
 type continuingNativeRunner struct{ recordingNativeRunner }
 
 func (*continuingNativeRunner) ProcessMayContinue() bool { return true }
+
+type uncertainContinuingNativeRunner struct{ recordingNativeRunner }
+
+func (*uncertainContinuingNativeRunner) ProcessMayContinue() bool     { return true }
+func (*uncertainContinuingNativeRunner) NativeActivityOccurred() bool { return false }
 
 func TestDetachedTmuxViewerLeavesRefreshToNativeProcessOwner(t *testing.T) {
 	service, runtime, current := nativeServiceHarness(t, "codex", "native-exact")
@@ -571,8 +625,55 @@ func TestDetachedTmuxViewerLeavesRefreshToNativeProcessOwner(t *testing.T) {
 	}
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
-	if !reflect.DeepEqual(runtime.calls, []string{"status"}) {
+	if !reflect.DeepEqual(runtime.calls, []string{"native_acquire"}) || runtime.owner == "" {
 		t.Fatalf("viewer detach scheduled premature refresh: %v", runtime.calls)
+	}
+}
+
+func TestUncertainTmuxHandoffRetainsOwnershipFailClosed(t *testing.T) {
+	service, runtime, current := nativeServiceHarness(t, "codex", "native-exact")
+	runner := &uncertainContinuingNativeRunner{recordingNativeRunner{err: errors.New("tmux owner inspection failed")}}
+	err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{Runner: runner, Verifier: &acceptingNativeVerifier{}})
+	if err == nil || !strings.Contains(err.Error(), "tmux owner inspection failed") {
+		t.Fatalf("uncertain tmux error = %v", err)
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if !reflect.DeepEqual(runtime.calls, []string{"native_acquire"}) || runtime.owner == "" {
+		t.Fatalf("uncertain tmux handoff released ownership: calls=%v owner=%q", runtime.calls, runtime.owner)
+	}
+}
+
+func TestNativeAttachRejectsWhileExactRefreshWritesProvider(t *testing.T) {
+	service, runtime, current := nativeServiceHarness(t, "codex", "native-exact")
+	runtime.refreshing = true
+	runner := &recordingNativeRunner{}
+	err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{Runner: runner, Verifier: &acceptingNativeVerifier{}})
+	if err == nil || !strings.Contains(err.Error(), "identity refresh is active") || runner.invocation.Command != "" {
+		t.Fatalf("refresh collision error=%v invocation=%#v", err, runner.invocation)
+	}
+}
+
+func TestNativeTmuxOuterAndHiddenOwnerAcquireIdempotently(t *testing.T) {
+	service, runtime, current := nativeServiceHarness(t, "codex", "native-exact")
+	outer := &continuingNativeRunner{}
+	if err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{Runner: outer, Verifier: &acceptingNativeVerifier{}}); err != nil {
+		t.Fatal(err)
+	}
+	token, err := native.OwnerToken(service.home.Root, current.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hidden := &recordingNativeRunner{}
+	if err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{
+		Runner: hidden, Verifier: &acceptingNativeVerifier{}, OwnerToken: token,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if !reflect.DeepEqual(runtime.calls, []string{"native_acquire", "native_acquire", "native_release"}) || runtime.owner != "" {
+		t.Fatalf("outer/hidden ownership calls=%v owner=%q", runtime.calls, runtime.owner)
 	}
 }
 

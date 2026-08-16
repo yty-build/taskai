@@ -191,12 +191,12 @@ func runHiddenWorker(ctx context.Context, args []string, home config.Home, datab
 }
 
 func runHiddenNative(ctx context.Context, args []string, stdout, stderr io.Writer, service *appservice.SessionService) error {
-	options, err := parseOptions(args, map[string]optionKind{"--session": stringOption})
-	if err != nil || len(options.positionals) != 0 || options.values["--session"] == "" {
-		return usagef("usage: acpctl _native --session <session-id>")
+	options, err := parseOptions(args, map[string]optionKind{"--session": stringOption, "--owner-token": stringOption})
+	if err != nil || len(options.positionals) != 0 || options.values["--session"] == "" || options.values["--owner-token"] == "" {
+		return usagef("usage: acpctl _native --session <session-id> --owner-token <token>")
 	}
 	return service.AttachNative(ctx, options.values["--session"], appservice.NativeAttachOptions{
-		Runner: &native.ExecRunner{}, Input: os.Stdin, Output: stdout, ErrorOutput: stderr,
+		Runner: &native.ExecRunner{}, OwnerToken: options.values["--owner-token"], Input: os.Stdin, Output: stdout, ErrorOutput: stderr,
 	})
 }
 

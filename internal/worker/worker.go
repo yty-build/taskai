@@ -16,9 +16,11 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/yty-build/acp-gateway/internal/acp"
 	"github.com/yty-build/acp-gateway/internal/agents"
+	"github.com/yty-build/acp-gateway/internal/native"
 	"github.com/yty-build/acp-gateway/internal/session"
 	"github.com/yty-build/acp-gateway/internal/sessionlog"
 )
@@ -51,14 +53,15 @@ type refreshableACPClient interface {
 }
 
 type Config struct {
-	Session          session.Session
-	Profile          agents.Profile
-	Repository       Repository
-	ACP              ACPClient
-	WorkersDirectory string
-	LogsDirectory    string
-	PID              int
-	RefreshTimeout   time.Duration
+	Session                     session.Session
+	Profile                     agents.Profile
+	Repository                  Repository
+	ACP                         ACPClient
+	WorkersDirectory            string
+	LogsDirectory               string
+	PID                         int
+	RefreshTimeout              time.Duration
+	ReconcileProviderTranscript func(context.Context, agents.Profile, string, string) error
 }
 
 type queuedPrompt struct {
@@ -88,6 +91,9 @@ type Worker struct {
 	refreshPending         bool
 	refreshQueueRemaining  int
 	refreshing             bool
+	nativeOwnerToken       string
+	nativeRefreshBarrier   bool
+	acpConnected           bool
 	transportError         string
 	seenRequestIDs         map[string]struct{}
 	permissions            map[string]*pendingPermission
@@ -114,6 +120,12 @@ func New(config Config) (*Worker, error) {
 	}
 	if config.PID == 0 {
 		config.PID = os.Getpid()
+	}
+	if config.ReconcileProviderTranscript == nil {
+		config.ReconcileProviderTranscript = func(ctx context.Context, profile agents.Profile, conversationID, workingDirectory string) error {
+			_, err := native.ReadProviderTranscript(ctx, profile, conversationID, workingDirectory)
+			return err
+		}
 	}
 	workingDirectory := config.Session.WorktreePath
 	if workingDirectory == "" {
@@ -150,6 +162,13 @@ func (w *Worker) LockPath() string {
 	return filepath.Join(w.config.WorkersDirectory, w.config.Session.ID+".lock")
 }
 
+// NativeOwnerPath is a private runtime marker, not a persistent domain
+// entity. It survives a worker restart so a still-running provider-native
+// process continues to exclude ACP writes.
+func (w *Worker) NativeOwnerPath() string {
+	return filepath.Join(w.config.WorkersDirectory, w.config.Session.ID+".native-owner.json")
+}
+
 func (w *Worker) LogPath() string {
 	if w.config.Session.LogPath != "" {
 		return w.config.Session.LogPath
@@ -169,6 +188,9 @@ func (w *Worker) Run(ctx context.Context) error {
 		_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 		_ = lock.Close()
 	}()
+	if err := w.restoreNativeOwnership(); err != nil {
+		return err
+	}
 
 	if err := os.Remove(w.SocketPath()); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove stale worker socket: %w", err)
@@ -197,14 +219,41 @@ func (w *Worker) Run(ctx context.Context) error {
 	if _, err := w.publish("", "worker_starting", map[string]any{"pid": w.config.PID}); err != nil {
 		return err
 	}
+	w.mu.Lock()
+	restoredOwner := w.nativeOwnerToken != ""
+	restoredRefresh := w.nativeRefreshBarrier
+	w.mu.Unlock()
+	if restoredOwner || restoredRefresh {
+		state := nativeMarkerOwned
+		if restoredRefresh {
+			state = nativeMarkerRefreshPending
+		}
+		if _, err := w.publish("", "native_ownership_restored", map[string]string{"state": state}); err != nil {
+			return err
+		}
+	}
 
-	info, err := w.connectACP(ctx)
+	var info acp.SessionInfo
+	if restoredOwner {
+		// ensureSession/resume launches an ACP adapter and may mutate provider
+		// state (for example, by selecting a provider mode). While the restored
+		// native owner may still be alive, expose only the worker socket and use
+		// the already-persisted identity for diagnostics.
+		info, err = w.persistedRuntimeInfo()
+	} else {
+		info, err = w.connectACP(ctx)
+		if err == nil {
+			err = w.persistRuntimeInfo(ctx, info)
+		}
+		if err == nil {
+			w.mu.Lock()
+			w.acpConnected = true
+			w.mu.Unlock()
+		}
+	}
 	if err != nil {
 		_, _ = w.publish("", "worker_error", map[string]string{"message": err.Error()})
 		_, _ = w.config.Repository.UpdateSessionStatus(context.Background(), w.config.Session.ID, session.StatusFailed)
-		return err
-	}
-	if err := w.persistRuntimeInfo(ctx, info); err != nil {
 		return err
 	}
 	if _, err := w.config.Repository.UpdateSessionWorker(ctx, w.config.Session.ID, w.config.PID, w.SocketPath(), w.LogPath(), session.StatusWaiting); err != nil {
@@ -229,6 +278,9 @@ func (w *Worker) Run(ctx context.Context) error {
 		defer close(processorDone)
 		w.processPrompts(runContext)
 	}()
+	if restoredRefresh {
+		w.signalWake()
+	}
 	acceptDone := make(chan error, 1)
 	go func() { acceptDone <- w.accept(runContext) }()
 
@@ -281,6 +333,17 @@ func (w *Worker) connectACP(ctx context.Context) (acp.SessionInfo, error) {
 		return acp.SessionInfo{}, fmt.Errorf("Session %s has canonical provider conversation %q but no ACP Session ID; refusing to start a replacement conversation", w.config.Session.ID, spec.ExpectedProviderConversationID)
 	}
 	return w.config.ACP.Start(ctx, spec)
+}
+
+func (w *Worker) persistedRuntimeInfo() (acp.SessionInfo, error) {
+	if strings.TrimSpace(w.config.Session.ACPSessionID) == "" {
+		return acp.SessionInfo{}, fmt.Errorf("Session %s has durable native ownership but no persisted ACP Session ID; refusing to open ACP or discard native ownership", w.config.Session.ID)
+	}
+	return acp.SessionInfo{
+		ACPXRecordID:    w.config.Session.ACPXRecordID,
+		ACPSessionID:    w.config.Session.ACPSessionID,
+		NativeSessionID: w.config.Session.NativeSessionID,
+	}, nil
 }
 
 func (w *Worker) accept(ctx context.Context) error {
@@ -343,7 +406,25 @@ func (w *Worker) handleConnection(ctx context.Context, connection net.Conn) {
 	case "refresh":
 		state := w.scheduleRefresh()
 		writeMessage(connection, Message{Type: "refresh_scheduled", State: state})
+	case "native_acquire":
+		state, err := w.acquireNative(command.OwnerToken)
+		if err != nil {
+			writeMessage(connection, Message{Type: "error", Message: err.Error()})
+			return
+		}
+		writeMessage(connection, Message{Type: "native_acquired", State: state, NativeOwned: true, ProviderWriter: "native"})
+	case "native_release":
+		state, err := w.releaseNative(command.OwnerToken, command.NativeActivity)
+		if err != nil {
+			writeMessage(connection, Message{Type: "error", Message: err.Error()})
+			return
+		}
+		writeMessage(connection, Message{Type: "native_released", State: state})
 	case "stop":
+		if w.nativeOwned() {
+			writeMessage(connection, Message{Type: "error", Message: "provider-native work owns this Session; exit the native provider before stopping its worker"})
+			return
+		}
 		writeMessage(connection, Message{Type: "stopping"})
 		go w.requestStop()
 	default:
@@ -369,7 +450,7 @@ func (w *Worker) enqueue(requestID, message, displayMessage string) (string, err
 		return "", fmt.Errorf("request_id %q is already active or queued", requestID)
 	}
 	state := "ready"
-	if w.active != nil || w.refreshPending || w.refreshing || len(w.queue) > 0 {
+	if w.active != nil || w.refreshPending || w.refreshing || w.nativeOwnerToken != "" || len(w.queue) > 0 {
 		state = "queued"
 	}
 	if strings.TrimSpace(displayMessage) == "" {
@@ -410,7 +491,7 @@ func (w *Worker) processPrompts(ctx context.Context) {
 func (w *Worker) nextPrompt(ctx context.Context) (queuedPrompt, context.Context, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.transportError != "" || w.active != nil || w.refreshing || len(w.queue) == 0 || (w.refreshPending && w.refreshQueueRemaining == 0) {
+	if w.transportError != "" || w.active != nil || w.refreshing || w.nativeOwnerToken != "" || len(w.queue) == 0 || (w.refreshPending && w.refreshQueueRemaining == 0) {
 		return queuedPrompt{}, nil, false
 	}
 	prompt := w.queue[0]
@@ -552,7 +633,7 @@ func (w *Worker) scheduleRefresh() string {
 		w.refreshQueueRemaining = len(w.queue)
 	}
 	w.refreshPending = true
-	deferred := w.active != nil || w.refreshing || w.refreshQueueRemaining > 0
+	deferred := w.active != nil || w.refreshing || w.nativeOwnerToken != "" || w.refreshQueueRemaining > 0
 	w.mu.Unlock()
 	w.signalWake()
 	if deferred {
@@ -563,7 +644,7 @@ func (w *Worker) scheduleRefresh() string {
 
 func (w *Worker) refreshIfIdle(ctx context.Context) {
 	w.mu.Lock()
-	if !w.refreshPending || w.refreshing || w.active != nil || w.refreshQueueRemaining > 0 {
+	if !w.refreshPending || w.refreshing || w.active != nil || w.nativeOwnerToken != "" || w.refreshQueueRemaining > 0 {
 		w.mu.Unlock()
 		return
 	}
@@ -581,13 +662,6 @@ func (w *Worker) refreshIfIdle(ctx context.Context) {
 		}
 	}()
 
-	refresher, ok := w.config.ACP.(refreshableACPClient)
-	if !ok {
-		err := errors.New("ACP transport does not support idle refresh")
-		_, _ = w.publish("", "native_refresh_warning", map[string]string{"message": err.Error()})
-		w.quarantineTransport(err)
-		return
-	}
 	current, err := w.currentIdentity(ctx)
 	if err != nil {
 		_, _ = w.publish("", "native_refresh_warning", map[string]string{"message": err.Error()})
@@ -601,6 +675,34 @@ func (w *Worker) refreshIfIdle(ctx context.Context) {
 		return
 	}
 	_, _ = w.publish("", "native_refresh_started", map[string]string{"acp_session_id": current.ACPSessionID})
+	w.mu.Lock()
+	connected := w.acpConnected
+	w.mu.Unlock()
+	if !connected {
+		// A worker restored under a durable native owner deliberately did not
+		// open an ACP adapter. Now that native ownership has been released, an
+		// exact Resume is the first provider-facing ACP operation.
+		info, resumeErr := w.resumeExact(ctx, current)
+		if resumeErr != nil {
+			_, _ = w.publish("", "native_refresh_recovery_warning", map[string]string{"message": resumeErr.Error()})
+			w.quarantineTransport(fmt.Errorf("exact ACP reconnect after native owner release: %w", resumeErr))
+			return
+		}
+		if barrierErr := w.completeNativeRefreshBarrier(ctx); barrierErr != nil {
+			_, _ = w.publish("", "native_refresh_recovery_warning", map[string]string{"message": barrierErr.Error()})
+			w.quarantineTransport(barrierErr)
+			return
+		}
+		_, _ = w.publish("", "native_refreshed", map[string]string{"acp_session_id": info.ACPSessionID, "connection": "resumed"})
+		return
+	}
+	refresher, ok := w.config.ACP.(refreshableACPClient)
+	if !ok {
+		err := errors.New("ACP transport does not support idle refresh")
+		_, _ = w.publish("", "native_refresh_warning", map[string]string{"message": err.Error()})
+		w.quarantineTransport(err)
+		return
+	}
 	refreshContext, cancelRefresh := context.WithTimeout(ctx, w.refreshTimeout())
 	info, err := refresher.Refresh(refreshContext, acp.StartSpec{
 		Target: w.target, ResumeACPSessionID: current.ACPSessionID,
@@ -615,6 +717,11 @@ func (w *Worker) refreshIfIdle(ctx context.Context) {
 	if err == nil {
 		err = w.persistRuntimeInfo(ctx, info)
 	}
+	if err == nil {
+		w.mu.Lock()
+		w.acpConnected = true
+		w.mu.Unlock()
+	}
 	if err != nil {
 		_, _ = w.publish("", "native_refresh_warning", map[string]string{"message": err.Error()})
 		recovered, recoveryErr := w.resumeExact(ctx, current)
@@ -623,13 +730,71 @@ func (w *Worker) refreshIfIdle(ctx context.Context) {
 			w.quarantineTransport(fmt.Errorf("exact recovery after native refresh failure: %w", recoveryErr))
 			return
 		}
+		if barrierErr := w.completeNativeRefreshBarrier(ctx); barrierErr != nil {
+			_, _ = w.publish("", "native_refresh_recovery_warning", map[string]string{"message": barrierErr.Error()})
+			w.quarantineTransport(barrierErr)
+			return
+		}
 		_, _ = w.publish("", "native_refresh_recovered", map[string]string{"acp_session_id": recovered.ACPSessionID})
 		return
 	}
 	if err := w.writeMetadata(info); err != nil {
 		_, _ = w.publish("", "native_refresh_warning", map[string]string{"message": err.Error()})
 	}
+	if err := w.completeNativeRefreshBarrier(ctx); err != nil {
+		_, _ = w.publish("", "native_refresh_warning", map[string]string{"message": err.Error()})
+		w.quarantineTransport(err)
+		return
+	}
 	_, _ = w.publish("", "native_refreshed", map[string]string{"acp_session_id": info.ACPSessionID})
+}
+
+func (w *Worker) completeNativeRefreshBarrier(ctx context.Context) error {
+	w.mu.Lock()
+	if !w.nativeRefreshBarrier {
+		w.mu.Unlock()
+		return nil
+	}
+	w.mu.Unlock()
+
+	// Re-opening the exact ACP identity is necessary but not sufficient: a
+	// provider-native turn is not safe to follow with queued ACP work until the
+	// provider's durable transcript can also be verified and parsed for that
+	// same canonical conversation and checkout. Keep the private ownership
+	// marker in refresh_pending for the entire read. Any failure therefore
+	// survives worker shutdown and is retryable through the normal Session
+	// resume path without ever dispatching the queued ACP prompt.
+	reconcileContext, cancel := context.WithTimeout(ctx, w.refreshTimeout())
+	defer cancel()
+	current, err := w.currentIdentity(reconcileContext)
+	if err != nil {
+		return fmt.Errorf("load exact identity for provider transcript reconciliation: %w", err)
+	}
+	conversationID := strings.TrimSpace(current.ProviderConversationID)
+	if conversationID == "" {
+		return fmt.Errorf("Session %s has no canonical provider conversation ID for transcript reconciliation", current.ID)
+	}
+	workingDirectory := current.WorktreePath
+	if workingDirectory == "" {
+		workingDirectory = current.RepoPath
+	}
+	if err := w.config.ReconcileProviderTranscript(reconcileContext, w.config.Profile, conversationID, workingDirectory); err != nil {
+		return fmt.Errorf("reconcile exact provider transcript before releasing ACP queue: %w", err)
+	}
+	if err := reconcileContext.Err(); err != nil {
+		return fmt.Errorf("reconcile exact provider transcript before releasing ACP queue: %w", err)
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.nativeRefreshBarrier {
+		return fmt.Errorf("native refresh barrier changed during provider transcript reconciliation")
+	}
+	if err := w.removeNativeOwnership(); err != nil {
+		return fmt.Errorf("complete exact native-to-ACP transcript barrier: %w", err)
+	}
+	w.nativeRefreshBarrier = false
+	return nil
 }
 
 func (w *Worker) refreshTimeout() time.Duration {
@@ -661,6 +826,9 @@ func (w *Worker) resumeExact(ctx context.Context, current session.Session) (acp.
 			err = w.writeMetadata(info)
 		}
 		if err == nil {
+			w.mu.Lock()
+			w.acpConnected = true
+			w.mu.Unlock()
 			return info, nil
 		}
 		lastErr = err
@@ -777,7 +945,18 @@ func (w *Worker) tail(connection net.Conn, from uint64) {
 func (w *Worker) statusMessage() Message {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	message := Message{Type: "status", Status: string(w.status), Queued: len(w.queue), RefreshPending: w.refreshPending, Refreshing: w.refreshing}
+	message := Message{
+		Type: "status", Status: string(w.status), Queued: len(w.queue),
+		RefreshPending: w.refreshPending, Refreshing: w.refreshing, NativeOwned: w.nativeOwnerToken != "",
+	}
+	switch {
+	case w.active != nil:
+		message.ProviderWriter = "acp"
+	case w.refreshing:
+		message.ProviderWriter = "refresh"
+	case w.nativeOwnerToken != "":
+		message.ProviderWriter = "native"
+	}
 	message.Message = w.transportError
 	if w.active != nil {
 		message.ActiveRequestID = w.active.RequestID
@@ -789,6 +968,118 @@ func (w *Worker) statusMessage() Message {
 	}
 	sort.Slice(message.Permissions, func(i, j int) bool { return message.Permissions[i].ID < message.Permissions[j].ID })
 	return message
+}
+
+func (w *Worker) acquireNative(ownerToken string) (string, error) {
+	ownerToken, err := validateNativeOwnerToken(ownerToken)
+	if err != nil {
+		return "", err
+	}
+	w.mu.Lock()
+	switch {
+	case w.transportError != "":
+		message := w.transportError
+		w.mu.Unlock()
+		return "", fmt.Errorf("provider-native attachment is unavailable because exact ACP continuity failed: %s", message)
+	case w.nativeOwnerToken == ownerToken:
+		w.mu.Unlock()
+		return "already_acquired", nil
+	case w.nativeOwnerToken != "":
+		w.mu.Unlock()
+		return "", fmt.Errorf("provider writer is busy: another native provider process owns Session %s", w.config.Session.ID)
+	case w.active != nil:
+		requestID := w.active.RequestID
+		w.mu.Unlock()
+		return "", fmt.Errorf("provider writer is busy: ACP request %s is active; retry native attachment after that turn settles", requestID)
+	case w.refreshing:
+		w.mu.Unlock()
+		return "", fmt.Errorf("provider writer is busy: exact ACP identity refresh is active; retry native attachment after refresh completes")
+	case w.refreshPending:
+		w.mu.Unlock()
+		return "", fmt.Errorf("provider writer is busy: exact ACP identity refresh is scheduled; retry native attachment after refresh completes")
+	default:
+		if err := w.persistNativeOwnership(nativeMarkerOwned, ownerToken); err != nil {
+			w.mu.Unlock()
+			return "", fmt.Errorf("persist exclusive native provider ownership: %w", err)
+		}
+		w.nativeOwnerToken = ownerToken
+		w.mu.Unlock()
+	}
+	if _, err := w.publish("", "native_acquired", map[string]string{"state": "acquired"}); err != nil {
+		w.mu.Lock()
+		if w.nativeOwnerToken == ownerToken {
+			if removeErr := w.removeNativeOwnership(); removeErr != nil {
+				w.mu.Unlock()
+				return "", fmt.Errorf("publish native ownership: %v; ownership remains fail-closed because rollback failed: %w", err, removeErr)
+			}
+			w.nativeOwnerToken = ""
+		}
+		w.mu.Unlock()
+		return "", err
+	}
+	return "acquired", nil
+}
+
+func (w *Worker) releaseNative(ownerToken string, activity bool) (string, error) {
+	ownerToken, err := validateNativeOwnerToken(ownerToken)
+	if err != nil {
+		return "", err
+	}
+	w.mu.Lock()
+	if w.nativeOwnerToken == "" {
+		if w.nativeRefreshBarrier {
+			w.mu.Unlock()
+			return "refresh_scheduled", nil
+		}
+		w.mu.Unlock()
+		return "already_released", nil
+	}
+	if w.nativeOwnerToken != ownerToken {
+		w.mu.Unlock()
+		return "", fmt.Errorf("native provider ownership token does not match Session %s", w.config.Session.ID)
+	}
+	state := "released"
+	needsConnectionBarrier := !w.acpConnected
+	if activity || needsConnectionBarrier {
+		if err := w.persistNativeOwnership(nativeMarkerRefreshPending, ownerToken); err != nil {
+			w.mu.Unlock()
+			return "", fmt.Errorf("persist exact-refresh barrier before releasing native provider ownership: %w", err)
+		}
+		// Every prompt accepted while native owned must remain behind this exact
+		// identity refresh. This is a hard barrier, not the older refresh policy
+		// that allowed pre-existing queued prompts to run first.
+		w.nativeRefreshBarrier = true
+		w.refreshPending = true
+		w.refreshQueueRemaining = 0
+		state = "refresh_scheduled"
+	} else if err := w.removeNativeOwnership(); err != nil {
+		w.mu.Unlock()
+		return "", fmt.Errorf("release exclusive native provider ownership: %w", err)
+	}
+	w.nativeOwnerToken = ""
+	w.mu.Unlock()
+	_, publishErr := w.publish("", "native_released", map[string]any{
+		"activity": activity, "connection_deferred": needsConnectionBarrier, "state": state,
+	})
+	w.signalWake()
+	return state, publishErr
+}
+
+func (w *Worker) nativeOwned() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.nativeOwnerToken != ""
+}
+
+func validateNativeOwnerToken(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", fmt.Errorf("native owner_token is required")
+	}
+	if len(value) > 512 || strings.IndexFunc(value, unicode.IsControl) >= 0 {
+		return "", fmt.Errorf("native owner_token is invalid")
+	}
+	return value, nil
 }
 
 func (w *Worker) publish(requestID, lineType string, data any) (sessionlog.Line, error) {

@@ -86,7 +86,7 @@ func TestTmuxRunnerCreatesAttachesAndReattachesOnePrivateHarness(t *testing.T) {
 			t.Fatalf("tmux metadata leaked %q in %q", forbidden, createCommand)
 		}
 	}
-	if !strings.Contains(createCommand, "'_native' '--session' 'S-EXACT'") {
+	if !strings.Contains(createCommand, "'_native' '--session' 'S-EXACT' '--owner-token' '"+owner+"'") {
 		t.Fatalf("private owner command = %q", createCommand)
 	}
 	if !reflect.DeepEqual(calls[0].arguments[shellIndex+1:shellIndex+5], []string{";", "set-option", "-t", "agent-S-EXACT"}) || calls[0].arguments[shellIndex+5] != tmuxOwnerOption {
@@ -168,7 +168,7 @@ func TestTmuxRunnerRejectsUnownedNameCollision(t *testing.T) {
 		},
 	}
 	err := runner.Run(context.Background(), Invocation{WorkingDirectory: "/repo"}, strings.NewReader(""), io.Discard, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "not owned by this Agent Task Console state root") || attached || !runner.ProcessMayContinue() || runner.NativeActivityOccurred() {
+	if err == nil || !strings.Contains(err.Error(), "not owned by this Agent Task Console state root") || attached || runner.ProcessMayContinue() || runner.NativeActivityOccurred() {
 		t.Fatalf("collision error=%v attached=%t continuing=%t activity=%t", err, attached, runner.ProcessMayContinue(), runner.NativeActivityOccurred())
 	}
 }

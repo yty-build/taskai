@@ -47,6 +47,7 @@ type TmuxRunner struct {
 	Executable       string
 	ConsoleSessionID string
 	StateRoot        string
+	OwnerToken       string
 	mayContinue      bool
 	activityOccurred bool
 	isInteractive    func(io.Reader, io.Writer) bool
@@ -80,10 +81,14 @@ func (r *TmuxRunner) Run(ctx context.Context, invocation Invocation, input io.Re
 		return r.runDirect(ctx, invocation, input, output, errorOutput)
 	}
 	name := TmuxSessionName(r.ConsoleSessionID)
-	owner, err := tmuxOwnerIdentity(r.StateRoot, r.ConsoleSessionID)
+	owner, err := OwnerToken(r.StateRoot, r.ConsoleSessionID)
 	if err != nil {
 		return err
 	}
+	if r.OwnerToken != "" && r.OwnerToken != owner {
+		return fmt.Errorf("native owner token does not match this Agent Task Console state root and Session")
+	}
+	r.OwnerToken = owner
 	hasSession := tmuxHasSession
 	if r.hasSession != nil {
 		hasSession = r.hasSession
@@ -103,7 +108,7 @@ func (r *TmuxRunner) Run(ctx context.Context, invocation Invocation, input io.Re
 		r.mayContinue = true
 	}
 	if !exists {
-		shellCommand := shellJoin(r.Executable, "_native", "--session", r.ConsoleSessionID)
+		shellCommand := shellJoin(r.Executable, "_native", "--session", r.ConsoleSessionID, "--owner-token", owner)
 		arguments := []string{
 			"new-session", "-d", "-s", name, "-c", invocation.WorkingDirectory,
 			"-e", "AGENT_HOME=" + r.StateRoot,
@@ -137,6 +142,7 @@ func (r *TmuxRunner) Run(ctx context.Context, invocation Invocation, input io.Re
 		return err
 	}
 	if !owned {
+		r.mayContinue = false
 		return fmt.Errorf("tmux Session %q already exists but is not owned by this Agent Task Console state root; refusing to attach", name)
 	}
 	r.activityOccurred = true
@@ -157,7 +163,11 @@ func (r *TmuxRunner) runDirect(ctx context.Context, invocation Invocation, input
 	return err
 }
 
-func tmuxOwnerIdentity(stateRoot, consoleSessionID string) (string, error) {
+// OwnerToken is the stable per-state-root, per-Session identity shared by the
+// outer viewer and the hidden tmux provider owner. It contains no filesystem
+// path or provider credential and exists only to make worker acquisition
+// idempotent across that handoff.
+func OwnerToken(stateRoot, consoleSessionID string) (string, error) {
 	if strings.TrimSpace(stateRoot) == "" {
 		return "", fmt.Errorf("Agent Task Console state root is required for native tmux attachment")
 	}
@@ -167,6 +177,10 @@ func tmuxOwnerIdentity(stateRoot, consoleSessionID string) (string, error) {
 	}
 	sum := sha256.Sum256([]byte(filepath.Clean(root)))
 	return fmt.Sprintf("v1:%x:%s", sum, consoleSessionID), nil
+}
+
+func tmuxOwnerIdentity(stateRoot, consoleSessionID string) (string, error) {
+	return OwnerToken(stateRoot, consoleSessionID)
 }
 
 func tmuxSessionOwned(ctx context.Context, run tmuxCommandFunc, tmux, name, expected string) (bool, error) {

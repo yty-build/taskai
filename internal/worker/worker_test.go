@@ -169,8 +169,44 @@ type workerHarness struct {
 	runtime    *Worker
 	client     *SocketClient
 	acp        *fakeACP
+	reconcile  *fakeTranscriptReconciler
 	cancel     context.CancelFunc
 	done       chan error
+}
+
+type fakeTranscriptReconciler struct {
+	mu             sync.Mutex
+	calls          int
+	conversationID string
+	workingDir     string
+	wait           <-chan struct{}
+	err            error
+	started        chan struct{}
+}
+
+func newFakeTranscriptReconciler() *fakeTranscriptReconciler {
+	return &fakeTranscriptReconciler{started: make(chan struct{}, 8)}
+}
+
+func (r *fakeTranscriptReconciler) Reconcile(ctx context.Context, _ agents.Profile, conversationID, workingDirectory string) error {
+	r.mu.Lock()
+	r.calls++
+	r.conversationID = conversationID
+	r.workingDir = workingDirectory
+	wait, err := r.wait, r.err
+	r.mu.Unlock()
+	select {
+	case r.started <- struct{}{}:
+	default:
+	}
+	if wait != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-wait:
+		}
+	}
+	return err
 }
 
 type permissionDecision struct {
@@ -350,10 +386,11 @@ func startWorkerHarness(t *testing.T) *workerHarness {
 		t.Fatal(err)
 	}
 	fake := newFakeACP()
+	reconciler := newFakeTranscriptReconciler()
 	runtime, err := New(Config{
 		Session: createdSession, Profile: agents.Profile{Name: "codex", Provider: "openai", Command: "codex"},
 		Repository: repository, ACP: fake, WorkersDirectory: filepath.Join(root, "workers"), LogsDirectory: filepath.Join(root, "logs"),
-		RefreshTimeout: 250 * time.Millisecond,
+		RefreshTimeout: 250 * time.Millisecond, ReconcileProviderTranscript: reconciler.Reconcile,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -367,7 +404,7 @@ func startWorkerHarness(t *testing.T) *workerHarness {
 		defer stop()
 		return client.Ping(pingContext) == nil
 	})
-	harness := &workerHarness{root: root, repository: repository, runtime: runtime, client: client, acp: fake, cancel: cancel, done: done}
+	harness := &workerHarness{root: root, repository: repository, runtime: runtime, client: client, acp: fake, reconcile: reconciler, cancel: cancel, done: done}
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -417,8 +454,8 @@ func TestWorkerSerializesPromptsBroadcastsAndReplays(t *testing.T) {
 	if err != nil || status.ActiveRequestID != "req-1" || status.Queued != 1 || status.Status != "working" {
 		t.Fatalf("status = %#v, %v", status, err)
 	}
-	if _, err := harness.client.Send(context.Background(), Command{Type: "native_acquire"}); err == nil {
-		t.Fatal("removed native lease command was accepted")
+	if _, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: "owner-active"}); err == nil || !strings.Contains(err.Error(), "ACP request req-1 is active") {
+		t.Fatalf("native acquire during ACP turn error = %v", err)
 	}
 	if _, err := harness.client.Send(context.Background(), Command{Type: "cancel", RequestID: "req-1"}); err != nil {
 		t.Fatal(err)
@@ -716,6 +753,280 @@ func TestNativeRefreshDefersUntilActiveAndQueuedPromptsFinish(t *testing.T) {
 		latest, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
 		return statusErr == nil && !latest.RefreshPending && !latest.Refreshing && latest.Queued == 0 && latest.ActiveRequestID == ""
 	})
+}
+
+func TestNativeOwnershipQueuesACPThroughExactRefreshBarrier(t *testing.T) {
+	harness := startWorkerHarness(t)
+	const ownerToken = "owner-native-barrier"
+	reconcileRelease := make(chan struct{})
+	harness.reconcile.mu.Lock()
+	harness.reconcile.wait = reconcileRelease
+	harness.reconcile.mu.Unlock()
+	acquired, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: ownerToken})
+	if err != nil || acquired.Type != "native_acquired" || acquired.State != "acquired" {
+		t.Fatalf("native acquire = %#v, %v", acquired, err)
+	}
+	if duplicate, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: ownerToken}); err != nil || duplicate.State != "already_acquired" {
+		t.Fatalf("idempotent native acquire = %#v, %v", duplicate, err)
+	}
+	if _, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: "another-owner"}); err == nil || !strings.Contains(err.Error(), "another native provider process") {
+		t.Fatalf("competing native acquire error = %v", err)
+	}
+	marker, err := os.Stat(harness.runtime.NativeOwnerPath())
+	if err != nil || marker.Mode().Perm() != 0o600 {
+		t.Fatalf("native ownership marker = %#v, %v", marker, err)
+	}
+	accepted, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-native", Message: "continue"})
+	if err != nil || accepted.State != "queued" {
+		t.Fatalf("prompt while native owns = %#v, %v", accepted, err)
+	}
+	status, err := harness.client.Send(context.Background(), Command{Type: "status"})
+	if err != nil || !status.NativeOwned || status.ProviderWriter != "native" || status.Queued != 1 || status.ActiveRequestID != "" {
+		t.Fatalf("native-owned status = %#v, %v", status, err)
+	}
+	if _, err := harness.client.Send(context.Background(), Command{Type: "stop"}); err == nil || !strings.Contains(err.Error(), "exit the native provider") {
+		t.Fatalf("stop while native owns error = %v", err)
+	}
+	select {
+	case requestID := <-harness.acp.started:
+		t.Fatalf("ACP prompt %s started while native owned the provider", requestID)
+	case <-time.After(100 * time.Millisecond):
+	}
+	harness.acp.mu.Lock()
+	harness.acp.refreshWait = true
+	harness.acp.mu.Unlock()
+	released, err := harness.client.Send(context.Background(), Command{Type: "native_release", OwnerToken: ownerToken, NativeActivity: true})
+	if err != nil || released.State != "refresh_scheduled" {
+		t.Fatalf("native release = %#v, %v", released, err)
+	}
+	waitFor(t, time.Second, func() bool {
+		status, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
+		return statusErr == nil && !status.NativeOwned && status.Refreshing && status.ProviderWriter == "refresh"
+	})
+	if _, err := os.Stat(harness.runtime.NativeOwnerPath()); err != nil {
+		t.Fatalf("refresh barrier marker disappeared before exact refresh completed: %v", err)
+	}
+	if _, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: ownerToken}); err == nil || !strings.Contains(err.Error(), "identity refresh is active") {
+		t.Fatalf("native acquire during refresh error = %v", err)
+	}
+	select {
+	case requestID := <-harness.acp.started:
+		t.Fatalf("ACP prompt %s beat the exact identity refresh", requestID)
+	case <-time.After(100 * time.Millisecond):
+	}
+	select {
+	case <-harness.reconcile.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("provider transcript reconciliation did not start after exact ACP recovery")
+	}
+	if _, err := os.Stat(harness.runtime.NativeOwnerPath()); err != nil {
+		t.Fatalf("refresh barrier marker disappeared during provider transcript reconciliation: %v", err)
+	}
+	select {
+	case requestID := <-harness.acp.started:
+		t.Fatalf("ACP prompt %s beat provider transcript reconciliation", requestID)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(reconcileRelease)
+	waitStarted(t, harness.acp.started, "req-after-native")
+	harness.acp.mu.Lock()
+	refreshCount, resumeCount := harness.acp.refreshCount, harness.acp.resumeCount
+	harness.acp.mu.Unlock()
+	if refreshCount != 1 || resumeCount != 1 {
+		t.Fatalf("exact refresh/recovery count = %d/%d, want 1/1", refreshCount, resumeCount)
+	}
+	if _, err := os.Stat(harness.runtime.NativeOwnerPath()); !os.IsNotExist(err) {
+		t.Fatalf("native refresh barrier marker remains after exact transcript reconciliation: %v", err)
+	}
+	harness.reconcile.mu.Lock()
+	if harness.reconcile.calls != 1 || harness.reconcile.conversationID != "native-start" || harness.reconcile.workingDir == "" {
+		t.Fatalf("provider transcript reconcile = calls %d, conversation %q, directory %q", harness.reconcile.calls, harness.reconcile.conversationID, harness.reconcile.workingDir)
+	}
+	harness.reconcile.mu.Unlock()
+	harness.acp.Complete("req-after-native")
+}
+
+func TestProviderTranscriptReconcileFailureKeepsDurableBarrierRetryable(t *testing.T) {
+	harness := startWorkerHarness(t)
+	const ownerToken = "owner-reconcile-retry"
+	harness.reconcile.mu.Lock()
+	harness.reconcile.err = errors.New("provider transcript is temporarily unreadable")
+	harness.reconcile.mu.Unlock()
+	if _, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: ownerToken}); err != nil {
+		t.Fatal(err)
+	}
+	if queued, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-blocked-by-reconcile", Message: "must wait"}); err != nil || queued.State != "queued" {
+		t.Fatalf("queued prompt = %#v, %v", queued, err)
+	}
+	if _, err := harness.client.Send(context.Background(), Command{Type: "native_release", OwnerToken: ownerToken, NativeActivity: true}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, func() bool {
+		current, err := harness.repository.GetSession(context.Background(), harness.runtime.config.Session.ID)
+		return err == nil && current.WorkerPID == 0
+	})
+	select {
+	case requestID := <-harness.acp.started:
+		t.Fatalf("ACP prompt %s dispatched after provider transcript reconciliation failed", requestID)
+	case <-time.After(150 * time.Millisecond):
+	}
+	marker, err := os.ReadFile(harness.runtime.NativeOwnerPath())
+	if err != nil || !strings.Contains(string(marker), `"state": "refresh_pending"`) {
+		t.Fatalf("durable refresh barrier after reconcile failure = %q, %v", marker, err)
+	}
+
+	current, err := harness.repository.GetSession(context.Background(), harness.runtime.config.Session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryReconciler := newFakeTranscriptReconciler()
+	retryConfig := harness.runtime.config
+	retryConfig.Session = current
+	retryConfig.ReconcileProviderTranscript = retryReconciler.Reconcile
+	restarted, err := New(retryConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartContext, stopRestart := context.WithCancel(context.Background())
+	restartDone := make(chan error, 1)
+	go func() { restartDone <- restarted.Run(restartContext) }()
+	t.Cleanup(func() {
+		stopRestart()
+		select {
+		case err := <-restartDone:
+			if err != nil {
+				t.Errorf("retry Worker.Run() error = %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Error("retry worker did not stop")
+		}
+	})
+	restartedClient := NewSocketClient(restarted.SocketPath())
+	waitFor(t, 3*time.Second, func() bool {
+		probe, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		return restartedClient.Ping(probe) == nil
+	})
+	waitFor(t, 3*time.Second, func() bool {
+		_, markerErr := os.Stat(restarted.NativeOwnerPath())
+		status, statusErr := restartedClient.Send(context.Background(), Command{Type: "status"})
+		return os.IsNotExist(markerErr) && statusErr == nil && !status.RefreshPending && !status.Refreshing
+	})
+	retryReconciler.mu.Lock()
+	if retryReconciler.calls != 1 {
+		t.Fatalf("provider transcript reconcile retries = %d, want 1", retryReconciler.calls)
+	}
+	retryReconciler.mu.Unlock()
+	if accepted, err := restartedClient.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-reconcile-retry", Message: "continue"}); err != nil || accepted.State != "ready" {
+		t.Fatalf("prompt after retry = %#v, %v", accepted, err)
+	}
+	waitStarted(t, harness.acp.started, "req-after-reconcile-retry")
+	harness.acp.Complete("req-after-reconcile-retry")
+}
+
+func TestNativeOwnershipSurvivesWorkerRestartUntilOwnerRelease(t *testing.T) {
+	harness := startWorkerHarness(t)
+	const ownerToken = "owner-survives-restart"
+	if _, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: ownerToken}); err != nil {
+		t.Fatal(err)
+	}
+	harness.cancel()
+	waitFor(t, 3*time.Second, func() bool {
+		current, err := harness.repository.GetSession(context.Background(), harness.runtime.config.Session.ID)
+		return err == nil && current.WorkerPID == 0 && current.WorkerSocket == ""
+	})
+	if _, err := os.Stat(harness.runtime.NativeOwnerPath()); err != nil {
+		t.Fatalf("native owner marker did not survive worker shutdown: %v", err)
+	}
+
+	current, err := harness.repository.GetSession(context.Background(), harness.runtime.config.Session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := New(Config{
+		Session: current, Profile: harness.runtime.config.Profile,
+		Repository: harness.repository, ACP: harness.acp,
+		WorkersDirectory:            harness.runtime.config.WorkersDirectory,
+		LogsDirectory:               harness.runtime.config.LogsDirectory,
+		RefreshTimeout:              250 * time.Millisecond,
+		ReconcileProviderTranscript: harness.reconcile.Reconcile,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartContext, stopRestart := context.WithCancel(context.Background())
+	restartDone := make(chan error, 1)
+	go func() { restartDone <- restarted.Run(restartContext) }()
+	t.Cleanup(func() {
+		stopRestart()
+		select {
+		case err := <-restartDone:
+			if err != nil {
+				t.Errorf("restarted Worker.Run() error = %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Error("restarted worker did not stop")
+		}
+	})
+	restartedClient := NewSocketClient(restarted.SocketPath())
+	waitFor(t, 3*time.Second, func() bool {
+		pingContext, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		return restartedClient.Ping(pingContext) == nil
+	})
+	status, err := restartedClient.Send(context.Background(), Command{Type: "status"})
+	if err != nil || !status.NativeOwned || status.ProviderWriter != "native" {
+		t.Fatalf("status after worker restart = %#v, %v", status, err)
+	}
+	harness.acp.mu.Lock()
+	resumeCountWhileNative := harness.acp.resumeCount
+	harness.acp.mu.Unlock()
+	if resumeCountWhileNative != 0 {
+		t.Fatalf("worker restart resumed ACP %d time(s) while native still owned the provider", resumeCountWhileNative)
+	}
+	accepted, err := restartedClient.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-worker-restart", Message: "continue"})
+	if err != nil || accepted.State != "queued" {
+		t.Fatalf("restart prompt = %#v, %v", accepted, err)
+	}
+	select {
+	case requestID := <-harness.acp.started:
+		t.Fatalf("ACP prompt %s started after worker restart while native still owned", requestID)
+	case <-time.After(150 * time.Millisecond):
+	}
+	if _, err := restartedClient.Send(context.Background(), Command{Type: "native_release", OwnerToken: ownerToken, NativeActivity: true}); err != nil {
+		t.Fatal(err)
+	}
+	waitStarted(t, harness.acp.started, "req-after-worker-restart")
+	harness.acp.mu.Lock()
+	refreshCount, resumeCountAfterRelease := harness.acp.refreshCount, harness.acp.resumeCount
+	harness.acp.mu.Unlock()
+	if refreshCount != 0 || resumeCountAfterRelease != 1 {
+		t.Fatalf("provider calls after restart release: refresh=%d resume=%d, want 0/1", refreshCount, resumeCountAfterRelease)
+	}
+	if _, err := os.Stat(restarted.NativeOwnerPath()); !os.IsNotExist(err) {
+		t.Fatalf("native owner marker remains after restart refresh: %v", err)
+	}
+	harness.acp.Complete("req-after-worker-restart")
+}
+
+func TestInvalidNativeOwnershipMarkerFailsClosed(t *testing.T) {
+	runtime, fake := disconnectedIdentityWorker(t, "acp-canonical", "native-canonical")
+	if err := os.MkdirAll(runtime.config.WorkersDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(runtime.NativeOwnerPath(), []byte("not-json\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := runtime.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "refusing ACP work until it is recovered explicitly") {
+		t.Fatalf("invalid native marker error = %v", err)
+	}
+	fake.mu.Lock()
+	startCount, resumeCount := fake.startCount, fake.resumeCount
+	fake.mu.Unlock()
+	if startCount != 0 || resumeCount != 0 {
+		t.Fatalf("ACP transport opened despite invalid native marker: start=%d resume=%d", startCount, resumeCount)
+	}
 }
 
 func TestScheduledRefreshKeepsItsQueueBoundaryAheadOfNewPrompts(t *testing.T) {

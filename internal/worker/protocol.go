@@ -18,6 +18,8 @@ type Command struct {
 	PermissionID   string `json:"permission_id,omitempty"`
 	OptionID       string `json:"option_id,omitempty"`
 	Cancelled      bool   `json:"cancelled,omitempty"`
+	OwnerToken     string `json:"owner_token,omitempty"`
+	NativeActivity bool   `json:"native_activity,omitempty"`
 }
 
 type PermissionOption struct {
@@ -46,6 +48,8 @@ type Message struct {
 	Queued          int                 `json:"queued,omitempty"`
 	RefreshPending  bool                `json:"refresh_pending,omitempty"`
 	Refreshing      bool                `json:"refreshing,omitempty"`
+	NativeOwned     bool                `json:"native_owned,omitempty"`
+	ProviderWriter  string              `json:"provider_writer,omitempty"`
 	Permissions     []PendingPermission `json:"permissions,omitempty"`
 	Data            json.RawMessage     `json:"data,omitempty"`
 	Message         string              `json:"message,omitempty"`

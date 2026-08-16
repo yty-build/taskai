@@ -88,6 +88,7 @@ type TaskLaunchResult struct {
 type NativeAttachOptions struct {
 	Runner      native.Runner
 	Verifier    native.Verifier
+	OwnerToken  string
 	Input       io.Reader
 	Output      io.Writer
 	ErrorOutput io.Writer
@@ -553,8 +554,9 @@ func (s *SessionService) Stop(ctx context.Context, id string) error {
 }
 
 // AttachNative opens the real provider harness for the Session's exact
-// canonical provider conversation. ACP work is deliberately left untouched;
-// cross-surface coordination belongs to the user.
+// canonical provider conversation. The worker grants one exclusive provider
+// writer before the provider starts; attachment itself remains a disposable
+// viewer and never owns a tmux-hosted provider lifecycle.
 func (s *SessionService) AttachNative(ctx context.Context, id string, options NativeAttachOptions) error {
 	current, err := s.repository.GetSession(ctx, id)
 	if err != nil {
@@ -599,14 +601,38 @@ func (s *SessionService) AttachNative(ctx context.Context, id string, options Na
 	if err != nil {
 		return fmt.Errorf("Session %s native attachment: %w", id, err)
 	}
+	ownerToken, err := native.OwnerToken(s.home.Root, current.ID)
+	if err != nil {
+		return err
+	}
+	if options.OwnerToken != "" && options.OwnerToken != ownerToken {
+		return fmt.Errorf("Session %s native owner token does not match this Agent Task Console state root", id)
+	}
+	options.OwnerToken = ownerToken
+	if current.WorkerSocket == "" {
+		return fmt.Errorf("Session %s has no live worker to coordinate exclusive provider access; resume the Session before native attachment", id)
+	}
 	if options.Runner == nil {
 		if strings.TrimSpace(s.executable) != "" {
-			options.Runner = &native.TmuxRunner{Executable: s.executable, ConsoleSessionID: current.ID, StateRoot: s.home.Root}
+			options.Runner = &native.TmuxRunner{
+				Executable: s.executable, ConsoleSessionID: current.ID, StateRoot: s.home.Root, OwnerToken: ownerToken,
+			}
 		} else {
 			options.Runner = &native.ExecRunner{}
 		}
+	} else if runner, ok := options.Runner.(*native.TmuxRunner); ok {
+		if runner.OwnerToken != "" && runner.OwnerToken != ownerToken {
+			return fmt.Errorf("Session %s native runner owner token does not match", id)
+		}
+		runner.OwnerToken = ownerToken
 	}
-	s.writeNativeConcurrencyNotice(ctx, current, options.ErrorOutput)
+	acquired, err := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{Type: "native_acquire", OwnerToken: ownerToken})
+	if err != nil {
+		return fmt.Errorf("Session %s native attachment could not acquire exclusive provider access: %w", id, err)
+	}
+	if acquired.Type != "native_acquired" {
+		return fmt.Errorf("Session %s native attachment received unexpected worker response %q", id, acquired.Type)
+	}
 	runErr := options.Runner.Run(ctx, invocation, options.Input, options.Output, options.ErrorOutput)
 	mayContinue := false
 	if aware, ok := options.Runner.(native.MayContinueRunner); ok {
@@ -616,8 +642,14 @@ func (s *SessionService) AttachNative(ctx context.Context, id string, options Na
 	if aware, ok := options.Runner.(native.ActivityAwareRunner); ok {
 		activityOccurred = aware.NativeActivityOccurred()
 	}
-	if activityOccurred && !mayContinue {
-		s.requestNativeRefresh(current, options.ErrorOutput)
+	if !mayContinue {
+		releaseErr := s.releaseNativeOwnership(current, ownerToken, activityOccurred, options.ErrorOutput)
+		if releaseErr != nil && runErr == nil {
+			return releaseErr
+		}
+		if releaseErr != nil {
+			return fmt.Errorf("native harness for Session %s: %v; additionally failed to release exclusive provider access: %w", id, runErr, releaseErr)
+		}
 	}
 	if runErr != nil {
 		return fmt.Errorf("native harness for Session %s: %w", id, runErr)
@@ -625,37 +657,22 @@ func (s *SessionService) AttachNative(ctx context.Context, id string, options Na
 	return nil
 }
 
-func (s *SessionService) writeNativeConcurrencyNotice(ctx context.Context, current session.Session, notices io.Writer) {
-	if current.WorkerSocket == "" {
-		return
-	}
-	status, err := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{Type: "status"})
-	if err != nil {
-		return
-	}
-	if status.ActiveRequestID != "" || status.Queued > 0 || status.Refreshing {
-		fmt.Fprintln(notices, "Agent Task Console: ACP activity is also live. Native attachment will not pause or cancel it; avoid steering both surfaces concurrently unless the provider supports it.")
-	}
-}
-
-func (s *SessionService) requestNativeRefresh(current session.Session, notices io.Writer) {
-	if current.WorkerSocket == "" {
-		return
-	}
-	refreshContext, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+func (s *SessionService) releaseNativeOwnership(current session.Session, ownerToken string, activity bool, notices io.Writer) error {
+	releaseContext, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	message, err := s.runtime.Send(refreshContext, current.WorkerSocket, worker.Command{Type: "refresh"})
+	message, err := s.runtime.Send(releaseContext, current.WorkerSocket, worker.Command{
+		Type: "native_release", OwnerToken: ownerToken, NativeActivity: activity,
+	})
 	if err != nil {
-		fmt.Fprintf(notices, "Agent Task Console: native process exited, but ACP refresh could not be scheduled: %v\n", err)
-		return
+		return fmt.Errorf("release native provider ownership: %w", err)
 	}
-	if message.State == "unavailable" {
-		fmt.Fprintln(notices, "Agent Task Console: ACP refresh was not scheduled because the exact transport is unavailable; resume the stopped Session before sending more work.")
-	} else if message.State == "deferred" {
-		fmt.Fprintln(notices, "Agent Task Console: ACP refresh is deferred until the active turn and queued prompts finish.")
-	} else {
-		fmt.Fprintln(notices, "Agent Task Console: ACP refresh scheduled at the idle boundary.")
+	if message.Type != "native_released" {
+		return fmt.Errorf("unexpected worker response %q while releasing native provider ownership", message.Type)
 	}
+	if message.State == "refresh_scheduled" {
+		fmt.Fprintln(notices, "Agent Task Console: native process exited; exact ACP refresh scheduled before queued prompts.")
+	}
+	return nil
 }
 
 func (s *SessionService) History(ctx context.Context, id string, cursor uint64) ([]sessionlog.Line, error) {
