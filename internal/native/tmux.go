@@ -173,7 +173,10 @@ func tmuxSessionOwned(ctx context.Context, run tmuxCommandFunc, tmux, name, expe
 	deadline := time.Now().Add(tmuxOwnerRetryWindow)
 	for {
 		var output strings.Builder
-		if err := run(ctx, tmux, []string{"show-options", "-qv", "-t", "=" + name, tmuxOwnerOption}, "", nil, &output, io.Discard); err != nil {
+		// tmux 3.5a accepts =name here but silently returns an empty user-option
+		// value. has-session already proved the exact name exists, and tmux gives
+		// a full-name match precedence over prefix matching, so use the plain name.
+		if err := run(ctx, tmux, []string{"show-options", "-qv", "-t", name, tmuxOwnerOption}, "", nil, &output, io.Discard); err != nil {
 			return false, fmt.Errorf("verify native tmux harness %q: %w", name, err)
 		}
 		actual := strings.TrimSpace(output.String())

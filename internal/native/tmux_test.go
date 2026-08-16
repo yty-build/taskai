@@ -100,6 +100,11 @@ func TestTmuxRunnerCreatesAttachesAndReattachesOnePrivateHarness(t *testing.T) {
 			t.Fatalf("attach call %d = %#v", index, calls[index])
 		}
 	}
+	for _, index := range []int{1, 3} {
+		if !reflect.DeepEqual(calls[index].arguments, []string{"show-options", "-qv", "-t", "agent-S-EXACT", tmuxOwnerOption}) {
+			t.Fatalf("owner verification call %d = %#v", index, calls[index])
+		}
+	}
 	if strings.Count(notices.String(), "detach with Ctrl-b d") != 2 {
 		t.Fatalf("tmux notices = %q", notices.String())
 	}
