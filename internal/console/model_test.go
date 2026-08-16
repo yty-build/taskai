@@ -14,6 +14,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/yty-build/acp-gateway/internal/agents"
+	"github.com/yty-build/acp-gateway/internal/presentation"
 	appservice "github.com/yty-build/acp-gateway/internal/service"
 	"github.com/yty-build/acp-gateway/internal/session"
 	"github.com/yty-build/acp-gateway/internal/sessionlog"
@@ -22,24 +23,39 @@ import (
 )
 
 type fakeBackend struct {
-	mu          sync.Mutex
-	detail      task.Detail
-	sessions    map[string]session.Session
-	histories   map[string][]sessionlog.Line
-	prompts     []promptCall
-	permissions []permissionCall
-	cancelled   []string
-	resumed     []string
-	stopped     []string
-	starts      []appservice.StartSessionParams
-	profiles    []agents.Profile
-	promptState string
-	native      []string
+	mu           sync.Mutex
+	detail       task.Detail
+	sessions     map[string]session.Session
+	histories    map[string][]sessionlog.Line
+	historyCalls []historyCall
+	prompts      []promptCall
+	permissions  []permissionCall
+	cancelled    []string
+	resumed      []string
+	stopped      []string
+	starts       []appservice.StartSessionParams
+	profiles     []agents.Profile
+	promptState  string
+	native       []string
+}
+
+type conversationFakeBackend struct {
+	*fakeBackend
+	snapshot appservice.ConversationSnapshot
+}
+
+func (f *conversationFakeBackend) Conversation(context.Context, string) (appservice.ConversationSnapshot, error) {
+	return f.snapshot, nil
 }
 
 type promptCall struct {
 	sessionID string
 	message   string
+}
+
+type historyCall struct {
+	sessionID string
+	cursor    uint64
 }
 
 type permissionCall struct {
@@ -66,6 +82,7 @@ func (f *fakeBackend) Session(_ context.Context, id string) (session.Session, er
 func (f *fakeBackend) History(_ context.Context, id string, cursor uint64) ([]sessionlog.Line, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.historyCalls = append(f.historyCalls, historyCall{sessionID: id, cursor: cursor})
 	var result []sessionlog.Line
 	for _, line := range f.histories[id] {
 		if line.Seq > cursor {
@@ -318,14 +335,128 @@ func TestTaskConsoleMouseUsesScrolledNavigatorWindow(t *testing.T) {
 	}
 	model.width, model.height = 100, 16
 	model.selected = len(model.task.Sessions) - 1
-	indices, start, visible := model.taskSessionWindow(taskNavigatorHeight(model.width, model.height))
+	layout := layoutTaskWorkspace(model.width, model.height)
+	indices, start, visible := model.taskSessionWindow(layout.Navigator.Height)
 	if start == 0 || visible >= len(indices) {
 		t.Fatalf("test did not create a scrolled window: start=%d visible=%d total=%d", start, visible, len(indices))
 	}
-	updated, command := model.Update(tea.MouseMsg(tea.MouseEvent{X: 2, Y: 5, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft}))
+	hits := model.taskSessionHits(layout)
+	if len(hits) == 0 {
+		t.Fatal("layout exposed no visible Session hit targets")
+	}
+	updated, command := model.Update(tea.MouseMsg(tea.MouseEvent{
+		X: hits[0].Rect.X, Y: hits[0].Rect.Y, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft,
+	}))
 	model = updated.(Model)
 	if command != nil || model.selected != indices[start] {
 		t.Fatalf("scrolled mouse selected index %d, want %d; command=%v", model.selected, indices[start], command)
+	}
+}
+
+func TestTaskConsoleMouseUsesResponsiveLayoutHitRegions(t *testing.T) {
+	for _, width := range []int{40, 60, 80, 120} {
+		t.Run(fmt.Sprintf("%d-columns", width), func(t *testing.T) {
+			model := visualTaskModel()
+			model.width, model.height = width, 24
+			model.selected = 1
+			layout := layoutTaskWorkspace(model.width, model.height)
+			hits := model.taskSessionHits(layout)
+			if len(hits) < 2 {
+				t.Fatalf("%d-column layout exposed %d Session targets", width, len(hits))
+			}
+			updated, command := model.handleMouse(tea.MouseEvent{
+				X:      hits[0].Rect.X + hits[0].Rect.Width/2,
+				Y:      hits[0].Rect.Y,
+				Action: tea.MouseActionPress, Button: tea.MouseButtonLeft,
+			})
+			model = updated.(Model)
+			if command != nil || model.selected != 0 {
+				t.Fatalf("%d-column hit selected=%d command=%v", width, model.selected, command)
+			}
+			if layout.Preview.Width > 0 {
+				updated, command = model.handleMouse(tea.MouseEvent{
+					X: layout.Preview.X, Y: layout.Preview.Y,
+					Action: tea.MouseActionPress, Button: tea.MouseButtonLeft,
+				})
+				model = updated.(Model)
+				if command != nil || model.selected != 0 {
+					t.Fatalf("%d-column preview click changed selection=%d command=%v", width, model.selected, command)
+				}
+			}
+		})
+	}
+}
+
+func TestTaskConsoleMouseWheelMovesFilteredSelectionAcrossResponsiveLayouts(t *testing.T) {
+	for _, width := range []int{40, 60, 80, 120} {
+		t.Run(fmt.Sprintf("%d-columns", width), func(t *testing.T) {
+			model := visualTaskModel()
+			model.task.Sessions = nil
+			for index := 0; index < 10; index++ {
+				agent := "claude"
+				if index%2 == 0 {
+					agent = "codex"
+				}
+				model.task.Sessions = append(model.task.Sessions, session.Session{
+					ID: fmt.Sprintf("S-%02d", index), TaskID: "T-VISUAL", Agent: agent,
+					Role: "worker", Status: session.StatusWaiting,
+				})
+			}
+			model.width, model.height = width, 16
+			model.filter = "codex"
+			model.selected = 0
+			model.scroll, model.unread = 7, 2
+			matches := model.filteredSessionIndices()
+			if !reflect.DeepEqual(matches, []int{0, 2, 4, 6, 8}) {
+				t.Fatalf("filtered Sessions = %v", matches)
+			}
+			layout := layoutTaskWorkspace(model.width, model.height)
+			for position := 1; position < len(matches); position++ {
+				updated, command := model.handleMouse(tea.MouseEvent{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown})
+				model = updated.(Model)
+				if command != nil || model.selected != matches[position] {
+					t.Fatalf("wheel step %d selected=%d, want %d; command=%v", position, model.selected, matches[position], command)
+				}
+				indices, start, visible := model.taskSessionWindow(layout.Navigator.Height)
+				selectedPosition := -1
+				for candidate, actual := range indices {
+					if actual == model.selected {
+						selectedPosition = candidate
+						break
+					}
+				}
+				if selectedPosition < start || selectedPosition >= start+visible {
+					t.Fatalf("selected Session is outside visible window: selectedPosition=%d start=%d visible=%d", selectedPosition, start, visible)
+				}
+			}
+			updated, command := model.handleMouse(tea.MouseEvent{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown})
+			model = updated.(Model)
+			if command != nil || model.selected != matches[len(matches)-1] {
+				t.Fatalf("wheel moved past filtered end: selected=%d command=%v", model.selected, command)
+			}
+			updated, command = model.handleMouse(tea.MouseEvent{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp})
+			model = updated.(Model)
+			if command != nil || model.selected != matches[len(matches)-2] || model.scroll != 7 || model.unread != 2 {
+				t.Fatalf("wheel up state: selected=%d scroll=%d unread=%d command=%v", model.selected, model.scroll, model.unread, command)
+			}
+		})
+	}
+}
+
+func TestSessionConsoleMouseWheelRetainsTranscriptScrolling(t *testing.T) {
+	model := visualSessionModel(t)
+	model.scroll, model.unread = 3, 2
+	updated, command := model.handleMouse(tea.MouseEvent{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp})
+	model = updated.(Model)
+	if command != nil || model.scroll != 6 || model.unread != 2 {
+		t.Fatalf("wheel up state: scroll=%d unread=%d command=%v", model.scroll, model.unread, command)
+	}
+	updated, command = model.handleMouse(tea.MouseEvent{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown})
+	model = updated.(Model)
+	updated, command = model.handleMouse(tea.MouseEvent{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown})
+	model = updated.(Model)
+	if command != nil || model.scroll != 0 || model.unread != 0 {
+		t.Fatalf("wheel down state: scroll=%d unread=%d command=%v", model.scroll, model.unread, command)
 	}
 }
 
@@ -518,6 +649,278 @@ func TestSessionConsoleReplaysThenDeduplicatesLiveAndTogglesRaw(t *testing.T) {
 	model = updated.(Model)
 	if !model.raw || !strings.Contains(model.View(), `"seq":2`) {
 		t.Fatalf("raw view not enabled:\n%s", model.View())
+	}
+}
+
+func TestSessionConsoleLoadsProviderHistoryAndKeepsLiveACPEventsAcrossReconcile(t *testing.T) {
+	base := newConsoleBackend()
+	snapshot := appservice.ConversationSnapshot{
+		Source:        appservice.ConversationSourceProvider,
+		GatewayCursor: 40,
+		Turns: []appservice.ConversationTurn{
+			{
+				Key:       "provider-first",
+				Committed: true,
+				Activities: []appservice.ConversationActivity{
+					{Display: &presentation.Activity{Type: "user_message", Text: "First ACP prompt"}},
+					{Display: &presentation.Activity{Type: "assistant_chunk", Text: "First answer"}},
+					{Display: &presentation.Activity{Type: "turn_state", State: "complete"}},
+				},
+			},
+			{
+				Key:       "provider-native",
+				Committed: true,
+				Activities: []appservice.ConversationActivity{
+					{Display: &presentation.Activity{Type: "user_message", Text: "Native-only prompt"}},
+					{Kind: "provider_transcript", Display: &presentation.Activity{Type: "thought_chunk", Text: "Native reasoning summary"}},
+					{Kind: "provider_transcript", Display: &presentation.Activity{Type: "assistant_chunk", Text: "Native answer"}},
+					{Display: &presentation.Activity{Type: "turn_state", State: "complete"}},
+				},
+			},
+		},
+	}
+	backend := &conversationFakeBackend{fakeBackend: base, snapshot: snapshot}
+	model, cancel, err := newSessionModel(context.Background(), backend, "S-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+
+	if got := model.View(); !strings.Contains(got, "Native-only prompt") || !strings.Contains(got, "Reasoning · stored provider history · 1 line") || !strings.Contains(got, "RESPONSE · GEMINI · committed provider history") || !strings.Contains(got, "Native answer") {
+		t.Fatalf("provider-backed transcript is incomplete:\n%s", got)
+	}
+	nativeTurn := model.projections["S-1"].byID["provider-native"]
+	if nativeTurn == nil || !nativeTurn.reasoningSeen || len(nativeTurn.blocks) < 2 || nativeTurn.blocks[1].kind != blockThought || nativeTurn.blocks[1].text != "Native reasoning summary" {
+		t.Fatalf("provider reasoning projection = %#v", nativeTurn)
+	}
+	if model.cursors["S-1"] != 40 {
+		t.Fatalf("provider snapshot cursor = %d, want 40", model.cursors["S-1"])
+	}
+
+	// An ACP event can arrive while the provider refresh is being read. A
+	// completed snapshot must not erase anything newer than its captured cursor.
+	model.addActivity("S-1", projectionLine(41, "REQ-LIVE", "prompt_submitted", map[string]any{"display_message": "Live follow-up"}), true)
+	model.addActivity("S-1", projectionACPLine(42, "REQ-LIVE", "agent_message_chunk", sessionUpdate(messageUpdate("agent_message_chunk", "Still streaming", "live-message"))), true)
+	updated, _ := model.Update(conversationMsg{sessionID: "S-1", snapshot: snapshot})
+	model = updated.(Model)
+
+	if got := model.View(); !strings.Contains(got, "Native-only prompt") || !strings.Contains(got, "Live follow-up") || !strings.Contains(got, "Still streaming") {
+		t.Fatalf("atomic reconciliation dropped committed or live content:\n%s", got)
+	}
+	if model.cursors["S-1"] != 42 {
+		t.Fatalf("cursor after buffered live events = %d, want 42", model.cursors["S-1"])
+	}
+}
+
+func TestSessionConsoleAdoptsGatewayFallbackSnapshotBeforeRawHistory(t *testing.T) {
+	base := newConsoleBackend()
+	base.histories["S-1"] = []sessionlog.Line{
+		projectionLine(10, "REQ-RAW-COVERED", "prompt_submitted", map[string]any{"display_message": "covered raw prompt"}),
+		projectionLine(21, "REQ-AFTER-CAPTURE", "prompt_submitted", map[string]any{"display_message": "newer live prompt"}),
+	}
+	snapshot := appservice.ConversationSnapshot{
+		Source: appservice.ConversationSourceGateway, GatewayCursor: 20,
+		Warning: "Provider history is unavailable; showing gateway history.",
+		Turns: []appservice.ConversationTurn{{
+			Key: "REQ-BOUNDED", Committed: false,
+			Activities: []appservice.ConversationActivity{
+				{Position: 10, RequestID: "REQ-BOUNDED", Kind: "prompt_submitted", Display: &presentation.Activity{Type: "user_message", Text: "bounded gateway prompt"}},
+				{Position: 11, RequestID: "REQ-BOUNDED", Kind: "agent_message_chunk", Display: &presentation.Activity{Type: "assistant_chunk", Text: "bounded gateway answer"}},
+			},
+		}},
+	}
+	backend := &conversationFakeBackend{fakeBackend: base, snapshot: snapshot}
+	model, cancel, err := newSessionModel(context.Background(), backend, "S-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+
+	view := model.View()
+	for _, want := range []string{"bounded gateway prompt", "bounded gateway answer", "newer live prompt"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("gateway snapshot view missing %q:\n%s", want, view)
+		}
+	}
+	if strings.Contains(view, "covered raw prompt") {
+		t.Fatalf("snapshot-covered raw activity was independently projected:\n%s", view)
+	}
+	if model.notice != snapshot.Warning || model.snapshotCursors["S-1"] != 20 || model.cursors["S-1"] != 21 {
+		t.Fatalf("fallback state: notice=%q snapshotCursor=%d cursor=%d", model.notice, model.snapshotCursors["S-1"], model.cursors["S-1"])
+	}
+	if got := len(model.histories["S-1"]); got != 1 || model.histories["S-1"][0].Seq != 21 {
+		t.Fatalf("post-snapshot raw history = %#v, want only position 21", model.histories["S-1"])
+	}
+	if _, exists := model.projections["S-1"].byID["REQ-RAW-COVERED"]; exists {
+		t.Fatal("snapshot-covered raw request was re-applied")
+	}
+	base.mu.Lock()
+	historyCalls := append([]historyCall(nil), base.historyCalls...)
+	base.mu.Unlock()
+	if !reflect.DeepEqual(historyCalls, []historyCall{{sessionID: "S-1", cursor: 20}}) {
+		t.Fatalf("History calls = %#v, want captured cursor 20", historyCalls)
+	}
+	model.raw = true
+	if raw := model.View(); strings.Contains(raw, `"seq":10`) || !strings.Contains(raw, `"seq":21`) || !strings.Contains(raw, "Pre-snapshot raw is not retained") || !strings.Contains(raw, "acpctl session logs <id> --raw") {
+		t.Fatalf("bounded raw diagnostics are misleading or incomplete:\n%s", raw)
+	}
+}
+
+func TestConversationSnapshotCursorRejectsLateProjectionButKeepsRawHistory(t *testing.T) {
+	backend := newConsoleBackend()
+	model := baseModel(context.Background(), backend)
+	defer model.manager.cancel()
+	model.mode = sessionView
+	model.current = session.Session{ID: "S-LATE", ProviderConversationID: "provider-conversation"}
+	model.scroll = 3
+	snapshot := appservice.ConversationSnapshot{
+		Source: appservice.ConversationSourceProvider, GatewayCursor: 40,
+		Turns: []appservice.ConversationTurn{{
+			Key: "provider-committed", Committed: true,
+			Activities: []appservice.ConversationActivity{
+				{Display: &presentation.Activity{Type: "user_message", Text: "committed prompt"}},
+				{Display: &presentation.Activity{Type: "assistant_chunk", Text: "committed answer"}},
+			},
+		}},
+	}
+	updated, command := model.Update(conversationMsg{sessionID: "S-LATE", snapshot: snapshot})
+	model = updated.(Model)
+	if command != nil || model.snapshotCursors["S-LATE"] != 40 {
+		t.Fatalf("snapshot adoption: cursor=%d command=%v", model.snapshotCursors["S-LATE"], command)
+	}
+
+	for _, line := range []sessionlog.Line{
+		projectionLine(39, "REQ-LATE-39", "prompt_submitted", map[string]any{"display_message": "late covered 39"}),
+		projectionLine(40, "REQ-LATE-40", "prompt_submitted", map[string]any{"display_message": "late covered 40"}),
+	} {
+		model.addActivity("S-LATE", line, true)
+	}
+	if got := len(model.histories["S-LATE"]); got != 2 {
+		t.Fatalf("late raw history has %d records, want 2", got)
+	}
+	if len(model.projections["S-LATE"].requests) != 1 || model.projections["S-LATE"].byID["REQ-LATE-39"] != nil || model.projections["S-LATE"].byID["REQ-LATE-40"] != nil {
+		t.Fatalf("snapshot-covered activities were re-applied: requests=%v", model.projections["S-LATE"].byID)
+	}
+	if model.unread != 0 {
+		t.Fatalf("snapshot-covered late delivery incremented unread to %d", model.unread)
+	}
+
+	model.addActivity("S-LATE", projectionLine(41, "REQ-NEW", "prompt_submitted", map[string]any{"display_message": "after snapshot"}), true)
+	if model.projections["S-LATE"].byID["REQ-NEW"] == nil || model.unread != 1 || model.cursors["S-LATE"] != 41 {
+		t.Fatalf("post-snapshot activity was not projected: unread=%d cursor=%d", model.unread, model.cursors["S-LATE"])
+	}
+	model.raw = true
+	if raw := model.View(); !strings.Contains(raw, `"seq":39`) || !strings.Contains(raw, `"seq":40`) || !strings.Contains(raw, `"seq":41`) {
+		t.Fatalf("raw history is incomplete after reconciliation:\n%s", raw)
+	}
+
+	stale := appservice.ConversationSnapshot{
+		Source: appservice.ConversationSourceGateway, GatewayCursor: 39,
+		Turns: []appservice.ConversationTurn{{Key: "stale-snapshot", Activities: []appservice.ConversationActivity{{Display: &presentation.Activity{Type: "user_message", Text: "stale replacement"}}}}},
+	}
+	if model.adoptConversationSnapshot("S-LATE", stale) {
+		t.Fatal("strictly older snapshot replaced the adopted projection")
+	}
+	if model.projections["S-LATE"].byID["stale-snapshot"] != nil || model.snapshotCursors["S-LATE"] != 40 {
+		t.Fatalf("stale snapshot mutated projection: cursor=%d", model.snapshotCursors["S-LATE"])
+	}
+
+	downgrade := appservice.ConversationSnapshot{
+		Source: appservice.ConversationSourceGateway, GatewayCursor: 41,
+		Warning: "Provider history is temporarily unavailable.",
+		Turns: []appservice.ConversationTurn{{
+			Key: "fallback-replacement", Committed: false,
+			Activities: []appservice.ConversationActivity{
+				{Display: &presentation.Activity{Type: "user_message", Text: "fallback replacement"}},
+				{Display: &presentation.Activity{Type: "turn_state", State: "complete"}},
+			},
+		}},
+	}
+	updated, command = model.Update(conversationMsg{sessionID: "S-LATE", snapshot: downgrade})
+	model = updated.(Model)
+	if command == nil || !model.conversationCommitPending["S-LATE"] || !strings.Contains(model.notice, "refresh is delayed") {
+		t.Fatalf("provider downgrade did not retain promotion retry: pending=%v notice=%q command=%v", model.conversationCommitPending["S-LATE"], model.notice, command)
+	}
+	if model.snapshotSources["S-LATE"] != appservice.ConversationSourceProvider || model.snapshotCursors["S-LATE"] != 40 || model.projections["S-LATE"].byID["fallback-replacement"] != nil || model.projections["S-LATE"].byID["REQ-NEW"] == nil {
+		t.Fatalf("gateway fallback replaced provider/live projection: source=%q cursor=%d", model.snapshotSources["S-LATE"], model.snapshotCursors["S-LATE"])
+	}
+}
+
+func TestConversationCommitRetryContinuesUntilProviderSnapshotCommits(t *testing.T) {
+	backend := newConsoleBackend()
+	model := baseModel(context.Background(), backend)
+	defer model.manager.cancel()
+	model.current = session.Session{ID: "S-1", ProviderConversationID: "provider-conversation"}
+	pending := appservice.ConversationSnapshot{
+		Source: appservice.ConversationSourceGateway,
+		Turns: []appservice.ConversationTurn{{
+			Key: "REQ-pending", Committed: false,
+			Activities: []appservice.ConversationActivity{{
+				Kind: "turn_completed", Display: &presentation.Activity{Type: "turn_state", State: "complete"},
+			}},
+		}},
+	}
+	updated, command := model.Update(conversationMsg{sessionID: "S-1", snapshot: pending})
+	model = updated.(Model)
+	if command == nil || !model.conversationCommitPending["S-1"] || model.conversationCommitRetries["S-1"] != 1 {
+		t.Fatalf("pending provider commit did not schedule retry: pending=%v retries=%d command=%v", model.conversationCommitPending["S-1"], model.conversationCommitRetries["S-1"], command)
+	}
+
+	updated, command = model.Update(conversationMsg{sessionID: "S-1", err: fmt.Errorf("provider store still flushing")})
+	model = updated.(Model)
+	if command == nil || model.conversationCommitRetries["S-1"] != 2 || !strings.Contains(model.notice, "live ACP output remains current") {
+		t.Fatalf("transient provider error stopped retrying: retries=%d notice=%q command=%v", model.conversationCommitRetries["S-1"], model.notice, command)
+	}
+
+	committed := pending
+	committed.Turns = append([]appservice.ConversationTurn(nil), pending.Turns...)
+	committed.Turns[0].Committed = true
+	committed.Source = appservice.ConversationSourceProvider
+	updated, command = model.Update(conversationMsg{sessionID: "S-1", snapshot: committed})
+	model = updated.(Model)
+	if command != nil || model.conversationCommitPending["S-1"] || model.conversationCommitRetries["S-1"] != 0 {
+		t.Fatalf("committed provider snapshot left retry state: pending=%v retries=%d command=%v", model.conversationCommitPending["S-1"], model.conversationCommitRetries["S-1"], command)
+	}
+
+	cancelled := pending
+	cancelled.Turns = append([]appservice.ConversationTurn(nil), pending.Turns...)
+	cancelled.Turns[0].Activities = []appservice.ConversationActivity{{
+		Kind: "turn_cancelled", Display: &presentation.Activity{Type: "turn_state", State: "cancelled"},
+	}}
+	if conversationSnapshotNeedsCommit(cancelled) {
+		t.Fatal("cancelled turn incorrectly requested perpetual provider commit polling")
+	}
+	if conversationCommitRetryDelay(0) != 220*time.Millisecond || conversationCommitRetryDelay(6) != 10*time.Second {
+		t.Fatalf("conversation retry delays = %s, %s", conversationCommitRetryDelay(0), conversationCommitRetryDelay(6))
+	}
+
+	for _, test := range []struct {
+		name      string
+		identity  string
+		turnState string
+	}{
+		{name: "missing canonical identity", turnState: "complete"},
+		{name: "live turn", identity: "provider-conversation", turnState: "working"},
+		{name: "failed turn", identity: "provider-conversation", turnState: "error"},
+		{name: "cancelled turn", identity: "provider-conversation", turnState: "cancelled"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := baseModel(context.Background(), backend)
+			defer candidate.manager.cancel()
+			candidate.current = session.Session{ID: "S-OTHER", ProviderConversationID: test.identity}
+			snapshot := appservice.ConversationSnapshot{
+				Source: appservice.ConversationSourceGateway,
+				Turns: []appservice.ConversationTurn{{
+					Key: "REQ-other", Committed: false,
+					Activities: []appservice.ConversationActivity{{Display: &presentation.Activity{Type: "turn_state", State: test.turnState}}},
+				}},
+			}
+			updated, retry := candidate.Update(conversationMsg{sessionID: "S-OTHER", snapshot: snapshot})
+			candidate = updated.(Model)
+			if retry != nil || candidate.conversationCommitPending["S-OTHER"] {
+				t.Fatalf("ineligible fallback scheduled promotion: pending=%v command=%v", candidate.conversationCommitPending["S-OTHER"], retry)
+			}
+		})
 	}
 }
 

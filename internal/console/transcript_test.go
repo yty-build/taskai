@@ -59,6 +59,73 @@ func TestTranscriptProjectsTurnsAndCoalescesRealShapedACP(t *testing.T) {
 	}
 }
 
+func TestTranscriptPreservesInterleavedReasoningChronology(t *testing.T) {
+	projection := newTranscript()
+	requestID := "REQ-ORDER"
+	lines := []sessionlog.Line{
+		projectionLine(1, requestID, "prompt_submitted", map[string]any{"display_message": "Investigate."}),
+		projectionLine(2, requestID, "turn_started", map[string]any{}),
+		projectionACPLine(3, requestID, "agent_thought_chunk", sessionUpdate(messageUpdate("agent_thought_chunk", "reason one", "thought-1"))),
+		projectionACPLine(4, requestID, "agent_message_chunk", sessionUpdate(messageUpdate("agent_message_chunk", "update one", "message-1"))),
+		projectionACPLine(5, requestID, "tool_call", sessionUpdate(map[string]any{"sessionUpdate": "tool_call", "toolCallId": "tool-1", "title": "Inspect", "status": "completed"})),
+		projectionACPLine(6, requestID, "agent_thought_chunk", sessionUpdate(messageUpdate("agent_thought_chunk", "reason two", "thought-2"))),
+		projectionACPLine(7, requestID, "agent_message_chunk", sessionUpdate(messageUpdate("agent_message_chunk", "final response", "message-2"))),
+		projectionLine(8, requestID, "turn_completed", map[string]any{"stopReason": "end_turn"}),
+	}
+	for _, line := range lines {
+		projection.apply(line)
+	}
+	request := projection.requests[0]
+	wantKinds := []blockKind{blockUser, blockThought, blockAssistant, blockTool, blockThought, blockAssistant}
+	if len(request.blocks) != len(wantKinds) {
+		t.Fatalf("blocks = %d, want %d: %#v", len(request.blocks), len(wantKinds), request.blocks)
+	}
+	for index, want := range wantKinds {
+		if request.blocks[index].kind != want {
+			t.Fatalf("block %d kind = %d, want %d", index, request.blocks[index].kind, want)
+		}
+	}
+	if request.blocks[1].text != "reason one" || request.blocks[4].text != "reason two" {
+		t.Fatalf("reasoning segments merged out of order: %#v", request.blocks)
+	}
+	if got := request.completedResponse(); got == nil || got.text != "final response" {
+		t.Fatalf("completed response = %#v", got)
+	}
+}
+
+func TestTranscriptRetainsRecentAssistantAndReasoningTails(t *testing.T) {
+	projection := newTranscript()
+	requestID := "REQ-TAIL"
+	projection.apply(projectionLine(1, requestID, "prompt_submitted", map[string]any{"display_message": "Stream a lot."}))
+	projection.apply(projectionACPLine(2, requestID, "agent_message_chunk", sessionUpdate(messageUpdate("agent_message_chunk", strings.Repeat("a", maxProjectedMessageBytes), "message"))))
+	projection.apply(projectionACPLine(3, requestID, "agent_message_chunk", sessionUpdate(messageUpdate("agent_message_chunk", "FINAL-MARKER", "message"))))
+	projection.apply(projectionACPLine(4, requestID, "agent_thought_chunk", sessionUpdate(messageUpdate("agent_thought_chunk", strings.Repeat("r", maxProjectedThoughtBytes), "thought"))))
+	projection.apply(projectionACPLine(5, requestID, "agent_thought_chunk", sessionUpdate(messageUpdate("agent_thought_chunk", "REASONING-TAIL", "thought"))))
+
+	request := projection.requests[0]
+	if request.assistantBytes > maxProjectedMessageBytes || request.thoughtBytes > maxProjectedThoughtBytes {
+		t.Fatalf("retention exceeded limits: assistant=%d thought=%d", request.assistantBytes, request.thoughtBytes)
+	}
+	if !request.contentClipped || !request.assistantSeen || !request.reasoningSeen {
+		t.Fatalf("retention provenance was lost: clipped=%v assistant=%v reasoning=%v", request.contentClipped, request.assistantSeen, request.reasoningSeen)
+	}
+	var assistant, thought *transcriptBlock
+	for _, block := range request.blocks {
+		switch block.kind {
+		case blockAssistant:
+			assistant = block
+		case blockThought:
+			thought = block
+		}
+	}
+	if assistant == nil || !strings.HasSuffix(assistant.text, "FINAL-MARKER") || !assistant.truncated {
+		t.Fatalf("assistant tail was not retained: %#v", assistant)
+	}
+	if thought == nil || !strings.HasSuffix(thought.text, "REASONING-TAIL") || !thought.truncated {
+		t.Fatalf("reasoning tail was not retained: %#v", thought)
+	}
+}
+
 func TestTranscriptProjectsLegacySessionPromptWithoutTransportScaffolding(t *testing.T) {
 	projection := newTranscript()
 	prompt := "Task T-1: Claude review\nDescription: (none)\nSession: S-1\nRole: reviewer\nRepository: /repo\nWorktree: /worktree\nBranch: agent/review\nWork in the repository context at /worktree. This is one Session under the Task; preserve the Task/Session boundary.\n\nSession-specific instructions:\nReview the implementation and report any problems."

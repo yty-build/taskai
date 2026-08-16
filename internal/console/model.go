@@ -9,6 +9,7 @@ import (
 	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
+	appservice "github.com/yty-build/acp-gateway/internal/service"
 	"github.com/yty-build/acp-gateway/internal/session"
 	"github.com/yty-build/acp-gateway/internal/sessionlog"
 	"github.com/yty-build/acp-gateway/internal/task"
@@ -95,10 +96,14 @@ type Model struct {
 	current  session.Session
 	selected int
 
-	histories   map[string][]sessionlog.Line
-	projections map[string]*transcript
-	cursors     map[string]uint64
-	seen        map[string]map[uint64]struct{}
+	histories                 map[string][]sessionlog.Line
+	projections               map[string]*transcript
+	cursors                   map[string]uint64
+	snapshotCursors           map[string]uint64
+	snapshotSources           map[string]appservice.ConversationSource
+	seen                      map[string]map[uint64]struct{}
+	conversationCommitPending map[string]bool
+	conversationCommitRetries map[string]int
 
 	raw           bool
 	showReasoning bool
@@ -134,6 +139,17 @@ type actionMsg struct {
 	accepted  worker.Message
 	current   session.Session
 	err       error
+}
+
+type conversationMsg struct {
+	sessionID string
+	snapshot  appservice.ConversationSnapshot
+	err       error
+}
+
+type conversationRetryMsg struct {
+	sessionID string
+	attempt   int
 }
 
 func newTaskModel(parent context.Context, backend Backend, taskID string) (Model, context.CancelFunc, error) {
@@ -181,14 +197,38 @@ func baseModel(ctx context.Context, backend Backend) Model {
 	return Model{
 		ctx: ctx, backend: backend, manager: newWatchManager(ctx, backend),
 		histories: make(map[string][]sessionlog.Line), projections: make(map[string]*transcript),
-		cursors: make(map[string]uint64), seen: make(map[string]map[uint64]struct{}),
+		cursors: make(map[string]uint64), snapshotCursors: make(map[string]uint64),
+		snapshotSources: make(map[string]appservice.ConversationSource), seen: make(map[string]map[uint64]struct{}),
+		conversationCommitPending: make(map[string]bool), conversationCommitRetries: make(map[string]int),
 		width: 100, height: 30,
 	}
 }
 
 func (m *Model) loadStored(current session.Session) error {
-	lines, err := m.backend.History(m.ctx, current.ID, 0)
+	snapshotLoaded := false
+	historyCursor := uint64(0)
+	snapshotWarning := ""
+	if backend, ok := m.backend.(conversationBackend); ok {
+		snapshot, err := backend.Conversation(m.ctx, current.ID)
+		if err == nil && isConversationSnapshot(snapshot) {
+			m.adoptConversationSnapshot(current.ID, snapshot)
+			m.conversationCommitPending[current.ID] = conversationSnapshotNeedsPromotion(current, snapshot)
+			snapshotLoaded = true
+			historyCursor = snapshot.GatewayCursor
+		}
+		if err == nil {
+			snapshotWarning = conversationSnapshotNotice(snapshot)
+			if snapshotWarning != "" {
+				m.notice = snapshotWarning
+			}
+		}
+	}
+	lines, err := m.backend.History(m.ctx, current.ID, historyCursor)
 	if err != nil {
+		if snapshotLoaded {
+			m.notice = strings.TrimSpace(snapshotWarning + " Conversation loaded; raw gateway diagnostics are temporarily unavailable.")
+			return nil
+		}
 		return fmt.Errorf("replay Session %s history: %w", current.ID, err)
 	}
 	for _, line := range lines {
@@ -198,7 +238,13 @@ func (m *Model) loadStored(current session.Session) error {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.manager.wait(), refreshTickCmd())
+	commands := []tea.Cmd{m.manager.wait(), refreshTickCmd()}
+	for sessionID, pending := range m.conversationCommitPending {
+		if pending {
+			commands = append(commands, m.scheduleConversationCommitRetry(sessionID))
+		}
+	}
+	return tea.Batch(commands...)
 }
 
 func refreshTickCmd() tea.Cmd {
@@ -246,7 +292,80 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 		return m, nil
 	case activityMsg:
 		m.addActivity(message.sessionID, message.line, true)
-		return m, m.manager.wait()
+		wait := m.manager.wait()
+		if shouldReconcileConversation(message.line) {
+			if _, ok := m.backend.(conversationBackend); ok {
+				if message.line.Type == "turn_completed" {
+					m.ensureConversationCommitState()
+					m.conversationCommitPending[message.sessionID] = true
+					m.conversationCommitRetries[message.sessionID] = 0
+				}
+				return m, tea.Batch(wait, conversationSnapshotCmd(m.ctx, m.backend, message.sessionID))
+			}
+		}
+		return m, wait
+	case conversationMsg:
+		if message.err != nil {
+			m.notice = "Provider history refresh delayed; live ACP output remains current."
+			if m.conversationCommitPending[message.sessionID] && m.canRetryConversationPromotion(message.sessionID) {
+				return m, m.scheduleConversationCommitRetry(message.sessionID)
+			}
+			delete(m.conversationCommitPending, message.sessionID)
+			delete(m.conversationCommitRetries, message.sessionID)
+			return m, nil
+		}
+		if !isConversationSnapshot(message.snapshot) {
+			if notice := conversationSnapshotNotice(message.snapshot); notice != "" {
+				m.notice = notice
+			}
+			return m, nil
+		}
+		if m.snapshotSources[message.sessionID] == appservice.ConversationSourceProvider && message.snapshot.Source == appservice.ConversationSourceGateway {
+			m.notice = "Provider history refresh is delayed; live ACP output remains current."
+			current, hasSession := m.session(message.sessionID)
+			if hasSession && conversationSnapshotNeedsPromotion(current, message.snapshot) {
+				m.conversationCommitPending[message.sessionID] = true
+			}
+			if m.conversationCommitPending[message.sessionID] && m.canRetryConversationPromotion(message.sessionID) {
+				return m, m.scheduleConversationCommitRetry(message.sessionID)
+			}
+			delete(m.conversationCommitPending, message.sessionID)
+			delete(m.conversationCommitRetries, message.sessionID)
+			return m, nil
+		}
+		if notice := conversationSnapshotNotice(message.snapshot); notice != "" {
+			m.notice = notice
+		}
+		if !m.adoptConversationSnapshot(message.sessionID, message.snapshot) {
+			if m.conversationCommitPending[message.sessionID] && m.canRetryConversationPromotion(message.sessionID) {
+				return m, m.scheduleConversationCommitRetry(message.sessionID)
+			}
+			delete(m.conversationCommitPending, message.sessionID)
+			delete(m.conversationCommitRetries, message.sessionID)
+			return m, nil
+		}
+		current, hasSession := m.session(message.sessionID)
+		eligible := hasSession && conversationSnapshotNeedsPromotion(current, message.snapshot)
+		if eligible || (message.snapshot.Source == appservice.ConversationSourceGateway && hasSession && strings.TrimSpace(current.ProviderConversationID) != "" && m.conversationCommitPending[message.sessionID]) {
+			m.conversationCommitPending[message.sessionID] = true
+			return m, m.scheduleConversationCommitRetry(message.sessionID)
+		}
+		if message.snapshot.Source == appservice.ConversationSourceGateway && hasSession && strings.TrimSpace(current.ProviderConversationID) != "" {
+			return m, nil
+		}
+		delete(m.conversationCommitPending, message.sessionID)
+		delete(m.conversationCommitRetries, message.sessionID)
+		return m, nil
+	case conversationRetryMsg:
+		if !m.conversationCommitPending[message.sessionID] || m.conversationCommitRetries[message.sessionID] != message.attempt {
+			return m, nil
+		}
+		if !m.canRetryConversationPromotion(message.sessionID) {
+			delete(m.conversationCommitPending, message.sessionID)
+			delete(m.conversationCommitRetries, message.sessionID)
+			return m, nil
+		}
+		return m, conversationSnapshotCmd(m.ctx, m.backend, message.sessionID)
 	case consoleErrorMsg:
 		m.notice = "Live stream: " + message.err.Error()
 		return m, m.manager.wait()
@@ -608,13 +727,21 @@ func (m Model) handleMouse(event tea.MouseEvent) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if event.Button == tea.MouseButtonWheelUp {
-		m.scroll += 3
+		if m.mode == taskView {
+			m.moveTaskSelection(-1)
+		} else {
+			m.scroll += 3
+		}
 		return m, nil
 	}
 	if event.Button == tea.MouseButtonWheelDown {
-		m.scroll = max(0, m.scroll-3)
-		if m.scroll == 0 {
-			m.unread = 0
+		if m.mode == taskView {
+			m.moveTaskSelection(1)
+		} else {
+			m.scroll = max(0, m.scroll-3)
+			if m.scroll == 0 {
+				m.unread = 0
+			}
 		}
 		return m, nil
 	}
@@ -624,17 +751,18 @@ func (m Model) handleMouse(event tea.MouseEvent) (tea.Model, tea.Cmd) {
 	if m.width < minimumConsoleWidth || m.height < minimumConsoleHeight {
 		return m, nil
 	}
-	const firstSessionRow = 5
-	if m.width >= 92 && event.X >= taskNavigatorWidth(m.width) {
+	layout := layoutTaskWorkspace(m.width, m.height)
+	selected := -1
+	for _, hit := range m.taskSessionHits(layout) {
+		if hit.Rect.contains(event.X, event.Y) {
+			selected = hit.SessionIndex
+			break
+		}
+	}
+	if selected < 0 {
 		return m, nil
 	}
-	position := (event.Y - firstSessionRow) / 2
-	indices, start, visible := m.taskSessionWindow(taskNavigatorHeight(m.width, m.height))
-	actualPosition := start + position
-	if event.Y < firstSessionRow || position < 0 || position >= visible || actualPosition >= len(indices) {
-		return m, nil
-	}
-	m.selected = indices[actualPosition]
+	m.selected = selected
 	current := m.task.Sessions[m.selected]
 	capability := nativeCapability(current)
 	if capability.available {
@@ -868,6 +996,135 @@ func sessionActionCmd(ctx context.Context, backend Backend, kind, sessionID stri
 	}
 }
 
+func conversationSnapshotCmd(ctx context.Context, backend Backend, sessionID string) tea.Cmd {
+	return func() tea.Msg {
+		provider, ok := backend.(conversationBackend)
+		if !ok {
+			return conversationMsg{sessionID: sessionID}
+		}
+		snapshot, err := provider.Conversation(ctx, sessionID)
+		return conversationMsg{sessionID: sessionID, snapshot: snapshot, err: err}
+	}
+}
+
+func isConversationSnapshot(snapshot appservice.ConversationSnapshot) bool {
+	return snapshot.Source == appservice.ConversationSourceProvider || snapshot.Source == appservice.ConversationSourceGateway
+}
+
+func conversationSnapshotNotice(snapshot appservice.ConversationSnapshot) string {
+	if warning := strings.TrimSpace(snapshot.Warning); warning != "" {
+		return warning
+	}
+	if snapshot.Truncated {
+		return "Earlier conversation history was omitted by bounded viewer limits."
+	}
+	return ""
+}
+
+// adoptConversationSnapshot constructs the replacement projection off-screen,
+// overlays only gateway positions captured after the snapshot, and publishes
+// both the projection and its coverage cursor in one Bubble Tea update. A
+// strictly older response cannot replace a newer adopted snapshot: doing so
+// could discard positions that have not reached the disposable viewer yet.
+func (m *Model) adoptConversationSnapshot(sessionID string, snapshot appservice.ConversationSnapshot) bool {
+	if m.histories == nil {
+		m.histories = make(map[string][]sessionlog.Line)
+	}
+	if m.seen == nil {
+		m.seen = make(map[string]map[uint64]struct{})
+	}
+	if m.snapshotCursors == nil {
+		m.snapshotCursors = make(map[string]uint64)
+	}
+	if m.snapshotSources == nil {
+		m.snapshotSources = make(map[string]appservice.ConversationSource)
+	}
+	if captured, adopted := m.snapshotCursors[sessionID]; adopted && snapshot.GatewayCursor < captured {
+		return false
+	}
+	projection := transcriptFromConversation(snapshot)
+	cursor := snapshot.GatewayCursor
+	retained := make([]sessionlog.Line, 0, len(m.histories[sessionID]))
+	for _, line := range m.histories[sessionID] {
+		if line.Seq > snapshot.GatewayCursor {
+			projection.apply(line)
+			cursor = max(cursor, line.Seq)
+			retained = append(retained, line)
+		}
+	}
+	if m.projections == nil {
+		m.projections = make(map[string]*transcript)
+	}
+	if m.cursors == nil {
+		m.cursors = make(map[string]uint64)
+	}
+	m.projections[sessionID] = projection
+	m.snapshotCursors[sessionID] = snapshot.GatewayCursor
+	m.snapshotSources[sessionID] = snapshot.Source
+	m.histories[sessionID] = retained
+	m.seen[sessionID] = make(map[uint64]struct{}, len(retained))
+	for _, line := range retained {
+		m.seen[sessionID][line.Seq] = struct{}{}
+	}
+	m.cursors[sessionID] = max(m.cursors[sessionID], cursor)
+	return true
+}
+
+func conversationSnapshotNeedsCommit(snapshot appservice.ConversationSnapshot) bool {
+	for _, turn := range snapshot.Turns {
+		if turn.Committed {
+			continue
+		}
+		for _, activity := range turn.Activities {
+			if activity.Display != nil && activity.Display.Type == "turn_state" && activity.Display.State == "complete" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func conversationSnapshotNeedsPromotion(current session.Session, snapshot appservice.ConversationSnapshot) bool {
+	return strings.TrimSpace(current.ProviderConversationID) != "" && conversationSnapshotNeedsCommit(snapshot)
+}
+
+func conversationCommitRetryDelay(attempt int) time.Duration {
+	if attempt >= 6 {
+		return 10 * time.Second
+	}
+	delay := 220 * time.Millisecond * time.Duration(1<<max(0, attempt))
+	return min(delay, 3*time.Second)
+}
+
+func (m *Model) scheduleConversationCommitRetry(sessionID string) tea.Cmd {
+	m.ensureConversationCommitState()
+	attempt := m.conversationCommitRetries[sessionID]
+	delay := conversationCommitRetryDelay(attempt)
+	attempt++
+	m.conversationCommitRetries[sessionID] = attempt
+	return tea.Tick(delay, func(time.Time) tea.Msg {
+		return conversationRetryMsg{sessionID: sessionID, attempt: attempt}
+	})
+}
+
+func (m *Model) ensureConversationCommitState() {
+	if m.conversationCommitPending == nil {
+		m.conversationCommitPending = make(map[string]bool)
+	}
+	if m.conversationCommitRetries == nil {
+		m.conversationCommitRetries = make(map[string]int)
+	}
+}
+
+func shouldReconcileConversation(line sessionlog.Line) bool {
+	switch line.Type {
+	case "turn_completed", "turn_error", "native_refreshed", "native_refresh_recovered":
+		return true
+	default:
+		return false
+	}
+}
+
 func actionProgress(kind, sessionID string) string {
 	switch kind {
 	case "cancel":
@@ -952,6 +1209,13 @@ func (m *Model) addActivity(sessionID string, line sessionlog.Line, live bool) {
 		return m.histories[sessionID][i].Seq < m.histories[sessionID][j].Seq
 	})
 	m.cursors[sessionID] = max(m.cursors[sessionID], line.Seq)
+	// A successfully adopted ConversationSnapshot already represents every
+	// gateway position through its captured cursor. Keep late delivery in raw
+	// history for diagnostics, but never project it into the visible transcript
+	// a second time under its gateway request identity.
+	if line.Seq <= m.snapshotCursors[sessionID] {
+		return
+	}
 	if m.projections[sessionID] == nil {
 		m.projections[sessionID] = newTranscript()
 	}
@@ -965,6 +1229,23 @@ func (m *Model) watchSessions(sessions []session.Session) {
 	for _, current := range sessions {
 		m.manager.ensure(current, m.cursors[current.ID])
 	}
+}
+
+func (m Model) session(sessionID string) (session.Session, bool) {
+	for _, current := range m.task.Sessions {
+		if current.ID == sessionID {
+			return current, true
+		}
+	}
+	if m.current.ID == sessionID {
+		return m.current, true
+	}
+	return session.Session{}, false
+}
+
+func (m Model) canRetryConversationPromotion(sessionID string) bool {
+	current, ok := m.session(sessionID)
+	return ok && strings.TrimSpace(current.ProviderConversationID) != ""
 }
 
 func (m *Model) syncCurrentFromTask() {

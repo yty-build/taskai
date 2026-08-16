@@ -42,15 +42,20 @@ type transcriptMetadata struct {
 }
 
 type transcriptRequest struct {
-	id         string
-	state      turnState
-	stop       string
-	errorText  string
-	blocks     []*transcriptBlock
-	tools      map[string]*toolCard
-	plan       *transcriptBlock
-	thought    *transcriptBlock
-	permission map[string]*permissionCard
+	id             string
+	committed      bool
+	state          turnState
+	stop           string
+	errorText      string
+	blocks         []*transcriptBlock
+	tools          map[string]*toolCard
+	plan           *transcriptBlock
+	permission     map[string]*permissionCard
+	assistantBytes int
+	thoughtBytes   int
+	assistantSeen  bool
+	reasoningSeen  bool
+	contentClipped bool
 }
 
 type turnState string
@@ -78,6 +83,7 @@ const (
 
 type transcriptBlock struct {
 	kind       blockKind
+	source     string
 	id         string
 	text       string
 	legacy     bool
@@ -328,6 +334,12 @@ func (r *transcriptRequest) appendMessage(kind blockKind, text, id string, limit
 	if text == "" {
 		return
 	}
+	if kind == blockAssistant && strings.TrimSpace(text) != "" {
+		r.assistantSeen = true
+	}
+	text, clipped := truncateUTF8Tail(text, limit)
+	r.contentClipped = r.contentClipped || clipped
+	r.makeRollingTextRoom(kind, len(text), limit)
 	var block *transcriptBlock
 	if len(r.blocks) > 0 {
 		candidate := r.blocks[len(r.blocks)-1]
@@ -339,7 +351,9 @@ func (r *transcriptRequest) appendMessage(kind blockKind, text, id string, limit
 		block = &transcriptBlock{kind: kind, id: id}
 		r.blocks = append(r.blocks, block)
 	}
-	block.text, block.truncated = appendBounded(block.text, text, limit)
+	block.text += text
+	block.truncated = block.truncated || clipped
+	r.addRetainedBytes(kind, len(text))
 }
 
 func (r *transcriptRequest) appendThought(text string) {
@@ -347,11 +361,82 @@ func (r *transcriptRequest) appendThought(text string) {
 	if text == "" {
 		return
 	}
-	if r.thought == nil {
-		r.thought = &transcriptBlock{kind: blockThought}
-		r.blocks = append(r.blocks, r.thought)
+	if strings.TrimSpace(text) != "" {
+		r.reasoningSeen = true
 	}
-	r.thought.text, r.thought.truncated = appendBounded(r.thought.text, text, maxProjectedThoughtBytes)
+	text, clipped := truncateUTF8Tail(text, maxProjectedThoughtBytes)
+	r.contentClipped = r.contentClipped || clipped
+	r.makeRollingTextRoom(blockThought, len(text), maxProjectedThoughtBytes)
+	var block *transcriptBlock
+	if len(r.blocks) > 0 && r.blocks[len(r.blocks)-1].kind == blockThought {
+		block = r.blocks[len(r.blocks)-1]
+	}
+	if block == nil {
+		block = &transcriptBlock{kind: blockThought}
+		r.blocks = append(r.blocks, block)
+	}
+	block.text += text
+	block.truncated = block.truncated || clipped
+	r.addRetainedBytes(blockThought, len(text))
+}
+
+func (r *transcriptRequest) retainedBytes(kind blockKind) int {
+	if kind == blockThought {
+		return r.thoughtBytes
+	}
+	return r.assistantBytes
+}
+
+func (r *transcriptRequest) addRetainedBytes(kind blockKind, amount int) {
+	if kind == blockThought {
+		r.thoughtBytes += amount
+		return
+	}
+	r.assistantBytes += amount
+}
+
+func (r *transcriptRequest) makeRollingTextRoom(kind blockKind, incomingBytes, limit int) {
+	needed := max(0, r.retainedBytes(kind)+incomingBytes-limit)
+	for index := 0; needed > 0 && index < len(r.blocks); {
+		block := r.blocks[index]
+		if block.kind != kind || block.text == "" {
+			index++
+			continue
+		}
+		trimmed, dropped := dropUTF8Prefix(block.text, min(needed, len(block.text)))
+		block.text = trimmed
+		block.truncated = true
+		r.contentClipped = true
+		r.addRetainedBytes(kind, -dropped)
+		needed = max(0, r.retainedBytes(kind)+incomingBytes-limit)
+		if block.text == "" {
+			r.blocks = append(r.blocks[:index], r.blocks[index+1:]...)
+			continue
+		}
+		index++
+	}
+}
+
+func (r *transcriptRequest) completedResponse() *transcriptBlock {
+	if r.state != turnComplete {
+		return nil
+	}
+	for index := len(r.blocks) - 1; index >= 0; index-- {
+		block := r.blocks[index]
+		if block.kind == blockAssistant && strings.TrimSpace(block.text) != "" {
+			return block
+		}
+	}
+	return nil
+}
+
+func (r *transcriptRequest) hasRetainedReasoning() bool {
+	for _, block := range r.blocks {
+		if block.kind == blockThought && strings.TrimSpace(block.text) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *transcriptRequest) upsertTool(update map[string]any) {
@@ -762,18 +847,6 @@ func sanitizeInline(value string) string {
 	return value
 }
 
-func appendBounded(existing, addition string, limit int) (string, bool) {
-	if len(existing) >= limit {
-		return existing, true
-	}
-	remaining := limit - len(existing)
-	if len(addition) <= remaining {
-		return existing + addition, false
-	}
-	addition, _ = truncateUTF8(addition, remaining)
-	return existing + addition, true
-}
-
 func truncateUTF8(value string, limit int) (string, bool) {
 	if len(value) <= limit {
 		return value, false
@@ -786,6 +859,32 @@ func truncateUTF8(value string, limit int) (string, bool) {
 		cut--
 	}
 	return value[:cut], true
+}
+
+func truncateUTF8Tail(value string, limit int) (string, bool) {
+	if len(value) <= limit {
+		return value, false
+	}
+	if limit <= 0 {
+		return "", true
+	}
+	start := len(value) - limit
+	for start < len(value) && !utf8.RuneStart(value[start]) {
+		start++
+	}
+	return value[start:], true
+}
+
+func dropUTF8Prefix(value string, minimumBytes int) (string, int) {
+	if minimumBytes <= 0 || value == "" {
+		return value, 0
+	}
+	dropped := 0
+	for dropped < len(value) && dropped < minimumBytes {
+		_, size := utf8.DecodeRuneInString(value[dropped:])
+		dropped += size
+	}
+	return value[dropped:], dropped
 }
 
 func logicalLines(value string) int {

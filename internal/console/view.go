@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	minimumConsoleWidth  = 60
+	minimumConsoleWidth  = 40
 	minimumConsoleHeight = 16
 )
 
@@ -114,34 +114,32 @@ func compactSizeWarning(width, height int) string {
 
 func (m Model) renderTask(width, height int) string {
 	item := m.task.Task
+	layout := layoutTaskWorkspace(width, height)
+	title := "AGENT TASK CONSOLE · TASK " + safeText(item.ID)
+	if width < 56 {
+		title = "TASK " + safeText(item.ID)
+	}
 	header := []string{
-		topBar("AGENT TASK CONSOLE · TASK "+safeText(item.ID), statusBadge(string(item.Status)), width),
+		topBar(title, statusBadge(string(item.Status)), width),
 		fitLine("  "+safeText(item.Title)+" · "+taskSubtitle(item.Description, len(m.task.Sessions)), width),
 		horizontalRule(width),
 	}
 
-	bodyHeight := max(1, height-len(header)-2)
 	var body []string
-	if width >= 92 {
-		navigatorWidth := taskNavigatorWidth(width)
-		previewWidth := width - navigatorWidth - 3
-		navigator := m.renderTaskNavigator(navigatorWidth, bodyHeight)
-		preview := m.renderTaskPreview(previewWidth, bodyHeight)
-		body = joinColumns(navigator, preview, navigatorWidth, previewWidth)
-	} else {
-		navigatorHeight := max(6, bodyHeight/2)
-		previewHeight := max(1, bodyHeight-navigatorHeight)
-		body = append(m.renderTaskNavigator(width, navigatorHeight), m.renderTaskPreview(width, previewHeight)...)
+	switch layout.Mode {
+	case taskWorkspaceSplit:
+		navigator := m.renderTaskNavigator(layout.Navigator.Width, layout.Navigator.Height)
+		preview := m.renderTaskPreview(layout.Preview.Width, layout.Preview.Height)
+		body = joinColumns(navigator, preview, layout.Navigator.Width, layout.Preview.Width)
+	case taskWorkspaceStacked:
+		body = append(m.renderTaskNavigator(layout.Navigator.Width, layout.Navigator.Height),
+			m.renderTaskPreview(layout.Preview.Width, layout.Preview.Height)...)
+	default:
+		body = m.renderTaskNavigator(layout.Navigator.Width, layout.Navigator.Height)
 	}
 	notice := noticeLine(m.notice, width)
 	footer := m.taskFooter(width)
 	return renderScreen(append(append(append(header, body...), notice), footer), width, height)
-}
-
-func taskNavigatorWidth(width int) int {
-	navigator := width * 42 / 100
-	navigator = min(52, max(36, navigator))
-	return min(navigator, max(1, width-40))
 }
 
 func (m Model) renderTaskNavigator(width, height int) []string {
@@ -167,7 +165,11 @@ func (m Model) renderTaskNavigator(width, height int) []string {
 		}
 		name := marker + strings.ToUpper(valueOr(current.Agent, "agent")) + " · " + valueOr(current.Role, "worker")
 		entries = append(entries, fitWithRight(name, statusBadge(string(current.Status)), width))
-		entries = append(entries, fitLine("  "+current.ID+" · "+compactSessionPath(current)+" · "+m.sessionSummary(current.ID), width))
+		detailMarker := "  "
+		if actual == m.selected {
+			detailMarker = "│ "
+		}
+		entries = append(entries, fitLine(detailMarker+current.ID+" · "+compactSessionPath(current)+" · "+m.sessionSummary(current.ID), width))
 	}
 	if start > 0 && len(entries) > 0 {
 		entries[0] = fitLine(fmt.Sprintf("  ↑ %d earlier · ", start)+entries[0], width)
@@ -195,14 +197,6 @@ func (m Model) taskSessionWindow(navigatorHeight int) (indices []int, start, vis
 	return indices, start, visible
 }
 
-func taskNavigatorHeight(width, height int) int {
-	bodyHeight := max(1, height-5)
-	if width >= 92 {
-		return bodyHeight
-	}
-	return max(6, bodyHeight/2)
-}
-
 func (m Model) renderTaskPreview(width, height int) []string {
 	if len(m.task.Sessions) == 0 || len(m.filteredSessionIndices()) == 0 {
 		lines := []string{sectionHeading("SELECTED SESSION", "", width), sectionRule(width)}
@@ -211,25 +205,44 @@ func (m Model) renderTaskPreview(width, height int) []string {
 	}
 	current := m.task.Sessions[m.selected]
 	lines := []string{sectionHeading("SELECTED SESSION", statusBadge(string(current.Status)), width), sectionRule(width)}
-	capability := nativeCapability(current)
-	content := []string{
-		strings.ToUpper(valueOr(current.Agent, "agent")) + " · " + valueOr(current.Role, "worker") + " · " + humanizeLabel(appservice.PermissionLabel(current)),
-	}
-	nativeLine := "↵ Enter  " + capability.label + " · " + capability.status
-	if capability.reason != "" {
-		nativeLine += ": " + capability.reason
-	}
-	content = append(content,
-		fitLine(nativeLine, width),
-		fitLine("a        Structured ACP · transcript, tools, and approvals", width),
-		current.ID+" · "+compactSessionPath(current),
-		"",
-		"LATEST",
-	)
-	content = append(content, indentWrapped(m.sessionSummary(current.ID), max(10, width-4), "  ")...)
 	innerHeight := max(1, height-2)
+	if height < 9 {
+		lines = append(lines, m.renderCompactTaskPreview(current, width, innerHeight)...)
+		return lines
+	}
+	if width >= 68 && height >= 18 {
+		railWidth := min(27, max(23, width*34/100))
+		timelineWidth := width - railWidth - 3
+		timeline := m.renderTaskTimeline(current, timelineWidth, innerHeight)
+		rail := m.renderTaskContextRail(current, railWidth, innerHeight)
+		lines = append(lines, joinColumns(timeline, rail, timelineWidth, railWidth)...)
+		return lines
+	}
+	overview := m.renderTaskPreviewOverview(current, width)
+	timelineHeight := max(1, innerHeight-len(overview))
+	content := append(overview, m.renderTaskTimeline(current, width, timelineHeight)...)
 	lines = append(lines, padLines(content, innerHeight, width)...)
 	return lines
+}
+
+func (m Model) sessionAttention(current session.Session) string {
+	projection := m.projections[current.ID]
+	if projection != nil {
+		if _, permission := projection.pendingPermission(); permission != nil {
+			return "Approval required · agent is waiting for a decision"
+		}
+		switch projection.latestState() {
+		case turnLive:
+			return "Streaming now · stored replay plus live ACP"
+		case turnFailed:
+			return "Turn failed · open Structured ACP for details"
+		case turnComplete:
+			return "Response complete · conversation remains resumable"
+		case turnCancelled:
+			return "Turn cancelled · Session remains available"
+		}
+	}
+	return statusBadge(string(current.Status)) + " · stored Session history"
 }
 
 func joinColumns(left, right []string, leftWidth, rightWidth int) []string {
@@ -249,6 +262,9 @@ func joinColumns(left, right []string, leftWidth, rightWidth int) []string {
 }
 
 func (m Model) taskFooter(width int) string {
+	if width < 56 {
+		return fitLine("Enter Native  a ACP  n New  q Detach", width)
+	}
 	type footerItem struct {
 		id   actionID
 		text string
@@ -405,8 +421,12 @@ func (m Model) renderSession(width, height int) string {
 	} else {
 		metadata = "  " + metadata + " · " + location
 	}
+	title := "STRUCTURED ACP · SESSION " + safeText(current.ID)
+	if width < 56 {
+		title = "SESSION " + safeText(current.ID) + " · ACP"
+	}
 	header := []string{
-		topBar("STRUCTURED ACP · SESSION "+safeText(current.ID), statusBadge(string(current.Status)), width),
+		topBar(title, statusBadge(string(current.Status)), width),
 		fitLine(metadata, width),
 		horizontalRule(width),
 	}
@@ -417,6 +437,13 @@ func (m Model) renderSession(width, height int) string {
 	var allBody []string
 	if m.raw {
 		allBody = renderRawHistory(m.histories[current.ID], width)
+		if captured, bounded := m.snapshotCursors[current.ID]; bounded {
+			allBody = append([]string{
+				fitLine(fmt.Sprintf("Pre-snapshot raw is not retained (≤%d).", captured), width),
+				fitLine("Full: acpctl session logs <id> --raw", width),
+				horizontalRule(width),
+			}, allBody...)
+		}
 	} else {
 		allBody = renderConversation(m.projections[current.ID], provider, width, conversationOptions{
 			showReasoning: m.showReasoning,
@@ -464,6 +491,22 @@ func (m Model) sessionFooter(width int) string {
 	if !m.direct {
 		required = append(required, "b Back")
 	}
+	if width < 56 {
+		items := []string{"p Write"}
+		if approval != "" {
+			items = append([]string{approval}, items...)
+		} else {
+			items = append(items, "Esc Cancel")
+		}
+		if !m.direct {
+			items = append(items, "b Back")
+		}
+		items = append(items, "q Detach")
+		for ansi.StringWidth(strings.Join(items, "  ")) > width && len(items) > 2 {
+			items = append(items[:len(items)-2], items[len(items)-1])
+		}
+		return fitLine(strings.Join(items, "  "), width)
+	}
 	optional := []string{mode, "↑/↓ Scroll", "End Follow", "d Tool", "x Stop"}
 	items := append([]string(nil), required...)
 	for _, item := range optional {
@@ -491,16 +534,27 @@ func renderConversation(projection *transcript, agent string, width int, options
 		if requestIndex > 0 {
 			lines = append(lines, "", sectionRule(width))
 		}
+		completedResponse := request.completedResponse()
 		for _, block := range request.blocks {
 			switch block.kind {
 			case blockUser:
 				lines = append(lines, "❯ YOU")
 				lines = append(lines, indentWrapped(block.text, contentWidth, "  ")...)
 			case blockAssistant:
-				lines = append(lines, "● "+agent)
+				if block == completedResponse {
+					if block.source == "provider" {
+						lines = append(lines, "✓ RESPONSE · "+agent+" · committed provider history")
+					} else {
+						lines = append(lines, "✓ RESPONSE · "+agent+" · turn complete")
+					}
+				} else if block.source == "provider" {
+					lines = append(lines, "● "+agent+" · stored provider history")
+				} else {
+					lines = append(lines, "● "+agent+" · ACP update")
+				}
 				lines = append(lines, indentWrapped(block.text, contentWidth, "  ")...)
 				if block.truncated {
-					lines = append(lines, "  … message clipped in the viewer; raw history is preserved")
+					lines = append(lines, "  … earlier content omitted; recent ACP output is preserved")
 				}
 			case blockThought:
 				lines = append(lines, renderThought(block, contentWidth, options.showReasoning)...)
@@ -515,6 +569,19 @@ func renderConversation(projection *transcript, agent string, width int, options
 				lines = append(lines, indentWrapped(block.text, contentWidth, "  ")...)
 			}
 		}
+		if request.state == turnComplete && !request.reasoningSeen {
+			lines = append(lines, "  ◇ No separate reasoning was exposed by ACP or the provider store for this turn.")
+		} else if request.state == turnComplete && request.reasoningSeen && !request.hasRetainedReasoning() {
+			lines = append(lines, "  ◇ Earlier ACP reasoning is outside this bounded view.")
+		}
+		if request.state == turnComplete && !request.assistantSeen {
+			lines = append(lines, "  ! Turn completed without an ACP assistant response; use the native CLI for provider-only detail.")
+		} else if request.state == turnComplete && request.completedResponse() == nil {
+			lines = append(lines, "  ! ACP assistant output is outside this bounded view; inspect the local Session log.")
+		}
+		if request.contentClipped {
+			lines = append(lines, "  ◇ Older detail in this turn is hidden to keep the console responsive.")
+		}
 		if state := renderTurnState(request.state); state != "" {
 			lines = append(lines, state)
 		}
@@ -524,13 +591,20 @@ func renderConversation(projection *transcript, agent string, width int, options
 
 func renderThought(block *transcriptBlock, width int, expanded bool) []string {
 	count := logicalLines(block.text)
-	if !expanded {
-		return []string{fmt.Sprintf("  ▸ Reasoning · %d line(s) · o expand", count)}
+	source := ""
+	if block.source == "provider" {
+		source = " · stored provider history"
 	}
-	lines := []string{"  ▾ Reasoning"}
+	if !expanded {
+		return []string{fmt.Sprintf("  ▸ Reasoning%s · %d line(s) · o expand", source, count)}
+	}
+	lines := []string{"  ▾ Reasoning" + source}
 	wrapped := indentWrapped(block.text, width, "  │ ")
 	if len(wrapped) > 10 {
 		wrapped = append(wrapped[:10], "  ╰ … reasoning clipped in this view")
+	}
+	if block.truncated {
+		wrapped = append(wrapped, "  ╰ … earlier reasoning omitted; recent ACP reasoning is preserved")
 	}
 	return append(lines, wrapped...)
 }
@@ -699,48 +773,13 @@ func renderScreen(lines []string, width, height int) string {
 	}
 	for index := range lines {
 		lines[index] = fitLine(lines[index], width)
-		lines[index] = decorateLine(lines[index], index == len(lines)-1)
+		footer := index == len(lines)-1
+		if footer {
+			lines[index] = padRight(lines[index], width)
+		}
+		lines[index] = decorateLine(lines[index], footer)
 	}
 	return strings.Join(lines, "\n")
-}
-
-func decorateLine(line string, footer bool) string {
-	if strings.TrimSpace(line) == "" {
-		return line
-	}
-	style := ""
-	switch {
-	case strings.HasPrefix(line, "◆ "):
-		style = "1;38;5;81"
-	case strings.HasPrefix(line, "  SESSIONS"), strings.HasPrefix(line, "  SELECTED SESSION"):
-		style = "1;38;5;252"
-	case strings.HasPrefix(line, "▌ "):
-		style = "1;38;5;81"
-	case strings.HasPrefix(line, "❯ YOU"):
-		style = "1;38;5;222"
-	case strings.HasPrefix(line, "● "):
-		style = "1;38;5;117"
-	case strings.HasPrefix(line, "  ▸ Reasoning"), strings.HasPrefix(line, "  ▾ Reasoning"):
-		style = "38;5;245"
-	case strings.HasPrefix(line, "  ├─ ✓ TOOL"):
-		style = "38;5;114"
-	case strings.HasPrefix(line, "  ✓ Turn complete"):
-		style = "38;5;114"
-	case strings.HasPrefix(line, "  ╭─ APPROVAL REQUIRED"):
-		style = "1;38;5;214"
-	case strings.HasPrefix(line, "╭─ MESSAGE"):
-		style = "1;38;5;252"
-	case strings.HasPrefix(line, "╰─ "), strings.HasPrefix(line, "│  "):
-		style = "38;5;245"
-	case strings.Trim(line, "─ │") == "":
-		style = "38;5;238"
-	case footer:
-		style = "38;5;245"
-	}
-	if style == "" {
-		return line
-	}
-	return "\x1b[" + style + "m" + line + "\x1b[0m"
 }
 
 func viewportLines(lines []string, count, scroll, width int) []string {

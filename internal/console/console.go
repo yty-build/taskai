@@ -31,6 +31,10 @@ type Backend interface {
 	AttachNative(context.Context, string, io.Reader, io.Writer, io.Writer) error
 }
 
+type conversationBackend interface {
+	Conversation(context.Context, string) (appservice.ConversationSnapshot, error)
+}
+
 type Services struct {
 	Tasks    *task.Service
 	Sessions *appservice.SessionService
@@ -46,6 +50,10 @@ func (s Services) Session(ctx context.Context, id string) (session.Session, erro
 
 func (s Services) History(ctx context.Context, id string, cursor uint64) ([]sessionlog.Line, error) {
 	return s.Sessions.History(ctx, id, cursor)
+}
+
+func (s Services) Conversation(ctx context.Context, id string) (appservice.ConversationSnapshot, error) {
+	return s.Sessions.Conversation(ctx, id)
 }
 
 func (s Services) Follow(ctx context.Context, id string, cursor uint64, consume func(sessionlog.Line) error) error {

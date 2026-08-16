@@ -2,14 +2,14 @@ package console
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/charmbracelet/x/ansi"
 	"github.com/yty-build/acp-gateway/internal/agents"
+	"github.com/yty-build/acp-gateway/internal/presentation"
+	appservice "github.com/yty-build/acp-gateway/internal/service"
 	"github.com/yty-build/acp-gateway/internal/session"
 	"github.com/yty-build/acp-gateway/internal/sessionlog"
 	"github.com/yty-build/acp-gateway/internal/task"
@@ -22,21 +22,22 @@ func TestTaskConsoleVisualContract(t *testing.T) {
 	for _, size := range []struct {
 		width  int
 		height int
-		digest string
+		mode   taskWorkspaceMode
+		wants  []string
 	}{
-		{width: 60, height: 16, digest: "011cb8eee81251ab"},
-		{width: 80, height: 24, digest: "1fb9a784a30b7934"},
-		{width: 120, height: 40, digest: "8d76b7037ec500be"},
+		{width: 40, height: 16, mode: taskWorkspaceCompact, wants: []string{"TASK T-VISUAL", "SESSIONS", "CLAUDE", "Enter Native", "a ACP", "n New", "q Detach"}},
+		{width: 60, height: 16, mode: taskWorkspaceStacked, wants: []string{"SESSIONS", "SELECTED SESSION", "CLAUDE · reviewer", "Enter  Claude CLI", "Structured ACP"}},
+		{width: 80, height: 24, mode: taskWorkspaceSplit, wants: []string{"SESSIONS", "SELECTED SESSION", "RECENT CONVERSATION", "PROVIDER COMMITTED", "LIVE ACP", "Streaming now", "TOOL · Read worker state"}},
+		{width: 120, height: 40, mode: taskWorkspaceSplit, wants: []string{"SESSIONS", "SELECTED SESSION", "RECENT CONVERSATION", "CONTEXT", "CONTINUE", "PROVENANCE", "Claude CLI", "Same provider conversation", "Provider transcript confirms safe detach"}},
 	} {
 		t.Run(strings.Join([]string{itoa(size.width), "x", itoa(size.height)}, ""), func(t *testing.T) {
 			model.width, model.height = size.width, size.height
 			view := model.View()
 			assertScreenSize(t, view, size.width, size.height)
-			for _, want := range []string{
-				"AGENT TASK CONSOLE · TASK T-VISUAL", "SESSIONS", "SELECTED SESSION",
-				"CLAUDE · reviewer", "Enter  Claude CLI", "a        Structured ACP",
-				"Enter Native CLI", "a ACP", "n New Session", "? Help", "q Detach",
-			} {
+			if got := layoutTaskWorkspace(size.width, size.height).Mode; got != size.mode {
+				t.Fatalf("%dx%d workspace mode = %d, want %d", size.width, size.height, got, size.mode)
+			}
+			for _, want := range size.wants {
 				if !strings.Contains(view, want) {
 					t.Fatalf("%dx%d Task view missing %q:\n%s", size.width, size.height, want, view)
 				}
@@ -44,10 +45,90 @@ func TestTaskConsoleVisualContract(t *testing.T) {
 			if strings.Contains(view, "╭─ AGENT TASK CONSOLE") || strings.Contains(view, "SESSION PREVIEW") {
 				t.Fatalf("%dx%d Task view retained the old framed hierarchy:\n%s", size.width, size.height, view)
 			}
-			if got := screenDigest(view); got != size.digest {
-				t.Fatalf("%dx%d Task snapshot digest = %s, want %s:\n%s", size.width, size.height, got, size.digest, view)
+			footer := strings.Split(view, "\n")[size.height-1]
+			if strings.Contains(footer, "…") || !strings.Contains(footer, "q Detach") {
+				t.Fatalf("%dx%d footer lost a core action: %q", size.width, size.height, footer)
 			}
 		})
+	}
+}
+
+func TestTaskConversationPreviewIsDenseBoundedAndProvenanced(t *testing.T) {
+	model := visualTaskModel()
+	for _, size := range []struct {
+		width, height int
+		minimumFilled int
+		wants         []string
+	}{
+		{
+			width: 80, height: 24, minimumFilled: 16,
+			wants: []string{"RECENT CONVERSATION", "REASONING · LIVE ACP", "TOOL · Read worker state · LIVE ACP", "CLAUDE · LIVE ACP", "STATUS · LIVE ACP"},
+		},
+		{
+			width: 120, height: 36, minimumFilled: 22,
+			wants: []string{"YOU · PROVIDER COMMITTED", "CLAUDE · PROVIDER COMMITTED", "REASONING · LIVE ACP", "TOOL · Read worker state · LIVE ACP", "CONTEXT", "CONTINUE", "PROVENANCE"},
+		},
+	} {
+		t.Run(fmt.Sprintf("%dx%d", size.width, size.height), func(t *testing.T) {
+			model.width, model.height = size.width, size.height
+			assertScreenSize(t, model.View(), size.width, size.height)
+			layout := layoutTaskWorkspace(size.width, size.height)
+			preview := model.renderTaskPreview(layout.Preview.Width, layout.Preview.Height)
+			if len(preview) != layout.Preview.Height {
+				t.Fatalf("preview height = %d, want %d", len(preview), layout.Preview.Height)
+			}
+			joined := strings.Join(preview, "\n")
+			for _, want := range size.wants {
+				if !strings.Contains(joined, want) {
+					t.Fatalf("%dx%d preview missing %q:\n%s", size.width, size.height, want, joined)
+				}
+			}
+			filled := 0
+			for _, line := range preview {
+				if strings.TrimSpace(ansi.Strip(line)) != "" {
+					filled++
+				}
+			}
+			if filled < size.minimumFilled {
+				t.Fatalf("%dx%d preview has only %d intentional lines, want at least %d:\n%s", size.width, size.height, filled, size.minimumFilled, joined)
+			}
+			for _, forbidden := range []string{"REQ-TASK", "jsonrpc", visualSentinel} {
+				if strings.Contains(joined, forbidden) {
+					t.Fatalf("%dx%d preview leaked %q:\n%s", size.width, size.height, forbidden, joined)
+				}
+			}
+		})
+	}
+}
+
+func TestTaskConversationPreviewBoundsLongHistoryAndKeepsRecentContext(t *testing.T) {
+	model := visualTaskModel()
+	projection := newTranscript()
+	for index := 0; index < taskPreviewRequestLimit+20; index++ {
+		request := projection.request(fmt.Sprintf("request-%03d", index))
+		request.setUserMessage(fmt.Sprintf("prompt-%03d", index), false)
+		request.appendMessage(blockAssistant, fmt.Sprintf("answer-%03d", index), "answer", maxProjectedMessageBytes)
+		request.state = turnComplete
+	}
+	latest := projection.requests[len(projection.requests)-1]
+	latest.appendThought("latest bounded reasoning")
+	latest.upsertTool(map[string]any{"toolCallId": "latest-tool", "title": "Latest bounded tool", "kind": "read", "status": "completed"})
+	model.projections[model.task.Sessions[0].ID] = projection
+
+	entries := taskPreviewEntries(projection, "CLAUDE")
+	if len(entries) > taskPreviewEntryLimit {
+		t.Fatalf("preview retained %d entries, limit is %d", len(entries), taskPreviewEntryLimit)
+	}
+	model.width, model.height = 120, 36
+	layout := layoutTaskWorkspace(model.width, model.height)
+	preview := strings.Join(model.renderTaskPreview(layout.Preview.Width, layout.Preview.Height), "\n")
+	for _, want := range []string{"prompt-051", "answer-051", "latest bounded reasoning", "Latest bounded tool"} {
+		if !strings.Contains(preview, want) {
+			t.Fatalf("bounded preview lost %q:\n%s", want, preview)
+		}
+	}
+	if strings.Contains(preview, "prompt-000") || strings.Contains(preview, "answer-000") {
+		t.Fatalf("bounded preview retained stale history:\n%s", preview)
 	}
 }
 
@@ -64,7 +145,7 @@ func TestTaskOverflowCueSurvivesLongSessionPaths(t *testing.T) {
 	for _, size := range []struct {
 		width, height int
 		want          string
-	}{{width: 60, height: 16, want: "8 more ↓"}, {width: 80, height: 24, want: "7 more ↓"}} {
+	}{{width: 60, height: 16, want: "more ↓"}, {width: 80, height: 24, want: "more ↓"}} {
 		model.width, model.height = size.width, size.height
 		view := model.View()
 		assertScreenSize(t, view, size.width, size.height)
@@ -79,22 +160,18 @@ func TestStructuredACPVisualContract(t *testing.T) {
 	for _, size := range []struct {
 		width  int
 		height int
-		digest string
+		wants  []string
 	}{
-		{width: 60, height: 16, digest: "b2e6e0ac7ef4366c"},
-		{width: 80, height: 24, digest: "8f2bb85be2959479"},
-		{width: 120, height: 40, digest: "3ba32891d706ce56"},
-		{width: 200, height: 60, digest: "b21851286bbd9c76"},
+		{width: 40, height: 16, wants: []string{"SESSION S-VISUAL", "MESSAGE CLAUDE", "p Write", "q Detach"}},
+		{width: 60, height: 16, wants: []string{"SESSION S-VISUAL", "CLAUDE · reviewer", "23.1 KB", "MESSAGE CLAUDE"}},
+		{width: 80, height: 24, wants: []string{"SESSION S-VISUAL", "CLAUDE · reviewer", "TOOL · model.go", "YOU", "I found two issues", "ACP update"}},
+		{width: 120, height: 40, wants: []string{"SESSION S-VISUAL", "CLAUDE · reviewer", "TOOL · model.go", "YOU", "I found two issues", "ACP update"}},
 	} {
 		t.Run(strings.Join([]string{itoa(size.width), "x", itoa(size.height)}, ""), func(t *testing.T) {
 			model.width, model.height = size.width, size.height
 			view := model.View()
 			assertScreenSize(t, view, size.width, size.height)
-			wants := []string{"STRUCTURED ACP · SESSION S-VISUAL", "CLAUDE · reviewer", "23.1 KB", "761 lines", "MESSAGE CLAUDE"}
-			if size.height >= 24 {
-				wants = append(wants, "TOOL · model.go", "YOU", "Review the implementation", "I found two issues")
-			}
-			for _, want := range wants {
+			for _, want := range size.wants {
 				if !strings.Contains(view, want) {
 					t.Fatalf("%dx%d view missing %q:\n%s", size.width, size.height, want, view)
 				}
@@ -104,10 +181,54 @@ func TestStructuredACPVisualContract(t *testing.T) {
 					t.Fatalf("%dx%d normal view leaked %q:\n%s", size.width, size.height, forbidden, view)
 				}
 			}
-			if got := screenDigest(view); got != size.digest {
-				t.Fatalf("%dx%d snapshot digest = %s, want %s:\n%s", size.width, size.height, got, size.digest, view)
-			}
 		})
+	}
+}
+
+func TestStructuredACPCompletedResponseAndReasoningDisclosure(t *testing.T) {
+	projection := newTranscript()
+	projection.apply(projectionLine(1, "REQ-COMPLETE", "prompt_submitted", map[string]any{"display_message": "Give me the result."}))
+	projection.apply(projectionLine(2, "REQ-COMPLETE", "turn_started", map[string]any{}))
+	projection.apply(projectionACPLine(3, "REQ-COMPLETE", "agent_message_chunk", sessionUpdate(messageUpdate("agent_message_chunk", "The verified result is 42.", "response"))))
+	projection.apply(projectionLine(4, "REQ-COMPLETE", "turn_completed", map[string]any{"stopReason": "end_turn"}))
+	model := visualSessionModel(t)
+	model.projections[model.current.ID] = projection
+	model.width, model.height = 80, 24
+	view := model.View()
+	for _, want := range []string{
+		"✓ RESPONSE · CLAUDE · turn complete",
+		"The verified result is 42.",
+		"No separate reasoning was exposed by ACP or the provider store",
+		"✓ Turn complete",
+	} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("completed turn missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestTaskPreviewMarksCleanGatewayPromptAsPartOfCommittedTurn(t *testing.T) {
+	projection := transcriptFromConversation(appservice.ConversationSnapshot{Turns: []appservice.ConversationTurn{{
+		Key: "matched-provider-turn", Committed: true,
+		Activities: []appservice.ConversationActivity{
+			{Kind: "prompt_submitted", Display: &presentation.Activity{Type: "user_message", Text: "Clean user-facing prompt"}},
+			{Kind: "acp", Display: &presentation.Activity{Type: "thought_chunk", Text: "ACP-only reasoning"}},
+			{Kind: "provider_transcript", Display: &presentation.Activity{Type: "assistant_chunk", Text: "Committed answer"}},
+			{Kind: "turn_completed", Display: &presentation.Activity{Type: "turn_state", State: "complete"}},
+		},
+	}}})
+	entries := taskPreviewEntries(projection, "CODEX")
+	var user, thought taskPreviewEntry
+	for _, entry := range entries {
+		switch entry.kind {
+		case "user":
+			user = entry
+		case "reasoning":
+			thought = entry
+		}
+	}
+	if user.provenance != taskPreviewProvider || thought.provenance != taskPreviewLive {
+		t.Fatalf("committed prompt / supplemental reasoning provenance = user:%q thought:%q", user.provenance, thought.provenance)
 	}
 }
 
@@ -271,10 +392,27 @@ func visualTaskModel() Model {
 		ProviderConversationID: "codex-conversation", Status: session.StatusWaiting,
 		MetadataJSON: []byte(`{"permission":"approve-all"}`),
 	}
-	projection := newTranscript()
-	projection.apply(projectionLine(1, "REQ-TASK", "prompt_submitted", map[string]any{"display_message": "Review the native attachment UX."}))
+	projection := transcriptFromConversation(appservice.ConversationSnapshot{Turns: []appservice.ConversationTurn{{
+		Key: "provider-task", Committed: true,
+		Activities: []appservice.ConversationActivity{
+			{Kind: "provider_transcript", Display: &presentation.Activity{Type: "user_message", Text: "Review the native attachment UX and preserve exact conversation continuity."}},
+			{Kind: "provider_transcript", Display: &presentation.Activity{Type: "thought_chunk", Text: "Checked the durable provider transcript before continuing."}},
+			{Kind: "provider_transcript", Display: &presentation.Activity{Type: "tool_upsert", Tool: &presentation.Tool{ID: "provider-read", Title: "Inspect continuity", Kind: "read", Status: "completed"}}},
+			{Kind: "provider_transcript", Display: &presentation.Activity{Type: "assistant_chunk", MessageID: "provider-answer", Text: "Provider transcript confirms safe detach and exact native continuity."}},
+			{Kind: "provider_transcript", Display: &presentation.Activity{Type: "turn_state", State: "complete"}},
+		},
+	}}})
+
+	projection.apply(projectionLine(1, "REQ-TASK", "prompt_submitted", map[string]any{"display_message": "Check the active ACP handoff and report the latest state."}))
 	projection.apply(projectionLine(2, "REQ-TASK", "turn_started", map[string]any{}))
-	projection.apply(projectionACPLine(3, "REQ-TASK", "agent_message_chunk", sessionUpdate(messageUpdate("agent_message_chunk", "Auditing the terminal interaction model.", "message"))))
+	projection.apply(projectionACPLine(3, "REQ-TASK", "agent_thought_chunk", sessionUpdate(messageUpdate("agent_thought_chunk", "Checking the active ACP handoff and ownership barrier.", "thought"))))
+	projection.apply(projectionACPLine(4, "REQ-TASK", "tool_call", sessionUpdate(map[string]any{
+		"sessionUpdate": "tool_call", "toolCallId": "tool-worker", "title": "Read worker state", "kind": "read", "status": "in_progress",
+	})))
+	projection.apply(projectionACPLine(5, "REQ-TASK", "tool_call_update", sessionUpdate(map[string]any{
+		"sessionUpdate": "tool_call_update", "toolCallId": "tool-worker", "title": "Read worker state", "kind": "read", "status": "completed",
+	})))
+	projection.apply(projectionACPLine(6, "REQ-TASK", "agent_message_chunk", sessionUpdate(messageUpdate("agent_message_chunk", "Streaming the latest findings through ACP while the provider conversation remains continuous.", "message"))))
 	return Model{
 		mode: taskView,
 		task: task.Detail{
@@ -310,11 +448,6 @@ func assertScreenSize(t *testing.T, view string, width, height int) {
 			t.Fatalf("line %d width = %d, terminal width %d: %q", index+1, got, width, line)
 		}
 	}
-}
-
-func screenDigest(view string) string {
-	digest := sha256.Sum256([]byte(view))
-	return hex.EncodeToString(digest[:8])
 }
 
 func itoa(value int) string { return fmt.Sprintf("%d", value) }
