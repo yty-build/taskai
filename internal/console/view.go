@@ -213,28 +213,20 @@ func (m Model) renderTaskPreview(width, height int) []string {
 	}
 	current := m.task.Sessions[m.selected]
 	lines := []string{frameTop("SESSION PREVIEW", statusBadge(string(current.Status)), width)}
-	identity := "conversation identity pending"
-	if current.ProviderConversationID != "" {
-		identity = "conversation " + current.ProviderConversationID
-		if current.ConversationIDVerifiedAt != nil {
-			identity += " · verified"
-		}
-	}
+	capability := nativeCapability(current)
 	content := []string{
 		strings.ToUpper(valueOr(current.Agent, "agent")) + " · " + valueOr(current.Role, "worker") + " · " + appservice.PermissionLabel(current),
-		current.ID,
-		"Checkout  " + sessionPath(current),
-		"Identity  " + identity,
+		current.ID + " · " + compactSessionPath(current),
 		"",
-		"LATEST ACTIVITY",
+		"SURFACES",
 	}
+	nativeLine := "Enter  " + capability.label + " · " + capability.status
+	if capability.reason != "" {
+		nativeLine += ": " + capability.reason
+	}
+	content = append(content, indentWrapped(nativeLine, max(10, width), "")...)
+	content = append(content, "a      Structured ACP · ready for transcript, tools, and approvals", "", "LATEST ACTIVITY")
 	content = append(content, indentWrapped(m.sessionSummary(current.ID), max(10, width-4), "  ")...)
-	content = append(content,
-		"",
-		"Enter  Open real "+valueOr(current.Agent, "provider")+" harness",
-		"a      Open structured ACP console",
-		"p      Message through ACP",
-	)
 	innerHeight := max(1, height-2)
 	lines = append(lines, padLines(content, innerHeight, width)...)
 	return append(lines, frameBottom(width))
@@ -257,9 +249,83 @@ func joinColumns(left, right []string, leftWidth, rightWidth int) []string {
 }
 
 func (m Model) taskFooter(width int) string {
-	footer := "↑/↓ select · Enter native · a ACP · / filter · : commands · ? help · q detach"
-	if strings.TrimSpace(m.filter) != "" {
-		footer = "FILTER /" + safeText(m.filter) + " · " + footer
+	type footerItem struct {
+		id   actionID
+		text string
+	}
+	capability := nativeCLICapability{}
+	if len(m.task.Sessions) > 0 && m.selected >= 0 && m.selected < len(m.task.Sessions) {
+		capability = nativeCapability(m.task.Sessions[m.selected])
+	}
+	actionItem := func(id actionID) footerItem {
+		action, ok := taskActionForID(id)
+		if !ok {
+			return footerItem{id: id}
+		}
+		label := valueOr(action.FooterLabel, action.Label)
+		if id == actionNative && !capability.available {
+			label = "Native N/A"
+		}
+		return footerItem{id: id, text: displayActionKey(action.Key) + " " + label}
+	}
+
+	// These actions remain visible at the minimum supported width. Optional
+	// context is added only when it cannot push New Session or detach off-screen.
+	required := []footerItem{
+		actionItem(actionNative), actionItem(actionACP), actionItem(actionNew),
+		actionItem(actionHelp), actionItem(actionDetach),
+	}
+	optional := []footerItem{
+		actionItem(actionFilter),
+		{text: "↑/↓ Select"},
+		actionItem(actionMessage),
+		actionItem(actionPalette),
+	}
+	enabled := make(map[actionID]bool, len(required)+len(optional))
+	includeNavigation := false
+	for _, item := range required {
+		enabled[item.id] = true
+	}
+	items := func() []string {
+		ordered := []footerItem{
+			{text: "↑/↓ Select"},
+			actionItem(actionNative), actionItem(actionACP), actionItem(actionNew), actionItem(actionMessage),
+			actionItem(actionFilter), actionItem(actionPalette), actionItem(actionHelp), actionItem(actionDetach),
+		}
+		var result []string
+		for _, item := range ordered {
+			if item.id == "" {
+				if includeNavigation {
+					result = append(result, item.text)
+				}
+				continue
+			}
+			if enabled[item.id] && item.text != "" {
+				result = append(result, item.text)
+			}
+		}
+		return result
+	}
+	for _, candidate := range optional {
+		if candidate.id == "" {
+			includeNavigation = true
+		} else {
+			enabled[candidate.id] = true
+		}
+		if ansi.StringWidth(strings.Join(items(), " · ")) > width {
+			if candidate.id == "" {
+				includeNavigation = false
+			} else {
+				delete(enabled, candidate.id)
+			}
+		}
+	}
+	footer := strings.Join(items(), " · ")
+	if filter := strings.TrimSpace(m.filter); filter != "" {
+		filtered := "FILTER /" + safeText(filter) + " · " + footer
+		if ansi.StringWidth(filtered) <= width {
+			footer = filtered
+		}
 	}
 	return fitLine(footer, width)
 }
@@ -269,7 +335,7 @@ func (m Model) renderOverlay(width, height int) string {
 	var body []string
 	switch m.overlay {
 	case helpOverlay:
-		title, subtitle, footer = "KEYBOARD HELP", "Actions are contextual; native and ACP always continue the same Session.", "Esc/?/Enter closes help"
+		title, subtitle, footer = "KEYBOARD HELP", "Native CLI and Structured ACP continue the same provider conversation.", "Esc/?/Enter closes help"
 		if m.mode == taskView {
 			body = append(body, "NAVIGATION", "  ↑/↓ or j/k    Select a Session", "")
 			for _, action := range taskActions {
@@ -277,7 +343,7 @@ func (m Model) renderOverlay(width, height int) string {
 			}
 		} else {
 			body = []string{
-				"SESSION ACP CONSOLE", "  p / i / Enter  Compose a message", "  ↑/↓ PgUp/PgDn Scroll history", "  End            Follow live output",
+				"STRUCTURED ACP CONSOLE", "  p / i / Enter  Compose a message", "  ↑/↓ PgUp/PgDn Scroll history", "  End            Follow live output",
 				"  1-9            Choose an offered permission", "  d              Expand selected tool", "  [ / ]          Select tool", "  o              Toggle reasoning",
 				"  r              Toggle raw ACP events", "  Esc / c        Cancel active turn", "  b              Back to Task", "  q              Detach viewer",
 			}
@@ -333,7 +399,7 @@ func (m Model) renderSession(width, height int) string {
 	current := m.current
 	provider := strings.ToUpper(valueOr(current.Agent, "agent"))
 	header := []string{
-		frameTop("SESSION "+safeText(current.ID), statusBadge(string(current.Status)), width),
+		frameTop("STRUCTURED ACP · SESSION "+safeText(current.ID), statusBadge(string(current.Status)), width),
 		frameLine(provider+" · "+valueOr(current.Role, "worker")+" · "+appservice.PermissionLabel(current), width),
 		frameLine("Task "+safeText(current.TaskID)+" · "+compactSessionPath(current), width),
 		frameBottom(width),

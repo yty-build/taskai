@@ -17,23 +17,23 @@ import (
 
 const visualSentinel = "SENTINEL-FULL-SOURCE-MUST-STAY-OUT-OF-CONVERSATION"
 
-func TestSessionHarnessVisualContract(t *testing.T) {
+func TestStructuredACPVisualContract(t *testing.T) {
 	model := visualSessionModel(t)
 	for _, size := range []struct {
 		width  int
 		height int
 		digest string
 	}{
-		{width: 60, height: 16, digest: "483ed44e34c78c79"},
-		{width: 80, height: 24, digest: "8c9622387ad40b36"},
-		{width: 120, height: 40, digest: "4c091ca3e3078e82"},
-		{width: 200, height: 60, digest: "2584fce0c5bafd2e"},
+		{width: 60, height: 16, digest: "a4becd41a9d75aa5"},
+		{width: 80, height: 24, digest: "aac3b325eb4efff2"},
+		{width: 120, height: 40, digest: "4f085a58d6d6fd20"},
+		{width: 200, height: 60, digest: "e1c182f6f7f5d475"},
 	} {
 		t.Run(strings.Join([]string{itoa(size.width), "x", itoa(size.height)}, ""), func(t *testing.T) {
 			model.width, model.height = size.width, size.height
 			view := model.View()
 			assertScreenSize(t, view, size.width, size.height)
-			wants := []string{"SESSION S-VISUAL", "CLAUDE · reviewer", "23.1 KB", "761 lines", "MESSAGE CLAUDE"}
+			wants := []string{"STRUCTURED ACP · SESSION S-VISUAL", "CLAUDE · reviewer", "23.1 KB", "761 lines", "MESSAGE CLAUDE"}
 			if size.height >= 24 {
 				wants = append(wants, "TOOL · model.go", "YOU", "Review the implementation", "I found two issues")
 			}
@@ -54,7 +54,7 @@ func TestSessionHarnessVisualContract(t *testing.T) {
 	}
 }
 
-func TestSessionHarnessRawViewIsExplicitAndForensic(t *testing.T) {
+func TestStructuredACPRawViewIsExplicitAndForensic(t *testing.T) {
 	model := visualSessionModel(t)
 	model.width, model.height, model.raw = 120, 40, true
 	view := model.View()
@@ -69,7 +69,7 @@ func TestSessionHarnessRawViewIsExplicitAndForensic(t *testing.T) {
 	}
 }
 
-func TestSessionHarnessToolDetailsStayBounded(t *testing.T) {
+func TestStructuredACPToolDetailsStayBounded(t *testing.T) {
 	model := visualSessionModel(t)
 	model.width, model.height = 100, 32
 	tool := model.currentTool()
@@ -150,7 +150,7 @@ func visualSessionModel(t *testing.T) Model {
 }
 
 func taskFixture() task.Detail {
-	return task.Detail{Task: task.Task{ID: "T-VISUAL", Title: "Build the native Session harness", Status: task.StatusWorking}}
+	return task.Detail{Task: task.Task{ID: "T-VISUAL", Title: "Build native Session attachment", Status: task.StatusWorking}}
 }
 
 func editorFixture(value string) composerState {

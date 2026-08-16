@@ -222,8 +222,13 @@ func TestTaskConsoleKeyboardMouseAndExplicitPromptTarget(t *testing.T) {
 	model = updated.(Model)
 	updated, nativeCommand := model.Update(tea.MouseMsg(tea.MouseEvent{X: 2, Y: 5, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft}))
 	model = updated.(Model)
-	if model.mode != taskView || model.selected != 0 || nativeCommand == nil {
-		t.Fatalf("mouse native attach: selected=%d mode=%d command=%v", model.selected, model.mode, nativeCommand)
+	if model.mode != taskView || model.selected != 0 || nativeCommand != nil {
+		t.Fatalf("mouse selection: selected=%d mode=%d command=%v", model.selected, model.mode, nativeCommand)
+	}
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	if len(backend.native) != 0 {
+		t.Fatalf("single click opened native CLI: %v", backend.native)
 	}
 }
 
@@ -237,15 +242,29 @@ func TestTaskConsoleNativeDefaultACPActionFilterHelpAndPalette(t *testing.T) {
 
 	updated, nativeCommand := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated.(Model)
-	if model.mode != taskView || nativeCommand == nil || !strings.Contains(model.notice, "native gemini harness") {
-		t.Fatalf("Enter did not choose native harness: mode=%d command=%v notice=%q", model.mode, nativeCommand, model.notice)
+	if model.mode != taskView || nativeCommand != nil || !strings.Contains(model.notice, "Native CLI unavailable") || !strings.Contains(model.notice, "Structured ACP") {
+		t.Fatalf("unsupported native surface: mode=%d command=%v notice=%q", model.mode, nativeCommand, model.notice)
 	}
-	direct := &nativeAttachCommand{ctx: context.Background(), backend: backend, sessionID: "S-1", input: strings.NewReader(""), output: io.Discard, stderr: io.Discard}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	model = updated.(Model)
+	if model.mode != sessionView || model.current.ID != "S-1" || model.composer.focused || !strings.Contains(model.View(), "STRUCTURED ACP · SESSION S-1") {
+		t.Fatalf("Structured ACP action = mode %d Session %s composer=%v\n%s", model.mode, model.current.ID, model.composer.focused, model.View())
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
+	model = updated.(Model)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model = updated.(Model)
+	updated, nativeCommand = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if model.mode != taskView || nativeCommand == nil || !strings.Contains(model.notice, "Opening Codex CLI") || !strings.Contains(model.notice, "same provider conversation") {
+		t.Fatalf("Enter did not choose native CLI: mode=%d command=%v notice=%q", model.mode, nativeCommand, model.notice)
+	}
+	direct := &nativeAttachCommand{ctx: context.Background(), backend: backend, sessionID: "S-2", input: strings.NewReader(""), output: io.Discard, stderr: io.Discard}
 	if err := direct.Run(); err != nil {
 		t.Fatal(err)
 	}
 	backend.mu.Lock()
-	if !reflect.DeepEqual(backend.native, []string{"S-1"}) {
+	if !reflect.DeepEqual(backend.native, []string{"S-2"}) {
 		backend.mu.Unlock()
 		t.Fatalf("native calls = %v", backend.native)
 	}
@@ -253,7 +272,7 @@ func TestTaskConsoleNativeDefaultACPActionFilterHelpAndPalette(t *testing.T) {
 
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
 	model = updated.(Model)
-	if model.mode != sessionView || model.current.ID != "S-1" || model.composer.focused {
+	if model.mode != sessionView || model.current.ID != "S-2" || model.composer.focused {
 		t.Fatalf("ACP action = mode %d Session %s composer=%v", model.mode, model.current.ID, model.composer.focused)
 	}
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
@@ -271,7 +290,7 @@ func TestTaskConsoleNativeDefaultACPActionFilterHelpAndPalette(t *testing.T) {
 
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("?")})
 	model = updated.(Model)
-	if model.overlay != helpOverlay || !strings.Contains(model.View(), "KEYBOARD HELP") || !strings.Contains(model.View(), "Native harness") {
+	if model.overlay != helpOverlay || !strings.Contains(model.View(), "KEYBOARD HELP") || !strings.Contains(model.View(), "Native CLI") || !strings.Contains(model.View(), "Structured ACP") || strings.Contains(model.View(), "harness") {
 		t.Fatalf("help overlay:\n%s", model.View())
 	}
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
@@ -305,8 +324,110 @@ func TestTaskConsoleMouseUsesScrolledNavigatorWindow(t *testing.T) {
 	}
 	updated, command := model.Update(tea.MouseMsg(tea.MouseEvent{X: 2, Y: 5, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft}))
 	model = updated.(Model)
-	if command == nil || model.selected != indices[start] {
+	if command != nil || model.selected != indices[start] {
 		t.Fatalf("scrolled mouse selected index %d, want %d; command=%v", model.selected, indices[start], command)
+	}
+}
+
+func TestTaskFooterUsesActionRegistryAndKeepsNewSessionVisible(t *testing.T) {
+	backend := newConsoleBackend()
+	model, cancel, err := newTaskModel(context.Background(), backend, "T-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	newAction, ok := taskActionForID(actionNew)
+	if !ok {
+		t.Fatal("New Session action is missing from the registry")
+	}
+	wantNew := displayActionKey(newAction.Key) + " " + newAction.FooterLabel
+	for _, width := range []int{60, 72, 80, 91, 92, 120} {
+		model.width, model.height = width, 24
+		lines := strings.Split(model.View(), "\n")
+		footer := lines[len(lines)-1]
+		if !strings.Contains(footer, wantNew) || strings.Contains(footer, "…") {
+			t.Fatalf("%d-column footer does not expose %q intact: %q", width, wantNew, footer)
+		}
+		for _, want := range []string{"a ACP", "? Help", "q Detach"} {
+			if !strings.Contains(footer, want) {
+				t.Fatalf("%d-column footer missing %q: %q", width, want, footer)
+			}
+		}
+	}
+	model.selected, model.width = 1, 60
+	availableFooter := strings.Split(model.View(), "\n")[model.height-1]
+	if !strings.Contains(availableFooter, "Enter Native CLI") || !strings.Contains(availableFooter, wantNew) || strings.Contains(availableFooter, "…") {
+		t.Fatalf("minimum-width available footer is not intact: %q", availableFooter)
+	}
+	model.width = 120
+	footer := strings.Split(model.View(), "\n")[model.height-1]
+	for _, want := range []string{"p Message", "/ Filter", ": Commands"} {
+		if !strings.Contains(footer, want) {
+			t.Fatalf("wide footer missing %q: %q", want, footer)
+		}
+	}
+}
+
+func TestTaskNativeCapabilityUsesSupportedMappingAndCanonicalIdentity(t *testing.T) {
+	verifiedAt := time.Now().UTC()
+	tests := []struct {
+		name      string
+		current   session.Session
+		available bool
+		want      string
+	}{
+		{name: "supported pending verification", current: session.Session{Agent: "claude", ProviderConversationID: "claude-id", RepoPath: "/repo"}, available: true, want: "identity checked before opening"},
+		{name: "supported verified", current: session.Session{Agent: "opencode", ProviderConversationID: "ses-id", RepoPath: "/repo", ConversationIDVerifiedAt: &verifiedAt}, available: true, want: "identity verified"},
+		{name: "missing identity", current: session.Session{Agent: "codex", RepoPath: "/repo"}, want: "exact provider conversation identity"},
+		{name: "unsupported mapping", current: session.Session{Agent: "gemini", ProviderConversationID: "gemini-id", RepoPath: "/repo"}, want: "no supported exact native resume command"},
+		{name: "missing checkout", current: session.Session{Agent: "grok", ProviderConversationID: "grok-id"}, want: "no checkout path"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			capability := nativeCapability(test.current)
+			if capability.available != test.available || !strings.Contains(capability.status+" "+capability.reason, test.want) {
+				t.Fatalf("capability = %#v, want available=%t and %q", capability, test.available, test.want)
+			}
+		})
+	}
+}
+
+func TestTaskMouseCannotClickThroughInteractiveLayers(t *testing.T) {
+	backend := newConsoleBackend()
+	base, cancel, err := newTaskModel(context.Background(), backend, "T-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	base.selected = 1
+	base.scroll, base.unread = 7, 2
+	tests := []struct {
+		name   string
+		setup  func(*Model)
+		active func(Model) bool
+	}{
+		{name: "help", setup: func(m *Model) { m.overlay = helpOverlay }, active: func(m Model) bool { return m.overlay == helpOverlay }},
+		{name: "palette", setup: func(m *Model) { m.overlay = paletteOverlay }, active: func(m Model) bool { return m.overlay == paletteOverlay }},
+		{name: "filter", setup: func(m *Model) { m.overlay = filterOverlay }, active: func(m Model) bool { return m.overlay == filterOverlay }},
+		{name: "wizard", setup: func(m *Model) { m.wizard = &sessionWizard{} }, active: func(m Model) bool { return m.wizard != nil }},
+		{name: "composer", setup: func(m *Model) { m.composer.focused = true }, active: func(m Model) bool { return m.composer.focused }},
+		{name: "confirmation", setup: func(m *Model) { m.confirm = &confirmation{kind: "stop", sessionID: "S-2"} }, active: func(m Model) bool { return m.confirm != nil }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			model := base
+			test.setup(&model)
+			updated, command := model.Update(tea.MouseMsg(tea.MouseEvent{X: 2, Y: 5, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft}))
+			model = updated.(Model)
+			if command != nil || model.selected != 1 || !test.active(model) {
+				t.Fatalf("click reached Task navigator: selected=%d command=%v", model.selected, command)
+			}
+			updated, command = model.Update(tea.MouseMsg(tea.MouseEvent{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown}))
+			model = updated.(Model)
+			if command != nil || model.selected != 1 || model.scroll != 7 || model.unread != 2 || !test.active(model) {
+				t.Fatalf("wheel reached underlying view: selected=%d scroll=%d unread=%d command=%v", model.selected, model.scroll, model.unread, command)
+			}
+		})
 	}
 }
 
@@ -590,7 +711,8 @@ func newConsoleBackend() *fakeBackend {
 		"S-2": {
 			ID: "S-2", TaskID: "T-1", Role: "implementer", Agent: "codex", Provider: "openai",
 			RepoPath: "/repo/two", WorktreePath: "/worktrees/two", Branch: "agent/S-2",
-			Status: session.StatusWaiting, WorkerSocket: "/tmp/S-2.sock",
+			ProviderConversationID: "codex-conversation",
+			Status:                 session.StatusWaiting, WorkerSocket: "/tmp/S-2.sock",
 			MetadataJSON: json.RawMessage(`{"permission":"approve-all"}`),
 		},
 	}

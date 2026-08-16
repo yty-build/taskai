@@ -601,6 +601,12 @@ func (m Model) handleConfirmation(name string) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleMouse(event tea.MouseEvent) (tea.Model, tea.Cmd) {
+	// Mouse input must not reach the Task navigator through a visible modal or
+	// focused editor. In particular, a click intended for the New Session wizard
+	// must never select an underlying row or leave the console.
+	if m.wizard != nil || m.overlay != noOverlay || m.composer.focused || m.confirm != nil {
+		return m, nil
+	}
 	if event.Button == tea.MouseButtonWheelUp {
 		m.scroll += 3
 		return m, nil
@@ -629,7 +635,14 @@ func (m Model) handleMouse(event tea.MouseEvent) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.selected = indices[actualPosition]
-	return m.attachSelectedNative()
+	current := m.task.Sessions[m.selected]
+	capability := nativeCapability(current)
+	if capability.available {
+		m.notice = "Selected " + current.ID + ". Enter opens " + capability.label + "; a opens Structured ACP."
+	} else {
+		m.notice = "Selected " + current.ID + ". Native CLI unavailable: " + capability.reason + "."
+	}
+	return m, nil
 }
 
 func (m Model) attachSelectedNative() (tea.Model, tea.Cmd) {
@@ -638,7 +651,12 @@ func (m Model) attachSelectedNative() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	current := m.task.Sessions[m.selected]
-	m.notice = "Opening the native " + valueOr(current.Agent, "provider") + " harness for " + current.ID + "…"
+	capability := nativeCapability(current)
+	if !capability.available {
+		m.notice = "Native CLI unavailable for " + current.ID + ": " + capability.reason + "."
+		return m, nil
+	}
+	m.notice = "Opening " + capability.label + " for " + current.ID + " — same provider conversation…"
 	command := &nativeAttachCommand{ctx: m.ctx, backend: m.backend, sessionID: current.ID}
 	return m, tea.Exec(command, func(err error) tea.Msg {
 		return actionMsg{kind: "native", sessionID: current.ID, err: err}
@@ -814,7 +832,7 @@ func (m Model) handleAction(message actionMsg) (tea.Model, tea.Cmd) {
 	case "permission":
 		m.notice = "Permission decision accepted. The agent turn continues in this Session."
 	case "native":
-		m.notice = "Returned from the native harness. The provider conversation remains the same."
+		m.notice = "Back in Task Console. Native CLI and Structured ACP continue the same provider conversation."
 	}
 	return m, m.refreshCmd()
 }
@@ -864,6 +882,9 @@ func actionProgress(kind, sessionID string) string {
 }
 
 func actionLabel(kind string) string {
+	if kind == "native" {
+		return "Native CLI"
+	}
 	if kind == "" {
 		return "Action"
 	}

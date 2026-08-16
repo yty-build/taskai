@@ -22,23 +22,33 @@ type consoleAction struct {
 	ID          actionID
 	Key         string
 	Label       string
+	FooterLabel string
 	Description string
 }
 
 // taskActions is the single source for direct keys, help, the command palette,
 // and contextual footer labels.
 var taskActions = []consoleAction{
-	{ID: actionNative, Key: "enter", Label: "Native harness", Description: "Resume this exact conversation in the provider's real CLI"},
-	{ID: actionACP, Key: "a", Label: "ACP console", Description: "Open the structured gateway transcript and permission view"},
-	{ID: actionMessage, Key: "p", Label: "Message through ACP", Description: "Open the ACP console with the message composer focused"},
-	{ID: actionNew, Key: "n", Label: "New Session", Description: "Add another agent Session to this Task"},
-	{ID: actionCancel, Key: "c", Label: "Cancel turn", Description: "Request cancellation of only the selected active ACP turn"},
-	{ID: actionResume, Key: "u", Label: "Resume worker", Description: "Resume the selected Session worker"},
-	{ID: actionStop, Key: "x", Label: "Stop worker", Description: "Stop the worker without deleting provider conversation state"},
-	{ID: actionFilter, Key: "/", Label: "Filter Sessions", Description: "Filter by ID, agent, role, status, repo, or activity"},
-	{ID: actionPalette, Key: ":", Label: "Command palette", Description: "Search every action available on this screen"},
-	{ID: actionHelp, Key: "?", Label: "Keyboard help", Description: "Show the complete key map and interaction model"},
-	{ID: actionDetach, Key: "q", Label: "Detach viewer", Description: "Close only this viewer; Sessions and turns continue"},
+	{ID: actionNative, Key: "enter", Label: "Native CLI", FooterLabel: "Native CLI", Description: "Open this exact conversation in the provider's real CLI"},
+	{ID: actionACP, Key: "a", Label: "Structured ACP", FooterLabel: "ACP", Description: "Open the gateway transcript, tools, and approvals"},
+	{ID: actionMessage, Key: "p", Label: "Message via Structured ACP", FooterLabel: "Message", Description: "Open Structured ACP with the message composer focused"},
+	{ID: actionNew, Key: "n", Label: "New Session", FooterLabel: "New Session", Description: "Add another agent Session to this Task"},
+	{ID: actionCancel, Key: "c", Label: "Cancel turn", FooterLabel: "Cancel", Description: "Request cancellation of only the selected active ACP turn"},
+	{ID: actionResume, Key: "u", Label: "Resume worker", FooterLabel: "Resume", Description: "Resume the selected Session worker"},
+	{ID: actionStop, Key: "x", Label: "Stop worker", FooterLabel: "Stop", Description: "Stop the worker without deleting provider conversation state"},
+	{ID: actionFilter, Key: "/", Label: "Filter Sessions", FooterLabel: "Filter", Description: "Filter by ID, agent, role, status, repo, or activity"},
+	{ID: actionPalette, Key: ":", Label: "Command palette", FooterLabel: "Commands", Description: "Search every action available on this screen"},
+	{ID: actionHelp, Key: "?", Label: "Keyboard help", FooterLabel: "Help", Description: "Show the complete key map and interaction model"},
+	{ID: actionDetach, Key: "q", Label: "Detach viewer", FooterLabel: "Detach", Description: "Close only this viewer; Sessions and turns continue"},
+}
+
+func taskActionForID(id actionID) (consoleAction, bool) {
+	for _, action := range taskActions {
+		if action.ID == id {
+			return action, true
+		}
+	}
+	return consoleAction{}, false
 }
 
 func taskActionForKey(key string) (consoleAction, bool) {
