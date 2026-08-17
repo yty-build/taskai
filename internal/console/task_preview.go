@@ -2,10 +2,10 @@ package console
 
 import (
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 
-	appservice "github.com/yty-build/acp-gateway/internal/service"
 	"github.com/yty-build/acp-gateway/internal/session"
 )
 
@@ -28,95 +28,54 @@ type taskPreviewEntry struct {
 
 func (m Model) renderCompactTaskPreview(current session.Session, width, height int) []string {
 	capability := nativeCapability(current)
-	nativeLine := "↵ Enter  " + capability.label + " · " + capability.status
-	if capability.reason != "" {
-		nativeLine += ": " + capability.reason
+	nativeLine := "Enter " + capability.label
+	if !capability.available {
+		nativeLine = "Native unavailable"
 	}
 	content := []string{
-		strings.ToUpper(valueOr(current.Agent, "agent")) + " · " + valueOr(current.Role, "worker") + " · " + humanizeLabel(appservice.PermissionLabel(current)),
-		fitLine(nativeLine, width),
-		fitLine("a        Structured ACP · transcript, tools, and approvals", width),
+		fitLine(m.sessionAttention(current), width),
+		fitWithRight(taskCheckoutLabel(current), taskContinuationReadiness(capability), width),
+		fitLine(nativeLine+" · a Structured view", width),
 	}
 	return padLines(content, height, width)
 }
 
 func (m Model) renderTaskPreviewOverview(current session.Session, width int) []string {
 	capability := nativeCapability(current)
-	identity := strings.ToUpper(valueOr(current.Agent, "agent")) + " · " + valueOr(current.Role, "worker")
-	action := "↵ " + capability.label + "   a Structured ACP"
+	action := "Enter " + capability.label + " · a Structured view · p Message"
 	if !capability.available {
-		action = "↵ Native unavailable   a Structured ACP"
+		action = "Native unavailable · a Structured view · p Message"
 	}
 	return []string{
-		fitWithRight(identity, statusBadge(string(current.Status)), width),
-		fitLine(action, width),
-		fitLine("◆ PROVIDER COMMITTED   ● LIVE ACP", width),
 		fitLine(m.sessionAttention(current), width),
+		fitWithRight(taskCheckoutLabel(current), taskContinuationReadiness(capability), width),
+		fitLine(action, width),
 	}
-}
-
-func (m Model) renderTaskContextRail(current session.Session, width, height int) []string {
-	capability := nativeCapability(current)
-	provider := strings.ToUpper(valueOr(current.Agent, "agent"))
-	nativeStatus := capability.status
-	if capability.reason != "" {
-		nativeStatus += " · " + capability.reason
-	}
-	lines := []string{
-		sectionHeading("CONTEXT", statusBadge(string(current.Status)), width),
-		sectionRule(width),
-		fitLine(provider+" · "+valueOr(current.Role, "worker"), width),
-	}
-	attention := indentWrapped(m.sessionAttention(current), max(10, width-2), "  ")
-	lines = append(lines, takeLines(attention, 3)...)
-	lines = append(lines,
-		"",
-		sectionHeading("CONTINUE", "", width),
-		fitLine("↵ "+capability.label, width),
-		fitLine("  "+nativeStatus, width),
-		fitLine("a Structured ACP", width),
-		fitLine("  transcript · tools · approvals", width),
-		fitLine("p Message via ACP", width),
-		"",
-		sectionHeading("PROVENANCE", "", width),
-		fitLine("◆ Provider committed", width),
-		fitLine("● Live ACP stream", width),
-		fitLine("Same provider conversation", width),
-		"",
-		sectionHeading("SESSION", "", width),
-		fitLine(current.ID, width),
-		fitLine(compactSessionPath(current), width),
-		fitLine(humanizeLabel(appservice.PermissionLabel(current)), width),
-	)
-	return padLines(lines, height, width)
 }
 
 func (m Model) renderTaskTimeline(current session.Session, width, height int) []string {
 	if height <= 0 {
 		return nil
 	}
-	lines := []string{sectionHeading("RECENT CONVERSATION", "committed + live", width), sectionRule(width)}
-	bodyHeight := max(0, height-len(lines))
-	if bodyHeight == 0 {
-		return padLines(lines, height, width)
-	}
-	entries := taskPreviewEntries(m.projections[current.ID], strings.ToUpper(valueOr(current.Agent, "agent")))
+	entries := taskPreviewEntries(m.projections[current.ID], taskProviderName(current))
 	if len(entries) == 0 {
-		empty := []string{"", centerLine("No conversation yet", width), centerLine("Native and ACP continuations appear here.", width)}
-		return append(lines, padLines(empty, bodyHeight, width)...)
+		empty := []string{"", centerLine("No conversation yet", width), centerLine("Messages appear here as work continues.", width)}
+		return padLines(empty, height, width)
 	}
 	totalEntries := len(entries)
-	maxEntries := max(1, bodyHeight/2)
+	maxEntries := max(1, height/2)
 	entries = selectTaskPreviewEntries(entries, maxEntries)
 	var body []string
 	for _, entry := range entries {
 		body = append(body, fitLine(taskPreviewEntryHeading(entry), width))
-		body = append(body, fitLine("  "+taskPreviewSnippet(entry.text), width))
+		if entry.kind != "status" {
+			body = append(body, fitLine("  "+taskPreviewSnippet(entry.text), width))
+		}
 	}
-	if len(body) < bodyHeight && len(entries) < totalEntries {
+	if len(body) < height && len(entries) < totalEntries {
 		body = append(body, fitLine("  ↑ earlier conversation retained", width))
 	}
-	return append(lines, padLines(body, bodyHeight, width)...)
+	return padLines(body, height, width)
 }
 
 func taskPreviewEntries(projection *transcript, agent string) []taskPreviewEntry {
@@ -153,30 +112,30 @@ func taskPreviewEntries(projection *transcript, agent string) []taskPreviewEntry
 				if request.committed {
 					provenance = taskPreviewProvider
 				}
-				appendEntry("user", "YOU", block.text, provenance)
+				appendEntry("user", "You", block.text, provenance)
 			case blockThought:
-				appendEntry("reasoning", "REASONING", block.text, provenance)
+				appendEntry("reasoning", "Reasoning", block.text, provenance)
 			case blockAssistant:
 				appendEntry("assistant", agent, block.text, provenance)
 			case blockTool:
 				if block.tool == nil {
 					continue
 				}
-				appendEntry("tool", "TOOL · "+toolDisplayTitle(block.tool), taskPreviewToolSummary(block.tool), provenance)
+				appendEntry("tool", "Tool · "+toolDisplayTitle(block.tool), taskPreviewToolSummary(block.tool), provenance)
 			case blockPlan:
-				appendEntry("plan", "PLAN", taskPreviewPlanSummary(block.plan), provenance)
+				appendEntry("plan", "Plan", taskPreviewPlanSummary(block.plan), provenance)
 			case blockPermission:
 				if block.permission == nil {
 					continue
 				}
 				state := valueOr(block.permission.state, "pending")
-				appendEntry("approval", "APPROVAL", valueOr(block.permission.title, "Tool permission")+" · "+state, provenance)
+				appendEntry("approval", "Approval", valueOr(block.permission.title, "Tool permission")+" · "+state, provenance)
 			case blockError:
-				appendEntry("error", "ERROR", block.text, provenance)
+				appendEntry("error", "Error", block.text, provenance)
 			}
 		}
 		if text := taskPreviewStateText(request.state); text != "" {
-			appendEntry("status", "STATUS", text, taskPreviewRequestProvenance(request))
+			appendEntry("status", "Status", text, taskPreviewRequestProvenance(request))
 		}
 		if len(entries) > taskPreviewEntryLimit {
 			entries = append([]taskPreviewEntry(nil), entries[len(entries)-taskPreviewEntryLimit:]...)
@@ -235,11 +194,6 @@ func latestTaskPreviewEntry(entries []taskPreviewEntry, matches func(taskPreview
 
 func taskPreviewEntryHeading(entry taskPreviewEntry) string {
 	glyph := "●"
-	provenance := "LIVE ACP"
-	if entry.provenance == taskPreviewProvider {
-		glyph = "◆"
-		provenance = "PROVIDER COMMITTED"
-	}
 	switch entry.kind {
 	case "user":
 		glyph = "❯"
@@ -252,7 +206,43 @@ func taskPreviewEntryHeading(entry taskPreviewEntry) string {
 	case "error":
 		glyph = "!"
 	}
-	return fmt.Sprintf("%s %s · %s", glyph, entry.label, provenance)
+	if entry.kind == "status" {
+		return fmt.Sprintf("%s %s", glyph, entry.text)
+	}
+	return fmt.Sprintf("%s %s", glyph, entry.label)
+}
+
+func taskProviderName(current session.Session) string {
+	label := nativeCapability(current).label
+	if provider := strings.TrimSpace(strings.TrimSuffix(label, " CLI")); provider != "" && provider != "Native" {
+		return provider
+	}
+	return providerDisplayName(strings.ToLower(strings.TrimSpace(current.Agent)))
+}
+
+func taskContinuationReadiness(capability nativeCLICapability) string {
+	if !capability.available {
+		return "Native unavailable"
+	}
+	if strings.HasPrefix(capability.status, "identity verified") {
+		return "Exact conversation verified"
+	}
+	return "Conversation linked · verified on open"
+}
+
+func taskCheckoutLabel(current session.Session) string {
+	path := strings.TrimSpace(current.RepoPath)
+	if path == "" {
+		path = strings.TrimSpace(current.WorktreePath)
+	}
+	name := filepath.Base(strings.TrimSuffix(path, string(filepath.Separator)))
+	if name == "." || name == string(filepath.Separator) || name == "" {
+		name = valueOr(path, "Checkout")
+	}
+	if strings.TrimSpace(current.WorktreePath) != "" {
+		return safeText(name) + " · isolated worktree"
+	}
+	return safeText(name) + " · shared checkout"
 }
 
 func taskPreviewStateGlyph(text string) string {
@@ -344,11 +334,4 @@ func taskPreviewStateText(state turnState) string {
 	default:
 		return ""
 	}
-}
-
-func takeLines(lines []string, limit int) []string {
-	if len(lines) <= limit {
-		return lines
-	}
-	return lines[:limit]
 }

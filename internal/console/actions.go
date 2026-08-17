@@ -30,8 +30,8 @@ type consoleAction struct {
 // and contextual footer labels.
 var taskActions = []consoleAction{
 	{ID: actionNative, Key: "enter", Label: "Native CLI", FooterLabel: "Native CLI", Description: "Open this exact conversation in the provider's real CLI"},
-	{ID: actionACP, Key: "a", Label: "Structured ACP", FooterLabel: "ACP", Description: "Open the gateway transcript, tools, and approvals"},
-	{ID: actionMessage, Key: "p", Label: "Message via Structured ACP", FooterLabel: "Message", Description: "Open Structured ACP with the message composer focused"},
+	{ID: actionACP, Key: "a", Label: "Structured view", FooterLabel: "View", Description: "Open the gateway conversation, tools, and approvals"},
+	{ID: actionMessage, Key: "p", Label: "Message in structured view", FooterLabel: "Message", Description: "Open the conversation with the message composer focused"},
 	{ID: actionNew, Key: "n", Label: "New Session", FooterLabel: "New Session", Description: "Add another agent Session to this Task"},
 	{ID: actionCancel, Key: "c", Label: "Cancel turn", FooterLabel: "Cancel", Description: "Request cancellation of only the selected active ACP turn"},
 	{ID: actionResume, Key: "u", Label: "Resume worker", FooterLabel: "Resume", Description: "Resume the selected Session worker"},

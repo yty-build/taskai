@@ -688,6 +688,11 @@ typed upgrade-required result and exact `agent-<session-id>` exit plus
 stop/resume instructions; none of the requested provider input is sent. Cancel,
 Stop, status/read, conversation/history, permission-list, and stream operations
 remain available so the operator can inspect and migrate the Session safely.
+The permission-list response includes a sanitized decision-readiness result.
+When a pending request belongs to an older or unverifiable worker, Web/mobile
+must keep the request visible, disable Allow/Reject controls, and show the exact
+safe migration message rather than presenting a decision that the server will
+refuse.
 
 Closing a subscriber connection only detaches that viewer. It must not cancel a turn, stop the worker, or close the ACP Session.
 
@@ -1103,8 +1108,10 @@ in Session status and selected-Session context. Each Session row pairs its
 status color with a glyph and word, gives agent/role priority over opaque IDs,
 and keeps status/activity context aligned for scanning. The preview emphasizes
 latest activity, checkout, canonical-conversation readiness, and the primary
-actions: `Enter` opens the real provider CLI, `a` opens Structured ACP, and `p`
-targets an ACP message.
+actions: `Enter` opens the real provider CLI, `a` opens the structured
+conversation view, and `p` targets a message through ACP. Normal conversation
+rows use human labels; protocol/source provenance belongs in details or the
+explicit raw view, not a repeated third pane or every transcript line.
 
 Narrow terminals use a stacked navigator/preview. At the supported minimum of
 40 columns by 16 rows, the console keeps a useful Session navigator and its

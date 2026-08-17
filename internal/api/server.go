@@ -205,16 +205,19 @@ func (s *Server) prompt(writer http.ResponseWriter, request *http.Request) {
 }
 
 func (s *Server) permissions(writer http.ResponseWriter, request *http.Request) {
-	pending, err := s.sessions.PendingPermissions(request.Context(), request.PathValue("sessionID"))
+	snapshot, err := s.sessions.PendingPermissionSnapshot(request.Context(), request.PathValue("sessionID"))
 	if err != nil {
 		writeActionError(writer, err)
 		return
 	}
-	result := make([]PermissionDTO, 0, len(pending))
-	for _, permission := range pending {
+	result := make([]PermissionDTO, 0, len(snapshot.Permissions))
+	for _, permission := range snapshot.Permissions {
 		result = append(result, makePendingPermissionDTO(permission))
 	}
-	writeJSON(writer, http.StatusOK, map[string]any{"permissions": result})
+	writeJSON(writer, http.StatusOK, map[string]any{
+		"permissions": result, "decisions_ready": snapshot.DecisionsReady,
+		"blocked_code": snapshot.BlockedCode, "blocked_message": snapshot.BlockedMessage,
+	})
 }
 
 type permissionDecisionRequest struct {

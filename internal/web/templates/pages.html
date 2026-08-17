@@ -189,6 +189,7 @@
           <h1>{{.Session.Agent}} <span>· {{.Session.Role}}</span></h1>
         </div>
         <div class="session-header-actions">
+          <span id="history-summary" class="history-summary">Loading history…</span>
           <span id="session-status" class="status status-{{statusTone .Session.Status}}"><i></i>{{statusLabel .Session.Status}}</span>
           <span id="continuity-chip" class="continuity-chip{{if .Session.ConversationVerified}} verified{{else if .Session.ConversationReady}} linked{{end}}">{{if .Session.ConversationVerified}}✓ Verified{{else if .Session.ConversationReady}}↔ Linked{{else}}○ Linking{{end}}</span>
           <span id="stream-state" class="connection-state"><i></i><span>Connecting</span></span>
@@ -217,7 +218,7 @@
           <label class="sr-only" for="prompt-message">Message this Session</label>
           <textarea id="prompt-message" name="message" rows="1" required placeholder="Message {{.Session.Agent}}…"></textarea>
           <div class="composer-footer">
-            <div class="composer-context"><span class="surface-label">Structured ACP</span><span id="composer-hint">Enter to send · Shift+Enter for a new line</span></div>
+            <div class="composer-context"><span class="surface-label">Conversation</span><span id="composer-hint">Enter to send · Shift+Enter for a new line</span></div>
             <button type="submit" class="send-button" aria-label="Send message"><span>Send</span><b>↑</b></button>
           </div>
         </form>

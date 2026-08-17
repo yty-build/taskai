@@ -36,6 +36,16 @@ function activity(position, type, display, permission, requestID = "REQ") {
   return {session_id:"S", position, request_id:requestID, kind:type, activity:type, display, permission};
 }
 
+const savedHistorySummary = conversationHistorySummary({turns:[{committed:true,blocks:[]},{committed:true,blocks:[]},{committed:true,blocks:[]}],snapshotTruncated:false,historyClipped:false});
+testAssert(savedHistorySummary.short === "3 saved turns" && savedHistorySummary.detail.includes("all available history is loaded"), "complete provider history was not explained clearly");
+const liveHistorySummary = conversationHistorySummary({turns:[{committed:false,blocks:[{type:"tool"},{type:"tool"}]}],snapshotTruncated:false,historyClipped:false});
+testAssert(liveHistorySummary.short === "1 live turn · 2 steps" && liveHistorySummary.detail.includes("can be saved after successful completion"), "unfinished provider history was not explained clearly");
+const stoppedHistorySummary = conversationHistorySummary({turns:[{committed:false,state:"cancelled",blocks:[]},{committed:false,state:"error",blocks:[]},{committed:false,state:"failed",blocks:[]}],snapshotTruncated:false,historyClipped:false});
+testAssert(stoppedHistorySummary.short === "3 unsaved" && stoppedHistorySummary.active === 0 && stoppedHistorySummary.stopped === 3, "terminal unsaved history was misclassified as live");
+testAssert(stoppedHistorySummary.detail.includes("remain unsaved gateway history") && !stoppedHistorySummary.detail.includes("can be saved"), "terminal unsaved history promised an impossible provider save");
+const liveWithoutReasoning = renderTurnTail({state:"working",reasoningSeen:false,permissionIDs:[],blocks:[],contentClipped:false});
+testAssert(liveWithoutReasoning.textContent.includes("has not exposed a separate reasoning stream"), "live provider reasoning absence was not disclosed");
+
 testAssert(
   permissionActionErrorMessage({status:409, code:"worker_upgrade_required", message:"Exact worker recovery instructions"}) === "Exact worker recovery instructions",
   "worker upgrade conflict hid its actionable recovery message"
@@ -272,6 +282,11 @@ const committedSnapshot = {
     {key:"u3",committed:true,activities:[activity(0,"provider_transcript",{type:"user_message",text:"ACP three"}),activity(0,"provider_transcript",{type:"assistant_chunk",text:"THREE"}),activity(0,"provider_turn_completed",{type:"turn_state",state:"complete"})]}
   ], diagnostics:[]
 };
+const savedOnlyCandidate = buildConversationSnapshot(committedSnapshot, []);
+const savedOnlySummary = conversationHistorySummary(savedOnlyCandidate);
+testAssert(savedOnlyCandidate.turns.length === 3 && savedOnlyCandidate.turns.every((turn) => turn.committed), "ACP-native-ACP provider history was not fully loaded");
+testAssert(savedOnlyCandidate.turns[1].blocks.some((block) => block.type === "user" && block.text === "Native middle"), "native middle turn disappeared from the structured conversation");
+testAssert(savedOnlySummary.short === "3 saved turns" && !savedOnlySummary.bounded, "complete three-turn history was not disclosed as fully loaded");
 const candidate = buildConversationSnapshot(committedSnapshot, [activity(41, "turn_started", {type:"turn_state",state:"working"}, null, "LIVE")]);
 testAssert(candidate.source === "provider-store" && candidate.checkpoint === "pt1-three-turns", "provider snapshot identity was not retained");
 testAssert(candidate.turns.length === 4 && candidate.turns[1].blocks.some((block) => block.type === "thought" && block.text === "native reasoning"), "provider ACP-native-ACP history was not grouped in order");
@@ -284,11 +299,11 @@ const providerReasoningCard = thoughtElement({source:"provider",text:"First stor
 testAssert(providerReasoningCard.open, "stored provider reasoning was not open by default");
 testAssert(providerReasoningCard.className.includes("provider-history"), "stored reasoning card lacked unmistakable provider-history styling");
 testAssert(providerReasoningCard.children[0].className === "thought-summary", "reasoning card lacked a structured visible header");
-testAssert(providerReasoningCard.textContent.includes("Provider history"), "reasoning card did not expose its committed source");
+testAssert(providerReasoningCard.textContent.includes("Saved"), "reasoning card did not expose its saved state");
 testAssert(providerReasoningCard.textContent.includes("2 lines") && providerReasoningCard.textContent.includes("6 words"), "reasoning card did not summarize its readable content");
 const liveReasoningCard = thoughtElement({source:"acp",text:"Streaming thought",revision:1}, {streaming:true});
 testAssert(liveReasoningCard.className.includes("live-acp"), "live ACP reasoning card lacked distinct source styling");
-testAssert(liveReasoningCard.textContent.includes("Live ACP"), "live ACP reasoning source was not visible");
+testAssert(liveReasoningCard.textContent.includes("Live"), "live reasoning state was not visible");
 testAssert(providerReasoningCard.tagName === "DETAILS" && providerReasoningCard.children[0].tagName === "SUMMARY", "reasoning disclosure lost native keyboard semantics");
 providerReasoningCard.open = false;
 providerReasoningCard.dataset.userToggled = "true";
@@ -357,6 +372,17 @@ restoreConversationScrollAnchor(fakeScroller, scrollAnchor, 120);
 testAssert(fakeScroller.scrollTop === 165, "atomic reconciliation did not preserve the visible content anchor");
 testAssert(fakeScroller.style.scrollBehavior === "smooth", "scroll-anchor restoration changed the viewer's scroll behavior");
 	transcriptState.turns = savedTurns;
+
+const readinessApiRequest = apiRequest;
+apiRequest = async () => ({
+  permissions:[{id:"UPGRADE-PERMISSION",state:"waiting",title:"Write scratch test",options:[{id:"allow",name:"Allow once",kind:"allow_once"}]}],
+  decisions_ready:false,
+  blocked_code:"worker_upgrade_required",
+  blocked_message:"Exit agent-S, then stop and resume this Session."
+});
+testAssert(await refreshPermissions(), "permission readiness refresh did not report a presentation change");
+testAssert(!permissionDecisionsReady && permissionDecisionBlockedCode === "worker_upgrade_required" && permissionDecisionBlockedMessage.includes("stop and resume"), "stale worker permission controls were left actionable");
+apiRequest = readinessApiRequest;
 
 const originalApiRequest = apiRequest;
 const gatewaySnapshot = {

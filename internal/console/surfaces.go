@@ -21,21 +21,21 @@ func nativeCapability(current session.Session) nativeCLICapability {
 		return nativeCLICapability{
 			label:  label,
 			status: "unavailable",
-			reason: "this agent has no supported exact native resume command; use Structured ACP",
+			reason: "this agent has no supported exact native resume command; use the structured view",
 		}
 	}
 	if strings.TrimSpace(current.ProviderConversationID) == "" {
 		return nativeCLICapability{
 			label:  label,
 			status: "unavailable",
-			reason: "waiting for the exact provider conversation identity; use Structured ACP now",
+			reason: "waiting for the exact provider conversation identity; use the structured view now",
 		}
 	}
 	if strings.TrimSpace(current.WorktreePath) == "" && strings.TrimSpace(current.RepoPath) == "" {
 		return nativeCLICapability{
 			label:  label,
 			status: "unavailable",
-			reason: "the Session has no checkout path for the provider CLI; use Structured ACP",
+			reason: "the Session has no checkout path for the provider CLI; use the structured view",
 		}
 	}
 	status := "identity present · safety checked on open"

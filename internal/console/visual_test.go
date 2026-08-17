@@ -25,10 +25,10 @@ func TestTaskConsoleVisualContract(t *testing.T) {
 		mode   taskWorkspaceMode
 		wants  []string
 	}{
-		{width: 40, height: 16, mode: taskWorkspaceCompact, wants: []string{"TASK T-VISUAL", "SESSIONS", "CLAUDE", "Enter Native", "a ACP", "n New", "q Detach"}},
-		{width: 60, height: 16, mode: taskWorkspaceStacked, wants: []string{"SESSIONS", "SELECTED SESSION", "CLAUDE · reviewer", "Enter  Claude CLI", "Structured ACP"}},
-		{width: 80, height: 24, mode: taskWorkspaceSplit, wants: []string{"SESSIONS", "SELECTED SESSION", "RECENT CONVERSATION", "PROVIDER COMMITTED", "LIVE ACP", "Streaming now", "TOOL · Read worker state"}},
-		{width: 120, height: 40, mode: taskWorkspaceSplit, wants: []string{"SESSIONS", "SELECTED SESSION", "RECENT CONVERSATION", "CONTEXT", "CONTINUE", "PROVENANCE", "Claude CLI", "Same provider conversation", "Provider transcript confirms safe detach"}},
+		{width: 40, height: 16, mode: taskWorkspaceCompact, wants: []string{"TASK · Ship the native", "T-VISUAL", "SESSIONS", "CLAUDE", "Enter Native", "a View", "n New", "q Detach"}},
+		{width: 60, height: 16, mode: taskWorkspaceStacked, wants: []string{"SESSIONS", "CONVERSATION · Claude · reviewer", "Enter Claude CLI", "Structured view"}},
+		{width: 80, height: 24, mode: taskWorkspaceSplit, wants: []string{"SESSIONS", "CONVERSATION · Claude · reviewer", "Working now", "Reasoning", "Tool · Read worker state"}},
+		{width: 120, height: 40, mode: taskWorkspaceSplit, wants: []string{"SESSIONS", "CONVERSATION · Claude · reviewer", "Conversation linked · verified on open", "Claude CLI", "Provider transcript confirms safe detach"}},
 	} {
 		t.Run(strings.Join([]string{itoa(size.width), "x", itoa(size.height)}, ""), func(t *testing.T) {
 			model.width, model.height = size.width, size.height
@@ -45,6 +45,16 @@ func TestTaskConsoleVisualContract(t *testing.T) {
 			if strings.Contains(view, "╭─ AGENT TASK CONSOLE") || strings.Contains(view, "SESSION PREVIEW") {
 				t.Fatalf("%dx%d Task view retained the old framed hierarchy:\n%s", size.width, size.height, view)
 			}
+			for _, line := range strings.Split(ansi.Strip(view), "\n") {
+				if strings.Count(line, " │ ") > 1 {
+					t.Fatalf("%dx%d Task view rendered a nested third pane: %q\n%s", size.width, size.height, line, view)
+				}
+			}
+			for _, noise := range []string{"LIVE ACP", "PROVIDER COMMITTED", "PROVENANCE", "  CONTEXT"} {
+				if strings.Contains(ansi.Strip(view), noise) {
+					t.Fatalf("%dx%d Task view exposed implementation noise %q:\n%s", size.width, size.height, noise, view)
+				}
+			}
 			footer := strings.Split(view, "\n")[size.height-1]
 			if strings.Contains(footer, "…") || !strings.Contains(footer, "q Detach") {
 				t.Fatalf("%dx%d footer lost a core action: %q", size.width, size.height, footer)
@@ -53,7 +63,7 @@ func TestTaskConsoleVisualContract(t *testing.T) {
 	}
 }
 
-func TestTaskConversationPreviewIsDenseBoundedAndProvenanced(t *testing.T) {
+func TestTaskConversationPreviewIsDenseBoundedAndHumanReadable(t *testing.T) {
 	model := visualTaskModel()
 	for _, size := range []struct {
 		width, height int
@@ -62,11 +72,11 @@ func TestTaskConversationPreviewIsDenseBoundedAndProvenanced(t *testing.T) {
 	}{
 		{
 			width: 80, height: 24, minimumFilled: 16,
-			wants: []string{"RECENT CONVERSATION", "REASONING · LIVE ACP", "TOOL · Read worker state · LIVE ACP", "CLAUDE · LIVE ACP", "STATUS · LIVE ACP"},
+			wants: []string{"CONVERSATION", "◇ Reasoning", "▸ Tool · Read worker state", "● Claude", "● Agent is working"},
 		},
 		{
 			width: 120, height: 36, minimumFilled: 22,
-			wants: []string{"YOU · PROVIDER COMMITTED", "CLAUDE · PROVIDER COMMITTED", "REASONING · LIVE ACP", "TOOL · Read worker state · LIVE ACP", "CONTEXT", "CONTINUE", "PROVENANCE"},
+			wants: []string{"❯ You", "● Claude", "◇ Reasoning", "▸ Tool · Read worker state", "✓ Turn complete", "Conversation linked · verified on open"},
 		},
 	} {
 		t.Run(fmt.Sprintf("%dx%d", size.width, size.height), func(t *testing.T) {
@@ -92,7 +102,7 @@ func TestTaskConversationPreviewIsDenseBoundedAndProvenanced(t *testing.T) {
 			if filled < size.minimumFilled {
 				t.Fatalf("%dx%d preview has only %d intentional lines, want at least %d:\n%s", size.width, size.height, filled, size.minimumFilled, joined)
 			}
-			for _, forbidden := range []string{"REQ-TASK", "jsonrpc", visualSentinel} {
+			for _, forbidden := range []string{"REQ-TASK", "jsonrpc", visualSentinel, "LIVE ACP", "PROVIDER COMMITTED", "PROVENANCE", "CONTEXT"} {
 				if strings.Contains(joined, forbidden) {
 					t.Fatalf("%dx%d preview leaked %q:\n%s", size.width, size.height, forbidden, joined)
 				}
@@ -164,8 +174,8 @@ func TestStructuredACPVisualContract(t *testing.T) {
 	}{
 		{width: 40, height: 16, wants: []string{"SESSION S-VISUAL", "MESSAGE CLAUDE", "p Write", "q Detach"}},
 		{width: 60, height: 16, wants: []string{"SESSION S-VISUAL", "CLAUDE · reviewer", "23.1 KB", "MESSAGE CLAUDE"}},
-		{width: 80, height: 24, wants: []string{"SESSION S-VISUAL", "CLAUDE · reviewer", "TOOL · model.go", "YOU", "I found two issues", "ACP update"}},
-		{width: 120, height: 40, wants: []string{"SESSION S-VISUAL", "CLAUDE · reviewer", "TOOL · model.go", "YOU", "I found two issues", "ACP update"}},
+		{width: 80, height: 24, wants: []string{"CONVERSATION · SESSION S-VISUAL", "CLAUDE · reviewer", "TOOL · model.go", "YOU", "I found two issues", "CLAUDE · update"}},
+		{width: 120, height: 40, wants: []string{"CONVERSATION · SESSION S-VISUAL", "CLAUDE · reviewer", "TOOL · model.go", "YOU", "I found two issues", "CLAUDE · update"}},
 	} {
 		t.Run(strings.Join([]string{itoa(size.width), "x", itoa(size.height)}, ""), func(t *testing.T) {
 			model.width, model.height = size.width, size.height
@@ -196,9 +206,9 @@ func TestStructuredACPCompletedResponseAndReasoningDisclosure(t *testing.T) {
 	model.width, model.height = 80, 24
 	view := model.View()
 	for _, want := range []string{
-		"✓ RESPONSE · CLAUDE · turn complete",
+		"✓ RESPONSE · CLAUDE · complete",
 		"The verified result is 42.",
-		"No separate reasoning was exposed by ACP or the provider store",
+		"No separate reasoning summary was available",
 		"✓ Turn complete",
 	} {
 		if !strings.Contains(view, want) {

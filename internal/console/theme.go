@@ -53,11 +53,10 @@ func decorateLine(line string, footer bool) string {
 	switch {
 	case strings.HasPrefix(line, "◆ "):
 		tone = toneBrand
-	case strings.HasPrefix(line, "  SESSIONS"), strings.HasPrefix(line, "  SELECTED SESSION"), strings.HasPrefix(line, "  LIVE ACP"),
-		strings.HasPrefix(line, "  RECENT CONVERSATION"), strings.HasPrefix(line, "  CONTEXT"),
-		strings.HasPrefix(line, "  CONTINUE"), strings.HasPrefix(line, "  PROVENANCE"), strings.HasPrefix(line, "  SESSION"):
+	case strings.HasPrefix(line, "  SESSIONS"), strings.HasPrefix(line, "  SELECTED SESSION"),
+		strings.HasPrefix(line, "  CONVERSATION"), strings.HasPrefix(line, "  SESSION"):
 		tone = toneSection
-	case strings.HasPrefix(line, "▌ "), strings.HasPrefix(line, "│ S-"):
+	case strings.HasPrefix(line, "▌ "), strings.HasPrefix(line, "┃ "):
 		if left, right, split := strings.Cut(line, " │ "); split {
 			return cockpitTheme.paint(toneSelected, left) + " " + cockpitTheme.paint(toneMuted, "│") + " " + right
 		}

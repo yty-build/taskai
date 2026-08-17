@@ -53,6 +53,7 @@ Using the fake ACP/acpx fixtures:
   permission listing, and streams remain usable for migration. Cover
   `TestPromptNegotiatesCurrentWorkerBeforeSending`,
   `TestStaleWorkerPermissionDecisionIsNotSent`,
+  `TestPendingPermissionSnapshotDisablesStaleWorkerDecisions`,
   `TestResumeLiveWorkerNegotiatesCurrentOrRequiresUpgradeWithoutSpawn`,
   `TestNativeAttachRejectsStaleWorkerBeforeAcquireOrProviderStart`, and
   `TestStaleWorkerProviderWritesReturnConflictWithoutSendingProviderCommand`.
@@ -84,9 +85,9 @@ For `acpctl task attach`:
 - Session drill-down and return work.
 - Task-level input cannot silently broadcast.
 - Detaching does not affect workers.
-- Enter opens the selected provider-native harness and `a` opens structured
-  ACP; neither action silently substitutes the other.
-- From Structured ACP, `n` opens that Session's exact native harness and is
+- Enter opens the selected provider-native harness and `a` opens the structured
+  conversation view; neither action silently substitutes the other.
+- From the structured conversation view, `n` opens that Session's exact native harness and is
   present in both the contextual footer and help.
 - When Task/Session attachment already runs inside tmux, native handoff
   switches to the single stable `agent-<session-id>` harness; it never launches

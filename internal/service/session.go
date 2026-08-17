@@ -81,6 +81,16 @@ type LaunchResult struct {
 	State     string
 }
 
+// PermissionSnapshot is disposable transport state for viewers. It keeps the
+// actionable permissions and the live worker's provider-write readiness in one
+// read so a stale worker is never presented as accepting a decision.
+type PermissionSnapshot struct {
+	Permissions    []worker.PendingPermission
+	DecisionsReady bool
+	BlockedCode    string
+	BlockedMessage string
+}
+
 type TaskLaunchResult struct {
 	Task task.Task
 	LaunchResult
@@ -521,18 +531,40 @@ func (s *SessionService) DecidePermission(ctx context.Context, id, permissionID,
 // A stopped Session has no in-memory pending callback, so it returns an empty
 // slice while durable history remains available through History/Follow.
 func (s *SessionService) PendingPermissions(ctx context.Context, id string) ([]worker.PendingPermission, error) {
-	current, err := s.repository.GetSession(ctx, id)
+	snapshot, err := s.PendingPermissionSnapshot(ctx, id)
 	if err != nil {
 		return nil, err
 	}
+	return snapshot.Permissions, nil
+}
+
+// PendingPermissionSnapshot returns permission choices together with a safe,
+// live-negotiated indication of whether this worker can accept a decision.
+func (s *SessionService) PendingPermissionSnapshot(ctx context.Context, id string) (PermissionSnapshot, error) {
+	current, err := s.repository.GetSession(ctx, id)
+	if err != nil {
+		return PermissionSnapshot{}, err
+	}
 	if current.WorkerSocket == "" {
-		return []worker.PendingPermission{}, nil
+		return PermissionSnapshot{Permissions: []worker.PendingPermission{}}, nil
 	}
 	status, err := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{Type: "status"})
 	if err != nil {
-		return nil, err
+		return PermissionSnapshot{}, err
 	}
-	return append([]worker.PendingPermission(nil), status.Permissions...), nil
+	result := PermissionSnapshot{Permissions: append([]worker.PendingPermission(nil), status.Permissions...)}
+	if err := s.requireCurrentWorkerProtocol(ctx, current, "permission not sent"); err != nil {
+		if errors.Is(err, ErrWorkerUpgradeRequired) {
+			result.BlockedCode = "worker_upgrade_required"
+			result.BlockedMessage = err.Error()
+			return result, nil
+		}
+		result.BlockedCode = "worker_capability_unavailable"
+		result.BlockedMessage = fmt.Sprintf("Session %s worker capability could not be verified; permission controls remain disabled and no decision was sent", id)
+		return result, nil
+	}
+	result.DecisionsReady = true
+	return result, nil
 }
 
 func (s *SessionService) Resume(ctx context.Context, id string) (session.Session, error) {

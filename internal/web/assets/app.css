@@ -178,6 +178,9 @@ button:disabled { opacity: .5; cursor: wait; }
 .session-title h1 { margin: 0; overflow: hidden; font-size: 14px; font-weight: 640; letter-spacing: -.01em; text-overflow: ellipsis; text-transform: capitalize; white-space: nowrap; }
 .session-title h1 span { color: var(--muted); font-weight: 450; }
 .session-header-actions { display: flex; align-items: center; gap: 9px; }
+.history-summary { display: inline-flex; max-width: 190px; min-height: 26px; align-items: center; padding: 3px 9px; overflow: hidden; border: 1px solid var(--line); border-radius: 999px; color: var(--text-soft); background: var(--surface-soft); font-size: 10px; font-weight: 620; text-overflow: ellipsis; white-space: nowrap; }
+.history-summary.live { border-color: rgba(120, 201, 155, .25); color: var(--green); background: var(--green-soft); }
+.history-summary.bounded { border-color: rgba(215, 156, 102, .28); color: var(--amber); background: var(--amber-soft); }
 .connection-state { display: inline-flex; align-items: center; gap: 6px; color: var(--faint); font-size: 11px; }
 .connection-state i { width: 6px; height: 6px; border-radius: 50%; background: var(--amber); }
 .connection-state.connected { color: var(--muted); }
@@ -307,6 +310,7 @@ button:disabled { opacity: .5; cursor: wait; }
 .approval-heading strong { display: block; font-size: 13px; }
 .approval-heading p { margin: 2px 0 0; color: var(--muted); font-size: 11px; }
 .permission-options { display: flex; flex-wrap: wrap; gap: 7px; margin: 12px 0 0 38px; }
+.approval-blocked { width: 100%; padding: 10px 11px; border: 1px solid rgba(231, 133, 128, .24); border-radius: 8px; color: var(--text-soft); background: var(--red-soft); font: 10px/1.55 var(--mono); overflow-wrap: anywhere; white-space: pre-wrap; }
 .permission-options button { min-height: 32px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--text-soft); background: var(--surface-raised); font-size: 10px; font-weight: 620; cursor: pointer; }
 .permission-options button:hover { border-color: rgba(226, 185, 110, .4); color: var(--text); }
 .permission-options button.reject { color: var(--red); }
@@ -403,6 +407,7 @@ dialog { color: var(--text); }
   .session-title h1 { font-size: 13px; }
   .session-header-actions { gap: 4px; }
   .session-header-actions .continuity-chip, .session-header-actions .compact-action { display: none !important; }
+  .session-header-actions .history-summary { max-width: 108px; padding-right: 7px; padding-left: 7px; font-size: 9px; }
   .session-header-actions .status { display: inline-flex !important; gap: 0; width: 12px; overflow: hidden; font-size: 0; }
   .conversation { width: calc(100% - 28px); padding: 28px 0 65px; }
   .turn { padding-bottom: 26px; }

@@ -768,7 +768,7 @@ func (m Model) handleMouse(event tea.MouseEvent) (tea.Model, tea.Cmd) {
 	current := m.task.Sessions[m.selected]
 	capability := nativeCapability(current)
 	if capability.available {
-		m.notice = "Selected " + current.ID + ". Enter opens " + capability.label + "; a opens Structured ACP."
+		m.notice = "Selected " + current.ID + ". Enter opens " + capability.label + "; a opens the structured view."
 	} else {
 		m.notice = "Selected " + current.ID + ". Native CLI unavailable: " + capability.reason + "."
 	}
@@ -975,9 +975,9 @@ func (m Model) handleAction(message actionMsg) (tea.Model, tea.Cmd) {
 		m.notice = "Permission decision accepted. The agent turn continues in this Session."
 	case "native":
 		if m.mode == sessionView {
-			m.notice = "Back in Structured ACP. The native CLI used the same provider conversation."
+			m.notice = "Back in the structured view. The provider CLI used the same conversation."
 		} else {
-			m.notice = "Back in Task Console. Native CLI and Structured ACP continue the same provider conversation."
+			m.notice = "Back in Task Console. The provider CLI and structured view continue the same conversation."
 		}
 	}
 	return m, m.refreshCmd()

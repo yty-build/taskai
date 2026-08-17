@@ -420,6 +420,7 @@ type nativeTestRuntime struct {
 	acquireState                    string
 	spawnCalls                      int
 	releaseReservationBeforeRecover bool
+	permissions                     []worker.PendingPermission
 }
 
 func (r *nativeTestRuntime) Spawn(context.Context, string) (worker.SpawnResult, error) {
@@ -443,7 +444,7 @@ func (r *nativeTestRuntime) Send(_ context.Context, _ string, command worker.Com
 			Capabilities: []string{worker.CapabilityExclusiveNativeOwner},
 		}, nil
 	case "status":
-		return worker.Message{Type: "status", ActiveRequestID: r.active, Queued: r.queued, Status: "working"}, nil
+		return worker.Message{Type: "status", ActiveRequestID: r.active, Queued: r.queued, Status: "working", Permissions: append([]worker.PendingPermission(nil), r.permissions...)}, nil
 	case "prompt":
 		return worker.Message{Type: "accepted", State: "ready", RequestID: command.RequestID}, nil
 	case "permission_decision":
@@ -613,6 +614,32 @@ func TestStaleWorkerPermissionDecisionIsNotSent(t *testing.T) {
 	defer runtime.mu.Unlock()
 	if !reflect.DeepEqual(runtime.calls, []string{"ping"}) {
 		t.Fatalf("stale permission decision reached provider: %v", runtime.calls)
+	}
+}
+
+func TestPendingPermissionSnapshotDisablesStaleWorkerDecisions(t *testing.T) {
+	service, runtime, current := nativeServiceHarness(t, "claude", "native-exact")
+	runtime.stale = true
+	runtime.permissions = []worker.PendingPermission{{
+		ID: "permission-stale", RequestID: "request-stale", Title: "Write scratch test", Kind: "edit",
+		Options: []worker.PermissionOption{{ID: "allow-once", Name: "Allow once", Kind: "allow_once"}},
+	}}
+	snapshot, err := service.PendingPermissionSnapshot(context.Background(), current.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.DecisionsReady || snapshot.BlockedCode != "worker_upgrade_required" || len(snapshot.Permissions) != 1 {
+		t.Fatalf("permission snapshot = %#v", snapshot)
+	}
+	for _, want := range []string{"permission not sent", "agent-S-native", "acpctl session stop S-native", "acpctl session resume S-native"} {
+		if !strings.Contains(snapshot.BlockedMessage, want) {
+			t.Fatalf("blocked message missing %q: %s", want, snapshot.BlockedMessage)
+		}
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if !reflect.DeepEqual(runtime.calls, []string{"status", "ping"}) {
+		t.Fatalf("permission snapshot calls = %v", runtime.calls)
 	}
 }
 

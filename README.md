@@ -103,19 +103,19 @@ acpctl session attach <session-id>
 acpctl session attach <session-id> --acp
 ```
 
-The Task console is a responsive Go/Bubble Tea developer cockpit over every child Session. It discovers new Sessions without restart, keeps attention states scannable, uses a two-pane layout at wide widths and stacked/single-pane layouts as space narrows, and offers contextual help plus a searchable action palette. Enter opens the selected provider's real native harness; `a` opens the structured ACP view.
+The Task console is a responsive Go/Bubble Tea developer cockpit over every child Session. It discovers new Sessions without restart, keeps attention states scannable, uses a true two-pane layout at wide widths and stacked/single-pane layouts as space narrows, and offers contextual help plus a searchable action palette. The default surface uses human conversation labels; protocol provenance and Session internals stay in details/raw views. Enter opens the selected provider's real native harness; `a` opens the structured conversation view backed by ACP.
 
 The structured view loads a verified, bounded snapshot of the exact provider-owned conversation, overlays gateway-only provisional and lifecycle state through one captured JSONL cursor, then follows live ACP from that boundary without duplication. It renders user/assistant turns, provider-exposed reasoning in event order, merged tool cards, a multiline composer, and actionable permission cards. After settled ACP turns and provider-native process exit, an open structured viewer fetches a fresh joined projection in the background and publishes it atomically, without a visible reload or flicker, while preserving scroll/follow state, focus, composer draft/cursor, selection, pending-approval focus, and expanded reasoning/tool state. If the provider store is unavailable on initial load, the service returns a bounded gateway-history fallback with an explicit warning. If a transient refresh fails in an already-open viewer, that viewer keeps its existing in-memory presentation and discloses the delay; it never presents JSONL as the provider's committed transcript.
 
-Task and structured ACP console controls (provider-native keys remain owned by that provider):
+Task and structured conversation controls (provider-native keys remain owned by that provider):
 
 | Key | Effect |
 | --- | --- |
 | `↑`/`↓`, `j`/`k`, click | Select a Session |
 | `Enter` | Open the selected Session in its real provider-native harness |
-| `a` (Task screen) | Open the selected Session's structured ACP console |
+| `a` (Task screen) | Open the selected Session's structured conversation view |
 | `n` (Task screen) | Open the in-console New Session wizard; choose agent, role, repository, worktree, permission mode, and optional prompt |
-| `n` (Structured ACP screen) | Open the current Session's exact provider-native harness; from tmux, switch to its stable `agent-<session-id>` session |
+| `n` (conversation screen) | Open the current Session's exact provider-native harness; from tmux, switch to its stable `agent-<session-id>` session |
 | `p` | Prompt the selected/current Session only |
 | `/` | Filter the Session list |
 | `:` | Open the searchable command palette |

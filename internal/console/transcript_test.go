@@ -306,8 +306,12 @@ func TestTranscriptAppliesTenThousandEventsWithinBudget(t *testing.T) {
 		projection.apply(projectionACPLine(sequence, "REQ-PERF", "agent_message_chunk", sessionUpdate(messageUpdate("agent_message_chunk", "x", "message-perf"))))
 	}
 	elapsed := time.Since(started)
-	if elapsed > 2*time.Second {
-		t.Fatalf("10k event projection took %s, budget is 2s", elapsed)
+	// Acceptance also runs this guard with race instrumentation while the other
+	// packages execute concurrently. Keep this as a generous runaway bound;
+	// steady-state performance remains exercised by the projection benchmark.
+	const budget = 5 * time.Second
+	if elapsed > budget {
+		t.Fatalf("10k event projection took %s, budget is %s", elapsed, budget)
 	}
 	request := projection.requests[0]
 	if len(request.blocks) != 2 || len(request.blocks[1].text) != 10_000 {

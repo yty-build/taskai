@@ -248,10 +248,11 @@ func TestVersionedTaskAndSessionAPI(t *testing.T) {
 	permissions := performRequest(t, fixture.handler, http.MethodGet, "/api/v1/sessions/"+sessionID+"/permissions", nil, nil)
 	assertStatus(t, permissions, http.StatusOK)
 	var permissionResult struct {
-		Permissions []PermissionDTO `json:"permissions"`
+		Permissions    []PermissionDTO `json:"permissions"`
+		DecisionsReady bool            `json:"decisions_ready"`
 	}
 	decodeResponse(t, permissions, &permissionResult)
-	if len(permissionResult.Permissions) != 1 || permissionResult.Permissions[0].ID != "permission-safe-1" || len(permissionResult.Permissions[0].Options) != 2 {
+	if !permissionResult.DecisionsReady || len(permissionResult.Permissions) != 1 || permissionResult.Permissions[0].ID != "permission-safe-1" || len(permissionResult.Permissions[0].Options) != 2 {
 		t.Fatalf("permissions response = %#v", permissionResult)
 	}
 	if strings.Contains(permissionResult.Permissions[0].Title, "\x1b") {
@@ -437,7 +438,34 @@ func TestStaleWorkerProviderWritesReturnConflictWithoutSendingProviderCommand(t 
 	assertOnlyWorkerCommand(t, fixture.runtime, "ping")
 
 	// Read/control operations deliberately remain available during migration.
-	assertStatus(t, performRequest(t, fixture.handler, http.MethodGet, "/api/v1/sessions/"+sessionID+"/permissions", nil, nil), http.StatusOK)
+	fixture.runtime.mu.Lock()
+	fixture.runtime.pending[sessionID] = []worker.PendingPermission{{ID: "permission-stale", Title: "Write scratch test"}}
+	fixture.runtime.commands = nil
+	fixture.runtime.mu.Unlock()
+	permissionState := performRequest(t, fixture.handler, http.MethodGet, "/api/v1/sessions/"+sessionID+"/permissions", nil, nil)
+	assertStatus(t, permissionState, http.StatusOK)
+	var blocked struct {
+		Permissions    []PermissionDTO `json:"permissions"`
+		DecisionsReady bool            `json:"decisions_ready"`
+		BlockedCode    string          `json:"blocked_code"`
+		BlockedMessage string          `json:"blocked_message"`
+	}
+	decodeResponse(t, permissionState, &blocked)
+	if blocked.DecisionsReady || blocked.BlockedCode != "worker_upgrade_required" || len(blocked.Permissions) != 1 {
+		t.Fatalf("stale permission state = %#v", blocked)
+	}
+	for _, want := range []string{"permission not sent", "agent-" + sessionID, "acpctl session stop " + sessionID, "acpctl session resume " + sessionID} {
+		if !strings.Contains(blocked.BlockedMessage, want) {
+			t.Fatalf("stale permission message missing %q: %s", want, blocked.BlockedMessage)
+		}
+	}
+	fixture.runtime.mu.Lock()
+	if len(fixture.runtime.commands) != 2 || fixture.runtime.commands[0].Type != "status" || fixture.runtime.commands[1].Type != "ping" {
+		got := append([]worker.Command(nil), fixture.runtime.commands...)
+		fixture.runtime.mu.Unlock()
+		t.Fatalf("stale permission read commands = %v", got)
+	}
+	fixture.runtime.mu.Unlock()
 	assertStatus(t, performRequest(t, fixture.handler, http.MethodPost, "/api/v1/sessions/"+sessionID+"/cancel", nil, nil), http.StatusAccepted)
 
 	// The explicit migration path stops the old process, starts the replacement

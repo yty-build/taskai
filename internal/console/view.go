@@ -115,13 +115,10 @@ func compactSizeWarning(width, height int) string {
 func (m Model) renderTask(width, height int) string {
 	item := m.task.Task
 	layout := layoutTaskWorkspace(width, height)
-	title := "AGENT TASK CONSOLE · TASK " + safeText(item.ID)
-	if width < 56 {
-		title = "TASK " + safeText(item.ID)
-	}
+	title := "TASK · " + safeText(item.Title)
 	header := []string{
 		topBar(title, statusBadge(string(item.Status)), width),
-		fitLine("  "+safeText(item.Title)+" · "+taskSubtitle(item.Description, len(m.task.Sessions)), width),
+		fitLine("  "+safeText(item.ID)+" · "+taskSubtitle(item.Description, len(m.task.Sessions)), width),
 		horizontalRule(width),
 	}
 
@@ -167,9 +164,9 @@ func (m Model) renderTaskNavigator(width, height int) []string {
 		entries = append(entries, fitWithRight(name, statusBadge(string(current.Status)), width))
 		detailMarker := "  "
 		if actual == m.selected {
-			detailMarker = "│ "
+			detailMarker = "┃ "
 		}
-		entries = append(entries, fitLine(detailMarker+current.ID+" · "+compactSessionPath(current)+" · "+m.sessionSummary(current.ID), width))
+		entries = append(entries, fitLine(detailMarker+compactSessionID(current.ID)+" · "+m.sessionSummary(current.ID)+" · "+compactSessionPath(current), width))
 	}
 	if start > 0 && len(entries) > 0 {
 		entries[0] = fitLine(fmt.Sprintf("  ↑ %d earlier · ", start)+entries[0], width)
@@ -180,6 +177,14 @@ func (m Model) renderTaskNavigator(width, height int) []string {
 	}
 	lines = append(lines, padLines(entries, innerHeight, width)...)
 	return lines
+}
+
+func compactSessionID(id string) string {
+	id = strings.TrimSpace(id)
+	if len(id) <= 12 {
+		return id
+	}
+	return id[:2] + "…" + id[len(id)-8:]
 }
 
 func (m Model) taskSessionWindow(navigatorHeight int) (indices []int, start, visible int) {
@@ -199,23 +204,16 @@ func (m Model) taskSessionWindow(navigatorHeight int) (indices []int, start, vis
 
 func (m Model) renderTaskPreview(width, height int) []string {
 	if len(m.task.Sessions) == 0 || len(m.filteredSessionIndices()) == 0 {
-		lines := []string{sectionHeading("SELECTED SESSION", "", width), sectionRule(width)}
+		lines := []string{sectionHeading("CONVERSATION", "", width), sectionRule(width)}
 		lines = append(lines, padLines([]string{"", centerLine("Select or create a Session", width)}, max(1, height-2), width)...)
 		return lines
 	}
 	current := m.task.Sessions[m.selected]
-	lines := []string{sectionHeading("SELECTED SESSION", statusBadge(string(current.Status)), width), sectionRule(width)}
+	title := "CONVERSATION · " + taskProviderName(current) + " · " + valueOr(current.Role, "worker")
+	lines := []string{sectionHeading(title, statusBadge(string(current.Status)), width), sectionRule(width)}
 	innerHeight := max(1, height-2)
 	if height < 9 {
 		lines = append(lines, m.renderCompactTaskPreview(current, width, innerHeight)...)
-		return lines
-	}
-	if width >= 68 && height >= 18 {
-		railWidth := min(27, max(23, width*34/100))
-		timelineWidth := width - railWidth - 3
-		timeline := m.renderTaskTimeline(current, timelineWidth, innerHeight)
-		rail := m.renderTaskContextRail(current, railWidth, innerHeight)
-		lines = append(lines, joinColumns(timeline, rail, timelineWidth, railWidth)...)
 		return lines
 	}
 	overview := m.renderTaskPreviewOverview(current, width)
@@ -233,16 +231,16 @@ func (m Model) sessionAttention(current session.Session) string {
 		}
 		switch projection.latestState() {
 		case turnLive:
-			return "Streaming now · stored replay plus live ACP"
+			return "Working now · open the conversation for full detail"
 		case turnFailed:
-			return "Turn failed · open Structured ACP for details"
+			return "Turn failed · open the structured view for details"
 		case turnComplete:
 			return "Response complete · conversation remains resumable"
 		case turnCancelled:
 			return "Turn cancelled · Session remains available"
 		}
 	}
-	return statusBadge(string(current.Status)) + " · stored Session history"
+	return statusBadge(string(current.Status)) + " · conversation available"
 }
 
 func joinColumns(left, right []string, leftWidth, rightWidth int) []string {
@@ -263,7 +261,7 @@ func joinColumns(left, right []string, leftWidth, rightWidth int) []string {
 
 func (m Model) taskFooter(width int) string {
 	if width < 56 {
-		return fitLine("Enter Native  a ACP  n New  q Detach", width)
+		return fitLine("Enter Native  a View  n New  q Detach", width)
 	}
 	type footerItem struct {
 		id   actionID
@@ -351,7 +349,7 @@ func (m Model) renderOverlay(width, height int) string {
 	var body []string
 	switch m.overlay {
 	case helpOverlay:
-		title, subtitle, footer = "KEYBOARD HELP", "Native CLI and Structured ACP continue the same provider conversation.", "Esc/?/Enter closes help"
+		title, subtitle, footer = "KEYBOARD HELP", "The provider CLI and structured view continue the same conversation.", "Esc/?/Enter closes help"
 		if m.mode == taskView {
 			body = append(body, "NAVIGATION", "  ↑/↓ or j/k    Select a Session", "")
 			for _, action := range taskActions {
@@ -359,7 +357,7 @@ func (m Model) renderOverlay(width, height int) string {
 			}
 		} else {
 			body = []string{
-				"STRUCTURED ACP CONSOLE", "  n              Open the exact conversation in the provider's native CLI", "  p / i / Enter  Compose a message", "  ↑/↓ PgUp/PgDn Scroll history", "  End            Follow live output",
+				"CONVERSATION VIEW", "  n              Open the exact conversation in the provider's native CLI", "  p / i / Enter  Compose a message", "  ↑/↓ PgUp/PgDn Scroll history", "  End            Follow live output",
 				"  1-9            Choose an offered permission", "  d              Expand selected tool", "  [ / ]          Select tool", "  o              Toggle reasoning",
 				"  r              Toggle raw ACP events", "  Esc / c        Cancel active turn", "  b              Back to Task", "  q              Detach viewer",
 			}
@@ -421,9 +419,9 @@ func (m Model) renderSession(width, height int) string {
 	} else {
 		metadata = "  " + metadata + " · " + location
 	}
-	title := "STRUCTURED ACP · SESSION " + safeText(current.ID)
+	title := "CONVERSATION · SESSION " + safeText(current.ID)
 	if width < 56 {
-		title = "SESSION " + safeText(current.ID) + " · ACP"
+		title = "SESSION " + safeText(current.ID) + " · VIEW"
 	}
 	header := []string{
 		topBar(title, statusBadge(string(current.Status)), width),
@@ -531,7 +529,7 @@ type conversationOptions struct {
 
 func renderConversation(projection *transcript, agent string, width int, options conversationOptions) []string {
 	if projection == nil || len(projection.requests) == 0 {
-		return []string{"", centerLine("No ACP-visible conversation yet", width), centerLine("Messages and agent work will appear here live.", width)}
+		return []string{"", centerLine("No conversation yet", width), centerLine("Messages and agent work will appear here live.", width)}
 	}
 	contentWidth := max(20, width-4)
 	var lines []string
@@ -548,18 +546,18 @@ func renderConversation(projection *transcript, agent string, width int, options
 			case blockAssistant:
 				if block == completedResponse {
 					if block.source == "provider" {
-						lines = append(lines, "✓ RESPONSE · "+agent+" · committed provider history")
+						lines = append(lines, "✓ RESPONSE · "+agent+" · saved")
 					} else {
-						lines = append(lines, "✓ RESPONSE · "+agent+" · turn complete")
+						lines = append(lines, "✓ RESPONSE · "+agent+" · complete")
 					}
 				} else if block.source == "provider" {
-					lines = append(lines, "● "+agent+" · stored provider history")
+					lines = append(lines, "● "+agent+" · earlier response")
 				} else {
-					lines = append(lines, "● "+agent+" · ACP update")
+					lines = append(lines, "● "+agent+" · update")
 				}
 				lines = append(lines, indentWrapped(block.text, contentWidth, "  ")...)
 				if block.truncated {
-					lines = append(lines, "  … earlier content omitted; recent ACP output is preserved")
+					lines = append(lines, "  … earlier content omitted; the newest output is preserved")
 				}
 			case blockThought:
 				lines = append(lines, renderThought(block, contentWidth, options.showReasoning)...)
@@ -575,14 +573,14 @@ func renderConversation(projection *transcript, agent string, width int, options
 			}
 		}
 		if request.state == turnComplete && !request.reasoningSeen {
-			lines = append(lines, "  ◇ No separate reasoning was exposed by ACP or the provider store for this turn.")
+			lines = append(lines, "  ◇ No separate reasoning summary was available for this turn.")
 		} else if request.state == turnComplete && request.reasoningSeen && !request.hasRetainedReasoning() {
-			lines = append(lines, "  ◇ Earlier ACP reasoning is outside this bounded view.")
+			lines = append(lines, "  ◇ Earlier reasoning is outside this bounded view.")
 		}
 		if request.state == turnComplete && !request.assistantSeen {
-			lines = append(lines, "  ! Turn completed without an ACP assistant response; use the native CLI for provider-only detail.")
+			lines = append(lines, "  ! Turn completed without a visible response; open the provider CLI for more detail.")
 		} else if request.state == turnComplete && request.completedResponse() == nil {
-			lines = append(lines, "  ! ACP assistant output is outside this bounded view; inspect the local Session log.")
+			lines = append(lines, "  ! Assistant output is outside this bounded view; inspect the local Session log.")
 		}
 		if request.contentClipped {
 			lines = append(lines, "  ◇ Older detail in this turn is hidden to keep the console responsive.")
@@ -598,7 +596,7 @@ func renderThought(block *transcriptBlock, width int, expanded bool) []string {
 	count := logicalLines(block.text)
 	source := ""
 	if block.source == "provider" {
-		source = " · stored provider history"
+		source = " · saved"
 	}
 	if !expanded {
 		return []string{fmt.Sprintf("  ▸ Reasoning%s · %d line(s) · o expand", source, count)}
@@ -609,7 +607,7 @@ func renderThought(block *transcriptBlock, width int, expanded bool) []string {
 		wrapped = append(wrapped[:10], "  ╰ … reasoning clipped in this view")
 	}
 	if block.truncated {
-		wrapped = append(wrapped, "  ╰ … earlier reasoning omitted; recent ACP reasoning is preserved")
+		wrapped = append(wrapped, "  ╰ … earlier reasoning omitted; the newest reasoning is preserved")
 	}
 	return append(lines, wrapped...)
 }

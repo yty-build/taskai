@@ -178,7 +178,7 @@ func TestTaskConsoleShowsEverySessionAndDetachesOnlyViewer(t *testing.T) {
 	defer cancel()
 
 	view := model.View()
-	for _, want := range []string{"TASK T-1", "S-1", "researcher", "GEMINI", "one", "S-2", "implementer", "CODEX", "two", "waiting", "No conversation yet"} {
+	for _, want := range []string{"TASK · Investigate gateway", "T-1", "researcher", "GEMINI", "one", "implementer", "CODEX", "two", "waiting", "No conversation yet"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("Task view missing %q:\n%s", want, view)
 		}
@@ -259,12 +259,12 @@ func TestTaskConsoleNativeDefaultACPActionFilterHelpAndPalette(t *testing.T) {
 
 	updated, nativeCommand := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated.(Model)
-	if model.mode != taskView || nativeCommand != nil || !strings.Contains(model.notice, "Native CLI unavailable") || !strings.Contains(model.notice, "Structured ACP") {
+	if model.mode != taskView || nativeCommand != nil || !strings.Contains(model.notice, "Native CLI unavailable") || !strings.Contains(model.notice, "structured view") {
 		t.Fatalf("unsupported native surface: mode=%d command=%v notice=%q", model.mode, nativeCommand, model.notice)
 	}
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
 	model = updated.(Model)
-	if model.mode != sessionView || model.current.ID != "S-1" || model.composer.focused || !strings.Contains(model.View(), "STRUCTURED ACP · SESSION S-1") {
+	if model.mode != sessionView || model.current.ID != "S-1" || model.composer.focused || !strings.Contains(model.View(), "CONVERSATION · SESSION S-1") {
 		t.Fatalf("Structured ACP action = mode %d Session %s composer=%v\n%s", model.mode, model.current.ID, model.composer.focused, model.View())
 	}
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
@@ -322,7 +322,7 @@ func TestTaskConsoleNativeDefaultACPActionFilterHelpAndPalette(t *testing.T) {
 
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("?")})
 	model = updated.(Model)
-	if model.overlay != helpOverlay || !strings.Contains(model.View(), "KEYBOARD HELP") || !strings.Contains(model.View(), "Native CLI") || !strings.Contains(model.View(), "Structured ACP") || strings.Contains(model.View(), "harness") {
+	if model.overlay != helpOverlay || !strings.Contains(model.View(), "KEYBOARD HELP") || !strings.Contains(model.View(), "provider CLI") || !strings.Contains(model.View(), "structured view") || strings.Contains(model.View(), "harness") {
 		t.Fatalf("help overlay:\n%s", model.View())
 	}
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
@@ -494,7 +494,7 @@ func TestTaskFooterUsesActionRegistryAndKeepsNewSessionVisible(t *testing.T) {
 		if !strings.Contains(footer, wantNew) || strings.Contains(footer, "…") {
 			t.Fatalf("%d-column footer does not expose %q intact: %q", width, wantNew, footer)
 		}
-		for _, want := range []string{"a ACP", "? Help", "q Detach"} {
+		for _, want := range []string{"a View", "? Help", "q Detach"} {
 			if !strings.Contains(footer, want) {
 				t.Fatalf("%d-column footer missing %q: %q", width, want, footer)
 			}
@@ -701,7 +701,7 @@ func TestSessionConsoleLoadsProviderHistoryAndKeepsLiveACPEventsAcrossReconcile(
 	}
 	defer cancel()
 
-	if got := model.View(); !strings.Contains(got, "Native-only prompt") || !strings.Contains(got, "Reasoning · stored provider history · 1 line") || !strings.Contains(got, "RESPONSE · GEMINI · committed provider history") || !strings.Contains(got, "Native answer") {
+	if got := model.View(); !strings.Contains(got, "Native-only prompt") || !strings.Contains(got, "Reasoning · saved · 1 line") || !strings.Contains(got, "RESPONSE · GEMINI · saved") || !strings.Contains(got, "Native answer") {
 		t.Fatalf("provider-backed transcript is incomplete:\n%s", got)
 	}
 	nativeTurn := model.projections["S-1"].byID["provider-native"]
@@ -1059,8 +1059,19 @@ func TestRefreshAddsNewTaskSessionWithoutRestart(t *testing.T) {
 	backend.mu.Unlock()
 	updated, _ := model.Update(model.refreshCmd()())
 	model = updated.(Model)
-	if len(model.task.Sessions) != 2 || !strings.Contains(model.View(), "S-2") {
+	if len(model.task.Sessions) != 2 || !strings.Contains(model.View(), "S-2") || !strings.Contains(model.View(), "CODEX") || !strings.Contains(model.View(), "implementer") {
 		t.Fatalf("new Session did not appear:\n%s", model.View())
+	}
+}
+
+func TestTaskContinuationReadinessDistinguishesLinkedFromVerified(t *testing.T) {
+	linked := nativeCLICapability{available: true, status: "identity present · safety checked on open"}
+	if got := taskContinuationReadiness(linked); got != "Conversation linked · verified on open" {
+		t.Fatalf("linked readiness = %q", got)
+	}
+	verified := nativeCLICapability{available: true, status: "identity verified · worker checked on open"}
+	if got := taskContinuationReadiness(verified); got != "Exact conversation verified" {
+		t.Fatalf("verified readiness = %q", got)
 	}
 }
 

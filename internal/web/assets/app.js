@@ -958,11 +958,51 @@ function scheduleProviderCommitRetry(sessionID) {
   scheduleConversationReconcile(sessionID, delay);
 }
 
+function conversationHistorySummary(state = transcriptState) {
+  const turns = state?.turns || [];
+  const saved = turns.filter((turn) => turn.committed).length;
+  const unsaved = turns.filter((turn) => !turn.committed);
+  const active = unsaved.filter((turn) => !["complete", "cancelled", "error", "failed"].includes(turn.state)).length;
+  const saving = unsaved.filter((turn) => turn.state === "complete").length;
+  const stopped = unsaved.filter((turn) => ["cancelled", "error", "failed"].includes(turn.state)).length;
+  const tools = turns.reduce((count, turn) => count + (turn.blocks || []).filter((block) => block.type === "tool").length, 0);
+  const bounded = Boolean(state?.snapshotTruncated || state?.historyClipped);
+  const shortParts = [];
+  if (saved > 0) shortParts.push(`${saved} saved${saved === 1 ? " turn" : " turns"}`);
+  if (active > 0) shortParts.push(`${active} live${active === 1 ? " turn" : " turns"}`);
+  if (saving > 0) shortParts.push(`${saving} saving`);
+  if (stopped > 0) shortParts.push(`${stopped} unsaved`);
+  let short = shortParts.join(" · ") || "No history yet";
+  if (saved === 0 && active > 0 && tools > 0) short += ` · ${tools} steps`;
+  if (bounded) short += " · partial";
+  const savedCopy = `${saved} saved provider ${saved === 1 ? "turn" : "turns"}`;
+  let detail = saved > 0 ? savedCopy : "No saved provider turns yet";
+  if (active > 0) detail += ` · ${active} live ${active === 1 ? "turn" : "turns"} can be saved after successful completion`;
+  if (saving > 0) detail += ` · ${saving} completed ${saving === 1 ? "turn is" : "turns are"} waiting for provider commit`;
+  if (stopped > 0) detail += ` · ${stopped} failed or cancelled ${stopped === 1 ? "turn remains" : "turns remain"} unsaved gateway history`;
+  if (tools > 0) detail += ` · ${tools} tool ${tools === 1 ? "step" : "steps"} loaded`;
+  detail += bounded ? " · older content is outside this bounded view" : " · all available history is loaded";
+  return { short, detail, saved, active, saving, stopped, tools, bounded };
+}
+
+function updateHistorySummary(state = transcriptState) {
+  const summary = conversationHistorySummary(state);
+  const label = document.querySelector("#history-summary");
+  if (label) {
+    label.textContent = summary.short;
+    label.className = `history-summary${summary.active > 0 || summary.saving > 0 ? " live" : ""}${summary.bounded ? " bounded" : ""}`;
+    label.setAttribute("title", summary.detail);
+    label.setAttribute("aria-label", summary.detail);
+  }
+  return summary;
+}
+
 function updateHistorySource(source, warning = "") {
   const label = document.querySelector("#history-source");
   if (!label) return;
+  const summary = conversationHistorySummary();
   label.textContent = source === "provider-store"
-    ? "Committed provider history + live ACP stream"
+    ? summary.detail
     : warning || "Gateway JSONL fallback + live ACP stream";
 }
 
@@ -1174,8 +1214,8 @@ function messageElement(block, assistantName, context = {}) {
   author.textContent = assistantName;
   const phase = document.createElement("span");
   phase.textContent = context.final
-    ? (block.source === "provider" ? "Response · committed provider history" : "Response · turn complete")
-    : block.source === "provider" ? "Stored provider history" : context.streaming ? "Streaming over ACP" : "ACP update";
+    ? (block.source === "provider" ? "Response · saved" : "Response · complete")
+    : block.source === "provider" ? "Earlier response" : context.streaming ? "Working" : "Earlier update";
   meta.append(author, phase);
   const body = document.createElement("div");
   body.className = "message-body";
@@ -1225,7 +1265,7 @@ function thoughtElement(block, context = {}) {
   heading.append(title, metrics);
   const state = document.createElement("span");
   state.className = "thought-source";
-  state.textContent = block.source === "provider" ? "Provider history" : context.streaming ? "Live ACP" : "ACP capture";
+  state.textContent = block.source === "provider" ? "Saved" : context.streaming ? "Live" : "Captured";
   summary.append(heading, state);
   const content = document.createElement("div");
   content.className = "thought-content";
@@ -1347,13 +1387,19 @@ function renderTurnTail(turn) {
     state.append(dot, document.createTextNode(copy));
     tail.append(state);
   }
+  if (turn.state === "working" && !turnHasReasoning(turn)) {
+    const unavailable = document.createElement("div");
+    unavailable.className = "reasoning-unavailable";
+    unavailable.textContent = "This provider has not exposed a separate reasoning stream for the live turn.";
+    tail.append(unavailable);
+  }
   if (turn.state === "complete") {
     const retainedResponse = completedResponseBlock(turn);
     const retainedReasoning = turn.blocks.some((block) => block.type === "thought" && block.text.trim());
     if (!turnHasReasoning(turn)) {
       const unavailable = document.createElement("div");
       unavailable.className = "reasoning-unavailable";
-      unavailable.textContent = "No separate reasoning was exposed by ACP or the provider store for this turn.";
+      unavailable.textContent = "No separate reasoning summary was available for this turn.";
       tail.append(unavailable);
     } else if (!retainedReasoning) {
       const unavailable = document.createElement("div");
@@ -1616,6 +1662,7 @@ function renderConversation() {
   const container = document.querySelector("#conversation");
   const scroller = document.querySelector("#conversation-scroll");
   if (!container || !scroller) return;
+  updateHistorySummary();
   const priorTop = scroller.scrollTop;
   const scrollAnchor = captureConversationScrollAnchor(scroller, container);
   const assistantName = document.querySelector(".session-title h1")?.firstChild?.textContent?.trim() || "Agent";
@@ -1700,12 +1747,15 @@ function latestWaitingPermission() {
 }
 
 let renderedPermissionSignature = "";
+let permissionDecisionsReady = false;
+let permissionDecisionBlockedCode = "";
+let permissionDecisionBlockedMessage = "";
 function renderApprovalShelf() {
   const shelf = document.querySelector("#approval-shelf");
   if (!shelf) return;
   const announcer = document.querySelector("#approval-announcer");
   const permission = latestWaitingPermission();
-  const signature = permission ? JSON.stringify([permission.id, permission.state, permission.title, permission.options, transcriptState.permissionOverflow]) : `none:${transcriptState.permissionOverflow}`;
+  const signature = permission ? JSON.stringify([permission.id, permission.state, permission.title, permission.options, transcriptState.permissionOverflow, permissionDecisionsReady, permissionDecisionBlockedCode, permissionDecisionBlockedMessage]) : `none:${transcriptState.permissionOverflow}`;
   if (signature === renderedPermissionSignature) {
     renderSessionStatus();
     return;
@@ -1727,25 +1777,37 @@ function renderApprovalShelf() {
   const title = document.createElement("strong");
   title.textContent = `Approval required · ${permission.title || "Tool request"}`;
   const detail = document.createElement("p");
-  detail.textContent = transcriptState.permissionOverflow ? "Many approvals are pending; none have been discarded. Close this page safely or resolve them one at a time." : "The Session remains safely waiting if you close this page.";
+  detail.textContent = !permissionDecisionsReady
+    ? (permissionDecisionBlockedCode === "worker_upgrade_required" ? "This request is preserved, but the older worker must be upgraded before a browser decision is safe." : "Checking whether this worker can safely accept a decision…")
+    : transcriptState.permissionOverflow ? "Many approvals are pending; none have been discarded. Close this page safely or resolve them one at a time." : "The Session remains safely waiting if you close this page.";
   copy.append(title, detail);
   heading.append(icon, copy);
   const options = document.createElement("div");
   options.className = "permission-options";
-  for (const option of permission.options || []) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.textContent = option.name || option.kind.replaceAll("_", " ");
-    if (String(option.kind).startsWith("reject")) button.classList.add("reject");
-    if (["allow_always", "reject_always"].includes(option.kind)) button.classList.add("persistent");
-    button.addEventListener("click", () => submitPermission(permission, option));
-    options.append(button);
+  if (!permissionDecisionsReady) {
+    const blocked = document.createElement("div");
+    blocked.className = "approval-blocked";
+    blocked.textContent = permissionDecisionBlockedMessage || "Permission controls remain disabled until the live worker capability check succeeds.";
+    options.append(blocked);
+  } else {
+    for (const option of permission.options || []) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = option.name || option.kind.replaceAll("_", " ");
+      if (String(option.kind).startsWith("reject")) button.classList.add("reject");
+      if (["allow_always", "reject_always"].includes(option.kind)) button.classList.add("persistent");
+      button.addEventListener("click", () => submitPermission(permission, option));
+      options.append(button);
+    }
   }
   shelf.replaceChildren(heading, options);
   shelf.hidden = false;
   if (announcer) {
     announcer.textContent = "";
-    window.setTimeout(() => { announcer.textContent = `Approval required. ${permission.title || "Tool request"}.`; }, 0);
+    const announcement = permissionDecisionBlockedCode === "worker_upgrade_required"
+      ? `Approval blocked. ${permission.title || "Tool request"}. The older worker must be upgraded before a decision is safe.`
+      : `Approval required. ${permission.title || "Tool request"}.`;
+    window.setTimeout(() => { announcer.textContent = announcement; }, 0);
   }
   renderSessionStatus();
 }
@@ -1809,7 +1871,15 @@ async function submitPermission(permission, option) {
 async function refreshPermissions() {
   const sessionID = document.body.dataset.sessionId;
   const result = await apiRequest(`/api/v1/sessions/${encodeURIComponent(sessionID)}/permissions`);
-  return reconcilePermissionSnapshot(result.permissions || []);
+  const ready = Boolean(result.decisions_ready);
+  const blockedCode = String(result.blocked_code || "");
+  const blockedMessage = String(result.blocked_message || "");
+  const readinessChanged = ready !== permissionDecisionsReady || blockedCode !== permissionDecisionBlockedCode || blockedMessage !== permissionDecisionBlockedMessage;
+  permissionDecisionsReady = ready;
+  permissionDecisionBlockedCode = blockedCode;
+  permissionDecisionBlockedMessage = blockedMessage;
+  if (readinessChanged) renderedPermissionSignature = "";
+  return reconcilePermissionSnapshot(result.permissions || []) || readinessChanged;
 }
 
 function reconcilePermissionSnapshot(received) {
@@ -1966,7 +2036,8 @@ function renderSessionStatus() {
   if (!element) return;
   if (latestWaitingPermission()) {
     element.className = "status status-waiting";
-    element.replaceChildren(document.createElement("i"), document.createTextNode("Needs approval"));
+    const label = permissionDecisionBlockedCode === "worker_upgrade_required" ? "Upgrade required" : "Needs approval";
+    element.replaceChildren(document.createElement("i"), document.createTextNode(label));
     return;
   }
   setStatus(element, currentSessionRuntimeStatus);

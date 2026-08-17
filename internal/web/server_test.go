@@ -141,7 +141,7 @@ func TestServerRenderedPagesAndVersionedBrowserBoundary(t *testing.T) {
 
 	sessionPage := webRequest(fixture.handler, "/sessions/S-web")
 	assertWebStatus(t, sessionPage, http.StatusOK)
-	for _, expected := range []string{"Structured ACP", "canonical conversation", "Verified", "Message codex", "Stop response", "Resume", "Stop worker", "Create reviewer Session", "Closing this page only detaches", "Conversation details", "Session diagnostics", "/private/product"} {
+	for _, expected := range []string{"Structured ACP", "canonical conversation", "Verified", "Loading history", "Conversation", "Message codex", "Stop response", "Resume", "Stop worker", "Create reviewer Session", "Closing this page only detaches", "Conversation details", "Session diagnostics", "/private/product"} {
 		if !strings.Contains(sessionPage.Body.String(), expected) {
 			t.Errorf("Session page does not contain %q", expected)
 		}

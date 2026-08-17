@@ -181,8 +181,9 @@ Commit: `feat: add session lifecycle controls`
 - Keep one action registry for direct keys, footer, help, filtering, and a
   searchable substring command palette. Label unavailable native continuation
   and return an actionable notice for an invalid current action. `Enter` opens
-  the exact real provider-native harness; `a` opens Structured ACP; `p` targets
-  an ACP message.
+  the exact real provider-native harness; `a` opens the structured conversation
+  view; `p` targets an ACP message. Keep normal labels human-facing and move
+  protocol provenance into details/raw views rather than a third context rail.
 - Make Structured ACP conversation-first: compact identity/status line,
   transcript on the terminal background, distinct user/agent gutters, inline
   reasoning/tools, compact tool status/previews with `d` detail disclosure,

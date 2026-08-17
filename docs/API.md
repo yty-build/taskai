@@ -229,6 +229,22 @@ Permission decision:
 {"permission_id":"permission-…:tool-…","option_id":"allow-once","cancelled":false}
 ```
 
+The permission-list response also reports whether the live worker can safely
+accept a browser decision:
+
+```json
+{
+  "permissions": [],
+  "decisions_ready": false,
+  "blocked_code": "worker_upgrade_required",
+  "blocked_message": "safe recovery instructions"
+}
+```
+
+When `decisions_ready` is false, clients must keep every pending request visible
+but disable its decision controls. `blocked_message` is a sanitized local-user
+recovery message; the decision has not been sent to the provider.
+
 IDs are opaque and must come from the current permission list or stream event. The worker revalidates Session, active request, permission, and offered option; concurrent callers receive one accepted decision and a `409` conflict for later attempts. Detaching or closing the client leaves an undecided permission pending.
 
 Cancel and stop require an empty request body. Resume accepts an empty body or:
