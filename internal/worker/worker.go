@@ -92,6 +92,8 @@ type Worker struct {
 	refreshQueueRemaining  int
 	refreshing             bool
 	nativeOwnerToken       string
+	nativeOwnerGeneration  string
+	nativeOwnerReserved    bool
 	nativeRefreshBarrier   bool
 	acpConnected           bool
 	transportError         string
@@ -221,11 +223,14 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 	w.mu.Lock()
 	restoredOwner := w.nativeOwnerToken != ""
+	restoredReservation := w.nativeOwnerReserved
 	restoredRefresh := w.nativeRefreshBarrier
 	w.mu.Unlock()
 	if restoredOwner || restoredRefresh {
 		state := nativeMarkerOwned
-		if restoredRefresh {
+		if restoredReservation {
+			state = nativeMarkerReserved
+		} else if restoredRefresh {
 			state = nativeMarkerRefreshPending
 		}
 		if _, err := w.publish("", "native_ownership_restored", map[string]string{"state": state}); err != nil {
@@ -377,7 +382,10 @@ func (w *Worker) handleConnection(ctx context.Context, connection net.Conn) {
 	}
 	switch command.Type {
 	case "ping":
-		writeMessage(connection, Message{Type: "pong"})
+		writeMessage(connection, Message{
+			Type: "pong", ProtocolVersion: ProtocolVersion,
+			Capabilities: []string{CapabilityExclusiveNativeOwner},
+		})
 	case "status":
 		writeMessage(connection, w.statusMessage())
 	case "prompt":
@@ -407,14 +415,28 @@ func (w *Worker) handleConnection(ctx context.Context, connection net.Conn) {
 		state := w.scheduleRefresh()
 		writeMessage(connection, Message{Type: "refresh_scheduled", State: state})
 	case "native_acquire":
-		state, err := w.acquireNative(command.OwnerToken)
+		state, generation, err := w.acquireNative(command.OwnerToken, command.NativeOwnerRole, command.NativeGeneration)
 		if err != nil {
 			writeMessage(connection, Message{Type: "error", Message: err.Error()})
 			return
 		}
-		writeMessage(connection, Message{Type: "native_acquired", State: state, NativeOwned: true, ProviderWriter: "native"})
+		writeMessage(connection, Message{Type: "native_acquired", State: state, NativeOwned: true, NativeGeneration: generation, ProviderWriter: "native"})
+	case "native_reservation_status":
+		state, generation, err := w.nativeReservationStatus(command.OwnerToken)
+		if err != nil {
+			writeMessage(connection, Message{Type: "error", Message: err.Error()})
+			return
+		}
+		writeMessage(connection, Message{Type: "native_reservation_status", State: state, NativeOwned: state != "released", NativeGeneration: generation})
+	case "native_recover_reservation":
+		state, err := w.recoverNativeReservation(command.OwnerToken, command.NativeGeneration)
+		if err != nil {
+			writeMessage(connection, Message{Type: "error", Message: err.Error()})
+			return
+		}
+		writeMessage(connection, Message{Type: "native_reservation_recovered", State: state})
 	case "native_release":
-		state, err := w.releaseNative(command.OwnerToken, command.NativeActivity)
+		state, err := w.releaseNative(command.OwnerToken, command.NativeGeneration, command.NativeActivity)
 		if err != nil {
 			writeMessage(connection, Message{Type: "error", Message: err.Error()})
 			return
@@ -784,6 +806,11 @@ func (w *Worker) completeNativeRefreshBarrier(ctx context.Context) error {
 	if err := reconcileContext.Err(); err != nil {
 		return fmt.Errorf("reconcile exact provider transcript before releasing ACP queue: %w", err)
 	}
+	if _, err := w.publish("", "provider_transcript_reconciled", map[string]string{
+		"source": "provider-store", "state": "reconciled",
+	}); err != nil {
+		return fmt.Errorf("record exact provider transcript reconciliation before releasing ACP queue: %w", err)
+	}
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -954,6 +981,8 @@ func (w *Worker) statusMessage() Message {
 		message.ProviderWriter = "acp"
 	case w.refreshing:
 		message.ProviderWriter = "refresh"
+	case w.nativeOwnerToken != "" && w.nativeOwnerReserved:
+		message.ProviderWriter = "native-reservation"
 	case w.nativeOwnerToken != "":
 		message.ProviderWriter = "native"
 	}
@@ -970,57 +999,161 @@ func (w *Worker) statusMessage() Message {
 	return message
 }
 
-func (w *Worker) acquireNative(ownerToken string) (string, error) {
+func (w *Worker) acquireNative(ownerToken, role, generation string) (string, string, error) {
 	ownerToken, err := validateNativeOwnerToken(ownerToken)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
+	if role != NativeOwnerRoleReservation && role != NativeOwnerRoleProvider && role != NativeOwnerRoleDirect {
+		return "", "", fmt.Errorf("unknown or missing native owner role %q for worker protocol %d", role, ProtocolVersion)
+	}
+	if role == NativeOwnerRoleProvider {
+		if err := validateNativeGeneration(generation); err != nil {
+			return "", "", fmt.Errorf("activate native provider reservation: %w", err)
+		}
+	} else if generation != "" {
+		return "", "", fmt.Errorf("only a private provider process may supply a native generation")
+	}
+
 	w.mu.Lock()
 	switch {
 	case w.transportError != "":
 		message := w.transportError
 		w.mu.Unlock()
-		return "", fmt.Errorf("provider-native attachment is unavailable because exact ACP continuity failed: %s", message)
+		return "", "", fmt.Errorf("provider-native attachment is unavailable because exact ACP continuity failed: %s", message)
 	case w.nativeOwnerToken == ownerToken:
+		existingGeneration := w.nativeOwnerGeneration
+		if role == NativeOwnerRoleReservation {
+			state := "already_acquired"
+			if w.nativeOwnerReserved {
+				state = "already_reserved"
+			}
+			w.mu.Unlock()
+			return state, existingGeneration, nil
+		}
+		if role == NativeOwnerRoleDirect {
+			if w.nativeOwnerReserved {
+				w.mu.Unlock()
+				return "", "", fmt.Errorf("Session %s has a tmux native reservation; direct execution cannot activate it", w.config.Session.ID)
+			}
+			w.mu.Unlock()
+			return "already_acquired", existingGeneration, nil
+		}
+		if !w.nativeOwnerReserved {
+			w.mu.Unlock()
+			return "already_acquired", existingGeneration, nil
+		}
+		if generation != existingGeneration {
+			w.mu.Unlock()
+			return "", "", fmt.Errorf("native reservation generation does not match Session %s; refusing to start a stale provider process", w.config.Session.ID)
+		}
+		if err := w.persistNativeOwnership(nativeMarkerOwned, ownerToken, existingGeneration); err != nil {
+			w.mu.Unlock()
+			return "", "", fmt.Errorf("activate exclusive native provider ownership: %w", err)
+		}
+		w.nativeOwnerReserved = false
 		w.mu.Unlock()
-		return "already_acquired", nil
+		if _, err := w.publish("", "native_activated", map[string]string{"state": "activated"}); err != nil {
+			w.mu.Lock()
+			if w.nativeOwnerToken == ownerToken && w.nativeOwnerGeneration == existingGeneration && !w.nativeOwnerReserved {
+				if rollbackErr := w.persistNativeOwnership(nativeMarkerReserved, ownerToken, existingGeneration); rollbackErr != nil {
+					w.mu.Unlock()
+					return "", "", fmt.Errorf("publish native activation: %v; ownership remains fail-closed as active because reservation rollback failed: %w", err, rollbackErr)
+				}
+				w.nativeOwnerReserved = true
+				w.mu.Unlock()
+				return "", "", fmt.Errorf("publish native activation: %w; restored the exact pre-launch reservation and did not authorize provider start", err)
+			}
+			w.mu.Unlock()
+			return "", "", fmt.Errorf("publish native activation: %w; ownership changed concurrently and was not rewritten", err)
+		}
+		return "activated", existingGeneration, nil
 	case w.nativeOwnerToken != "":
 		w.mu.Unlock()
-		return "", fmt.Errorf("provider writer is busy: another native provider process owns Session %s", w.config.Session.ID)
+		return "", "", fmt.Errorf("provider writer is busy: another native provider process owns Session %s", w.config.Session.ID)
 	case w.active != nil:
 		requestID := w.active.RequestID
 		w.mu.Unlock()
-		return "", fmt.Errorf("provider writer is busy: ACP request %s is active; retry native attachment after that turn settles", requestID)
+		return "", "", fmt.Errorf("provider writer is busy: ACP request %s is active; retry native attachment after that turn settles", requestID)
 	case w.refreshing:
 		w.mu.Unlock()
-		return "", fmt.Errorf("provider writer is busy: exact ACP identity refresh is active; retry native attachment after refresh completes")
+		return "", "", fmt.Errorf("provider writer is busy: exact ACP identity refresh is active; retry native attachment after refresh completes")
 	case w.refreshPending:
 		w.mu.Unlock()
-		return "", fmt.Errorf("provider writer is busy: exact ACP identity refresh is scheduled; retry native attachment after refresh completes")
+		return "", "", fmt.Errorf("provider writer is busy: exact ACP identity refresh is scheduled; retry native attachment after refresh completes")
 	default:
-		if err := w.persistNativeOwnership(nativeMarkerOwned, ownerToken); err != nil {
+		if role == NativeOwnerRoleProvider {
 			w.mu.Unlock()
-			return "", fmt.Errorf("persist exclusive native provider ownership: %w", err)
+			return "", "", fmt.Errorf("native provider reservation is no longer active for Session %s; refusing to start a stale provider process", w.config.Session.ID)
+		}
+		newGeneration, generationErr := newNativeGeneration()
+		if generationErr != nil {
+			w.mu.Unlock()
+			return "", "", generationErr
+		}
+		markerState := nativeMarkerOwned
+		resultState := "acquired"
+		if role == NativeOwnerRoleReservation {
+			markerState = nativeMarkerReserved
+			resultState = "reserved"
+		}
+		if err := w.persistNativeOwnership(markerState, ownerToken, newGeneration); err != nil {
+			w.mu.Unlock()
+			return "", "", fmt.Errorf("persist exclusive native provider ownership: %w", err)
 		}
 		w.nativeOwnerToken = ownerToken
+		w.nativeOwnerGeneration = newGeneration
+		w.nativeOwnerReserved = role == NativeOwnerRoleReservation
 		w.mu.Unlock()
-	}
-	if _, err := w.publish("", "native_acquired", map[string]string{"state": "acquired"}); err != nil {
-		w.mu.Lock()
-		if w.nativeOwnerToken == ownerToken {
-			if removeErr := w.removeNativeOwnership(); removeErr != nil {
-				w.mu.Unlock()
-				return "", fmt.Errorf("publish native ownership: %v; ownership remains fail-closed because rollback failed: %w", err, removeErr)
+		if _, err := w.publish("", "native_acquired", map[string]string{"state": resultState}); err != nil {
+			w.mu.Lock()
+			if w.nativeOwnerToken == ownerToken && w.nativeOwnerGeneration == newGeneration {
+				if removeErr := w.removeNativeOwnership(); removeErr != nil {
+					w.mu.Unlock()
+					return "", "", fmt.Errorf("publish native ownership: %v; ownership remains fail-closed because rollback failed: %w", err, removeErr)
+				}
+				w.nativeOwnerToken = ""
+				w.nativeOwnerGeneration = ""
+				w.nativeOwnerReserved = false
 			}
-			w.nativeOwnerToken = ""
+			w.mu.Unlock()
+			return "", "", err
 		}
-		w.mu.Unlock()
-		return "", err
+		return resultState, newGeneration, nil
 	}
-	return "acquired", nil
 }
 
-func (w *Worker) releaseNative(ownerToken string, activity bool) (string, error) {
+func (w *Worker) nativeReservationStatus(ownerToken string) (string, string, error) {
+	ownerToken, err := validateNativeOwnerToken(ownerToken)
+	if err != nil {
+		return "", "", err
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.nativeOwnerToken == "" {
+		return "released", "", nil
+	}
+	if w.nativeOwnerToken != ownerToken {
+		return "", "", fmt.Errorf("native provider ownership token does not match Session %s", w.config.Session.ID)
+	}
+	if w.nativeOwnerReserved {
+		return "reserved", w.nativeOwnerGeneration, nil
+	}
+	return "active", w.nativeOwnerGeneration, nil
+}
+
+func (w *Worker) releaseNative(ownerToken, generation string, activity bool) (string, error) {
+	return w.releaseNativeOwnership(ownerToken, generation, activity, false)
+}
+
+func (w *Worker) recoverNativeReservation(ownerToken, generation string) (string, error) {
+	// A foreign collision may have written the provider conversation. Recovery
+	// therefore crosses the same exact refresh/reconciliation barrier as a real
+	// native turn even though this generation never started our provider.
+	return w.releaseNativeOwnership(ownerToken, generation, true, true)
+}
+
+func (w *Worker) releaseNativeOwnership(ownerToken, generation string, activity, reservationOnly bool) (string, error) {
 	ownerToken, err := validateNativeOwnerToken(ownerToken)
 	if err != nil {
 		return "", err
@@ -1038,10 +1171,18 @@ func (w *Worker) releaseNative(ownerToken string, activity bool) (string, error)
 		w.mu.Unlock()
 		return "", fmt.Errorf("native provider ownership token does not match Session %s", w.config.Session.ID)
 	}
+	if generation != w.nativeOwnerGeneration {
+		w.mu.Unlock()
+		return "", fmt.Errorf("native ownership generation does not match Session %s; refusing a stale release", w.config.Session.ID)
+	}
+	if reservationOnly && !w.nativeOwnerReserved {
+		w.mu.Unlock()
+		return "", fmt.Errorf("Session %s has active provider-native ownership; missing tmux alone cannot prove that provider exited, so reservation recovery is refused", w.config.Session.ID)
+	}
 	state := "released"
 	needsConnectionBarrier := !w.acpConnected
 	if activity || needsConnectionBarrier {
-		if err := w.persistNativeOwnership(nativeMarkerRefreshPending, ownerToken); err != nil {
+		if err := w.persistNativeOwnership(nativeMarkerRefreshPending, ownerToken, generation); err != nil {
 			w.mu.Unlock()
 			return "", fmt.Errorf("persist exact-refresh barrier before releasing native provider ownership: %w", err)
 		}
@@ -1057,8 +1198,14 @@ func (w *Worker) releaseNative(ownerToken string, activity bool) (string, error)
 		return "", fmt.Errorf("release exclusive native provider ownership: %w", err)
 	}
 	w.nativeOwnerToken = ""
+	w.nativeOwnerGeneration = ""
+	w.nativeOwnerReserved = false
 	w.mu.Unlock()
-	_, publishErr := w.publish("", "native_released", map[string]any{
+	eventType := "native_released"
+	if reservationOnly {
+		eventType = "native_reservation_recovered"
+	}
+	_, publishErr := w.publish("", eventType, map[string]any{
 		"activity": activity, "connection_deferred": needsConnectionBarrier, "state": state,
 	})
 	w.signalWake()

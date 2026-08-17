@@ -329,6 +329,150 @@ func TestConversationMergeReconcilesACPThenNativeThenRepeatedACPAnswer(t *testin
 	}
 }
 
+func TestConversationMergeUsesProviderSemanticHistoryWhenBothSourcesContainReasoning(t *testing.T) {
+	provider := native.TranscriptSnapshot{Records: []native.TranscriptRecord{
+		{Key: "provider-user", Kind: native.TranscriptUser, Text: "Inspect the history"},
+		{Key: "provider-reasoning", Kind: native.TranscriptReasoning, Text: "Shared reasoning summary"},
+		{Key: "provider-answer", Kind: native.TranscriptAssistant, Text: "A sufficiently long committed answer"},
+	}}
+	gateway := conversationGatewayFixture("REQ-matched", 1, "Inspect the history", "A sufficiently long committed answer", true)
+	gateway.activities = []ConversationActivity{
+		{RequestID: gateway.id, Kind: "prompt_submitted", Display: &presentation.Activity{Type: "user_message", Text: "Inspect the history"}},
+		{RequestID: gateway.id, Kind: "turn_started", Display: &presentation.Activity{Type: "turn_state", State: "working"}},
+		{RequestID: gateway.id, Kind: "acp", Display: &presentation.Activity{Type: "thought_chunk", Text: "Shared reasoning"}},
+		{RequestID: gateway.id, Kind: "acp", Display: &presentation.Activity{Type: "thought_chunk", Text: " summary"}},
+		{RequestID: gateway.id, Kind: "acp", Display: &presentation.Activity{Type: "tool_upsert", Tool: &presentation.Tool{ID: "tool-1", Title: "Inspect", Status: "completed"}}},
+		{RequestID: gateway.id, Kind: "permission_resolved", Display: &presentation.Activity{Type: "permission", State: "resolved"}, Permission: &ConversationPermission{ID: "permission-1", State: "resolved", Decision: "allow_once"}},
+		{RequestID: gateway.id, Kind: "acp", Display: &presentation.Activity{Type: "assistant_chunk", Text: "A sufficiently long committed answer"}},
+		{RequestID: gateway.id, Kind: "turn_completed", Display: &presentation.Activity{Type: "turn_state", State: "complete", StopReason: "end_turn"}},
+	}
+
+	merged := mergeConversationTurns(provider, []*conversationTurn{gateway})
+	if len(merged) != 1 || !merged[0].Committed {
+		t.Fatalf("matched committed turn = %#v", merged)
+	}
+	if countConversationDisplayKind(merged[0].Activities, "user_message", "provider_transcript") != 1 ||
+		countConversationDisplayKind(merged[0].Activities, "thought_chunk", "provider_transcript") != 1 ||
+		countConversationDisplayKind(merged[0].Activities, "assistant_chunk", "provider_transcript") != 1 {
+		t.Fatalf("provider semantic records were not authoritative: %#v", merged[0].Activities)
+	}
+	if hasConversationDisplayKind(merged[0].Activities, "thought_chunk", "acp") {
+		t.Fatalf("normalized duplicate ACP reasoning remained beside provider history: %#v", merged[0].Activities)
+	}
+	for _, displayType := range []string{"turn_state", "tool_upsert", "permission"} {
+		if !containsConversationDisplayType(merged[0].Activities, displayType) {
+			t.Fatalf("gateway %s activity was lost: %#v", displayType, merged[0].Activities)
+		}
+	}
+	if !hasConversationDisplay(merged[0].Activities, "thought_chunk", "Shared reasoning summary") {
+		t.Fatalf("safe provider reasoning summary was not retained: %#v", merged[0].Activities)
+	}
+}
+
+func TestConversationMergeKeepsOnlyGenuinelySupplementalACPReasoning(t *testing.T) {
+	provider := native.TranscriptSnapshot{Records: []native.TranscriptRecord{
+		{Key: "provider-user", Kind: native.TranscriptUser, Text: "Inspect the history"},
+		{Key: "provider-reasoning", Kind: native.TranscriptReasoning, Text: "Shared reasoning"},
+		{Key: "provider-answer", Kind: native.TranscriptAssistant, Text: "A sufficiently long committed answer"},
+	}}
+	gateway := conversationGatewayFixture("REQ-supplemental", 1, "Inspect the history", "A sufficiently long committed answer", true)
+	gateway.activities = append(gateway.activities[:1], append([]ConversationActivity{
+		{RequestID: gateway.id, Kind: "acp", Display: &presentation.Activity{Type: "thought_chunk", Text: "Shared reasoning"}},
+		{RequestID: gateway.id, Kind: "acp", Display: &presentation.Activity{Type: "thought_chunk", Text: " Additional ACP-only detail"}},
+	}, gateway.activities[1:]...)...)
+
+	merged := mergeConversationTurns(provider, []*conversationTurn{gateway})
+	if len(merged) != 1 ||
+		!hasConversationDisplayKind(merged[0].Activities, "thought_chunk", "provider_transcript") ||
+		!hasConversationDisplayKind(merged[0].Activities, "thought_chunk", "acp") {
+		t.Fatalf("provider and supplemental ACP reasoning were not both retained: %#v", merged)
+	}
+	if countConversationDisplayKind(merged[0].Activities, "thought_chunk", "acp") != 1 ||
+		!hasConversationDisplay(merged[0].Activities, "thought_chunk", "Additional ACP-only detail") {
+		t.Fatalf("provider-equal ACP reasoning was not removed from the supplemental text: %#v", merged[0].Activities)
+	}
+}
+
+func TestConversationMergePreservesInterleavedProviderSemanticOrderAroundGatewayTool(t *testing.T) {
+	provider := native.TranscriptSnapshot{Records: []native.TranscriptRecord{
+		{Key: "provider-user", Kind: native.TranscriptUser, Text: "Inspect in phases"},
+		{Key: "provider-reasoning-1", Kind: native.TranscriptReasoning, Text: "Reasoning before commentary"},
+		{Key: "provider-assistant-1", Kind: native.TranscriptAssistant, Phase: "commentary", Text: "Commentary before tool"},
+		{Key: "provider-reasoning-2", Kind: native.TranscriptReasoning, Text: "Reasoning after tool"},
+		{Key: "provider-assistant-2", Kind: native.TranscriptAssistant, Phase: "final", Text: "Final committed response"},
+	}}
+	gateway := &conversationTurn{
+		id: "REQ-interleaved", first: 1, terminal: true, committable: true,
+		userMatchable: true, answerMatchable: true, retainActivities: true,
+		activities: []ConversationActivity{
+			{RequestID: "REQ-interleaved", Kind: "prompt_submitted", Display: &presentation.Activity{Type: "user_message", Text: "Inspect in phases"}},
+			{RequestID: "REQ-interleaved", Kind: "turn_started", Display: &presentation.Activity{Type: "turn_state", State: "working"}},
+			{RequestID: "REQ-interleaved", Kind: "acp", Display: &presentation.Activity{Type: "thought_chunk", Text: "Reasoning before commentary"}},
+			{RequestID: "REQ-interleaved", Kind: "acp", Display: &presentation.Activity{Type: "assistant_chunk", Text: "Commentary before tool"}},
+			{RequestID: "REQ-interleaved", Kind: "acp", Display: &presentation.Activity{Type: "tool_upsert", Tool: &presentation.Tool{ID: "tool-between", Title: "Inspect", Status: "completed"}}},
+			{RequestID: "REQ-interleaved", Kind: "acp", Display: &presentation.Activity{Type: "thought_chunk", Text: "Reasoning after tool"}},
+			{RequestID: "REQ-interleaved", Kind: "acp", Display: &presentation.Activity{Type: "assistant_chunk", Text: "Final committed response"}},
+			{RequestID: "REQ-interleaved", Kind: "turn_completed", Display: &presentation.Activity{Type: "turn_state", State: "complete", StopReason: "end_turn"}},
+		},
+	}
+	gateway.user.append("Inspect in phases")
+	gateway.assistant.append("Commentary before tool")
+	gateway.assistant.append("Final committed response")
+
+	merged := mergeConversationTurns(provider, []*conversationTurn{gateway})
+	if len(merged) != 1 || !merged[0].Committed {
+		t.Fatalf("interleaved committed turn = %#v", merged)
+	}
+	var semantic []string
+	toolIndex := -1
+	for index, activity := range merged[0].Activities {
+		if activity.Display == nil {
+			continue
+		}
+		switch activity.Display.Type {
+		case "user_message", "thought_chunk", "assistant_chunk":
+			semantic = append(semantic, activity.Display.Type+":"+activity.Display.Text)
+			if activity.Kind != "provider_transcript" {
+				t.Fatalf("semantic activity was not provider authoritative: %#v", activity)
+			}
+		case "tool_upsert":
+			toolIndex = index
+		}
+	}
+	want := []string{
+		"user_message:Inspect in phases",
+		"thought_chunk:Reasoning before commentary",
+		"assistant_chunk:Commentary before tool",
+		"thought_chunk:Reasoning after tool",
+		"assistant_chunk:Final committed response",
+	}
+	if strings.Join(semantic, "|") != strings.Join(want, "|") {
+		t.Fatalf("provider semantic order = %#v, want %#v; activities = %#v", semantic, want, merged[0].Activities)
+	}
+	commentaryIndex := conversationDisplayIndex(merged[0].Activities, "assistant_chunk", "Commentary before tool")
+	secondReasoningIndex := conversationDisplayIndex(merged[0].Activities, "thought_chunk", "Reasoning after tool")
+	if toolIndex <= commentaryIndex || toolIndex >= secondReasoningIndex {
+		t.Fatalf("gateway tool lost its observed semantic anchors: commentary=%d tool=%d next-reasoning=%d activities=%#v", commentaryIndex, toolIndex, secondReasoningIndex, merged[0].Activities)
+	}
+}
+
+func TestConversationMergePreservesACPReasoningWhenProviderHasNoReadableReasoning(t *testing.T) {
+	provider := native.TranscriptSnapshot{Records: []native.TranscriptRecord{
+		{Key: "provider-user", Kind: native.TranscriptUser, Text: "Inspect the history"},
+		{Key: "provider-answer", Kind: native.TranscriptAssistant, Text: "A sufficiently long committed answer"},
+	}}
+	gateway := conversationGatewayFixture("REQ-acp-fallback", 1, "Inspect the history", "A sufficiently long committed answer", true)
+	gateway.activities = append(gateway.activities[:1], append([]ConversationActivity{{
+		RequestID: gateway.id, Kind: "acp", Display: &presentation.Activity{Type: "thought_chunk", Text: "ACP reasoning remains visible"},
+	}}, gateway.activities[1:]...)...)
+
+	merged := mergeConversationTurns(provider, []*conversationTurn{gateway})
+	if len(merged) != 1 || !hasConversationDisplayKind(merged[0].Activities, "thought_chunk", "acp") ||
+		!hasConversationDisplay(merged[0].Activities, "thought_chunk", "ACP reasoning remains visible") {
+		t.Fatalf("ACP reasoning fallback was lost: %#v", merged)
+	}
+}
+
 func TestConversationMergeNeverCommitsCancelledOrTruncatedGatewayOutput(t *testing.T) {
 	provider := native.TranscriptSnapshot{Records: []native.TranscriptRecord{
 		{Key: "provider-user", Kind: native.TranscriptUser, Text: "Do it"},
@@ -558,6 +702,34 @@ func hasConversationDisplayKind(activities []ConversationActivity, displayType, 
 		}
 	}
 	return false
+}
+
+func countConversationDisplayKind(activities []ConversationActivity, displayType, activityKind string) int {
+	count := 0
+	for _, activity := range activities {
+		if activity.Kind == activityKind && activity.Display != nil && activity.Display.Type == displayType {
+			count++
+		}
+	}
+	return count
+}
+
+func containsConversationDisplayType(activities []ConversationActivity, displayType string) bool {
+	for _, activity := range activities {
+		if activity.Display != nil && activity.Display.Type == displayType {
+			return true
+		}
+	}
+	return false
+}
+
+func conversationDisplayIndex(activities []ConversationActivity, displayType, text string) int {
+	for index, activity := range activities {
+		if activity.Display != nil && activity.Display.Type == displayType && activity.Display.Text == text {
+			return index
+		}
+	}
+	return -1
 }
 
 func writeConversationFixture(t *testing.T, path, body string) {

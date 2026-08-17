@@ -191,12 +191,15 @@ func runHiddenWorker(ctx context.Context, args []string, home config.Home, datab
 }
 
 func runHiddenNative(ctx context.Context, args []string, stdout, stderr io.Writer, service *appservice.SessionService) error {
-	options, err := parseOptions(args, map[string]optionKind{"--session": stringOption, "--owner-token": stringOption})
-	if err != nil || len(options.positionals) != 0 || options.values["--session"] == "" || options.values["--owner-token"] == "" {
-		return usagef("usage: acpctl _native --session <session-id> --owner-token <token>")
+	options, err := parseOptions(args, map[string]optionKind{
+		"--session": stringOption, "--owner-token": stringOption, "--reservation-generation": stringOption,
+	})
+	if err != nil || len(options.positionals) != 0 || options.values["--session"] == "" || options.values["--owner-token"] == "" || options.values["--reservation-generation"] == "" {
+		return usagef("usage: acpctl _native --session <session-id> --owner-token <token> --reservation-generation <generation>")
 	}
 	return service.AttachNative(ctx, options.values["--session"], appservice.NativeAttachOptions{
-		Runner: &native.ExecRunner{}, OwnerToken: options.values["--owner-token"], Input: os.Stdin, Output: stdout, ErrorOutput: stderr,
+		Runner: &native.ExecRunner{}, OwnerToken: options.values["--owner-token"], ReservationGeneration: options.values["--reservation-generation"],
+		Input: os.Stdin, Output: stdout, ErrorOutput: stderr,
 	})
 }
 
@@ -347,7 +350,7 @@ func runStart(ctx context.Context, args []string, stdout io.Writer, sessions *ap
 
 func runSession(ctx context.Context, args []string, stdout, stderr io.Writer, service *appservice.SessionService) error {
 	if len(args) == 0 {
-		return usagef("usage: acpctl session start|review|attach|prompt|cancel|resume|stop|logs|<session-id>")
+		return usagef("usage: acpctl session start|review|attach|prompt|cancel|resume|stop|recover-native|logs|<session-id>")
 	}
 	switch args[0] {
 	case "start":
@@ -391,6 +394,16 @@ func runSession(ctx context.Context, args []string, stdout, stderr io.Writer, se
 		}
 		fmt.Fprintf(stdout, "Stopped %s\n", args[1])
 		return nil
+	case "recover-native":
+		if len(args) != 2 {
+			return usagef("usage: acpctl session recover-native <session-id>")
+		}
+		recovered, err := service.RecoverNativeReservation(ctx, args[1], appservice.NativeReservationRecoveryOptions{})
+		if err != nil {
+			return err
+		}
+		writeNativeRecoveryResult(stdout, args[1], recovered)
+		return nil
 	case "logs":
 		return runSessionLogs(ctx, args[1:], stdout, service)
 	case "review":
@@ -424,6 +437,14 @@ func runSession(ctx context.Context, args []string, stdout, stderr io.Writer, se
 		}
 		return showSession(ctx, args[0], stdout, service)
 	}
+}
+
+func writeNativeRecoveryResult(stdout io.Writer, sessionID string, recovered appservice.NativeReservationRecoveryResult) {
+	if recovered.State == "refresh_scheduled" {
+		fmt.Fprintf(stdout, "Recovered orphaned native reservation for %s; exact refresh and reconciliation are scheduled. Wait for native_refreshed, then run acpctl session attach %s.\n", sessionID, sessionID)
+		return
+	}
+	fmt.Fprintf(stdout, "Native reservation for %s was already released; no recovery refresh was scheduled. Inspect Session status, then retry acpctl session attach %s when it is ready.\n", sessionID, sessionID)
 }
 
 func runSessionStart(ctx context.Context, args []string, stdout io.Writer, service *appservice.SessionService) error {

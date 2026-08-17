@@ -359,7 +359,7 @@ func (m Model) renderOverlay(width, height int) string {
 			}
 		} else {
 			body = []string{
-				"STRUCTURED ACP CONSOLE", "  p / i / Enter  Compose a message", "  ↑/↓ PgUp/PgDn Scroll history", "  End            Follow live output",
+				"STRUCTURED ACP CONSOLE", "  n              Open the exact conversation in the provider's native CLI", "  p / i / Enter  Compose a message", "  ↑/↓ PgUp/PgDn Scroll history", "  End            Follow live output",
 				"  1-9            Choose an offered permission", "  d              Expand selected tool", "  [ / ]          Select tool", "  o              Toggle reasoning",
 				"  r              Toggle raw ACP events", "  Esc / c        Cancel active turn", "  b              Back to Task", "  q              Detach viewer",
 			}
@@ -482,17 +482,22 @@ func (m Model) sessionFooter(width int) string {
 			approval = fmt.Sprintf("1-%d choose approval", min(9, len(card.options)))
 		}
 	}
-	required := []string{"p Message", "Esc Cancel", "q Detach"}
+	nativeAction := "n Native CLI"
+	compactNativeAction := "n Native"
+	if !nativeCapability(m.current).available {
+		nativeAction = "n Native N/A"
+		compactNativeAction = "n N/A"
+	}
+	required := []string{nativeAction, "p Message", "Esc Cancel"}
 	if approval != "" {
-		required = append([]string{approval}, required...)
-	} else {
-		required = append([]string{"p Message", "o Reasoning"}, required[1:]...)
+		required = []string{approval, nativeAction, "p Message", "Esc Cancel"}
 	}
 	if !m.direct {
 		required = append(required, "b Back")
 	}
+	required = append(required, "q Detach")
 	if width < 56 {
-		items := []string{"p Write"}
+		items := []string{compactNativeAction, "p Write"}
 		if approval != "" {
 			items = append([]string{approval}, items...)
 		} else {
@@ -507,7 +512,7 @@ func (m Model) sessionFooter(width int) string {
 		}
 		return fitLine(strings.Join(items, "  "), width)
 	}
-	optional := []string{mode, "↑/↓ Scroll", "End Follow", "d Tool", "x Stop"}
+	optional := []string{"o Reasoning", mode, "↑/↓ Scroll", "End Follow", "d Tool", "x Stop"}
 	items := append([]string(nil), required...)
 	for _, item := range optional {
 		candidate := strings.Join(append(items, item), "  ")

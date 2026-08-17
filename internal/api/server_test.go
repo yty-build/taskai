@@ -36,6 +36,7 @@ type apiRuntime struct {
 	sockets    map[string]string
 	commands   []worker.Command
 	pending    map[string][]worker.PendingPermission
+	stale      bool
 }
 
 func (r *apiRuntime) Spawn(ctx context.Context, sessionID string) (worker.SpawnResult, error) {
@@ -56,9 +57,19 @@ func (r *apiRuntime) Send(ctx context.Context, socket string, command worker.Com
 	r.mu.Lock()
 	sessionID, ok := r.sockets[socket]
 	r.commands = append(r.commands, command)
+	stale := r.stale
 	r.mu.Unlock()
 	if !ok {
 		return worker.Message{}, fmt.Errorf("fake worker unavailable")
+	}
+	if command.Type == "ping" {
+		if stale {
+			return worker.Message{Type: "pong"}, nil
+		}
+		return worker.Message{
+			Type: "pong", ProtocolVersion: worker.ProtocolVersion,
+			Capabilities: []string{worker.CapabilityExclusiveNativeOwner},
+		}, nil
 	}
 	if command.Type == "stop" {
 		if _, err := r.repository.ClearSessionWorker(ctx, sessionID, session.StatusStopped); err != nil {
@@ -386,6 +397,111 @@ func TestVersionedTaskAndSessionAPI(t *testing.T) {
 	assertDTOIsRedacted(t, getSession.Body.String(), fixture.home, sessionID)
 }
 
+func TestStaleWorkerProviderWritesReturnConflictWithoutSendingProviderCommand(t *testing.T) {
+	fixture := newAPIFixture(t)
+	taskResponse := performJSON(t, fixture.handler, http.MethodPost, "/api/v1/tasks", map[string]any{"title": "Upgrade stale worker"})
+	assertStatus(t, taskResponse, http.StatusCreated)
+	var createdTask struct {
+		Task TaskDTO `json:"task"`
+	}
+	decodeResponse(t, taskResponse, &createdTask)
+
+	sessionResponse := performJSON(t, fixture.handler, http.MethodPost, "/api/v1/tasks/"+createdTask.Task.ID+"/sessions", map[string]any{
+		"agent": "codex", "role": "implementer", "repo_path": fixture.repo, "prompt": "Initial safe request",
+	})
+	assertStatus(t, sessionResponse, http.StatusCreated)
+	var started struct {
+		Session SessionDTO `json:"session"`
+	}
+	decodeResponse(t, sessionResponse, &started)
+	sessionID := started.Session.ID
+
+	fixture.runtime.mu.Lock()
+	fixture.runtime.stale = true
+	fixture.runtime.commands = nil
+	fixture.runtime.mu.Unlock()
+
+	prompt := performJSON(t, fixture.handler, http.MethodPost, "/api/v1/sessions/"+sessionID+"/prompt", map[string]string{"message": "Must not reach the provider"})
+	assertStatus(t, prompt, http.StatusConflict)
+	assertWorkerUpgradeResponse(t, prompt, sessionID, "prompt not sent", fixture.home.Root)
+	assertOnlyWorkerCommand(t, fixture.runtime, "ping")
+
+	fixture.runtime.mu.Lock()
+	fixture.runtime.commands = nil
+	fixture.runtime.mu.Unlock()
+	decision := performJSON(t, fixture.handler, http.MethodPost, "/api/v1/sessions/"+sessionID+"/permissions/decision", map[string]any{
+		"permission_id": "permission-stale", "option_id": "allow-once",
+	})
+	assertStatus(t, decision, http.StatusConflict)
+	assertWorkerUpgradeResponse(t, decision, sessionID, "permission not sent", fixture.home.Root)
+	assertOnlyWorkerCommand(t, fixture.runtime, "ping")
+
+	// Read/control operations deliberately remain available during migration.
+	assertStatus(t, performRequest(t, fixture.handler, http.MethodGet, "/api/v1/sessions/"+sessionID+"/permissions", nil, nil), http.StatusOK)
+	assertStatus(t, performRequest(t, fixture.handler, http.MethodPost, "/api/v1/sessions/"+sessionID+"/cancel", nil, nil), http.StatusAccepted)
+
+	// The explicit migration path stops the old process, starts the replacement
+	// binary, and sends only after that replacement proves the current protocol.
+	assertStatus(t, performRequest(t, fixture.handler, http.MethodPost, "/api/v1/sessions/"+sessionID+"/stop", nil, nil), http.StatusOK)
+	fixture.runtime.mu.Lock()
+	fixture.runtime.stale = false
+	fixture.runtime.commands = nil
+	fixture.runtime.mu.Unlock()
+	assertStatus(t, performJSON(t, fixture.handler, http.MethodPost, "/api/v1/sessions/"+sessionID+"/resume", map[string]any{}), http.StatusOK)
+	fixture.runtime.mu.Lock()
+	fixture.runtime.commands = nil
+	fixture.runtime.mu.Unlock()
+	postMigrationPrompt := performJSON(t, fixture.handler, http.MethodPost, "/api/v1/sessions/"+sessionID+"/prompt", map[string]string{"message": "Continue after migration"})
+	assertStatus(t, postMigrationPrompt, http.StatusAccepted)
+	assertWorkerCommands(t, fixture.runtime, "ping", "prompt")
+}
+
+func assertWorkerUpgradeResponse(t *testing.T, response *httptest.ResponseRecorder, sessionID, operation, forbiddenPath string) {
+	t.Helper()
+	var payload struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	decodeResponse(t, response, &payload)
+	if payload.Error.Code != "worker_upgrade_required" {
+		t.Fatalf("upgrade error code = %q", payload.Error.Code)
+	}
+	for _, expected := range []string{
+		operation,
+		"agent-" + sessionID,
+		"acpctl session stop " + sessionID,
+		"acpctl session resume " + sessionID,
+	} {
+		if !strings.Contains(payload.Error.Message, expected) {
+			t.Fatalf("upgrade response missing %q: %s", expected, payload.Error.Message)
+		}
+	}
+	if strings.Contains(payload.Error.Message, forbiddenPath) || strings.Contains(payload.Error.Message, ".sock") {
+		t.Fatalf("upgrade response exposed internal path: %s", payload.Error.Message)
+	}
+}
+
+func assertOnlyWorkerCommand(t *testing.T, runtime *apiRuntime, commandType string) {
+	t.Helper()
+	assertWorkerCommands(t, runtime, commandType)
+}
+
+func assertWorkerCommands(t *testing.T, runtime *apiRuntime, commandTypes ...string) {
+	t.Helper()
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if len(runtime.commands) != len(commandTypes) {
+		t.Fatalf("worker commands = %#v, want %v", runtime.commands, commandTypes)
+	}
+	for index, commandType := range commandTypes {
+		if runtime.commands[index].Type != commandType {
+			t.Fatalf("worker commands = %#v, want %v", runtime.commands, commandTypes)
+		}
+	}
+}
+
 func TestActivityPermissionDTOExposesOnlyActionableSafeFields(t *testing.T) {
 	line := sessionlog.Line{
 		Seq: 4, RequestID: "REQ", Type: "permission_requested",
@@ -489,6 +605,85 @@ func TestConversationAPIUsesOpaqueCommittedProviderHistory(t *testing.T) {
 		if strings.Contains(encoded, forbidden) {
 			t.Fatalf("conversation API leaked %q: %s", forbidden, encoded)
 		}
+	}
+}
+
+func TestConversationAPIUsesProviderReasoningForMatchedCommittedTurn(t *testing.T) {
+	fixture := newAPIFixture(t)
+	ctx := context.Background()
+	if _, err := fixture.repository.CreateTask(ctx, task.CreateParams{ID: "T-provider-reasoning", Title: "Provider reasoning"}); err != nil {
+		t.Fatal(err)
+	}
+	conversationID := "01-api-provider-reasoning"
+	verifiedAt := time.Now().UTC()
+	current, err := fixture.repository.CreateSession(ctx, session.CreateParams{
+		ID: "S-provider-reasoning", TaskID: "T-provider-reasoning", Agent: "codex", Provider: "openai",
+		RepoPath: fixture.repo, Status: session.StatusWaiting, LogPath: filepath.Join(fixture.home.Logs, "S-provider-reasoning.jsonl"),
+		ACPSessionID: conversationID, NativeSessionID: conversationID, ProviderConversationID: conversationID,
+		ConversationIDSource: session.ConversationSourceProviderStore, ConversationIDVerifiedAt: &verifiedAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	providerRoot := filepath.Join(fixture.home.Root, "codex-provider-reasoning")
+	t.Setenv("CODEX_HOME", providerRoot)
+	providerPath := filepath.Join(providerRoot, "sessions", "2026", "08", "16", "rollout-"+conversationID+".jsonl")
+	if err := os.MkdirAll(filepath.Dir(providerPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	providerTime := time.Now().UTC()
+	body := `{"timestamp":"` + providerTime.Format(time.RFC3339Nano) + `","type":"session_meta","payload":{"id":"` + conversationID + `","cwd":"` + fixture.repo + `"}}` + "\n" +
+		`{"timestamp":"` + providerTime.Format(time.RFC3339Nano) + `","type":"event_msg","payload":{"type":"user_message","message":"Inspect committed reasoning"}}` + "\n" +
+		`{"timestamp":"` + providerTime.Format(time.RFC3339Nano) + `","type":"response_item","payload":{"id":"reasoning-safe","type":"reasoning","encrypted_content":"MUST-NOT-LEAK","summary":[{"type":"summary_text","text":"Shared reasoning summary"}]}}` + "\n" +
+		`{"timestamp":"` + providerTime.Format(time.RFC3339Nano) + `","type":"response_item","payload":{"id":"answer-safe","type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"A sufficiently long committed answer"}]}}` + "\n"
+	if err := os.WriteFile(providerPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	log, err := sessionlog.Open(current.LogPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Append("REQ-reasoning", "prompt_submitted", map[string]string{"display_message": "Inspect committed reasoning"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Append("REQ-reasoning", "turn_started", map[string]string{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range []acp.Event{
+		{Type: "agent_thought_chunk", RequestID: "REQ-reasoning", Raw: json.RawMessage(`{"params":{"update":{"content":{"type":"text","text":"Shared reasoning summary"}}}}`)},
+		{Type: "agent_message_chunk", RequestID: "REQ-reasoning", Raw: json.RawMessage(`{"params":{"update":{"content":{"type":"text","text":"A sufficiently long committed answer"}}}}`)},
+	} {
+		if _, err := log.Append("REQ-reasoning", "acp", event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := log.Append("REQ-reasoning", "turn_completed", map[string]string{"stopReason": "end_turn"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	response := performRequest(t, fixture.handler, http.MethodGet, "/api/v1/sessions/"+current.ID+"/conversation", nil, nil)
+	assertStatus(t, response, http.StatusOK)
+	var snapshot ConversationDTO
+	decodeResponse(t, response, &snapshot)
+	if snapshot.Source != "provider-store" || len(snapshot.Turns) != 1 || !snapshot.Turns[0].Committed {
+		t.Fatalf("conversation DTO = %#v", snapshot)
+	}
+	semanticKinds := map[string]string{}
+	for _, activity := range snapshot.Turns[0].Activities {
+		if activity.Display != nil && (activity.Display.Type == "user_message" || activity.Display.Type == "thought_chunk" || activity.Display.Type == "assistant_chunk") {
+			semanticKinds[activity.Display.Type] = activity.Kind
+		}
+	}
+	for _, displayType := range []string{"user_message", "thought_chunk", "assistant_chunk"} {
+		if semanticKinds[displayType] != "provider_transcript" {
+			t.Fatalf("%s provenance = %q, want provider_transcript; activities = %#v", displayType, semanticKinds[displayType], snapshot.Turns[0].Activities)
+		}
+	}
+	if strings.Contains(response.Body.String(), "MUST-NOT-LEAK") {
+		t.Fatalf("conversation API leaked encrypted provider reasoning: %s", response.Body.String())
 	}
 }
 

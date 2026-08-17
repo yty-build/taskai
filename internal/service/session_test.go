@@ -39,6 +39,12 @@ func (r *recordingRuntime) Send(_ context.Context, _ string, command worker.Comm
 	r.mu.Lock()
 	r.commands = append(r.commands, command)
 	r.mu.Unlock()
+	if command.Type == "ping" {
+		return worker.Message{
+			Type: "pong", ProtocolVersion: worker.ProtocolVersion,
+			Capabilities: []string{worker.CapabilityExclusiveNativeOwner},
+		}, nil
+	}
 	return worker.Message{Type: "accepted", State: "ready", RequestID: command.RequestID}, nil
 }
 
@@ -399,17 +405,27 @@ func TestResumeAlsoProtectsSharedCheckout(t *testing.T) {
 }
 
 type nativeTestRuntime struct {
-	mu           sync.Mutex
-	active       string
-	queued       int
-	refreshing   bool
-	owner        string
-	calls        []string
-	refreshState string
-	refreshErr   error
+	mu                              sync.Mutex
+	active                          string
+	queued                          int
+	refreshing                      bool
+	owner                           string
+	reserved                        bool
+	generation                      string
+	generationID                    int
+	calls                           []string
+	refreshState                    string
+	refreshErr                      error
+	stale                           bool
+	acquireState                    string
+	spawnCalls                      int
+	releaseReservationBeforeRecover bool
 }
 
 func (r *nativeTestRuntime) Spawn(context.Context, string) (worker.SpawnResult, error) {
+	r.mu.Lock()
+	r.spawnCalls++
+	r.mu.Unlock()
 	return worker.SpawnResult{}, nil
 }
 
@@ -418,8 +434,20 @@ func (r *nativeTestRuntime) Send(_ context.Context, _ string, command worker.Com
 	defer r.mu.Unlock()
 	r.calls = append(r.calls, command.Type)
 	switch command.Type {
+	case "ping":
+		if r.stale {
+			return worker.Message{Type: "pong"}, nil
+		}
+		return worker.Message{
+			Type: "pong", ProtocolVersion: worker.ProtocolVersion,
+			Capabilities: []string{worker.CapabilityExclusiveNativeOwner},
+		}, nil
 	case "status":
 		return worker.Message{Type: "status", ActiveRequestID: r.active, Queued: r.queued, Status: "working"}, nil
+	case "prompt":
+		return worker.Message{Type: "accepted", State: "ready", RequestID: command.RequestID}, nil
+	case "permission_decision":
+		return worker.Message{Type: "permission_decided"}, nil
 	case "refresh":
 		if r.refreshErr != nil {
 			return worker.Message{}, r.refreshErr
@@ -437,18 +465,94 @@ func (r *nativeTestRuntime) Send(_ context.Context, _ string, command worker.Com
 			return worker.Message{}, errors.New("provider writer is busy: exact ACP identity refresh is active")
 		}
 		if r.owner == "" {
+			if command.NativeOwnerRole == worker.NativeOwnerRoleProvider {
+				return worker.Message{}, errors.New("native provider reservation is no longer active")
+			}
 			r.owner = command.OwnerToken
-			return worker.Message{Type: "native_acquired", State: "acquired", NativeOwned: true, ProviderWriter: "native"}, nil
+			r.generationID++
+			r.generation = fmt.Sprintf("%032x", r.generationID)
+			state := r.acquireState
+			if state == "" {
+				if command.NativeOwnerRole == worker.NativeOwnerRoleReservation {
+					state = "reserved"
+					r.reserved = true
+				} else {
+					state = "acquired"
+				}
+			}
+			return worker.Message{Type: "native_acquired", State: state, NativeOwned: true, NativeGeneration: r.generation, ProviderWriter: "native"}, nil
 		}
 		if r.owner == command.OwnerToken {
-			return worker.Message{Type: "native_acquired", State: "already_acquired", NativeOwned: true, ProviderWriter: "native"}, nil
+			switch command.NativeOwnerRole {
+			case worker.NativeOwnerRoleReservation:
+				state := "already_acquired"
+				if r.reserved {
+					state = "already_reserved"
+				}
+				return worker.Message{Type: "native_acquired", State: state, NativeOwned: true, NativeGeneration: r.generation, ProviderWriter: "native"}, nil
+			case worker.NativeOwnerRoleProvider:
+				if command.NativeGeneration != r.generation {
+					return worker.Message{}, errors.New("native reservation generation mismatch")
+				}
+				if !r.reserved {
+					return worker.Message{Type: "native_acquired", State: "already_acquired", NativeOwned: true, NativeGeneration: r.generation, ProviderWriter: "native"}, nil
+				}
+				r.reserved = false
+				return worker.Message{Type: "native_acquired", State: "activated", NativeOwned: true, NativeGeneration: r.generation, ProviderWriter: "native"}, nil
+			default:
+				if r.reserved {
+					return worker.Message{}, errors.New("direct execution cannot activate tmux reservation")
+				}
+				return worker.Message{Type: "native_acquired", State: "already_acquired", NativeOwned: true, NativeGeneration: r.generation, ProviderWriter: "native"}, nil
+			}
 		}
 		return worker.Message{}, errors.New("another native provider process owns this Session")
+	case "native_reservation_status":
+		if r.owner != "" && r.owner != command.OwnerToken {
+			return worker.Message{}, errors.New("native owner token mismatch")
+		}
+		state := "released"
+		if r.owner != "" {
+			state = "active"
+			if r.reserved {
+				state = "reserved"
+			}
+		}
+		return worker.Message{Type: "native_reservation_status", State: state, NativeOwned: r.owner != "", NativeGeneration: r.generation}, nil
+	case "native_recover_reservation":
+		if r.releaseReservationBeforeRecover && r.reserved {
+			r.owner = ""
+			r.reserved = false
+			r.generation = ""
+			r.releaseReservationBeforeRecover = false
+		}
+		if r.owner == "" {
+			return worker.Message{Type: "native_reservation_recovered", State: "already_released"}, nil
+		}
+		if r.owner != command.OwnerToken {
+			return worker.Message{}, errors.New("native owner token mismatch")
+		}
+		if !r.reserved {
+			return worker.Message{}, errors.New("active provider-native ownership cannot be recovered")
+		}
+		if command.NativeGeneration != r.generation {
+			return worker.Message{}, errors.New("native reservation generation mismatch")
+		}
+		r.owner = ""
+		r.reserved = false
+		r.generation = ""
+		r.refreshing = true
+		return worker.Message{Type: "native_reservation_recovered", State: "refresh_scheduled"}, nil
 	case "native_release":
 		if r.owner != command.OwnerToken {
 			return worker.Message{}, errors.New("native owner token mismatch")
 		}
+		if command.NativeGeneration != r.generation {
+			return worker.Message{}, errors.New("native owner generation mismatch")
+		}
 		r.owner = ""
+		r.reserved = false
+		r.generation = ""
 		state := "released"
 		if command.NativeActivity {
 			state = "refresh_scheduled"
@@ -461,6 +565,115 @@ func (r *nativeTestRuntime) Send(_ context.Context, _ string, command worker.Com
 
 func (r *nativeTestRuntime) Subscribe(context.Context, string, uint64, func(worker.Message) error) error {
 	return nil
+}
+
+func TestPromptNegotiatesCurrentWorkerBeforeSending(t *testing.T) {
+	t.Run("current", func(t *testing.T) {
+		service, runtime, current := nativeServiceHarness(t, "codex", "native-exact")
+		accepted, err := service.Prompt(context.Background(), current.ID, "continue safely")
+		if err != nil || accepted.Type != "accepted" || accepted.RequestID == "" {
+			t.Fatalf("current prompt = %#v, %v", accepted, err)
+		}
+		runtime.mu.Lock()
+		defer runtime.mu.Unlock()
+		if !reflect.DeepEqual(runtime.calls, []string{"ping", "prompt"}) {
+			t.Fatalf("current prompt calls = %v", runtime.calls)
+		}
+	})
+
+	t.Run("stale", func(t *testing.T) {
+		service, runtime, current := nativeServiceHarness(t, "codex", "native-exact")
+		runtime.stale = true
+		_, err := service.Prompt(context.Background(), current.ID, "must not reach provider")
+		var upgrade *WorkerUpgradeRequiredError
+		if !errors.Is(err, ErrWorkerUpgradeRequired) || !errors.As(err, &upgrade) || upgrade.Operation != "prompt not sent" {
+			t.Fatalf("stale prompt error = %T %v", err, err)
+		}
+		for _, want := range []string{"prompt not sent", "agent-S-native", "acpctl session stop S-native", "acpctl session resume S-native"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("stale prompt error missing %q: %v", want, err)
+			}
+		}
+		runtime.mu.Lock()
+		defer runtime.mu.Unlock()
+		if !reflect.DeepEqual(runtime.calls, []string{"ping"}) {
+			t.Fatalf("stale prompt reached provider: %v", runtime.calls)
+		}
+	})
+}
+
+func TestStaleWorkerPermissionDecisionIsNotSent(t *testing.T) {
+	service, runtime, current := nativeServiceHarness(t, "codex", "native-exact")
+	runtime.stale = true
+	err := service.DecidePermission(context.Background(), current.ID, "permission-1", "allow-once", false)
+	if !errors.Is(err, ErrWorkerUpgradeRequired) || !strings.Contains(err.Error(), "permission not sent") {
+		t.Fatalf("stale permission error = %v", err)
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if !reflect.DeepEqual(runtime.calls, []string{"ping"}) {
+		t.Fatalf("stale permission decision reached provider: %v", runtime.calls)
+	}
+}
+
+func TestResumeLiveWorkerNegotiatesCurrentOrRequiresUpgradeWithoutSpawn(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		stale bool
+	}{
+		{name: "current"},
+		{name: "stale", stale: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service, runtime, current := nativeServiceHarness(t, "codex", "native-exact")
+			runtime.stale = test.stale
+			_, err := service.Resume(context.Background(), current.ID)
+			if test.stale {
+				if !errors.Is(err, ErrWorkerUpgradeRequired) || !strings.Contains(err.Error(), "resume not performed") {
+					t.Fatalf("stale resume error = %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "worker is already running") {
+				t.Fatalf("current resume error = %v", err)
+			}
+			runtime.mu.Lock()
+			defer runtime.mu.Unlock()
+			if !reflect.DeepEqual(runtime.calls, []string{"ping"}) || runtime.spawnCalls != 0 {
+				t.Fatalf("%s resume calls=%v spawn=%d", test.name, runtime.calls, runtime.spawnCalls)
+			}
+		})
+	}
+}
+
+func TestNativeAttachRejectsStaleWorkerBeforeAcquireOrProviderStart(t *testing.T) {
+	service, runtime, current := nativeServiceHarness(t, "codex", "native-exact")
+	runtime.stale = true
+	runner := &recordingNativeRunner{}
+	err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{
+		Runner: runner, Verifier: &acceptingNativeVerifier{}, Input: strings.NewReader(""), Output: io.Discard, ErrorOutput: io.Discard,
+	})
+	if err == nil {
+		t.Fatal("stale worker unexpectedly opened provider-native attachment")
+	}
+	if !errors.Is(err, ErrWorkerUpgradeRequired) {
+		t.Fatalf("stale native error does not expose upgrade sentinel: %v", err)
+	}
+	for _, want := range []string{
+		"worker upgrade required", "Worker protocol 0", worker.CapabilityExclusiveNativeOwner,
+		"native not started", "tmux Session agent-S-native",
+		"acpctl session stop S-native", "acpctl session resume S-native",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("stale worker error missing %q: %v", want, err)
+		}
+	}
+	if runner.invocation.Command != "" {
+		t.Fatalf("stale worker launched native provider: %#v", runner.invocation)
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if !reflect.DeepEqual(runtime.calls, []string{"ping"}) || runtime.owner != "" {
+		t.Fatalf("stale worker calls=%v owner=%q", runtime.calls, runtime.owner)
+	}
 }
 
 type acceptingNativeVerifier struct {
@@ -504,7 +717,7 @@ func TestNativeAttachRejectsWhileACPProviderWriterIsActive(t *testing.T) {
 	runtime.mu.Lock()
 	calls, active, queued := append([]string(nil), runtime.calls...), runtime.active, runtime.queued
 	runtime.mu.Unlock()
-	if !reflect.DeepEqual(calls, []string{"native_acquire"}) || active != "req-active" || queued != 2 {
+	if !reflect.DeepEqual(calls, []string{"ping", "native_acquire"}) || active != "req-active" || queued != 2 {
 		t.Fatalf("native worker calls=%v active=%q queued=%d", calls, active, queued)
 	}
 	if len(verifier.calls) != 1 {
@@ -528,7 +741,7 @@ func TestNativeAttachRunsVerifiedCanonicalConversationAndReleasesToRefresh(t *te
 	runtime.mu.Lock()
 	calls, owner := append([]string(nil), runtime.calls...), runtime.owner
 	runtime.mu.Unlock()
-	if !reflect.DeepEqual(calls, []string{"native_acquire", "native_release"}) || owner != "" {
+	if !reflect.DeepEqual(calls, []string{"ping", "native_acquire", "native_release"}) || owner != "" {
 		t.Fatalf("native worker calls=%v owner=%q", calls, owner)
 	}
 	if !strings.Contains(notices.String(), "exact ACP refresh scheduled before queued prompts") {
@@ -581,7 +794,7 @@ func TestNativeProcessFailureStillSchedulesNonBlockingRefresh(t *testing.T) {
 	}
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
-	if !reflect.DeepEqual(runtime.calls, []string{"native_acquire", "native_release"}) || runtime.owner != "" {
+	if !reflect.DeepEqual(runtime.calls, []string{"ping", "native_acquire", "native_release"}) || runtime.owner != "" {
 		t.Fatalf("process failure refresh calls=%v", runtime.calls)
 	}
 }
@@ -603,7 +816,7 @@ func TestNativePrelaunchFailureDoesNotRefreshACP(t *testing.T) {
 	}
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
-	if !reflect.DeepEqual(runtime.calls, []string{"native_acquire", "native_release"}) || runtime.owner != "" {
+	if !reflect.DeepEqual(runtime.calls, []string{"ping", "native_acquire", "native_release"}) || runtime.owner != "" {
 		t.Fatalf("prelaunch failure worker calls=%v", runtime.calls)
 	}
 }
@@ -612,10 +825,64 @@ type continuingNativeRunner struct{ recordingNativeRunner }
 
 func (*continuingNativeRunner) ProcessMayContinue() bool { return true }
 
-type uncertainContinuingNativeRunner struct{ recordingNativeRunner }
+type reservationNativeRunner struct {
+	recordingNativeRunner
+	activator  func(context.Context) error
+	generation string
+	continuing bool
+	activity   bool
+}
 
-func (*uncertainContinuingNativeRunner) ProcessMayContinue() bool     { return true }
-func (*uncertainContinuingNativeRunner) NativeActivityOccurred() bool { return false }
+func (r *reservationNativeRunner) SetPreexistingOwnership(bool) {}
+func (r *reservationNativeRunner) SetReservationActivator(activate func(context.Context) error) {
+	r.activator = activate
+}
+func (r *reservationNativeRunner) SetReservationGeneration(generation string) {
+	r.generation = generation
+}
+func (r *reservationNativeRunner) ProcessMayContinue() bool     { return r.continuing }
+func (r *reservationNativeRunner) NativeActivityOccurred() bool { return r.activity }
+func (r *reservationNativeRunner) Run(ctx context.Context, invocation native.Invocation, _ io.Reader, _, _ io.Writer) error {
+	r.invocation = invocation
+	if r.err != nil {
+		return r.err
+	}
+	if r.continuing {
+		return nil
+	}
+	if r.activator == nil {
+		return errors.New("reservation activator was not configured")
+	}
+	if err := r.activator(ctx); err != nil {
+		return err
+	}
+	r.activity = true
+	return nil
+}
+
+type reservationRecoveryVerifier struct {
+	err   error
+	calls []string
+}
+
+func (v *reservationRecoveryVerifier) VerifyReservationAbsent(_ context.Context, sessionID string) error {
+	v.calls = append(v.calls, sessionID)
+	return v.err
+}
+
+type existingCollisionNativeRunner struct{ recordingNativeRunner }
+
+func (*existingCollisionNativeRunner) ProcessMayContinue() bool     { return true }
+func (*existingCollisionNativeRunner) NativeActivityOccurred() bool { return false }
+
+type preexistingOuterFailureRunner struct {
+	recordingNativeRunner
+	preexisting bool
+}
+
+func (r *preexistingOuterFailureRunner) SetPreexistingOwnership(value bool) {
+	r.preexisting = value
+}
 
 func TestDetachedTmuxViewerLeavesRefreshToNativeProcessOwner(t *testing.T) {
 	service, runtime, current := nativeServiceHarness(t, "codex", "native-exact")
@@ -625,22 +892,91 @@ func TestDetachedTmuxViewerLeavesRefreshToNativeProcessOwner(t *testing.T) {
 	}
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
-	if !reflect.DeepEqual(runtime.calls, []string{"native_acquire"}) || runtime.owner == "" {
+	if !reflect.DeepEqual(runtime.calls, []string{"ping", "native_acquire"}) || runtime.owner == "" {
 		t.Fatalf("viewer detach scheduled premature refresh: %v", runtime.calls)
 	}
 }
 
-func TestUncertainTmuxHandoffRetainsOwnershipFailClosed(t *testing.T) {
+func TestExistingTmuxCollisionNeverReleasesWorkerOwnership(t *testing.T) {
 	service, runtime, current := nativeServiceHarness(t, "codex", "native-exact")
-	runner := &uncertainContinuingNativeRunner{recordingNativeRunner{err: errors.New("tmux owner inspection failed")}}
+	runner := &existingCollisionNativeRunner{recordingNativeRunner{err: errors.New("existing tmux native-handoff protocol collision")}}
 	err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{Runner: runner, Verifier: &acceptingNativeVerifier{}})
-	if err == nil || !strings.Contains(err.Error(), "tmux owner inspection failed") {
+	if err == nil || !strings.Contains(err.Error(), "native-handoff protocol collision") {
 		t.Fatalf("uncertain tmux error = %v", err)
 	}
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
-	if !reflect.DeepEqual(runtime.calls, []string{"native_acquire"}) || runtime.owner == "" {
+	if !reflect.DeepEqual(runtime.calls, []string{"ping", "native_acquire"}) || runtime.owner == "" {
 		t.Fatalf("uncertain tmux handoff released ownership: calls=%v owner=%q", runtime.calls, runtime.owner)
+	}
+}
+
+func TestSecondOuterAttachFailureNeverReleasesLiveHiddenProviderOwnership(t *testing.T) {
+	service, runtime, current := nativeServiceHarness(t, "codex", "native-exact")
+	firstOuter := &continuingNativeRunner{}
+	if err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{
+		Runner: firstOuter, Verifier: &acceptingNativeVerifier{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	secondOuter := &preexistingOuterFailureRunner{recordingNativeRunner: recordingNativeRunner{err: errors.New("second viewer prelaunch failed")}}
+	err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{
+		Runner: secondOuter, Verifier: &acceptingNativeVerifier{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "second viewer prelaunch failed") {
+		t.Fatalf("second outer attach error = %v", err)
+	}
+	if !secondOuter.preexisting {
+		t.Fatal("second outer runner was not constrained to attach-only behavior")
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if !reflect.DeepEqual(runtime.calls, []string{"ping", "native_acquire", "ping", "native_acquire"}) || runtime.owner == "" {
+		t.Fatalf("second outer attach released live provider ownership: calls=%v owner=%q", runtime.calls, runtime.owner)
+	}
+}
+
+func TestSecondOuterAttachRejectsRunnerWithoutAttachOnlyContract(t *testing.T) {
+	service, runtime, current := nativeServiceHarness(t, "codex", "native-exact")
+	if err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{
+		Runner: &continuingNativeRunner{}, Verifier: &acceptingNativeVerifier{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runner := &recordingNativeRunner{}
+	err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{
+		Runner: runner, Verifier: &acceptingNativeVerifier{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot prove attach-only behavior") || !strings.Contains(err.Error(), "refusing to start a second provider process") {
+		t.Fatalf("unsafe second outer runner error = %v", err)
+	}
+	if runner.invocation.Command != "" {
+		t.Fatalf("unsafe second outer runner launched provider: %#v", runner.invocation)
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if !reflect.DeepEqual(runtime.calls, []string{"ping", "native_acquire", "ping", "native_acquire"}) || runtime.owner == "" {
+		t.Fatalf("unsafe second outer runner released ownership: calls=%v owner=%q", runtime.calls, runtime.owner)
+	}
+}
+
+func TestUnknownNativeAcquisitionStateFailsClosedWithoutProviderOrRelease(t *testing.T) {
+	service, runtime, current := nativeServiceHarness(t, "codex", "native-exact")
+	runtime.acquireState = "future_state"
+	runner := &recordingNativeRunner{}
+	err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{
+		Runner: runner, Verifier: &acceptingNativeVerifier{},
+	})
+	if err == nil || !strings.Contains(err.Error(), `unsafe acquisition state "future_state"`) || !strings.Contains(err.Error(), "preserving ownership") {
+		t.Fatalf("unknown acquisition state error = %v", err)
+	}
+	if runner.invocation.Command != "" {
+		t.Fatalf("unknown acquisition state launched provider: %#v", runner.invocation)
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if !reflect.DeepEqual(runtime.calls, []string{"ping", "native_acquire"}) || runtime.owner == "" {
+		t.Fatalf("unknown acquisition state failed open: calls=%v owner=%q", runtime.calls, runtime.owner)
 	}
 }
 
@@ -656,7 +992,7 @@ func TestNativeAttachRejectsWhileExactRefreshWritesProvider(t *testing.T) {
 
 func TestNativeTmuxOuterAndHiddenOwnerAcquireIdempotently(t *testing.T) {
 	service, runtime, current := nativeServiceHarness(t, "codex", "native-exact")
-	outer := &continuingNativeRunner{}
+	outer := &reservationNativeRunner{continuing: true}
 	if err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{Runner: outer, Verifier: &acceptingNativeVerifier{}}); err != nil {
 		t.Fatal(err)
 	}
@@ -666,14 +1002,151 @@ func TestNativeTmuxOuterAndHiddenOwnerAcquireIdempotently(t *testing.T) {
 	}
 	hidden := &recordingNativeRunner{}
 	if err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{
-		Runner: hidden, Verifier: &acceptingNativeVerifier{}, OwnerToken: token,
+		Runner: hidden, Verifier: &acceptingNativeVerifier{}, OwnerToken: token, ReservationGeneration: outer.generation,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
-	if !reflect.DeepEqual(runtime.calls, []string{"native_acquire", "native_acquire", "native_release"}) || runtime.owner != "" {
+	if !reflect.DeepEqual(runtime.calls, []string{"ping", "native_acquire", "ping", "native_acquire", "native_release"}) || runtime.owner != "" || runtime.reserved {
 		t.Fatalf("outer/hidden ownership calls=%v owner=%q", runtime.calls, runtime.owner)
+	}
+}
+
+func TestOrphanedTmuxReservationRecoveryAllowsFreshNativeLifecycleAndACPContinuation(t *testing.T) {
+	service, runtime, current := nativeServiceHarness(t, "codex", "native-exact")
+	collision := &reservationNativeRunner{
+		recordingNativeRunner: recordingNativeRunner{err: errors.New("foreign exact tmux collision")},
+		continuing:            true,
+	}
+	err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{
+		Runner: collision, Verifier: &acceptingNativeVerifier{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "foreign exact tmux collision") {
+		t.Fatalf("collision attach error = %v", err)
+	}
+	runtime.mu.Lock()
+	firstGeneration := runtime.generation
+	reserved := runtime.reserved
+	runtime.mu.Unlock()
+	if !reserved || firstGeneration == "" || collision.activity {
+		t.Fatalf("collision reservation = reserved:%t generation:%q activity:%t", reserved, firstGeneration, collision.activity)
+	}
+
+	stillExists := &reservationRecoveryVerifier{err: errors.New(`native reservation recovery refused while exact tmux Session "agent-S-native" still exists`)}
+	if _, err := service.RecoverNativeReservation(context.Background(), current.ID, NativeReservationRecoveryOptions{Verifier: stillExists}); err == nil || !strings.Contains(err.Error(), "still exists") {
+		t.Fatalf("live collision recovery error = %v", err)
+	}
+	runtime.mu.Lock()
+	if runtime.owner == "" || !runtime.reserved || runtime.generation != firstGeneration {
+		runtime.mu.Unlock()
+		t.Fatal("failed recovery did not preserve the exact reservation generation")
+	}
+	runtime.mu.Unlock()
+
+	absent := &reservationRecoveryVerifier{}
+	if recovered, err := service.RecoverNativeReservation(context.Background(), current.ID, NativeReservationRecoveryOptions{Verifier: absent}); err != nil {
+		t.Fatal(err)
+	} else if recovered.State != "refresh_scheduled" {
+		t.Fatalf("reservation recovery state = %q", recovered.State)
+	}
+	runtime.mu.Lock()
+	if runtime.owner != "" || runtime.reserved || !runtime.refreshing {
+		runtime.mu.Unlock()
+		t.Fatal("verified reservation recovery did not schedule the exact refresh barrier")
+	}
+	runtime.mu.Unlock()
+	if !reflect.DeepEqual(absent.calls, []string{current.ID}) {
+		t.Fatalf("reservation verifier calls = %v", absent.calls)
+	}
+
+	blocked := &reservationNativeRunner{}
+	if err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{Runner: blocked, Verifier: &acceptingNativeVerifier{}}); err == nil || !strings.Contains(err.Error(), "identity refresh is active") {
+		t.Fatalf("attach crossed recovery refresh barrier: %v", err)
+	}
+	if blocked.invocation.Command != "" {
+		t.Fatalf("refresh-blocked attach launched provider: %#v", blocked.invocation)
+	}
+
+	// Model completion of the worker's exact ACP refresh and provider-store
+	// reconciliation before a new generation can be reserved.
+	runtime.mu.Lock()
+	runtime.refreshing = false
+	runtime.mu.Unlock()
+	fresh := &reservationNativeRunner{}
+	if err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{Runner: fresh, Verifier: &acceptingNativeVerifier{}}); err != nil {
+		t.Fatal(err)
+	}
+	if !fresh.activity || fresh.generation == "" || fresh.generation == firstGeneration {
+		t.Fatalf("fresh native lifecycle activity=%t generation=%q prior=%q", fresh.activity, fresh.generation, firstGeneration)
+	}
+	runtime.mu.Lock()
+	runtime.refreshing = false
+	runtime.mu.Unlock()
+	if _, err := service.Prompt(context.Background(), current.ID, "continue after recovered native exit"); err != nil {
+		t.Fatal(err)
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.owner != "" || runtime.reserved {
+		t.Fatalf("fresh native exit left owner=%q reserved=%t", runtime.owner, runtime.reserved)
+	}
+	wantSuffix := []string{"ping", "native_acquire", "native_acquire", "native_release", "ping", "prompt"}
+	if len(runtime.calls) < len(wantSuffix) || !reflect.DeepEqual(runtime.calls[len(runtime.calls)-len(wantSuffix):], wantSuffix) {
+		t.Fatalf("fresh attach/ACP continuation calls = %v", runtime.calls)
+	}
+}
+
+func TestNativeReservationRecoveryNeverClearsActiveProviderOwnership(t *testing.T) {
+	service, runtime, current := nativeServiceHarness(t, "codex", "native-exact")
+	if err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{
+		Runner: &continuingNativeRunner{}, Verifier: &acceptingNativeVerifier{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	verifier := &reservationRecoveryVerifier{}
+	_, err := service.RecoverNativeReservation(context.Background(), current.ID, NativeReservationRecoveryOptions{Verifier: verifier})
+	if err == nil || !strings.Contains(err.Error(), "active provider-native ownership") || !strings.Contains(err.Error(), "does not prove provider exit") || !strings.Contains(err.Error(), "ACP remains blocked") {
+		t.Fatalf("active owner recovery error = %v", err)
+	}
+	if len(verifier.calls) != 0 {
+		t.Fatalf("active ownership unnecessarily consulted tmux absence: %v", verifier.calls)
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.owner == "" || runtime.reserved {
+		t.Fatalf("active recovery changed owner=%q reserved=%t", runtime.owner, runtime.reserved)
+	}
+	if runtime.calls[len(runtime.calls)-1] != "native_reservation_status" {
+		t.Fatalf("active recovery sent unsafe command: %v", runtime.calls)
+	}
+}
+
+func TestNativeReservationRecoveryReportsConcurrentSafeReleaseWithoutPhantomRefresh(t *testing.T) {
+	service, runtime, current := nativeServiceHarness(t, "codex", "native-exact")
+	collision := &reservationNativeRunner{
+		recordingNativeRunner: recordingNativeRunner{err: errors.New("pre-launch collision")},
+		continuing:            true,
+	}
+	if err := service.AttachNative(context.Background(), current.ID, NativeAttachOptions{
+		Runner: collision, Verifier: &acceptingNativeVerifier{},
+	}); err == nil {
+		t.Fatal("collision unexpectedly succeeded")
+	}
+	runtime.mu.Lock()
+	runtime.releaseReservationBeforeRecover = true
+	runtime.mu.Unlock()
+
+	result, err := service.RecoverNativeReservation(context.Background(), current.ID, NativeReservationRecoveryOptions{
+		Verifier: &reservationRecoveryVerifier{},
+	})
+	if err != nil || result.State != "already_released" {
+		t.Fatalf("concurrent release recovery = %#v, %v", result, err)
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.owner != "" || runtime.reserved || runtime.refreshing {
+		t.Fatalf("concurrent safe release owner=%q reserved=%t refreshing=%t", runtime.owner, runtime.reserved, runtime.refreshing)
 	}
 }
 

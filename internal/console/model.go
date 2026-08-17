@@ -445,6 +445,8 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 		m.composer.focused = true
 		m.composer.cursor = len(m.composer.value)
 		m.notice = "Enter sends · Ctrl+J adds a line · Esc keeps the draft"
+	case "n":
+		return m.attachCurrentNative()
 	case "esc", "c":
 		return m.confirmCurrent("cancel")
 	case "u":
@@ -779,6 +781,18 @@ func (m Model) attachSelectedNative() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	current := m.task.Sessions[m.selected]
+	return m.attachNative(current)
+}
+
+func (m Model) attachCurrentNative() (tea.Model, tea.Cmd) {
+	if strings.TrimSpace(m.current.ID) == "" {
+		m.notice = "No Session is selected for native attachment."
+		return m, nil
+	}
+	return m.attachNative(m.current)
+}
+
+func (m Model) attachNative(current session.Session) (tea.Model, tea.Cmd) {
 	capability := nativeCapability(current)
 	if !capability.available {
 		m.notice = "Native CLI unavailable for " + current.ID + ": " + capability.reason + "."
@@ -960,7 +974,11 @@ func (m Model) handleAction(message actionMsg) (tea.Model, tea.Cmd) {
 	case "permission":
 		m.notice = "Permission decision accepted. The agent turn continues in this Session."
 	case "native":
-		m.notice = "Back in Task Console. Native CLI and Structured ACP continue the same provider conversation."
+		if m.mode == sessionView {
+			m.notice = "Back in Structured ACP. The native CLI used the same provider conversation."
+		} else {
+			m.notice = "Back in Task Console. Native CLI and Structured ACP continue the same provider conversation."
+		}
 	}
 	return m, m.refreshCmd()
 }

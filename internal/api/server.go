@@ -494,6 +494,15 @@ func writeActionError(writer http.ResponseWriter, err error) {
 		writeJSONError(writer, http.StatusNotFound, "not_found", "Session was not found")
 		return
 	}
+	var upgrade *appservice.WorkerUpgradeRequiredError
+	if errors.As(err, &upgrade) && upgrade != nil {
+		writeJSONError(writer, http.StatusConflict, "worker_upgrade_required", upgrade.Error())
+		return
+	}
+	if errors.Is(err, appservice.ErrWorkerUpgradeRequired) {
+		writeJSONError(writer, http.StatusConflict, "worker_upgrade_required", "Session worker upgrade required; provider write was not sent. Stop and resume the Session before retrying")
+		return
+	}
 	message := err.Error()
 	for _, expected := range []string{
 		"has no live worker", "worker is already running", "already used by active Session", "no active turn",

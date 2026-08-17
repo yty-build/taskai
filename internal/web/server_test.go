@@ -175,7 +175,7 @@ func TestServerRenderedPagesAndVersionedBrowserBoundary(t *testing.T) {
 
 	stylesheet := webRequest(fixture.handler, "/assets/app.css")
 	assertWebStatus(t, stylesheet, http.StatusOK)
-	for _, expected := range []string{"100dvh", "safe-area-inset-bottom", "prefers-reduced-motion", "forced-colors", "@media (max-width: 760px)", ".approval-shelf", ".composer-region", ".mobile-session-actions", ".tool-inline-preview"} {
+	for _, expected := range []string{"100dvh", "safe-area-inset-bottom", "prefers-reduced-motion", "forced-colors", "@media (max-width: 760px)", ".approval-shelf", ".composer-region", ".mobile-session-actions", ".tool-inline-preview", ".thought-card.provider-history", ".thought-source"} {
 		if !strings.Contains(stylesheet.Body.String(), expected) {
 			t.Errorf("responsive stylesheet does not contain %q", expected)
 		}

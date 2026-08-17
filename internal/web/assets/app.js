@@ -24,6 +24,7 @@ async function apiRequest(path, method = "GET", body) {
     const message = payload.error?.message || `Request failed (${response.status})`;
     const error = new Error(message);
     error.status = response.status;
+    error.code = payload.error?.code || "";
     throw error;
   }
   return payload;
@@ -33,6 +34,13 @@ function setNotice(element, message, isError = false) {
   if (!element) return;
   element.textContent = message || "";
   element.classList.toggle("error", isError);
+}
+
+function permissionActionErrorMessage(error) {
+  if (error?.status === 409 && error?.code !== "worker_upgrade_required") {
+    return "That permission was already decided by another viewer.";
+  }
+  return error?.message || "Permission decision failed.";
 }
 
 function statusTone(status) {
@@ -1198,15 +1206,27 @@ function clippedNote(block = {}) {
 
 function thoughtElement(block, context = {}) {
   const details = document.createElement("details");
-  details.className = "thought-card";
+  const source = block.source === "provider" ? "provider-history" : context.streaming ? "live-acp" : "captured-acp";
+  details.className = `thought-card ${source}`;
   details.dataset.detailKey = "reasoning";
+  details.dataset.source = source;
   details.open = true;
   const summary = document.createElement("summary");
+  summary.className = "thought-summary";
+  const heading = document.createElement("span");
+  heading.className = "thought-heading";
   const title = document.createElement("strong");
   title.textContent = "Reasoning";
+  const readable = String(block.text || "").trim();
+  const lineCount = readable ? readable.split(/\r?\n/).filter((line) => line.trim()).length : 0;
+  const wordCount = readable ? readable.split(/\s+/u).filter(Boolean).length : 0;
+  const metrics = document.createElement("small");
+  metrics.textContent = `${lineCount} ${lineCount === 1 ? "line" : "lines"} · ${wordCount} ${wordCount === 1 ? "word" : "words"}`;
+  heading.append(title, metrics);
   const state = document.createElement("span");
-  state.textContent = block.source === "provider" ? "Stored provider history" : context.streaming ? "Streaming from ACP" : "Captured from ACP";
-  summary.append(title, state);
+  state.className = "thought-source";
+  state.textContent = block.source === "provider" ? "Provider history" : context.streaming ? "Live ACP" : "ACP capture";
+  summary.append(heading, state);
   const content = document.createElement("div");
   content.className = "thought-content";
   appendRichText(content, block.text);
@@ -1778,7 +1798,7 @@ async function submitPermission(permission, option) {
     scheduleTranscriptRender();
     refreshSession(sessionID).catch(() => {});
   } catch (error) {
-    setNotice(notice, error.status === 409 ? "That permission was already decided by another viewer." : error.message, true);
+    setNotice(notice, permissionActionErrorMessage(error), true);
     await refreshPermissions().catch(() => {});
     renderedPermissionSignature = "";
     for (const button of shelf?.querySelectorAll("button") || []) button.disabled = false;

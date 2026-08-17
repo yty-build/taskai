@@ -29,13 +29,28 @@ type Runner interface {
 // actually started. Callers use that distinction to avoid refreshing ACP after
 // a command lookup, working-directory, or pre-start context failure.
 type ExecRunner struct {
-	activityOccurred bool
+	activityOccurred      bool
+	preexistingOwner      bool
+	reservationGeneration string
+	activateReservation   func(context.Context) error
 }
 
 func (r *ExecRunner) NativeActivityOccurred() bool { return r.activityOccurred }
+func (r *ExecRunner) SetPreexistingOwnership(value bool) {
+	r.preexistingOwner = value
+}
+func (r *ExecRunner) SetReservationActivator(activate func(context.Context) error) {
+	r.activateReservation = activate
+}
+func (r *ExecRunner) SetReservationGeneration(generation string) {
+	r.reservationGeneration = generation
+}
 
 func (r *ExecRunner) Run(ctx context.Context, invocation Invocation, input io.Reader, output, errorOutput io.Writer) error {
 	r.activityOccurred = false
+	if r.preexistingOwner {
+		return fmt.Errorf("preexisting native ownership has no attachable harness; refusing to start a second provider-native process")
+	}
 	if strings.TrimSpace(invocation.Command) == "" {
 		return fmt.Errorf("native command is required")
 	}
@@ -43,6 +58,11 @@ func (r *ExecRunner) Run(ctx context.Context, invocation Invocation, input io.Re
 	command.Dir = invocation.WorkingDirectory
 	command.Env = mergeEnvironment(invocation.Environment)
 	command.Stdin, command.Stdout, command.Stderr = input, output, errorOutput
+	if r.activateReservation != nil {
+		if err := r.activateReservation(ctx); err != nil {
+			return fmt.Errorf("activate native provider reservation before execution: %w", err)
+		}
+	}
 	if err := command.Start(); err != nil {
 		return fmt.Errorf("native %s process: %w", invocation.Command, err)
 	}

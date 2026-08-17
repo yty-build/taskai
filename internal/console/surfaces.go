@@ -38,9 +38,9 @@ func nativeCapability(current session.Session) nativeCLICapability {
 			reason: "the Session has no checkout path for the provider CLI; use Structured ACP",
 		}
 	}
-	status := "available · identity checked before opening"
+	status := "identity present · safety checked on open"
 	if current.ConversationIDVerifiedAt != nil {
-		status = "ready · identity verified"
+		status = "identity verified · worker checked on open"
 	}
 	return nativeCLICapability{available: true, label: label, status: status}
 }

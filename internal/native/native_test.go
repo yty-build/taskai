@@ -3,6 +3,7 @@ package native
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -128,6 +129,39 @@ func TestExecRunnerDistinguishesPreStartFailureFromProcessExit(t *testing.T) {
 	}, strings.NewReader(""), io.Discard, io.Discard)
 	if err == nil || !exited.NativeActivityOccurred() {
 		t.Fatalf("process-exit error=%v activity=%t", err, exited.NativeActivityOccurred())
+	}
+}
+
+func TestExecRunnerActivatesExactReservationBeforeProviderStart(t *testing.T) {
+	fixture, err := filepath.Abs(filepath.Join("testdata", "fake-native"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := filepath.Join(t.TempDir(), "must-not-exist")
+	runner := &ExecRunner{}
+	runner.SetReservationGeneration(testNativeGeneration)
+	runner.SetReservationActivator(func(context.Context) error {
+		return errors.New("reservation was recovered first")
+	})
+	err = runner.Run(context.Background(), Invocation{
+		Command: fixture, WorkingDirectory: t.TempDir(),
+		Environment: map[string]string{"FAKE_NATIVE_RECORD": record},
+	}, strings.NewReader(""), io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "reservation was recovered first") || runner.NativeActivityOccurred() {
+		t.Fatalf("reservation activation error=%v activity=%t", err, runner.NativeActivityOccurred())
+	}
+	if _, statErr := os.Stat(record); !os.IsNotExist(statErr) {
+		t.Fatalf("provider started after reservation activation failed: %v", statErr)
+	}
+
+	runner = &ExecRunner{}
+	runner.SetPreexistingOwnership(true)
+	err = runner.Run(context.Background(), Invocation{
+		Command: fixture, WorkingDirectory: t.TempDir(),
+		Environment: map[string]string{"FAKE_NATIVE_RECORD": record},
+	}, strings.NewReader(""), io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "refusing to start a second provider-native process") {
+		t.Fatalf("preexisting direct ownership error = %v", err)
 	}
 }
 

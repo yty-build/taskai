@@ -299,6 +299,25 @@ func TestStructuredACPTaskReturnRemainsVisibleAtMinimumWidth(t *testing.T) {
 	}
 }
 
+func TestCompactStructuredACPLabelsUnavailableNativeAction(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*Model)
+	}{
+		{name: "missing identity", mutate: func(model *Model) { model.current.ProviderConversationID = "" }},
+		{name: "unsupported agent", mutate: func(model *Model) { model.current.Agent = "gemini" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			model := visualSessionModel(t)
+			test.mutate(&model)
+			footer := model.sessionFooter(55)
+			if !strings.Contains(footer, "n N/A") || strings.Contains(footer, "n Native") {
+				t.Fatalf("compact unavailable native action = %q", footer)
+			}
+		})
+	}
+}
+
 func TestStructuredACPToolDetailsStayBounded(t *testing.T) {
 	model := visualSessionModel(t)
 	model.width, model.height = 100, 32

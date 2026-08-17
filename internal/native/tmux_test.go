@@ -12,6 +12,8 @@ import (
 	"testing"
 )
 
+const testNativeGeneration = "0123456789abcdef0123456789abcdef"
+
 func TestTmuxHarnessUsesDerivedNameAndShellQuotesOnlyPrivateEntrypoint(t *testing.T) {
 	if got, want := TmuxSessionName("S-ABC_123"), "agent-S-ABC_123"; got != want {
 		t.Fatalf("TmuxSessionName() = %q, want %q", got, want)
@@ -33,7 +35,7 @@ func TestTmuxRunnerCreatesAttachesAndReattachesOnePrivateHarness(t *testing.T) {
 	exists := false
 	owner := ""
 	runner := &TmuxRunner{
-		Executable: "/private/path/acpctl", ConsoleSessionID: "S-EXACT", StateRoot: "/private/state-one",
+		Executable: "/private/path/acpctl", ConsoleSessionID: "S-EXACT", StateRoot: "/private/state-one", ReservationGeneration: testNativeGeneration,
 		isInteractive: func(io.Reader, io.Writer) bool { return true },
 		lookupPath:    func(string) (string, error) { return "/fake/tmux", nil },
 		hasSession: func(context.Context, string, string) (bool, error) {
@@ -56,6 +58,9 @@ func TestTmuxRunnerCreatesAttachesAndReattachesOnePrivateHarness(t *testing.T) {
 	}
 	var notices bytes.Buffer
 	for attempt := 0; attempt < 2; attempt++ {
+		if attempt == 1 {
+			runner.SetPreexistingOwnership(true)
+		}
 		if err := runner.Run(context.Background(), invocation, strings.NewReader("input"), &notices, &notices); err != nil {
 			t.Fatal(err)
 		}
@@ -86,13 +91,14 @@ func TestTmuxRunnerCreatesAttachesAndReattachesOnePrivateHarness(t *testing.T) {
 			t.Fatalf("tmux metadata leaked %q in %q", forbidden, createCommand)
 		}
 	}
-	if !strings.Contains(createCommand, "'_native' '--session' 'S-EXACT' '--owner-token' '"+owner+"'") {
+	stableOwner := strings.TrimSuffix(owner, ":"+testNativeGeneration)
+	if !strings.Contains(createCommand, "'_native' '--session' 'S-EXACT' '--owner-token' '"+stableOwner+"' '--reservation-generation' '"+testNativeGeneration+"'") {
 		t.Fatalf("private owner command = %q", createCommand)
 	}
 	if !reflect.DeepEqual(calls[0].arguments[shellIndex+1:shellIndex+5], []string{";", "set-option", "-t", "agent-S-EXACT"}) || calls[0].arguments[shellIndex+5] != tmuxOwnerOption {
 		t.Fatalf("atomic owner tagging arguments = %q", calls[0].arguments)
 	}
-	if !strings.HasPrefix(owner, "v1:") || strings.Contains(owner, "/private/state-one") || !strings.HasSuffix(owner, ":S-EXACT") {
+	if !strings.HasPrefix(owner, "v3:") || strings.Contains(owner, "/private/state-one") || !strings.HasSuffix(owner, ":S-EXACT:"+testNativeGeneration) {
 		t.Fatalf("private tmux owner tag = %q", owner)
 	}
 	for _, index := range []int{2, 4} {
@@ -119,8 +125,9 @@ func TestTmuxRunnerConcurrentCreateRaceAttachesWinner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	owner += ":" + testNativeGeneration
 	runner := &TmuxRunner{
-		Executable: "acpctl", ConsoleSessionID: "S-RACE", StateRoot: "/private/race-state",
+		Executable: "acpctl", ConsoleSessionID: "S-RACE", StateRoot: "/private/race-state", ReservationGeneration: testNativeGeneration,
 		isInteractive: func(io.Reader, io.Writer) bool { return true },
 		lookupPath:    func(string) (string, error) { return "/fake/tmux", nil },
 		hasSession: func(context.Context, string, string) (bool, error) {
@@ -154,13 +161,13 @@ func TestTmuxRunnerRejectsUnownedNameCollision(t *testing.T) {
 	t.Setenv("TMUX", "")
 	attached := false
 	runner := &TmuxRunner{
-		Executable: "acpctl", ConsoleSessionID: "S-COLLISION", StateRoot: "/private/right-state",
+		Executable: "acpctl", ConsoleSessionID: "S-COLLISION", StateRoot: "/private/right-state", ReservationGeneration: testNativeGeneration,
 		isInteractive: func(io.Reader, io.Writer) bool { return true },
 		lookupPath:    func(string) (string, error) { return "/fake/tmux", nil },
 		hasSession:    func(context.Context, string, string) (bool, error) { return true, nil },
 		runCommand: func(_ context.Context, _ string, arguments []string, _ string, _ io.Reader, output, _ io.Writer) error {
 			if arguments[0] == "show-options" {
-				_, _ = io.WriteString(output, "v1:wrong-state:S-COLLISION")
+				_, _ = io.WriteString(output, "v2:wrong-state:S-COLLISION")
 			} else if arguments[0] == "attach-session" {
 				attached = true
 			}
@@ -168,46 +175,271 @@ func TestTmuxRunnerRejectsUnownedNameCollision(t *testing.T) {
 		},
 	}
 	err := runner.Run(context.Background(), Invocation{WorkingDirectory: "/repo"}, strings.NewReader(""), io.Discard, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "not owned by this Agent Task Console state root") || attached || runner.ProcessMayContinue() || runner.NativeActivityOccurred() {
+	if err == nil || !strings.Contains(err.Error(), "different native owner protocol, state root, or generation") || !strings.Contains(err.Error(), "Do not kill it based on this mismatch alone") || !strings.Contains(err.Error(), "inspect Session status") || !strings.Contains(err.Error(), "acpctl session recover-native S-COLLISION") || strings.Contains(err.Error(), "session stop") || attached || !runner.ProcessMayContinue() || runner.NativeActivityOccurred() {
 		t.Fatalf("collision error=%v attached=%t continuing=%t activity=%t", err, attached, runner.ProcessMayContinue(), runner.NativeActivityOccurred())
 	}
 }
 
-func TestTmuxRunnerFallsBackToDirectProviderInsideTmuxOrWithoutTmux(t *testing.T) {
+func TestTmuxRunnerRetainsOwnershipWhenExistingSessionInspectionIsUncertain(t *testing.T) {
+	t.Setenv("TMUX", "")
+	runner := &TmuxRunner{
+		Executable: "acpctl", ConsoleSessionID: "S-UNCERTAIN", StateRoot: t.TempDir(), ReservationGeneration: testNativeGeneration,
+		isInteractive: func(io.Reader, io.Writer) bool { return true },
+		lookupPath:    func(string) (string, error) { return "/fake/tmux", nil },
+		hasSession: func(context.Context, string, string) (bool, error) {
+			return false, errors.New("tmux server inspection failed")
+		},
+	}
+	err := runner.Run(context.Background(), Invocation{WorkingDirectory: t.TempDir()}, strings.NewReader(""), io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "tmux server inspection failed") || !runner.ProcessMayContinue() || runner.NativeActivityOccurred() {
+		t.Fatalf("inspection uncertainty error=%v continuing=%t activity=%t", err, runner.ProcessMayContinue(), runner.NativeActivityOccurred())
+	}
+}
+
+func TestTmuxRunnerSwitchesCurrentClientToOnePrivateHarnessInsideTmux(t *testing.T) {
+	t.Setenv("TMUX", "/private/tmp/tmux/default,1,2")
+	exists := false
+	owner := ""
+	var calls [][]string
+	runner := &TmuxRunner{
+		Executable: "acpctl", ConsoleSessionID: "S-NESTED", StateRoot: "/private/nested-state", ReservationGeneration: testNativeGeneration,
+		isInteractive: func(io.Reader, io.Writer) bool { return true },
+		lookupPath:    func(string) (string, error) { return "/fake/tmux", nil },
+		hasSession: func(context.Context, string, string) (bool, error) {
+			return exists, nil
+		},
+		runCommand: func(_ context.Context, _ string, arguments []string, _ string, input io.Reader, output, _ io.Writer) error {
+			calls = append(calls, append([]string(nil), arguments...))
+			if arguments[0] == "new-session" {
+				exists = true
+				owner = arguments[len(arguments)-1]
+			}
+			if arguments[0] == "show-options" {
+				_, _ = io.WriteString(output, owner)
+			}
+			if arguments[0] == "switch-client" && input != nil {
+				t.Fatal("switch-client must not consume the provider terminal input")
+			}
+			return nil
+		},
+	}
+	var notices bytes.Buffer
+	invocation := Invocation{WorkingDirectory: "/private/worktree"}
+	for range 2 {
+		if err := runner.Run(context.Background(), invocation, strings.NewReader("must-not-be-consumed"), &notices, &notices); err != nil {
+			t.Fatal(err)
+		}
+		if !runner.ProcessMayContinue() || !runner.NativeActivityOccurred() {
+			t.Fatalf("nested handoff continuing=%t activity=%t", runner.ProcessMayContinue(), runner.NativeActivityOccurred())
+		}
+	}
+	if len(calls) != 5 {
+		t.Fatalf("nested tmux calls = %#v", calls)
+	}
+	for _, index := range []int{2, 4} {
+		if !reflect.DeepEqual(calls[index], []string{"switch-client", "-t", "=agent-S-NESTED"}) {
+			t.Fatalf("nested switch call %d = %q", index, calls[index])
+		}
+	}
+	if strings.Contains(strings.Join(flattenArguments(calls), " "), "attach-session") {
+		t.Fatalf("nested handoff tried to attach or launch a second provider: %#v", calls)
+	}
+	if strings.Count(notices.String(), "Ctrl-b L returns to this console") != 2 || !strings.Contains(notices.String(), "Ctrl-b d detaches while the provider continues") {
+		t.Fatalf("nested tmux notices = %q", notices.String())
+	}
+}
+
+func TestTmuxRunnerFallsBackToDirectProviderWithoutTmux(t *testing.T) {
 	fixture, err := filepath.Abs(filepath.Join("testdata", "fake-native"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("TMUX", "")
+	record := filepath.Join(t.TempDir(), "record")
+	runner := &TmuxRunner{
+		Executable: "acpctl", ConsoleSessionID: "S-FALLBACK", StateRoot: t.TempDir(), ReservationGeneration: testNativeGeneration,
+		lookupPath:    func(string) (string, error) { return "", os.ErrNotExist },
+		isInteractive: func(io.Reader, io.Writer) bool { return true },
+	}
+	activated := false
+	runner.SetReservationActivator(func(context.Context) error {
+		activated = true
+		return nil
+	})
+	var output bytes.Buffer
+	err = runner.Run(context.Background(), Invocation{
+		Command: fixture, WorkingDirectory: t.TempDir(),
+		Environment: map[string]string{"FAKE_NATIVE_RECORD": record, "FAKE_NATIVE_MARKER": "tmux unavailable"},
+	}, strings.NewReader(""), &output, &output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !activated {
+		t.Fatal("direct fallback started provider before activating its reservation")
+	}
+	if runner.ProcessMayContinue() {
+		t.Fatal("direct fallback incorrectly reported a continuing provider")
+	}
+	body, err := os.ReadFile(record)
+	if err != nil || !strings.Contains(string(body), "marker=tmux unavailable") {
+		t.Fatalf("direct fallback record = %q, %v", body, err)
+	}
+}
+
+func TestTmuxRunnerInsideTmuxFailsClosedWhenTmuxExecutableIsUnavailable(t *testing.T) {
+	t.Setenv("TMUX", "/private/tmp/tmux/default,1,2")
+	runner := &TmuxRunner{
+		Executable: "acpctl", ConsoleSessionID: "S-NO-TMUX", StateRoot: t.TempDir(), ReservationGeneration: testNativeGeneration,
+		lookupPath:    func(string) (string, error) { return "", os.ErrNotExist },
+		isInteractive: func(io.Reader, io.Writer) bool { return true },
+	}
+	err := runner.Run(context.Background(), Invocation{Command: "must-not-run", WorkingDirectory: t.TempDir()}, strings.NewReader(""), io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "refusing to start a second provider-native process") || runner.ProcessMayContinue() || runner.NativeActivityOccurred() {
+		t.Fatalf("nested missing-tmux error=%v continuing=%t activity=%t", err, runner.ProcessMayContinue(), runner.NativeActivityOccurred())
+	}
+}
+
+func TestTmuxRunnerInsideTmuxNeverDirectRunsWithoutInteractiveHandoffPrerequisites(t *testing.T) {
 	for _, test := range []struct {
-		name       string
-		tmuxEnv    string
-		lookupPath func(string) (string, error)
+		name        string
+		executable  string
+		interactive bool
+		want        string
 	}{
-		{name: "nested tmux", tmuxEnv: "already-inside"},
-		{name: "tmux unavailable", lookupPath: func(string) (string, error) { return "", os.ErrNotExist }},
+		{name: "missing console executable", interactive: true, want: "Agent Task Console executable is unavailable"},
+		{name: "noninteractive client", executable: "acpctl", want: "native handoff has no interactive client"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			t.Setenv("TMUX", test.tmuxEnv)
-			record := filepath.Join(t.TempDir(), "record")
+			t.Setenv("TMUX", "/private/tmp/tmux/default,1,2")
+			record := filepath.Join(t.TempDir(), "must-not-exist")
 			runner := &TmuxRunner{
-				Executable: "acpctl", ConsoleSessionID: "S-FALLBACK", lookupPath: test.lookupPath,
-				isInteractive: func(io.Reader, io.Writer) bool { return true },
+				Executable: test.executable, ConsoleSessionID: "S-FAIL-CLOSED", StateRoot: t.TempDir(), ReservationGeneration: testNativeGeneration,
+				isInteractive: func(io.Reader, io.Writer) bool { return test.interactive },
 			}
-			var output bytes.Buffer
 			err := runner.Run(context.Background(), Invocation{
-				Command: fixture, WorkingDirectory: t.TempDir(),
-				Environment: map[string]string{"FAKE_NATIVE_RECORD": record, "FAKE_NATIVE_MARKER": test.name},
-			}, strings.NewReader(""), &output, &output)
-			if err != nil {
-				t.Fatal(err)
+				Command: filepath.Join("testdata", "fake-native"), WorkingDirectory: t.TempDir(),
+				Environment: map[string]string{"FAKE_NATIVE_RECORD": record},
+			}, strings.NewReader(""), io.Discard, io.Discard)
+			if err == nil || !strings.Contains(err.Error(), test.want) || !strings.Contains(err.Error(), "refusing to start a second provider-native process") {
+				t.Fatalf("nested prerequisite error = %v", err)
 			}
-			if runner.ProcessMayContinue() {
-				t.Fatal("direct fallback incorrectly reported a continuing provider")
+			if _, statErr := os.Stat(record); !os.IsNotExist(statErr) {
+				t.Fatalf("nested fail-closed path launched provider; record stat = %v", statErr)
 			}
-			body, err := os.ReadFile(record)
-			if err != nil || !strings.Contains(string(body), "marker="+test.name) {
-				t.Fatalf("direct fallback record = %q, %v", body, err)
+			if runner.ProcessMayContinue() || runner.NativeActivityOccurred() {
+				t.Fatalf("nested fail-closed state continuing=%t activity=%t", runner.ProcessMayContinue(), runner.NativeActivityOccurred())
 			}
 		})
 	}
+}
+
+func TestPreexistingOwnershipNeverFallsBackOrCreatesReplacementProvider(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		interactive bool
+		lookupPath  func(string) (string, error)
+		hasSession  func(context.Context, string, string) (bool, error)
+		state       string
+		want        string
+	}{
+		{
+			name: "noninteractive", want: "requires an interactive tmux attachment",
+		},
+		{
+			name: "tmux unavailable", interactive: true,
+			lookupPath: func(string) (string, error) { return "", os.ErrNotExist },
+			want:       "existing tmux harness, but the tmux executable is unavailable",
+		},
+		{
+			name: "active session missing", interactive: true,
+			lookupPath: func(string) (string, error) { return "/fake/tmux", nil },
+			hasSession: func(context.Context, string, string) (bool, error) { return false, nil },
+			state:      PreexistingOwnershipActive,
+			want:       "active provider-native ownership exists, but tmux Session \"agent-S-PREEXISTING\" is missing",
+		},
+		{
+			name: "reservation missing", interactive: true,
+			lookupPath: func(string) (string, error) { return "/fake/tmux", nil },
+			hasSession: func(context.Context, string, string) (bool, error) { return false, nil },
+			state:      PreexistingOwnershipReserved,
+			want:       "acpctl session recover-native S-PREEXISTING",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("TMUX", "")
+			runCalls := 0
+			runner := &TmuxRunner{
+				Executable: "acpctl", ConsoleSessionID: "S-PREEXISTING", StateRoot: t.TempDir(), ReservationGeneration: testNativeGeneration,
+				isInteractive: func(io.Reader, io.Writer) bool { return test.interactive },
+				lookupPath:    test.lookupPath,
+				hasSession:    test.hasSession,
+				runCommand: func(context.Context, string, []string, string, io.Reader, io.Writer, io.Writer) error {
+					runCalls++
+					return nil
+				},
+			}
+			if test.state != "" {
+				runner.SetPreexistingOwnershipState(test.state)
+			} else {
+				runner.SetPreexistingOwnership(true)
+			}
+			err := runner.Run(context.Background(), Invocation{Command: "must-not-run", WorkingDirectory: t.TempDir()}, strings.NewReader(""), io.Discard, io.Discard)
+			if err == nil || !strings.Contains(err.Error(), test.want) || !strings.Contains(err.Error(), "refusing to") {
+				t.Fatalf("preexisting %s error = %v", test.name, err)
+			}
+			if runCalls != 0 || !runner.ProcessMayContinue() || runner.NativeActivityOccurred() {
+				t.Fatalf("preexisting %s runCalls=%d continuing=%t activity=%t", test.name, runCalls, runner.ProcessMayContinue(), runner.NativeActivityOccurred())
+			}
+		})
+	}
+}
+
+func TestTmuxReservationRecoveryVerifierRequiresExactHarnessAbsence(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		lookupErr  error
+		exists     bool
+		inspectErr error
+		want       string
+	}{
+		{name: "absent"},
+		{name: "harness still exists", exists: true, want: `exact tmux Session "agent-S-RECOVER" still exists`},
+		{name: "tmux unavailable", lookupErr: os.ErrNotExist, want: "tmux executable is unavailable"},
+		{name: "inspection uncertain", inspectErr: errors.New("tmux server unavailable"), want: "tmux server unavailable"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var inspectedName string
+			verifier := TmuxReservationRecoveryVerifier{
+				lookupPath: func(string) (string, error) {
+					if test.lookupErr != nil {
+						return "", test.lookupErr
+					}
+					return "/fake/tmux", nil
+				},
+				hasSession: func(_ context.Context, _, name string) (bool, error) {
+					inspectedName = name
+					return test.exists, test.inspectErr
+				},
+			}
+			err := verifier.VerifyReservationAbsent(context.Background(), "S-RECOVER")
+			if test.want == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("recovery verification error = %v, want %q", err, test.want)
+			}
+			if test.lookupErr == nil && inspectedName != "agent-S-RECOVER" {
+				t.Fatalf("recovery inspected %q", inspectedName)
+			}
+		})
+	}
+}
+
+func flattenArguments(calls [][]string) []string {
+	var flattened []string
+	for _, call := range calls {
+		flattened = append(flattened, call...)
+	}
+	return flattened
 }

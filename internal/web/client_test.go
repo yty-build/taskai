@@ -36,6 +36,25 @@ function activity(position, type, display, permission, requestID = "REQ") {
   return {session_id:"S", position, request_id:requestID, kind:type, activity:type, display, permission};
 }
 
+testAssert(
+  permissionActionErrorMessage({status:409, code:"worker_upgrade_required", message:"Exact worker recovery instructions"}) === "Exact worker recovery instructions",
+  "worker upgrade conflict hid its actionable recovery message"
+);
+testAssert(
+  permissionActionErrorMessage({status:409, code:"session_conflict", message:"internal race detail"}) === "That permission was already decided by another viewer.",
+  "ordinary permission conflict exposed transport detail"
+);
+let upgradeFetchError;
+try {
+  await apiRequest("/stale-worker", "POST", {});
+} catch (error) {
+  upgradeFetchError = error;
+}
+testAssert(
+  upgradeFetchError?.status === 409 && upgradeFetchError?.code === "worker_upgrade_required" && upgradeFetchError?.message === "Recover the worker",
+  "browser API client discarded the typed worker-upgrade conflict"
+);
+
 resetTranscript();
 applyActivity(activity(0, "acp", {type:"legacy_user_message", text:"Legacy injected prompt"}));
 applyActivity(activity(1, "prompt_submitted", {type:"user_message", text:"Do the work"}));
@@ -261,6 +280,22 @@ testAssert(candidate.lastPosition === 41 && candidate.byRequest.get("LIVE")?.sta
 testAssert(candidate.turns.slice(0, 3).every((turn) => turn.state === "complete" && turn.committed), "committed provider turns were not marked complete");
 testAssert(!candidate.byRequest.get("LIVE").committed, "buffered ACP turn was falsely marked provider-committed");
 
+const providerReasoningCard = thoughtElement({source:"provider",text:"First stored line\nSecond stored line",revision:1}, {streaming:false});
+testAssert(providerReasoningCard.open, "stored provider reasoning was not open by default");
+testAssert(providerReasoningCard.className.includes("provider-history"), "stored reasoning card lacked unmistakable provider-history styling");
+testAssert(providerReasoningCard.children[0].className === "thought-summary", "reasoning card lacked a structured visible header");
+testAssert(providerReasoningCard.textContent.includes("Provider history"), "reasoning card did not expose its committed source");
+testAssert(providerReasoningCard.textContent.includes("2 lines") && providerReasoningCard.textContent.includes("6 words"), "reasoning card did not summarize its readable content");
+const liveReasoningCard = thoughtElement({source:"acp",text:"Streaming thought",revision:1}, {streaming:true});
+testAssert(liveReasoningCard.className.includes("live-acp"), "live ACP reasoning card lacked distinct source styling");
+testAssert(liveReasoningCard.textContent.includes("Live ACP"), "live ACP reasoning source was not visible");
+testAssert(providerReasoningCard.tagName === "DETAILS" && providerReasoningCard.children[0].tagName === "SUMMARY", "reasoning disclosure lost native keyboard semantics");
+providerReasoningCard.open = false;
+providerReasoningCard.dataset.userToggled = "true";
+const reconciledReasoningBlock = {type:"thought",source:"provider",text:"First stored line\nSecond stored line",revision:2,renderedRevision:1,renderedContext:"acp:stored:update",element:providerReasoningCard};
+const reconciledReasoningCard = patchBlockElement(reconciledReasoningBlock, "grok", {streaming:false});
+testAssert(!reconciledReasoningCard.open && reconciledReasoningCard.dataset.userToggled === "true", "provider reconciliation discarded the user's reasoning disclosure state");
+
 const provisional = turnFor({request_id:"PROVISIONAL",position:42});
 const provisionalAssistantElement = {id:"stable-assistant"};
 provisional.blocks.push(
@@ -409,6 +444,23 @@ const fs = require("node:fs");
 const vm = require("node:vm");
 const createdEventSources = [];
 const scheduledTimeouts = [];
+class FakeElement {
+  constructor(tagName) {
+    this.tagName = String(tagName || "").toUpperCase();
+    this.children = [];
+    this.dataset = {};
+    this.attributes = {};
+    this.className = "";
+    this.open = false;
+    this._textContent = "";
+  }
+  append(...children) { this.children.push(...children); }
+  addEventListener() {}
+  matches(selector) { return selector === "details[data-detail-key]" && this.tagName === "DETAILS" && Boolean(this.dataset.detailKey); }
+  setAttribute(name, value) { this.attributes[name] = String(value); }
+  set textContent(value) { this._textContent = String(value); this.children = []; }
+  get textContent() { return this._textContent + this.children.map((child) => child?.textContent ?? child?.data ?? String(child)).join(""); }
+}
 class FakeEventSource {
   constructor(path) { createdEventSources.push(path); }
   addEventListener() {}
@@ -416,8 +468,13 @@ class FakeEventSource {
 }
 const sandbox = {
   TextEncoder, console, EventSource: FakeEventSource, createdEventSources, scheduledTimeouts,
+  fetch: async () => ({
+    ok:false, status:409,
+    async text(){ return JSON.stringify({error:{code:"worker_upgrade_required",message:"Recover the worker"}}); },
+  }),
   document: {
     body: {dataset:{page:""}, classList:{add(){},remove(){},contains(){return false;}}},
+    createElement(tagName){return new FakeElement(tagName);}, createTextNode(value){return {data:String(value),textContent:String(value)};},
     querySelectorAll(){return [];}, querySelector(){return null;}, getElementById(){return null;}, addEventListener(){},
   },
   window: {EventSource:FakeEventSource, setTimeout(_callback, delay = 0){scheduledTimeouts.push(delay);return scheduledTimeouts.length;}, clearTimeout(){}, setInterval(){return 0;}, addEventListener(){}, matchMedia(){return {matches:false};}},

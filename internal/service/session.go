@@ -5,6 +5,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -86,13 +87,42 @@ type TaskLaunchResult struct {
 }
 
 type NativeAttachOptions struct {
-	Runner      native.Runner
-	Verifier    native.Verifier
-	OwnerToken  string
-	Input       io.Reader
-	Output      io.Writer
-	ErrorOutput io.Writer
+	Runner                native.Runner
+	Verifier              native.Verifier
+	OwnerToken            string
+	ReservationGeneration string
+	Input                 io.Reader
+	Output                io.Writer
+	ErrorOutput           io.Writer
 }
+
+type NativeReservationRecoveryOptions struct {
+	Verifier native.ReservationRecoveryVerifier
+}
+
+type NativeReservationRecoveryResult struct {
+	State string
+}
+
+var ErrWorkerUpgradeRequired = errors.New("Session worker upgrade required")
+
+// WorkerUpgradeRequiredError is safe to expose through local transports. It
+// contains only Task Console identifiers and fixed recovery instructions—no
+// provider payload, authentication state, filesystem path, or socket detail.
+type WorkerUpgradeRequiredError struct {
+	SessionID       string
+	Operation       string
+	ProtocolVersion int
+}
+
+func (e *WorkerUpgradeRequiredError) Error() string {
+	return fmt.Sprintf(
+		"Session %s worker upgrade required; %s. Exit any provider CLI in tmux Session %s first. Then run `acpctl session stop %s` and `acpctl session resume %s`. Worker protocol %d does not satisfy the required protocol %d and capability %s contract",
+		e.SessionID, e.Operation, native.TmuxSessionName(e.SessionID), e.SessionID, e.SessionID, e.ProtocolVersion, worker.ProtocolVersion, worker.CapabilityExclusiveNativeOwner,
+	)
+}
+
+func (e *WorkerUpgradeRequiredError) Unwrap() error { return ErrWorkerUpgradeRequired }
 
 func NewSessionService(repository SessionRepository, registry *agents.Registry, home config.Home, runtime Runtime) *SessionService {
 	service := &SessionService{repository: repository, registry: registry, home: home, runtime: runtime}
@@ -431,6 +461,12 @@ func (s *SessionService) Prompt(ctx context.Context, id, message string) (worker
 	if current.WorkerSocket == "" {
 		return worker.Message{}, fmt.Errorf("Session %s has no live worker; run 'acpctl session resume %s'", id, id)
 	}
+	if err := s.requireCurrentWorkerProtocol(ctx, current, "prompt not sent"); err != nil {
+		if errors.Is(err, ErrWorkerUpgradeRequired) {
+			return worker.Message{}, err
+		}
+		return worker.Message{}, fmt.Errorf("Session %s worker capability check failed; prompt not sent: %w", id, err)
+	}
 	requestID, err := acp.NewRequestID()
 	if err != nil {
 		return worker.Message{}, err
@@ -469,6 +505,12 @@ func (s *SessionService) DecidePermission(ctx context.Context, id, permissionID,
 	if !cancelled && strings.TrimSpace(optionID) == "" {
 		return fmt.Errorf("permission option ID is required")
 	}
+	if err := s.requireCurrentWorkerProtocol(ctx, current, "permission not sent"); err != nil {
+		if errors.Is(err, ErrWorkerUpgradeRequired) {
+			return err
+		}
+		return fmt.Errorf("Session %s worker capability check failed; permission not sent: %w", id, err)
+	}
 	_, err = s.runtime.Send(ctx, current.WorkerSocket, worker.Command{
 		Type: "permission_decision", PermissionID: permissionID, OptionID: optionID, Cancelled: cancelled,
 	})
@@ -503,8 +545,12 @@ func (s *SessionService) ResumeWithOptions(ctx context.Context, id string, allow
 		return session.Session{}, err
 	}
 	if current.WorkerSocket != "" {
-		if _, err := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{Type: "ping"}); err == nil {
+		protocolErr := s.requireCurrentWorkerProtocol(ctx, current, "resume not performed")
+		if protocolErr == nil {
 			return current, fmt.Errorf("Session %s worker is already running", id)
+		}
+		if errors.Is(protocolErr, ErrWorkerUpgradeRequired) {
+			return session.Session{}, protocolErr
 		}
 	}
 	lock, err := gitrepo.LockRepository(ctx, s.home.Root, current.RepoPath)
@@ -558,6 +604,7 @@ func (s *SessionService) Stop(ctx context.Context, id string) error {
 // writer before the provider starts; attachment itself remains a disposable
 // viewer and never owns a tmux-hosted provider lifecycle.
 func (s *SessionService) AttachNative(ctx context.Context, id string, options NativeAttachOptions) error {
+	explicitOwnerProcess := strings.TrimSpace(options.OwnerToken) != ""
 	current, err := s.repository.GetSession(ctx, id)
 	if err != nil {
 		return err
@@ -574,6 +621,9 @@ func (s *SessionService) AttachNative(ctx context.Context, id string, options Na
 	conversationID := strings.TrimSpace(current.ProviderConversationID)
 	if conversationID == "" {
 		return fmt.Errorf("Session %s has no canonical provider conversation ID; native attachment is unavailable and no replacement conversation was started", id)
+	}
+	if current.WorkerSocket == "" {
+		return fmt.Errorf("Session %s has no live worker to coordinate exclusive provider access; resume the Session before native attachment", id)
 	}
 	if s.registry == nil {
 		return fmt.Errorf("agent registry is required for provider-native attachment")
@@ -609,8 +659,8 @@ func (s *SessionService) AttachNative(ctx context.Context, id string, options Na
 		return fmt.Errorf("Session %s native owner token does not match this Agent Task Console state root", id)
 	}
 	options.OwnerToken = ownerToken
-	if current.WorkerSocket == "" {
-		return fmt.Errorf("Session %s has no live worker to coordinate exclusive provider access; resume the Session before native attachment", id)
+	if err := s.requireExclusiveNativeWorker(ctx, current); err != nil {
+		return err
 	}
 	if options.Runner == nil {
 		if strings.TrimSpace(s.executable) != "" {
@@ -626,12 +676,78 @@ func (s *SessionService) AttachNative(ctx context.Context, id string, options Na
 		}
 		runner.OwnerToken = ownerToken
 	}
-	acquired, err := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{Type: "native_acquire", OwnerToken: ownerToken})
+	ownerRole := worker.NativeOwnerRoleDirect
+	reservationRunner, usesReservation := options.Runner.(native.ReservationRunner)
+	if usesReservation && !explicitOwnerProcess {
+		ownerRole = worker.NativeOwnerRoleReservation
+	} else if explicitOwnerProcess {
+		ownerRole = worker.NativeOwnerRoleProvider
+	}
+	acquired, err := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{
+		Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: ownerRole,
+		NativeGeneration: options.ReservationGeneration,
+	})
 	if err != nil {
 		return fmt.Errorf("Session %s native attachment could not acquire exclusive provider access: %w", id, err)
 	}
 	if acquired.Type != "native_acquired" {
 		return fmt.Errorf("Session %s native attachment received unexpected worker response %q", id, acquired.Type)
+	}
+	validAcquisition := false
+	switch ownerRole {
+	case worker.NativeOwnerRoleReservation:
+		validAcquisition = acquired.State == "reserved" || acquired.State == "already_reserved" || acquired.State == "already_acquired"
+	case worker.NativeOwnerRoleProvider:
+		validAcquisition = acquired.State == "activated"
+	case worker.NativeOwnerRoleDirect:
+		validAcquisition = acquired.State == "acquired" || acquired.State == "already_acquired"
+	}
+	if !validAcquisition {
+		return fmt.Errorf("Session %s native attachment received unsafe acquisition state %q for role %q; preserving ownership and refusing to start a provider process", id, acquired.State, ownerRole)
+	}
+	if acquired.NativeGeneration == "" {
+		return fmt.Errorf("Session %s native attachment received no ownership generation; preserving ownership and refusing to start a provider process", id)
+	}
+	if options.ReservationGeneration != "" && acquired.NativeGeneration != options.ReservationGeneration {
+		return fmt.Errorf("Session %s native ownership generation changed; preserving ownership and refusing a stale provider process", id)
+	}
+	options.ReservationGeneration = acquired.NativeGeneration
+	preexistingOuterOwnership := (acquired.State == "already_reserved" || acquired.State == "already_acquired") && !explicitOwnerProcess
+	ownershipAware, ownershipAwareOK := options.Runner.(native.PreexistingOwnershipAwareRunner)
+	if preexistingOuterOwnership && !ownershipAwareOK {
+		return fmt.Errorf("Session %s already has native ownership, but this outer viewer cannot prove attach-only behavior; preserving ownership and refusing to start a second provider process", id)
+	}
+	if ownershipAwareOK {
+		if stateAware, ok := options.Runner.(native.PreexistingOwnershipStateAwareRunner); ok {
+			phase := ""
+			switch acquired.State {
+			case "already_reserved":
+				phase = native.PreexistingOwnershipReserved
+			case "already_acquired":
+				phase = native.PreexistingOwnershipActive
+			}
+			stateAware.SetPreexistingOwnershipState(phase)
+		} else {
+			ownershipAware.SetPreexistingOwnership(preexistingOuterOwnership)
+		}
+	}
+	if usesReservation && acquired.State == "reserved" {
+		reservationRunner.SetReservationGeneration(acquired.NativeGeneration)
+		reservationRunner.SetReservationActivator(func(activateContext context.Context) error {
+			activated, activateErr := s.runtime.Send(activateContext, current.WorkerSocket, worker.Command{
+				Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: worker.NativeOwnerRoleProvider,
+				NativeGeneration: acquired.NativeGeneration,
+			})
+			if activateErr != nil {
+				return activateErr
+			}
+			if activated.Type != "native_acquired" || activated.State != "activated" {
+				return fmt.Errorf("unexpected reservation activation response %q/%q; refusing to start a duplicate provider process", activated.Type, activated.State)
+			}
+			return nil
+		})
+	} else if usesReservation {
+		reservationRunner.SetReservationGeneration(acquired.NativeGeneration)
 	}
 	runErr := options.Runner.Run(ctx, invocation, options.Input, options.Output, options.ErrorOutput)
 	mayContinue := false
@@ -642,8 +758,13 @@ func (s *SessionService) AttachNative(ctx context.Context, id string, options Na
 	if aware, ok := options.Runner.(native.ActivityAwareRunner); ok {
 		activityOccurred = aware.NativeActivityOccurred()
 	}
-	if !mayContinue {
-		releaseErr := s.releaseNativeOwnership(current, ownerToken, activityOccurred, options.ErrorOutput)
+	// An outer viewer that receives an existing generation did not create its
+	// ownership and must never release it after its own attach failure. The
+	// private _native process supplies both the stable token and exact generation;
+	// it is the lifecycle owner and releases after the provider process exits.
+	shouldRelease := acquired.State == "acquired" || acquired.State == "reserved" || explicitOwnerProcess
+	if !mayContinue && shouldRelease {
+		releaseErr := s.releaseNativeOwnership(current, ownerToken, acquired.NativeGeneration, activityOccurred, options.ErrorOutput)
 		if releaseErr != nil && runErr == nil {
 			return releaseErr
 		}
@@ -657,11 +778,102 @@ func (s *SessionService) AttachNative(ctx context.Context, id string, options Na
 	return nil
 }
 
-func (s *SessionService) releaseNativeOwnership(current session.Session, ownerToken string, activity bool, notices io.Writer) error {
+// RecoverNativeReservation clears only an outer tmux reservation that never
+// became an active provider owner. The exact stable tmux harness must first be
+// proven absent; an active marker remains fail-closed even when tmux is gone.
+func (s *SessionService) RecoverNativeReservation(ctx context.Context, id string, options NativeReservationRecoveryOptions) (NativeReservationRecoveryResult, error) {
+	current, err := s.repository.GetSession(ctx, id)
+	if err != nil {
+		return NativeReservationRecoveryResult{}, err
+	}
+	if current.WorkerSocket == "" {
+		return NativeReservationRecoveryResult{}, fmt.Errorf("Session %s has no live worker; resume it before native reservation recovery", id)
+	}
+	if err := s.requireCurrentWorkerProtocol(ctx, current, "native reservation not recovered"); err != nil {
+		return NativeReservationRecoveryResult{}, err
+	}
+	ownerToken, err := native.OwnerToken(s.home.Root, current.ID)
+	if err != nil {
+		return NativeReservationRecoveryResult{}, err
+	}
+	reservation, err := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{
+		Type: "native_reservation_status", OwnerToken: ownerToken,
+	})
+	if err != nil {
+		return NativeReservationRecoveryResult{}, fmt.Errorf("Session %s native reservation recovery refused: %w", id, err)
+	}
+	if reservation.Type != "native_reservation_status" {
+		return NativeReservationRecoveryResult{}, fmt.Errorf("Session %s native reservation recovery received unexpected worker response %q", id, reservation.Type)
+	}
+	switch reservation.State {
+	case "reserved":
+		if reservation.NativeGeneration == "" {
+			return NativeReservationRecoveryResult{}, fmt.Errorf("Session %s native reservation has no generation; recovery is unsafe and remains blocked", id)
+		}
+	case "active":
+		return NativeReservationRecoveryResult{}, fmt.Errorf("Session %s has active provider-native ownership. Missing tmux Session %s does not prove provider exit; recovery is refused and ACP remains blocked", id, native.TmuxSessionName(id))
+	case "released":
+		return NativeReservationRecoveryResult{}, fmt.Errorf("Session %s has no orphaned native reservation to recover", id)
+	default:
+		return NativeReservationRecoveryResult{}, fmt.Errorf("Session %s native reservation recovery received unknown ownership phase %q", id, reservation.State)
+	}
+	verifier := options.Verifier
+	if verifier == nil {
+		verifier = native.TmuxReservationRecoveryVerifier{}
+	}
+	if err := verifier.VerifyReservationAbsent(ctx, current.ID); err != nil {
+		return NativeReservationRecoveryResult{}, err
+	}
+	recovered, err := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{
+		Type: "native_recover_reservation", OwnerToken: ownerToken, NativeGeneration: reservation.NativeGeneration,
+	})
+	if err != nil {
+		return NativeReservationRecoveryResult{}, fmt.Errorf("Session %s native reservation recovery refused: %w", id, err)
+	}
+	if recovered.Type != "native_reservation_recovered" {
+		return NativeReservationRecoveryResult{}, fmt.Errorf("Session %s native reservation recovery received unexpected worker response %q", id, recovered.Type)
+	}
+	switch recovered.State {
+	case "released", "already_released", "refresh_scheduled":
+		return NativeReservationRecoveryResult{State: recovered.State}, nil
+	default:
+		return NativeReservationRecoveryResult{}, fmt.Errorf("Session %s native reservation recovery received unknown state %q", id, recovered.State)
+	}
+}
+
+func (s *SessionService) requireCurrentWorkerProtocol(ctx context.Context, current session.Session, operation string) error {
+	response, err := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{Type: "ping"})
+	if err != nil {
+		return err
+	}
+	if response.Type == "pong" && response.ProtocolVersion >= worker.ProtocolVersion && workerHasCapability(response, worker.CapabilityExclusiveNativeOwner) {
+		return nil
+	}
+	return &WorkerUpgradeRequiredError{SessionID: current.ID, Operation: operation, ProtocolVersion: response.ProtocolVersion}
+}
+
+func (s *SessionService) requireExclusiveNativeWorker(ctx context.Context, current session.Session) error {
+	err := s.requireCurrentWorkerProtocol(ctx, current, "native not started")
+	if err == nil || errors.Is(err, ErrWorkerUpgradeRequired) {
+		return err
+	}
+	return fmt.Errorf("Session %s worker capability check failed; native not started: %w", current.ID, err)
+}
+
+func workerHasCapability(response worker.Message, capability string) bool {
+	for _, candidate := range response.Capabilities {
+		if candidate == capability {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *SessionService) releaseNativeOwnership(current session.Session, ownerToken, generation string, activity bool, notices io.Writer) error {
 	releaseContext, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	message, err := s.runtime.Send(releaseContext, current.WorkerSocket, worker.Command{
-		Type: "native_release", OwnerToken: ownerToken, NativeActivity: activity,
+		Type: "native_release", OwnerToken: ownerToken, NativeGeneration: generation, NativeActivity: activity,
 	})
 	if err != nil {
 		return fmt.Errorf("release native provider ownership: %w", err)

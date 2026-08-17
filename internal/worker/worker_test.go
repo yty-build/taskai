@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +18,7 @@ import (
 	"github.com/yty-build/acp-gateway/internal/acp"
 	"github.com/yty-build/acp-gateway/internal/agents"
 	"github.com/yty-build/acp-gateway/internal/config"
+	"github.com/yty-build/acp-gateway/internal/native"
 	"github.com/yty-build/acp-gateway/internal/session"
 	"github.com/yty-build/acp-gateway/internal/sessionlog"
 	"github.com/yty-build/acp-gateway/internal/store"
@@ -454,7 +457,7 @@ func TestWorkerSerializesPromptsBroadcastsAndReplays(t *testing.T) {
 	if err != nil || status.ActiveRequestID != "req-1" || status.Queued != 1 || status.Status != "working" {
 		t.Fatalf("status = %#v, %v", status, err)
 	}
-	if _, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: "owner-active"}); err == nil || !strings.Contains(err.Error(), "ACP request req-1 is active") {
+	if _, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: "owner-active", NativeOwnerRole: NativeOwnerRoleDirect}); err == nil || !strings.Contains(err.Error(), "ACP request req-1 is active") {
 		t.Fatalf("native acquire during ACP turn error = %v", err)
 	}
 	if _, err := harness.client.Send(context.Background(), Command{Type: "cancel", RequestID: "req-1"}); err != nil {
@@ -465,6 +468,10 @@ func TestWorkerSerializesPromptsBroadcastsAndReplays(t *testing.T) {
 	subscriberContexts[0]()
 	if err := harness.client.Ping(context.Background()); err != nil {
 		t.Fatalf("Ping after detach: %v", err)
+	}
+	pong, err := harness.client.Send(context.Background(), Command{Type: "ping"})
+	if err != nil || pong.Type != "pong" || pong.ProtocolVersion != ProtocolVersion || !reflect.DeepEqual(pong.Capabilities, []string{CapabilityExclusiveNativeOwner}) {
+		t.Fatalf("worker capability pong = %#v, %v", pong, err)
 	}
 	harness.acp.Complete("req-2")
 	waitFor(t, 2*time.Second, func() bool {
@@ -762,14 +769,14 @@ func TestNativeOwnershipQueuesACPThroughExactRefreshBarrier(t *testing.T) {
 	harness.reconcile.mu.Lock()
 	harness.reconcile.wait = reconcileRelease
 	harness.reconcile.mu.Unlock()
-	acquired, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: ownerToken})
+	acquired, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleDirect})
 	if err != nil || acquired.Type != "native_acquired" || acquired.State != "acquired" {
 		t.Fatalf("native acquire = %#v, %v", acquired, err)
 	}
-	if duplicate, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: ownerToken}); err != nil || duplicate.State != "already_acquired" {
+	if duplicate, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleDirect}); err != nil || duplicate.State != "already_acquired" || duplicate.NativeGeneration != acquired.NativeGeneration {
 		t.Fatalf("idempotent native acquire = %#v, %v", duplicate, err)
 	}
-	if _, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: "another-owner"}); err == nil || !strings.Contains(err.Error(), "another native provider process") {
+	if _, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: "another-owner", NativeOwnerRole: NativeOwnerRoleDirect}); err == nil || !strings.Contains(err.Error(), "another native provider process") {
 		t.Fatalf("competing native acquire error = %v", err)
 	}
 	marker, err := os.Stat(harness.runtime.NativeOwnerPath())
@@ -795,7 +802,7 @@ func TestNativeOwnershipQueuesACPThroughExactRefreshBarrier(t *testing.T) {
 	harness.acp.mu.Lock()
 	harness.acp.refreshWait = true
 	harness.acp.mu.Unlock()
-	released, err := harness.client.Send(context.Background(), Command{Type: "native_release", OwnerToken: ownerToken, NativeActivity: true})
+	released, err := harness.client.Send(context.Background(), Command{Type: "native_release", OwnerToken: ownerToken, NativeGeneration: acquired.NativeGeneration, NativeActivity: true})
 	if err != nil || released.State != "refresh_scheduled" {
 		t.Fatalf("native release = %#v, %v", released, err)
 	}
@@ -806,7 +813,7 @@ func TestNativeOwnershipQueuesACPThroughExactRefreshBarrier(t *testing.T) {
 	if _, err := os.Stat(harness.runtime.NativeOwnerPath()); err != nil {
 		t.Fatalf("refresh barrier marker disappeared before exact refresh completed: %v", err)
 	}
-	if _, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: ownerToken}); err == nil || !strings.Contains(err.Error(), "identity refresh is active") {
+	if _, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleDirect}); err == nil || !strings.Contains(err.Error(), "identity refresh is active") {
 		t.Fatalf("native acquire during refresh error = %v", err)
 	}
 	select {
@@ -838,6 +845,26 @@ func TestNativeOwnershipQueuesACPThroughExactRefreshBarrier(t *testing.T) {
 	if _, err := os.Stat(harness.runtime.NativeOwnerPath()); !os.IsNotExist(err) {
 		t.Fatalf("native refresh barrier marker remains after exact transcript reconciliation: %v", err)
 	}
+	lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reconciledAt, dispatchedAt uint64
+	for _, line := range lines {
+		switch {
+		case line.Type == "provider_transcript_reconciled":
+			reconciledAt = line.Seq
+			var payload map[string]string
+			if json.Unmarshal(line.Data, &payload) != nil || len(payload) != 2 || payload["source"] != "provider-store" || payload["state"] != "reconciled" {
+				t.Fatalf("provider transcript reconciliation payload = %s", line.Data)
+			}
+		case line.Type == "turn_started" && line.RequestID == "req-after-native":
+			dispatchedAt = line.Seq
+		}
+	}
+	if reconciledAt == 0 || dispatchedAt == 0 || reconciledAt >= dispatchedAt {
+		t.Fatalf("provider transcript reconcile/dispatch ordering = %d/%d", reconciledAt, dispatchedAt)
+	}
 	harness.reconcile.mu.Lock()
 	if harness.reconcile.calls != 1 || harness.reconcile.conversationID != "native-start" || harness.reconcile.workingDir == "" {
 		t.Fatalf("provider transcript reconcile = calls %d, conversation %q, directory %q", harness.reconcile.calls, harness.reconcile.conversationID, harness.reconcile.workingDir)
@@ -846,19 +873,166 @@ func TestNativeOwnershipQueuesACPThroughExactRefreshBarrier(t *testing.T) {
 	harness.acp.Complete("req-after-native")
 }
 
+func TestGenerationScopedReservationRecoveryThenNativeExitContinuesACP(t *testing.T) {
+	harness := startWorkerHarness(t)
+	const ownerToken = "owner-reservation-recovery"
+	reserved, err := harness.client.Send(context.Background(), Command{
+		Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleReservation,
+	})
+	if err != nil || reserved.State != "reserved" || reserved.NativeGeneration == "" {
+		t.Fatalf("native reservation = %#v, %v", reserved, err)
+	}
+	marker, err := os.ReadFile(harness.runtime.NativeOwnerPath())
+	if err != nil || !strings.Contains(string(marker), `"state": "reserved"`) || !strings.Contains(string(marker), reserved.NativeGeneration) {
+		t.Fatalf("reservation marker = %q, %v", marker, err)
+	}
+	status, err := harness.client.Send(context.Background(), Command{Type: "native_reservation_status", OwnerToken: ownerToken})
+	if err != nil || status.State != "reserved" || status.NativeGeneration != reserved.NativeGeneration {
+		t.Fatalf("reservation status = %#v, %v", status, err)
+	}
+	recovered, err := harness.client.Send(context.Background(), Command{
+		Type: "native_recover_reservation", OwnerToken: ownerToken, NativeGeneration: reserved.NativeGeneration,
+	})
+	if err != nil || recovered.State != "refresh_scheduled" {
+		t.Fatalf("reservation recovery = %#v, %v", recovered, err)
+	}
+	if _, err := harness.client.Send(context.Background(), Command{
+		Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleProvider, NativeGeneration: reserved.NativeGeneration,
+	}); err == nil || (!strings.Contains(err.Error(), "reservation is no longer active") && !strings.Contains(err.Error(), "identity refresh")) {
+		t.Fatalf("delayed recovered-generation activation error = %v", err)
+	}
+	waitFor(t, 3*time.Second, func() bool {
+		current, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
+		return statusErr == nil && !current.NativeOwned && !current.RefreshPending && !current.Refreshing
+	})
+
+	second, err := harness.client.Send(context.Background(), Command{
+		Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleReservation,
+	})
+	if err != nil || second.State != "reserved" || second.NativeGeneration == "" || second.NativeGeneration == reserved.NativeGeneration {
+		t.Fatalf("second reservation = %#v, %v", second, err)
+	}
+	for _, stale := range []Command{
+		{Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleProvider, NativeGeneration: reserved.NativeGeneration},
+		{Type: "native_release", OwnerToken: ownerToken, NativeGeneration: reserved.NativeGeneration, NativeActivity: true},
+	} {
+		if _, err := harness.client.Send(context.Background(), stale); err == nil || !strings.Contains(err.Error(), "generation") {
+			t.Fatalf("stale generation command %#v error = %v", stale, err)
+		}
+	}
+	activated, err := harness.client.Send(context.Background(), Command{
+		Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleProvider, NativeGeneration: second.NativeGeneration,
+	})
+	if err != nil || activated.State != "activated" || activated.NativeGeneration != second.NativeGeneration {
+		t.Fatalf("reservation activation = %#v, %v", activated, err)
+	}
+	if _, err := harness.client.Send(context.Background(), Command{
+		Type: "native_recover_reservation", OwnerToken: ownerToken, NativeGeneration: second.NativeGeneration,
+	}); err == nil || !strings.Contains(err.Error(), "active provider-native ownership") {
+		t.Fatalf("active owner recovery error = %v", err)
+	}
+	queued, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-reservation-recovery", Message: "continue"})
+	if err != nil || queued.State != "queued" {
+		t.Fatalf("prompt during active native owner = %#v, %v", queued, err)
+	}
+	if _, err := harness.client.Send(context.Background(), Command{
+		Type: "native_release", OwnerToken: ownerToken, NativeGeneration: second.NativeGeneration, NativeActivity: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitStarted(t, harness.acp.started, "req-after-reservation-recovery")
+	harness.acp.Complete("req-after-reservation-recovery")
+}
+
+func TestNativeActivationPublishFailureRestoresRecoverableReservationWithoutProviderStart(t *testing.T) {
+	runtime, _ := disconnectedIdentityWorker(t, "acp-canonical", "native-canonical")
+	if err := os.MkdirAll(runtime.config.WorkersDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	history, err := sessionlog.Open(runtime.LogPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.log = history
+	runtime.hub = newHub(history.LastSequence())
+	t.Cleanup(func() {
+		if runtime.log != nil {
+			_ = runtime.log.Close()
+		}
+	})
+
+	const ownerToken = "owner-activation-publish-failure"
+	reserved, generation, err := runtime.acquireNative(ownerToken, NativeOwnerRoleReservation, "")
+	if err != nil || reserved != "reserved" || generation == "" {
+		t.Fatalf("native reservation = %q/%q, %v", reserved, generation, err)
+	}
+	if err := history.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	fixture, err := filepath.Abs(filepath.Join("..", "native", "testdata", "fake-native"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := filepath.Join(t.TempDir(), "provider-must-not-start")
+	runner := &native.ExecRunner{}
+	runner.SetReservationGeneration(generation)
+	runner.SetReservationActivator(func(context.Context) error {
+		_, _, activateErr := runtime.acquireNative(ownerToken, NativeOwnerRoleProvider, generation)
+		return activateErr
+	})
+	err = runner.Run(context.Background(), native.Invocation{
+		Command: fixture, WorkingDirectory: t.TempDir(),
+		Environment: map[string]string{"FAKE_NATIVE_RECORD": record},
+	}, strings.NewReader(""), io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "restored the exact pre-launch reservation") || runner.NativeActivityOccurred() {
+		t.Fatalf("activation publish failure = %v, activity=%t", err, runner.NativeActivityOccurred())
+	}
+	if _, statErr := os.Stat(record); !os.IsNotExist(statErr) {
+		t.Fatalf("provider started after failed activation publish: %v", statErr)
+	}
+
+	body, err := os.ReadFile(runtime.NativeOwnerPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var marker nativeOwnerMarker
+	if err := json.Unmarshal(body, &marker); err != nil {
+		t.Fatal(err)
+	}
+	if marker.State != nativeMarkerReserved || marker.Generation != generation || marker.OwnerToken != ownerToken {
+		t.Fatalf("rolled-back native marker = %#v", marker)
+	}
+	state, currentGeneration, err := runtime.nativeReservationStatus(ownerToken)
+	if err != nil || state != "reserved" || currentGeneration != generation {
+		t.Fatalf("rolled-back reservation status = %q/%q, %v", state, currentGeneration, err)
+	}
+
+	reopened, err := sessionlog.Open(runtime.LogPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.log = reopened
+	recovered, err := runtime.recoverNativeReservation(ownerToken, generation)
+	if err != nil || recovered != "refresh_scheduled" {
+		t.Fatalf("rolled-back reservation recovery = %q, %v", recovered, err)
+	}
+}
+
 func TestProviderTranscriptReconcileFailureKeepsDurableBarrierRetryable(t *testing.T) {
 	harness := startWorkerHarness(t)
 	const ownerToken = "owner-reconcile-retry"
 	harness.reconcile.mu.Lock()
 	harness.reconcile.err = errors.New("provider transcript is temporarily unreadable")
 	harness.reconcile.mu.Unlock()
-	if _, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: ownerToken}); err != nil {
+	acquired, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleDirect})
+	if err != nil {
 		t.Fatal(err)
 	}
 	if queued, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-blocked-by-reconcile", Message: "must wait"}); err != nil || queued.State != "queued" {
 		t.Fatalf("queued prompt = %#v, %v", queued, err)
 	}
-	if _, err := harness.client.Send(context.Background(), Command{Type: "native_release", OwnerToken: ownerToken, NativeActivity: true}); err != nil {
+	if _, err := harness.client.Send(context.Background(), Command{Type: "native_release", OwnerToken: ownerToken, NativeGeneration: acquired.NativeGeneration, NativeActivity: true}); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, 3*time.Second, func() bool {
@@ -873,6 +1047,15 @@ func TestProviderTranscriptReconcileFailureKeepsDurableBarrierRetryable(t *testi
 	marker, err := os.ReadFile(harness.runtime.NativeOwnerPath())
 	if err != nil || !strings.Contains(string(marker), `"state": "refresh_pending"`) {
 		t.Fatalf("durable refresh barrier after reconcile failure = %q, %v", marker, err)
+	}
+	failedLines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range failedLines {
+		if line.Type == "provider_transcript_reconciled" {
+			t.Fatalf("failed provider transcript read emitted successful reconciliation: %#v", line)
+		}
 	}
 
 	current, err := harness.repository.GetSession(context.Background(), harness.runtime.config.Session.ID)
@@ -927,7 +1110,8 @@ func TestProviderTranscriptReconcileFailureKeepsDurableBarrierRetryable(t *testi
 func TestNativeOwnershipSurvivesWorkerRestartUntilOwnerRelease(t *testing.T) {
 	harness := startWorkerHarness(t)
 	const ownerToken = "owner-survives-restart"
-	if _, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: ownerToken}); err != nil {
+	acquired, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleDirect})
+	if err != nil {
 		t.Fatal(err)
 	}
 	harness.cancel()
@@ -993,7 +1177,7 @@ func TestNativeOwnershipSurvivesWorkerRestartUntilOwnerRelease(t *testing.T) {
 		t.Fatalf("ACP prompt %s started after worker restart while native still owned", requestID)
 	case <-time.After(150 * time.Millisecond):
 	}
-	if _, err := restartedClient.Send(context.Background(), Command{Type: "native_release", OwnerToken: ownerToken, NativeActivity: true}); err != nil {
+	if _, err := restartedClient.Send(context.Background(), Command{Type: "native_release", OwnerToken: ownerToken, NativeGeneration: acquired.NativeGeneration, NativeActivity: true}); err != nil {
 		t.Fatal(err)
 	}
 	waitStarted(t, harness.acp.started, "req-after-worker-restart")
@@ -1007,6 +1191,47 @@ func TestNativeOwnershipSurvivesWorkerRestartUntilOwnerRelease(t *testing.T) {
 		t.Fatalf("native owner marker remains after restart refresh: %v", err)
 	}
 	harness.acp.Complete("req-after-worker-restart")
+}
+
+func TestWorkerRestorePreservesReservationPhaseAndLegacyOwnedIsActive(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		marker     string
+		generation string
+		reserved   bool
+	}{
+		{name: "generation reservation", marker: nativeMarkerReserved, generation: "0123456789abcdef0123456789abcdef", reserved: true},
+		{name: "legacy owned marker", marker: nativeMarkerOwned},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runtime, _ := disconnectedIdentityWorker(t, "acp-canonical", "native-canonical")
+			if err := os.MkdirAll(runtime.config.WorkersDirectory, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			const ownerToken = "owner-restored-phase"
+			if err := runtime.persistNativeOwnership(test.marker, ownerToken, test.generation); err != nil {
+				t.Fatal(err)
+			}
+			restored, err := New(runtime.config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := restored.restoreNativeOwnership(); err != nil {
+				t.Fatal(err)
+			}
+			restored.mu.Lock()
+			owner, generation, reserved := restored.nativeOwnerToken, restored.nativeOwnerGeneration, restored.nativeOwnerReserved
+			restored.mu.Unlock()
+			if owner != ownerToken || generation != test.generation || reserved != test.reserved {
+				t.Fatalf("restored owner=%q generation=%q reserved=%t", owner, generation, reserved)
+			}
+			if !test.reserved {
+				if _, err := restored.recoverNativeReservation(ownerToken, test.generation); err == nil || !strings.Contains(err.Error(), "active provider-native ownership") {
+					t.Fatalf("legacy active recovery error = %v", err)
+				}
+			}
+		})
+	}
 }
 
 func TestInvalidNativeOwnershipMarkerFailsClosed(t *testing.T) {

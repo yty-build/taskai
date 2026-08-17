@@ -292,6 +292,21 @@ func TestTaskConsoleNativeDefaultACPActionFilterHelpAndPalette(t *testing.T) {
 	if model.mode != sessionView || model.current.ID != "S-2" || model.composer.focused {
 		t.Fatalf("ACP action = mode %d Session %s composer=%v", model.mode, model.current.ID, model.composer.focused)
 	}
+	if !strings.Contains(model.View(), "n Native CLI") {
+		t.Fatalf("Structured ACP footer does not expose native handoff:\n%s", model.View())
+	}
+	updated, nativeFromSession := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	model = updated.(Model)
+	if nativeFromSession == nil || !strings.Contains(model.notice, "Opening Codex CLI") || model.mode != sessionView {
+		t.Fatalf("Structured ACP n handoff: command=%v notice=%q mode=%d", nativeFromSession, model.notice, model.mode)
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("?")})
+	model = updated.(Model)
+	if !strings.Contains(model.View(), "n              Open the exact conversation in the provider's native CLI") {
+		t.Fatalf("Structured ACP help does not document native handoff:\n%s", model.View())
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(Model)
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
 	model = updated.(Model)
 
@@ -507,7 +522,7 @@ func TestTaskNativeCapabilityUsesSupportedMappingAndCanonicalIdentity(t *testing
 		available bool
 		want      string
 	}{
-		{name: "supported pending verification", current: session.Session{Agent: "claude", ProviderConversationID: "claude-id", RepoPath: "/repo"}, available: true, want: "identity checked before opening"},
+		{name: "supported pending verification", current: session.Session{Agent: "claude", ProviderConversationID: "claude-id", RepoPath: "/repo"}, available: true, want: "safety checked on open"},
 		{name: "supported verified", current: session.Session{Agent: "opencode", ProviderConversationID: "ses-id", RepoPath: "/repo", ConversationIDVerifiedAt: &verifiedAt}, available: true, want: "identity verified"},
 		{name: "missing identity", current: session.Session{Agent: "codex", RepoPath: "/repo"}, want: "exact provider conversation identity"},
 		{name: "unsupported mapping", current: session.Session{Agent: "gemini", ProviderConversationID: "gemini-id", RepoPath: "/repo"}, want: "no supported exact native resume command"},

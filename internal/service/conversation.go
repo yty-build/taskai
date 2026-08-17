@@ -341,7 +341,6 @@ type providerConversationTurn struct {
 	displayUser     conversationCoverage
 	wrappedUser     bool
 	assistant       conversationCoverage
-	hasReasoning    bool
 	userMatchable   bool
 	answerMatchable bool
 	firstAt         time.Time
@@ -393,10 +392,7 @@ func mergeConversationTurns(provider native.TranscriptSnapshot, gateway []*conve
 			if len(activities) == 0 {
 				activities = providerTurnActivities(turn, true)
 			} else {
-				activities = markMatchedAssistantProvider(activities)
-				if !hasConversationDisplayType(activities, "thought_chunk") && turn.hasReasoning {
-					activities = insertProviderReasoning(activities, turn)
-				}
+				activities = matchedCommittedActivities(turn, gatewayTurn)
 			}
 			result = append(result, ConversationTurn{Key: turn.key, Committed: true, Activities: activities})
 			continue
@@ -442,8 +438,6 @@ func groupProviderTurns(records []native.TranscriptRecord) []*providerConversati
 			if !record.Timestamp.IsZero() {
 				current.answerAt = record.Timestamp
 			}
-		case native.TranscriptReasoning:
-			current.hasReasoning = current.hasReasoning || strings.TrimSpace(record.Text) != ""
 		}
 	}
 	// Provider stores write user/reasoning records before a final response
@@ -557,46 +551,214 @@ func providerRecordDisplay(record native.TranscriptRecord) *presentation.Activit
 	}
 }
 
-func insertProviderReasoning(activities []ConversationActivity, turn *providerConversationTurn) []ConversationActivity {
-	insertAt := len(activities)
-	for index, activity := range activities {
-		if activity.Display != nil && activity.Display.Type == "assistant_chunk" {
-			insertAt = index
-			break
-		}
-	}
-	var reasoning []ConversationActivity
+// matchedCommittedActivities makes the verified provider store authoritative
+// for committed user, reasoning, and assistant content. Gateway records remain
+// authoritative for live-only structure such as lifecycle, tools, plans, and
+// permissions. ACP reasoning is retained only when it adds readable content
+// that is not the provider's normalized committed reasoning.
+func matchedCommittedActivities(turn *providerConversationTurn, gateway *conversationTurn) []ConversationActivity {
+	provider := make([]ConversationActivity, 0, len(turn.records))
 	for _, record := range turn.records {
-		if record.Kind != native.TranscriptReasoning {
+		display := providerRecordDisplay(record)
+		if display == nil {
 			continue
 		}
-		reasoning = append(reasoning, ConversationActivity{
-			RequestID: turn.key, Kind: "provider_transcript", Timestamp: record.Timestamp, Display: providerRecordDisplay(record),
+		provider = append(provider, ConversationActivity{
+			RequestID: gateway.id, Kind: "provider_transcript", Timestamp: record.Timestamp, Display: display,
 		})
 	}
-	result := make([]ConversationActivity, 0, len(activities)+len(reasoning))
-	result = append(result, activities[:insertAt]...)
-	result = append(result, reasoning...)
-	result = append(result, activities[insertAt:]...)
+	groups := matchedGatewayActivityGroups(gateway.activities)
+	supplementalReasoning := supplementalACPReasoning(groups, turn)
+	result := make([]ConversationActivity, 0, len(gateway.activities)+len(turn.records))
+	providerIndex := 0
+	emitThroughType := func(displayType string) bool {
+		match := -1
+		for index := providerIndex; index < len(provider); index++ {
+			if provider[index].Display != nil && provider[index].Display.Type == displayType {
+				match = index
+				break
+			}
+		}
+		if match < 0 {
+			return false
+		}
+		end := match + 1
+		for end < len(provider) && provider[end].Display != nil && provider[end].Display.Type == displayType {
+			end++
+		}
+		result = append(result, provider[providerIndex:end]...)
+		providerIndex = end
+		return true
+	}
+	emitRemaining := func() {
+		result = append(result, provider[providerIndex:]...)
+		providerIndex = len(provider)
+	}
+
+	for _, group := range groups {
+		if group.displayType != "" {
+			emitThroughType(group.displayType)
+			if group.displayType == "thought_chunk" {
+				result = append(result, supplementalReasoning[group.start]...)
+			}
+			continue
+		}
+		for _, activity := range group.activities {
+			if activity.Display != nil && activity.Display.Type == "turn_state" && activity.Display.State == "complete" {
+				emitRemaining()
+			}
+			result = append(result, activity)
+		}
+	}
+	emitRemaining()
 	return result
 }
 
-func markMatchedAssistantProvider(activities []ConversationActivity) []ConversationActivity {
-	for index := range activities {
-		if activities[index].Display != nil && activities[index].Display.Type == "assistant_chunk" {
-			activities[index].Kind = "provider_transcript"
-		}
-	}
-	return activities
+type matchedGatewayActivityGroup struct {
+	start       int
+	displayType string
+	activities  []ConversationActivity
 }
 
-func hasConversationDisplayType(activities []ConversationActivity, kind string) bool {
-	for _, activity := range activities {
-		if activity.Display != nil && activity.Display.Type == kind {
-			return true
+func matchedGatewayActivityGroups(activities []ConversationActivity) []matchedGatewayActivityGroup {
+	groups := make([]matchedGatewayActivityGroup, 0, len(activities))
+	for index := 0; index < len(activities); {
+		displayType := providerSemanticDisplayType(activities[index])
+		if displayType == "" {
+			groups = append(groups, matchedGatewayActivityGroup{start: index, activities: []ConversationActivity{activities[index]}})
+			index++
+			continue
+		}
+		end := index + 1
+		for end < len(activities) && providerSemanticDisplayType(activities[end]) == displayType {
+			end++
+		}
+		groups = append(groups, matchedGatewayActivityGroup{
+			start: index, displayType: displayType, activities: activities[index:end],
+		})
+		index = end
+	}
+	return groups
+}
+
+func providerSemanticDisplayType(activity ConversationActivity) string {
+	if activity.Display == nil {
+		return ""
+	}
+	switch activity.Display.Type {
+	case "user_message", "legacy_user_message":
+		return "user_message"
+	case "thought_chunk", "assistant_chunk":
+		return activity.Display.Type
+	default:
+		return ""
+	}
+}
+
+func supplementalACPReasoning(groups []matchedGatewayActivityGroup, turn *providerConversationTurn) map[int][]ConversationActivity {
+	result := make(map[int][]ConversationActivity)
+	var providerRecords []native.TranscriptRecord
+	for _, record := range turn.records {
+		if record.Kind == native.TranscriptReasoning && strings.TrimSpace(record.Text) != "" {
+			providerRecords = append(providerRecords, record)
 		}
 	}
-	return false
+	type reasoningTokens struct {
+		group  matchedGatewayActivityGroup
+		tokens []string
+		flat   []int
+	}
+	var reasoningGroups []reasoningTokens
+	var gatewayTokens []string
+	for _, group := range groups {
+		if group.displayType != "thought_chunk" {
+			continue
+		}
+		var text strings.Builder
+		for _, activity := range group.activities {
+			if activity.Display != nil {
+				text.WriteString(activity.Display.Text)
+			}
+		}
+		tokens := strings.Fields(text.String())
+		flat := make([]int, len(tokens))
+		for index, token := range tokens {
+			flat[index] = len(gatewayTokens)
+			gatewayTokens = append(gatewayTokens, token)
+		}
+		reasoningGroups = append(reasoningGroups, reasoningTokens{group: group, tokens: tokens, flat: flat})
+	}
+	if len(providerRecords) == 0 {
+		for _, group := range reasoningGroups {
+			result[group.group.start] = append([]ConversationActivity(nil), group.group.activities...)
+		}
+		return result
+	}
+
+	removed := make([]bool, len(gatewayTokens))
+	cursor := 0
+	for _, record := range providerRecords {
+		providerTokens := strings.Fields(record.Text)
+		match := tokenSequenceIndex(gatewayTokens, providerTokens, cursor)
+		if match < 0 {
+			continue
+		}
+		for index := match; index < match+len(providerTokens); index++ {
+			removed[index] = true
+		}
+		cursor = match + len(providerTokens)
+	}
+	for _, group := range reasoningGroups {
+		var remaining []string
+		removedFromGroup := false
+		for index, token := range group.tokens {
+			if removed[group.flat[index]] {
+				removedFromGroup = true
+				continue
+			}
+			remaining = append(remaining, token)
+		}
+		if !removedFromGroup {
+			result[group.group.start] = append([]ConversationActivity(nil), group.group.activities...)
+			continue
+		}
+		if len(remaining) == 0 || len(group.group.activities) == 0 {
+			continue
+		}
+		supplement := group.group.activities[0]
+		if supplement.Display == nil {
+			continue
+		}
+		display := *supplement.Display
+		display.Text = strings.Join(remaining, " ")
+		for _, activity := range group.group.activities[1:] {
+			if activity.Display != nil {
+				display.Truncated = display.Truncated || activity.Display.Truncated
+			}
+		}
+		supplement.Display = &display
+		result[group.group.start] = []ConversationActivity{supplement}
+	}
+	return result
+}
+
+func tokenSequenceIndex(values, pattern []string, start int) int {
+	if len(pattern) == 0 || start < 0 || len(pattern) > len(values)-start {
+		return -1
+	}
+	for index := start; index+len(pattern) <= len(values); index++ {
+		matched := true
+		for offset := range pattern {
+			if values[index+offset] != pattern[offset] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return index
+		}
+	}
+	return -1
 }
 
 func (c *conversationCoverage) append(value string) {

@@ -9,17 +9,43 @@ import (
 	"github.com/yty-build/acp-gateway/internal/sessionlog"
 )
 
+const (
+	// ProtocolVersion is incremented when a new client-visible worker contract
+	// must be detected before an operation can be performed safely.
+	ProtocolVersion = 2
+
+	// CapabilityExclusiveNativeOwner means the worker durably serializes ACP
+	// and provider-native writers across viewer detach and worker restart.
+	CapabilityExclusiveNativeOwner = "exclusive-native-owner-v1"
+
+	// NativeOwnerRoleReservation is used by an outer tmux viewer before it has
+	// started the private provider-owning process. Only this phase is eligible
+	// for explicit missing-harness recovery.
+	NativeOwnerRoleReservation = "reservation"
+
+	// NativeOwnerRoleProvider marks the private process that can actually write
+	// the provider conversation. An active provider owner is never recoverable
+	// merely because a tmux Session cannot be found.
+	NativeOwnerRoleProvider = "provider"
+
+	// NativeOwnerRoleDirect is an outer foreground process that writes the
+	// provider conversation without a tmux reservation.
+	NativeOwnerRoleDirect = "direct"
+)
+
 type Command struct {
-	Type           string `json:"type"`
-	From           uint64 `json:"from,omitempty"`
-	RequestID      string `json:"request_id,omitempty"`
-	Message        string `json:"message,omitempty"`
-	DisplayMessage string `json:"display_message,omitempty"`
-	PermissionID   string `json:"permission_id,omitempty"`
-	OptionID       string `json:"option_id,omitempty"`
-	Cancelled      bool   `json:"cancelled,omitempty"`
-	OwnerToken     string `json:"owner_token,omitempty"`
-	NativeActivity bool   `json:"native_activity,omitempty"`
+	Type             string `json:"type"`
+	From             uint64 `json:"from,omitempty"`
+	RequestID        string `json:"request_id,omitempty"`
+	Message          string `json:"message,omitempty"`
+	DisplayMessage   string `json:"display_message,omitempty"`
+	PermissionID     string `json:"permission_id,omitempty"`
+	OptionID         string `json:"option_id,omitempty"`
+	Cancelled        bool   `json:"cancelled,omitempty"`
+	OwnerToken       string `json:"owner_token,omitempty"`
+	NativeOwnerRole  string `json:"native_owner_role,omitempty"`
+	NativeGeneration string `json:"native_generation,omitempty"`
+	NativeActivity   bool   `json:"native_activity,omitempty"`
 }
 
 type PermissionOption struct {
@@ -37,22 +63,25 @@ type PendingPermission struct {
 }
 
 type Message struct {
-	Type            string              `json:"type"`
-	State           string              `json:"state,omitempty"`
-	Status          string              `json:"status,omitempty"`
-	RequestID       string              `json:"request_id,omitempty"`
-	ActiveRequestID string              `json:"active_request_id,omitempty"`
-	Seq             uint64              `json:"seq,omitempty"`
-	Timestamp       time.Time           `json:"timestamp,omitempty"`
-	LineType        string              `json:"line_type,omitempty"`
-	Queued          int                 `json:"queued,omitempty"`
-	RefreshPending  bool                `json:"refresh_pending,omitempty"`
-	Refreshing      bool                `json:"refreshing,omitempty"`
-	NativeOwned     bool                `json:"native_owned,omitempty"`
-	ProviderWriter  string              `json:"provider_writer,omitempty"`
-	Permissions     []PendingPermission `json:"permissions,omitempty"`
-	Data            json.RawMessage     `json:"data,omitempty"`
-	Message         string              `json:"message,omitempty"`
+	Type             string              `json:"type"`
+	ProtocolVersion  int                 `json:"protocol_version,omitempty"`
+	Capabilities     []string            `json:"capabilities,omitempty"`
+	State            string              `json:"state,omitempty"`
+	Status           string              `json:"status,omitempty"`
+	RequestID        string              `json:"request_id,omitempty"`
+	ActiveRequestID  string              `json:"active_request_id,omitempty"`
+	Seq              uint64              `json:"seq,omitempty"`
+	Timestamp        time.Time           `json:"timestamp,omitempty"`
+	LineType         string              `json:"line_type,omitempty"`
+	Queued           int                 `json:"queued,omitempty"`
+	RefreshPending   bool                `json:"refresh_pending,omitempty"`
+	Refreshing       bool                `json:"refreshing,omitempty"`
+	NativeOwned      bool                `json:"native_owned,omitempty"`
+	NativeGeneration string              `json:"native_generation,omitempty"`
+	ProviderWriter   string              `json:"provider_writer,omitempty"`
+	Permissions      []PendingPermission `json:"permissions,omitempty"`
+	Data             json.RawMessage     `json:"data,omitempty"`
+	Message          string              `json:"message,omitempty"`
 }
 
 func lineMessage(line sessionlog.Line) Message {

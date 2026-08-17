@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -49,6 +50,30 @@ func TestRunUnknownCommandHasStableError(t *testing.T) {
 	}
 	if got, want := stderr.String(), "acpctl: unknown command \"wat\"; run 'acpctl help' for usage\n"; got != want {
 		t.Fatalf("stderr = %q, want %q", got, want)
+	}
+}
+
+func TestHiddenNativeRequiresReservationGeneration(t *testing.T) {
+	err := runHiddenNative(
+		context.Background(),
+		[]string{"--session", "S-EXACT", "--owner-token", "owner"},
+		io.Discard, io.Discard, nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "--reservation-generation <generation>") {
+		t.Fatalf("hidden native usage error = %v", err)
+	}
+}
+
+func TestNativeRecoveryOutputDoesNotInventRefreshAfterConcurrentRelease(t *testing.T) {
+	var output bytes.Buffer
+	writeNativeRecoveryResult(&output, "S-EXACT", appservice.NativeReservationRecoveryResult{State: "already_released"})
+	if !strings.Contains(output.String(), "already released") || !strings.Contains(output.String(), "no recovery refresh was scheduled") || strings.Contains(output.String(), "Wait for native_refreshed") {
+		t.Fatalf("already-released recovery output = %q", output.String())
+	}
+	output.Reset()
+	writeNativeRecoveryResult(&output, "S-EXACT", appservice.NativeReservationRecoveryResult{State: "refresh_scheduled"})
+	if !strings.Contains(output.String(), "Wait for native_refreshed") {
+		t.Fatalf("scheduled recovery output = %q", output.String())
 	}
 }
 

@@ -2,6 +2,8 @@ package worker
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,8 +11,11 @@ import (
 	"path/filepath"
 )
 
+const nativeGenerationBytes = 16
+
 const (
 	nativeMarkerVersion        = 1
+	nativeMarkerReserved       = "reserved"
 	nativeMarkerOwned          = "owned"
 	nativeMarkerRefreshPending = "refresh_pending"
 )
@@ -20,6 +25,7 @@ type nativeOwnerMarker struct {
 	SessionID  string `json:"session_id"`
 	State      string `json:"state"`
 	OwnerToken string `json:"owner_token"`
+	Generation string `json:"generation,omitempty"`
 }
 
 // restoreNativeOwnership deliberately fails closed. A malformed, insecure,
@@ -60,8 +66,17 @@ func (w *Worker) restoreNativeOwnership() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	switch marker.State {
+	case nativeMarkerReserved:
+		if err := validateNativeGeneration(marker.Generation); err != nil {
+			return fmt.Errorf("native provider reservation marker %q has an invalid generation; refusing ACP work until it is recovered explicitly", path)
+		}
+		w.nativeOwnerToken = ownerToken
+		w.nativeOwnerGeneration = marker.Generation
+		w.nativeOwnerReserved = true
 	case nativeMarkerOwned:
 		w.nativeOwnerToken = ownerToken
+		w.nativeOwnerGeneration = marker.Generation
+		w.nativeOwnerReserved = false
 	case nativeMarkerRefreshPending:
 		w.nativeRefreshBarrier = true
 		w.refreshPending = true
@@ -83,10 +98,29 @@ func requireJSONEOF(decoder *json.Decoder) error {
 	return nil
 }
 
-func (w *Worker) persistNativeOwnership(state, ownerToken string) error {
+func newNativeGeneration() (string, error) {
+	value := make([]byte, nativeGenerationBytes)
+	if _, err := rand.Read(value); err != nil {
+		return "", fmt.Errorf("generate native ownership generation: %w", err)
+	}
+	return hex.EncodeToString(value), nil
+}
+
+func validateNativeGeneration(value string) error {
+	if len(value) != nativeGenerationBytes*2 {
+		return fmt.Errorf("native generation must be %d hexadecimal characters", nativeGenerationBytes*2)
+	}
+	decoded, err := hex.DecodeString(value)
+	if err != nil || len(decoded) != nativeGenerationBytes {
+		return fmt.Errorf("native generation is invalid")
+	}
+	return nil
+}
+
+func (w *Worker) persistNativeOwnership(state, ownerToken, generation string) error {
 	marker := nativeOwnerMarker{
 		Version: nativeMarkerVersion, SessionID: w.config.Session.ID,
-		State: state, OwnerToken: ownerToken,
+		State: state, OwnerToken: ownerToken, Generation: generation,
 	}
 	body, err := json.MarshalIndent(marker, "", "  ")
 	if err != nil {
