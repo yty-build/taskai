@@ -56,6 +56,10 @@ type fakeACP struct {
 	refreshNativeID  string
 	refreshGate      <-chan struct{}
 	refreshStarted   chan int
+	configureCount   int
+	configureErr     error
+	configureHook    func(acp.StartSpec)
+	configureSpecs   []acp.StartSpec
 	calls            []string
 }
 
@@ -123,6 +127,29 @@ func (f *fakeACP) Refresh(ctx context.Context, spec acp.StartSpec) (acp.SessionI
 		nativeID = "native-start"
 	}
 	return acp.SessionInfo{ACPXRecordID: "acpx-refreshed", ACPSessionID: spec.ResumeACPSessionID, NativeSessionID: nativeID}, nil
+}
+
+func (f *fakeACP) Configure(_ context.Context, spec acp.StartSpec) (acp.SessionInfo, error) {
+	f.mu.Lock()
+	f.configureCount++
+	f.calls = append(f.calls, "configure")
+	f.configureSpecs = append(f.configureSpecs, spec)
+	configureErr := f.configureErr
+	configureHook := f.configureHook
+	f.mu.Unlock()
+	if configureHook != nil {
+		configureHook(spec)
+	}
+	if configureErr != nil {
+		return acp.SessionInfo{}, configureErr
+	}
+	nativeID := spec.ExpectedNativeSessionID
+	if nativeID == "" {
+		nativeID = "native-start"
+	}
+	return acp.SessionInfo{
+		ACPXRecordID: "acpx-configured", ACPSessionID: spec.ResumeACPSessionID, NativeSessionID: nativeID,
+	}, nil
 }
 
 func (f *fakeACP) Prompt(ctx context.Context, spec acp.PromptSpec, emit func(acp.Event) error) (acp.PromptReceipt, error) {
@@ -499,6 +526,187 @@ func startWorkerHarness(t *testing.T) *workerHarness {
 		}
 	})
 	return harness
+}
+
+func newProviderOptionsWorker(t *testing.T) (*Worker, *fakeACP, *store.Store) {
+	t.Helper()
+	root, err := os.MkdirTemp("/tmp", "atc-provider-options-worker-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	for _, directory := range []string{filepath.Join(root, "repo"), filepath.Join(root, "workers"), filepath.Join(root, "logs")} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	repository, err := store.Open(context.Background(), filepath.Join(root, "agent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repository.Close() })
+	createdTask, err := repository.CreateTask(context.Background(), task.CreateParams{ID: "T-provider-options", Title: "Provider options"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdSession, err := repository.CreateSession(context.Background(), session.CreateParams{
+		ID: "S-provider-options", TaskID: createdTask.ID, Agent: "codex", Provider: "openai",
+		RepoPath: filepath.Join(root, "repo"), Status: session.StatusStarting,
+		MetadataJSON: json.RawMessage(`{"permission":"read-approval","model":"model-selected","reasoning_effort":"high"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := newFakeACP()
+	runtime, err := New(Config{
+		Session: createdSession, Profile: agents.Profile{Name: "codex", Provider: "openai", Command: "codex"},
+		Repository: repository, ACP: fake, WorkersDirectory: filepath.Join(root, "workers"), LogsDirectory: filepath.Join(root, "logs"),
+		RefreshTimeout: 250 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return runtime, fake, repository
+}
+
+func TestWorkerPersistsIdentityBeforeProviderConfigurationFailure(t *testing.T) {
+	runtime, fake, repository := newProviderOptionsWorker(t)
+	observed := make(chan session.Session, 1)
+	fake.mu.Lock()
+	fake.configureErr = &acp.ProviderConfigurationError{}
+	fake.configureHook = func(acp.StartSpec) {
+		current, _ := repository.GetSession(context.Background(), "S-provider-options")
+		observed <- current
+	}
+	fake.mu.Unlock()
+	err := runtime.Run(context.Background())
+	var configurationError *acp.ProviderConfigurationError
+	if !errors.As(err, &configurationError) {
+		t.Fatalf("Worker.Run() error = %T %v", err, err)
+	}
+	persistedBeforeFailure := <-observed
+	if persistedBeforeFailure.ACPSessionID != "acp-start" || persistedBeforeFailure.NativeSessionID != "native-start" || persistedBeforeFailure.ACPXRecordID != "acpx-start" {
+		t.Fatalf("identity before Configure = %#v", persistedBeforeFailure)
+	}
+	current, err := repository.GetSession(context.Background(), "S-provider-options")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Status != session.StatusFailed || current.ACPSessionID != "acp-start" || current.NativeSessionID != "native-start" || current.ProviderConversationID == "" {
+		t.Fatalf("failed Session lost canonical identity = %#v", current)
+	}
+	fake.mu.Lock()
+	calls := append([]string(nil), fake.calls...)
+	fake.mu.Unlock()
+	if !reflect.DeepEqual(calls, []string{"start", "configure"}) {
+		t.Fatalf("provider calls = %v, want identity then configuration and no prompt", calls)
+	}
+	lines, err := sessionlog.ReadFile(runtime.LogPath(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var safeFailure bool
+	for _, line := range lines {
+		if line.Type != "worker_error" {
+			continue
+		}
+		var failure map[string]string
+		if json.Unmarshal(line.Data, &failure) == nil && failure["source"] == "provider" && failure["code"] == "configuration_failed" && !strings.Contains(failure["message"], "SECRET") {
+			safeFailure = true
+		}
+	}
+	if !safeFailure {
+		t.Fatalf("worker log did not retain a safe structured configuration failure: %#v", lines)
+	}
+}
+
+func TestWorkerAppliesProviderOptionsAfterIdentityAndEveryRefreshBeforePrompt(t *testing.T) {
+	runtime, fake, repository := newProviderOptionsWorker(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runtime.Run(ctx) }()
+	client := NewSocketClient(runtime.SocketPath())
+	waitFor(t, 3*time.Second, func() bool {
+		probe, stop := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer stop()
+		return client.Ping(probe) == nil
+	})
+	accepted, err := client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-provider-options", Message: "verify"})
+	if err != nil || accepted.State != "ready" {
+		t.Fatalf("prompt = %#v, %v", accepted, err)
+	}
+	waitStarted(t, fake.started, "req-provider-options")
+	fake.mu.Lock()
+	calls := append([]string(nil), fake.calls...)
+	specs := append([]acp.StartSpec(nil), fake.configureSpecs...)
+	fake.mu.Unlock()
+	want := []string{"start", "configure", "refresh", "configure", "prompt:req-provider-options"}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("provider option order = %v, want %v", calls, want)
+	}
+	if len(specs) != 2 {
+		t.Fatalf("Configure specs = %#v", specs)
+	}
+	for _, spec := range specs {
+		if spec.ResumeACPSessionID != "acp-start" || spec.ExpectedNativeSessionID != "native-start" || spec.Model != "model-selected" || spec.ReasoningEffort != "high" {
+			t.Fatalf("Configure spec = %#v", spec)
+		}
+	}
+	current, err := repository.GetSession(context.Background(), "S-provider-options")
+	if err != nil || current.ACPSessionID != "acp-start" || current.NativeSessionID != "native-start" {
+		t.Fatalf("configured Session = %#v, %v", current, err)
+	}
+	fake.Complete("req-provider-options")
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("provider options worker did not stop")
+	}
+}
+
+func TestWorkerReappliesProviderOptionsAfterRefreshFallsBackToExactResume(t *testing.T) {
+	runtime, fake, _ := newProviderOptionsWorker(t)
+	fake.mu.Lock()
+	fake.refreshErr = errors.New("refresh unavailable")
+	fake.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runtime.Run(ctx) }()
+	client := NewSocketClient(runtime.SocketPath())
+	waitFor(t, 3*time.Second, func() bool {
+		probe, stop := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer stop()
+		return client.Ping(probe) == nil
+	})
+	if _, err := client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-resume-options", Message: "verify fallback"}); err != nil {
+		t.Fatal(err)
+	}
+	waitStarted(t, fake.started, "req-resume-options")
+	fake.mu.Lock()
+	calls := append([]string(nil), fake.calls...)
+	specs := append([]acp.StartSpec(nil), fake.configureSpecs...)
+	fake.mu.Unlock()
+	want := []string{"start", "configure", "refresh", "resume", "configure", "prompt:req-resume-options"}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("fallback provider option order = %v, want %v", calls, want)
+	}
+	if len(specs) != 2 || specs[1].ResumeACPSessionID != "acp-start" || specs[1].ExpectedNativeSessionID != "native-start" || specs[1].Model != "model-selected" || specs[1].ReasoningEffort != "high" {
+		t.Fatalf("fallback Configure specs = %#v", specs)
+	}
+	fake.Complete("req-resume-options")
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("fallback provider options worker did not stop")
+	}
 }
 
 func TestWorkerSerializesPromptsBroadcastsAndReplays(t *testing.T) {

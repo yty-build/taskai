@@ -14,6 +14,8 @@ import (
 type ReviewSessionParams struct {
 	ProducerID          string
 	Agent               string
+	Model               string
+	ReasoningEffort     string
 	AllowActiveProducer bool
 }
 
@@ -47,6 +49,7 @@ func (s *SessionService) Review(ctx context.Context, params ReviewSessionParams)
 	prompt := BuildReviewPrompt(taskItem, producer, logPath, snapshot)
 	launched, err := s.Start(ctx, StartSessionParams{
 		TaskID: producer.TaskID, Agent: params.Agent, Role: "reviewer",
+		Model: params.Model, ReasoningEffort: params.ReasoningEffort,
 		RepoPath: producer.RepoPath, WorktreePath: producer.WorktreePath, Prompt: prompt,
 		ApproveAll: false, AllowSharedCheckout: params.AllowActiveProducer,
 	})

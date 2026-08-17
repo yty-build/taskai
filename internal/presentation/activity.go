@@ -108,6 +108,16 @@ func Project(line sessionlog.Line) *Activity {
 			}
 		}
 		if line.Type == "worker_error" {
+			var failure struct {
+				Source string `json:"source"`
+				Code   string `json:"code"`
+			}
+			if json.Unmarshal(line.Data, &failure) == nil && failure.Source == "provider" && failure.Code == "configuration_failed" {
+				return &Activity{
+					Type: "error_upsert", State: "error", ErrorSource: "provider", ErrorCode: "configuration_failed",
+					Text: "The provider could not apply the requested model or reasoning effort. Create a Session with Provider default, or choose values advertised by that provider.",
+				}
+			}
 			text = "The Session worker encountered an error. Check local server logs for details."
 		}
 		return &Activity{Type: "error_upsert", Text: text, State: "error"}

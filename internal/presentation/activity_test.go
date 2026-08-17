@@ -202,6 +202,17 @@ func TestProjectSurfacesOnlyAllowlistedProviderFailureProvenance(t *testing.T) {
 	}
 }
 
+func TestProjectSurfacesSafeProviderConfigurationFailure(t *testing.T) {
+	line := sessionlog.Line{Type: "worker_error", Data: json.RawMessage(`{"source":"provider","code":"configuration_failed","message":"SECRET provider stderr /Users/private"}`)}
+	display := Project(line)
+	if display == nil || display.Type != "error_upsert" || display.ErrorSource != "provider" || display.ErrorCode != "configuration_failed" {
+		t.Fatalf("provider configuration projection = %#v", display)
+	}
+	if !strings.Contains(display.Text, "requested model or reasoning effort") || strings.Contains(display.Text, "SECRET") || strings.Contains(display.Text, "/Users/private") {
+		t.Fatalf("unsafe or unhelpful provider configuration text = %q", display.Text)
+	}
+}
+
 func TestProjectBoundsToolContentDuringProjection(t *testing.T) {
 	large := strings.Repeat("tool-output-", 200000)
 	raw, err := json.Marshal(map[string]any{

@@ -208,6 +208,8 @@ Start Session:
 {
   "agent": "codex",
   "role": "implementer",
+  "model": "gpt-5.6-sol",
+  "reasoning_effort": "high",
   "repo_path": "/absolute/path/to/repo",
   "prompt": "Run the complete test suite",
   "worktree": true,
@@ -217,6 +219,39 @@ Start Session:
 ```
 
 The `201` response contains `session`, `request_id`, and worker queue `state`.
+`model` and `reasoning_effort` are optional, bounded provider values. Blank or
+omitted fields mean Provider default. Explicit values are immutable Session
+metadata, returned as `requested_model` and `requested_reasoning_effort`; these
+names describe requested controls and do not claim an inferred effective value.
+The same optional request fields are accepted when creating a reviewer Session.
+
+Supported explicit controls for the pinned adapters are:
+
+| Agent | Model | Reasoning effort |
+| --- | --- | --- |
+| Codex | yes, provider-advertised | yes, provider-advertised |
+| Claude | yes, provider-advertised | yes; leave blank for Claude's default sentinel |
+| OpenCode | yes, provider-advertised | no |
+| Grok / Grok Build | no; Provider default only | no; Provider default only |
+| Gemini / custom profiles | no declared native-parity contract | no declared native-parity contract |
+
+Unsupported combinations fail validation before a Session is created. Values
+that require ACP advertisement are checked after the exact provider identity is
+persisted but before the initial prompt. If that post-identity configuration
+fails, the API still returns `201` with the failed `session` and a bounded
+`warning` (`session_start_failed`) so clients open that saved resource instead
+of accidentally creating a duplicate. Provider/bridge detail remains redacted.
+A Session that did start but encountered a later Task-status write error uses
+`session_started_with_warning` instead.
+
+Repository selection is explicit. If `repo_path` names a non-repository folder
+with exactly one immediate Git checkout, the API does not start a Session or
+silently retarget it. It returns `422` with
+`code: "repository_selection_required"` and the canonical
+`suggested_repo_path`; the client may offer that path for a deliberate second
+submission. Folders with no checkout, multiple checkouts, or more than the
+bounded discovery limit require an exact repository path. The gateway never
+initializes the supplied directory.
 
 Prompt:
 
@@ -359,7 +394,7 @@ Common statuses:
 | `400` | malformed JSON/body/cursor |
 | `404` | Task or Session not found |
 | `409` | worker upgrade required, checkout, active-producer, permission race, native/ACP writer ownership, or lifecycle conflict |
-| `422` | valid JSON with invalid domain/profile/repository input |
+| `422` | valid JSON with invalid domain/profile/repository input, including an explicit nested-repository selection request |
 | `502` | worker operation failed; internal socket detail is suppressed |
 | `500` | internal storage/server failure with sanitized message |
 

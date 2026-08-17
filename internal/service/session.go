@@ -66,6 +66,8 @@ type StartSessionParams struct {
 	TaskID              string
 	Agent               string
 	Role                string
+	Model               string
+	ReasoningEffort     string
 	RepoPath            string
 	WorktreePath        string
 	Branch              string
@@ -79,6 +81,7 @@ type LaunchResult struct {
 	Session   session.Session
 	RequestID string
 	State     string
+	Started   bool
 }
 
 // PermissionSnapshot is disposable transport state for viewers. It keeps the
@@ -214,7 +217,16 @@ func (s *SessionService) PrepareContext(ctx context.Context, params StartSession
 	if role == "" {
 		role = "worker"
 	}
-	metadata, err := PermissionMetadata(params.ApproveAll)
+	providerOptions := session.ProviderOptions{
+		Model: strings.TrimSpace(params.Model), ReasoningEffort: strings.TrimSpace(params.ReasoningEffort),
+	}
+	if err := providerOptions.Validate(); err != nil {
+		return session.CreateParams{}, err
+	}
+	if err := native.ValidateProviderOptions(profile, providerOptions); err != nil {
+		return session.CreateParams{}, err
+	}
+	metadata, err := SessionMetadata(params.ApproveAll, providerOptions)
 	if err != nil {
 		return session.CreateParams{}, err
 	}
@@ -238,7 +250,8 @@ func (s *SessionService) Start(ctx context.Context, params StartSessionParams) (
 		return LaunchResult{Session: created}, err
 	}
 	if _, err := s.repository.UpdateTaskStatus(ctx, params.TaskID, task.StatusWorking); err != nil {
-		return LaunchResult{Session: created}, err
+		created = s.markSessionFailed(created)
+		return LaunchResult{Session: created, State: string(created.Status)}, err
 	}
 	return s.Launch(ctx, created.ID, params.Prompt)
 }
@@ -274,13 +287,14 @@ func (s *SessionService) StartTask(ctx context.Context, taskParams task.CreatePa
 	if params.Worktree {
 		planned := gitrepo.Worktree{Repository: createdSession.RepoPath, Path: createdSession.WorktreePath, Branch: createdSession.Branch}
 		if err := planned.Create(ctx); err != nil {
-			failed, _ := s.repository.UpdateSessionStatus(context.Background(), createdSession.ID, session.StatusFailed)
-			partial.Session = failed
+			partial.Session = s.markSessionFailed(createdSession)
 			_, _ = s.repository.UpdateTaskStatus(context.Background(), createdTask.ID, task.StatusFailed)
 			return partial, err
 		}
 	}
 	if err := gitrepo.UnlockRepository(lock); err != nil {
+		partial.Session = s.markSessionFailed(partial.Session)
+		partial.State = string(partial.Session.Status)
 		return partial, err
 	}
 	lock = nil
@@ -305,8 +319,7 @@ func (s *SessionService) createSessionContext(ctx context.Context, createParams 
 	if createWorktree {
 		planned := gitrepo.Worktree{Repository: created.RepoPath, Path: created.WorktreePath, Branch: created.Branch}
 		if err := planned.Create(ctx); err != nil {
-			failed, _ := s.repository.UpdateSessionStatus(context.Background(), created.ID, session.StatusFailed)
-			return failed, err
+			return s.markSessionFailed(created), err
 		}
 	}
 	return created, nil
@@ -360,14 +373,15 @@ func (s *SessionService) Launch(ctx context.Context, sessionID, extraPrompt stri
 	if err != nil {
 		return LaunchResult{}, err
 	}
-	spawned, err := s.runtime.Spawn(ctx, current.ID)
-	if err != nil {
-		_, _ = s.repository.UpdateSessionStatus(context.Background(), current.ID, session.StatusFailed)
-		return LaunchResult{Session: current}, err
-	}
 	requestID, err := acp.NewRequestID()
 	if err != nil {
-		return LaunchResult{Session: current}, err
+		current = s.markSessionFailed(current)
+		return LaunchResult{Session: current, State: string(current.Status)}, err
+	}
+	spawned, err := s.runtime.Spawn(ctx, current.ID)
+	if err != nil {
+		current = s.markSessionFailed(current)
+		return LaunchResult{Session: current, State: string(current.Status)}, err
 	}
 	message := BuildInitialPrompt(taskItem, current, extraPrompt)
 	displayMessage := BuildInitialDisplayMessage(taskItem, current, extraPrompt)
@@ -375,13 +389,26 @@ func (s *SessionService) Launch(ctx context.Context, sessionID, extraPrompt stri
 		Type: "prompt", RequestID: requestID, Message: message, DisplayMessage: displayMessage,
 	})
 	if err != nil {
-		_, _ = s.repository.UpdateSessionStatus(context.Background(), current.ID, session.StatusFailed)
-		return LaunchResult{Session: current, RequestID: requestID}, fmt.Errorf("submit initial Session prompt: %w", err)
+		current = s.markSessionFailed(current)
+		return LaunchResult{Session: current, RequestID: requestID, State: string(current.Status)}, fmt.Errorf("submit initial Session prompt: %w", err)
 	}
 	if refreshed, refreshErr := s.repository.GetSession(ctx, current.ID); refreshErr == nil {
 		current = refreshed
 	}
-	return LaunchResult{Session: current, RequestID: requestID, State: accepted.State}, nil
+	return LaunchResult{Session: current, RequestID: requestID, State: accepted.State, Started: true}, nil
+}
+
+func (s *SessionService) markSessionFailed(current session.Session) session.Session {
+	if current.ID == "" {
+		return current
+	}
+	if failed, err := s.repository.UpdateSessionStatus(context.Background(), current.ID, session.StatusFailed); err == nil {
+		return failed
+	}
+	if refreshed, err := s.repository.GetSession(context.Background(), current.ID); err == nil {
+		return refreshed
+	}
+	return current
 }
 
 func BuildInitialPrompt(taskItem task.Task, current session.Session, extra string) string {
@@ -434,11 +461,28 @@ func valueOrRole(role string) string {
 }
 
 func PermissionMetadata(approveAll bool) (json.RawMessage, error) {
+	return SessionMetadata(approveAll, session.ProviderOptions{})
+}
+
+// SessionMetadata persists transport permission and optional provider controls
+// on the owning Session. Provider controls remain empty when the operator wants
+// the provider's default model or effort.
+func SessionMetadata(approveAll bool, options session.ProviderOptions) (json.RawMessage, error) {
+	if err := options.Validate(); err != nil {
+		return nil, err
+	}
 	permission := string(acp.PermissionReadApproval)
 	if approveAll {
 		permission = string(acp.PermissionApproveAll)
 	}
-	encoded, err := json.Marshal(map[string]string{"permission": permission, "acp_transport": acp.RuntimeTransport})
+	metadata := map[string]string{"permission": permission, "acp_transport": acp.RuntimeTransport}
+	if options.Model != "" {
+		metadata[session.MetadataModelKey] = options.Model
+	}
+	if options.ReasoningEffort != "" {
+		metadata[session.MetadataReasoningEffortKey] = options.ReasoningEffort
+	}
+	encoded, err := json.Marshal(metadata)
 	return json.RawMessage(encoded), err
 }
 
@@ -665,6 +709,10 @@ func (s *SessionService) AttachNative(ctx context.Context, id string, options Na
 	if err != nil {
 		return err
 	}
+	providerOptions, err := session.ParseProviderOptions(current.MetadataJSON)
+	if err != nil {
+		return err
+	}
 	workingDirectory := current.WorktreePath
 	if workingDirectory == "" {
 		workingDirectory = current.RepoPath
@@ -680,7 +728,9 @@ func (s *SessionService) AttachNative(ctx context.Context, id string, options Na
 	if err != nil {
 		return err
 	}
-	invocation, err := native.BuildResume(profile, conversationID, workingDirectory)
+	invocation, err := native.BuildResume(profile, conversationID, workingDirectory, native.ProviderOptions{
+		Model: providerOptions.Model, ReasoningEffort: providerOptions.ReasoningEffort,
+	})
 	if err != nil {
 		return fmt.Errorf("Session %s native attachment: %w", id, err)
 	}

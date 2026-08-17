@@ -21,6 +21,7 @@ import (
 	"github.com/yty-build/acp-gateway/internal/native"
 	"github.com/yty-build/acp-gateway/internal/render"
 	appservice "github.com/yty-build/acp-gateway/internal/service"
+	"github.com/yty-build/acp-gateway/internal/session"
 	"github.com/yty-build/acp-gateway/internal/sessionlog"
 	"github.com/yty-build/acp-gateway/internal/store"
 	"github.com/yty-build/acp-gateway/internal/task"
@@ -323,24 +324,26 @@ func runStart(ctx context.Context, args []string, stdout io.Writer, sessions *ap
 	options, err := parseOptions(args, map[string]optionKind{
 		"--agent": stringOption, "--repo": stringOption, "--role": stringOption, "--description": stringOption,
 		"--external-ref": stringOption, "--metadata-json": stringOption, "--prompt": stringOption, "--approve-all": boolOption,
+		"--model": stringOption, "--reasoning-effort": stringOption,
 		"--worktree": boolOption, "--allow-shared-checkout": boolOption,
 	})
 	if err != nil {
 		return usagef("acpctl start: %s", err)
 	}
 	if len(options.positionals) != 1 || strings.TrimSpace(options.values["--agent"]) == "" || strings.TrimSpace(options.values["--repo"]) == "" {
-		return usagef("usage: acpctl start <title> --agent <name> --repo <path> [--role <role>] [--worktree] [--allow-shared-checkout]")
+		return usagef("usage: acpctl start <title> --agent <name> --repo <path> [--role <role>] [--model <id>] [--reasoning-effort <value>] [--worktree] [--allow-shared-checkout]")
 	}
 	started, err := sessions.StartTask(ctx,
 		task.CreateParams{Title: options.positionals[0], Description: options.values["--description"], ExternalRef: options.values["--external-ref"], MetadataJSON: rawJSON(options.values["--metadata-json"]), Status: task.StatusWorking},
 		appservice.StartSessionParams{
 			Agent: options.values["--agent"], RepoPath: options.values["--repo"], Role: options.values["--role"], Prompt: options.values["--prompt"],
+			Model: options.values["--model"], ReasoningEffort: options.values["--reasoning-effort"],
 			ApproveAll: options.booleans["--approve-all"], Worktree: options.booleans["--worktree"], AllowSharedCheckout: options.booleans["--allow-shared-checkout"],
 		},
 	)
 	if err != nil {
 		if started.Task.ID != "" && started.Session.ID != "" {
-			return fmt.Errorf("created Task %s and Session %s, but start failed: %w", started.Task.ID, started.Session.ID, err)
+			return fmt.Errorf("created Task %s and Session %s with status %s, but the Session did not start; inspect it with `acpctl session %s` before trying again", started.Task.ID, started.Session.ID, started.Session.Status, started.Session.ID)
 		}
 		return err
 	}
@@ -407,14 +410,21 @@ func runSession(ctx context.Context, args []string, stdout, stderr io.Writer, se
 	case "logs":
 		return runSessionLogs(ctx, args[1:], stdout, service)
 	case "review":
-		options, err := parseOptions(args[1:], map[string]optionKind{"--agent": stringOption, "--allow-active-producer": boolOption})
+		options, err := parseOptions(args[1:], map[string]optionKind{
+			"--agent": stringOption, "--model": stringOption, "--reasoning-effort": stringOption,
+			"--allow-active-producer": boolOption,
+		})
 		if err != nil || len(options.positionals) != 1 || strings.TrimSpace(options.values["--agent"]) == "" {
-			return usagef("usage: acpctl session review <producer-session-id> --agent <reviewer> [--allow-active-producer]")
+			return usagef("usage: acpctl session review <producer-session-id> --agent <reviewer> [--model <id>] [--reasoning-effort <value>] [--allow-active-producer]")
 		}
 		launched, err := service.Review(ctx, appservice.ReviewSessionParams{
-			ProducerID: options.positionals[0], Agent: options.values["--agent"], AllowActiveProducer: options.booleans["--allow-active-producer"],
+			ProducerID: options.positionals[0], Agent: options.values["--agent"], Model: options.values["--model"],
+			ReasoningEffort: options.values["--reasoning-effort"], AllowActiveProducer: options.booleans["--allow-active-producer"],
 		})
 		if err != nil {
+			if launched.Session.ID != "" {
+				return partialSessionStartError(launched)
+			}
 			return err
 		}
 		fmt.Fprintf(stdout, "Started reviewer %s for %s\nInitial request %s (%s)\n", launched.Session.ID, options.positionals[0], launched.RequestID, launched.State)
@@ -453,24 +463,36 @@ func writeNativeRecoveryResult(stdout io.Writer, sessionID string, recovered app
 func runSessionStart(ctx context.Context, args []string, stdout io.Writer, service *appservice.SessionService) error {
 	options, err := parseOptions(args, map[string]optionKind{
 		"--agent": stringOption, "--repo": stringOption, "--role": stringOption,
+		"--model": stringOption, "--reasoning-effort": stringOption,
 		"--prompt": stringOption, "--approve-all": boolOption, "--worktree": boolOption, "--allow-shared-checkout": boolOption,
 	})
 	if err != nil {
 		return usagef("acpctl session start: %s", err)
 	}
 	if len(options.positionals) != 1 || options.values["--agent"] == "" || options.values["--repo"] == "" {
-		return usagef("usage: acpctl session start <task-id> --agent <name> --repo <path> --role <role> [--worktree] [--allow-shared-checkout] [--prompt <text>] [--approve-all]")
+		return usagef("usage: acpctl session start <task-id> --agent <name> --repo <path> --role <role> [--model <id>] [--reasoning-effort <value>] [--worktree] [--allow-shared-checkout] [--prompt <text>] [--approve-all]")
 	}
 	launched, err := service.Start(ctx, appservice.StartSessionParams{
 		TaskID: options.positionals[0], Agent: options.values["--agent"], RepoPath: options.values["--repo"],
-		Role: options.values["--role"], Prompt: options.values["--prompt"], ApproveAll: options.booleans["--approve-all"],
+		Role: options.values["--role"], Model: options.values["--model"], ReasoningEffort: options.values["--reasoning-effort"],
+		Prompt: options.values["--prompt"], ApproveAll: options.booleans["--approve-all"],
 		Worktree: options.booleans["--worktree"], AllowSharedCheckout: options.booleans["--allow-shared-checkout"],
 	})
 	if err != nil {
+		if launched.Session.ID != "" {
+			return partialSessionStartError(launched)
+		}
 		return err
 	}
 	fmt.Fprintf(stdout, "Started %s\nInitial request %s (%s)\n", launched.Session.ID, launched.RequestID, launched.State)
 	return nil
+}
+
+func partialSessionStartError(launched appservice.LaunchResult) error {
+	if launched.Started {
+		return fmt.Errorf("Session %s started, but its Task status update did not complete; inspect it with `acpctl session %s`", launched.Session.ID, launched.Session.ID)
+	}
+	return fmt.Errorf("Session %s was created with status %s but did not start; inspect it with `acpctl session %s` before trying again", launched.Session.ID, launched.Session.Status, launched.Session.ID)
 }
 
 func showSession(ctx context.Context, id string, stdout io.Writer, service *appservice.SessionService) error {
@@ -480,6 +502,8 @@ func showSession(ctx context.Context, id string, stdout io.Writer, service *apps
 	}
 	fmt.Fprintf(stdout, "%s\nTask: %s\nRole: %s\nAgent: %s\nProvider: %s\nStatus: %s\n", current.ID, current.TaskID, valueOrDash(current.Role), current.Agent, valueOrDash(current.Provider), current.Status)
 	fmt.Fprintf(stdout, "Permission: %s\nRepo: %s\n", appservice.PermissionLabel(current), valueOrDash(current.RepoPath))
+	providerOptions, _ := session.ParseProviderOptions(current.MetadataJSON)
+	fmt.Fprintf(stdout, "Requested model: %s\nRequested reasoning effort: %s\n", valueOrProviderDefault(providerOptions.Model), valueOrProviderDefault(providerOptions.ReasoningEffort))
 	if current.WorktreePath != "" {
 		fmt.Fprintf(stdout, "Worktree: %s\n", current.WorktreePath)
 	}
@@ -610,6 +634,13 @@ func displayTime(value time.Time) string { return value.UTC().Format(time.RFC333
 func valueOrDash(value string) string {
 	if value == "" {
 		return "-"
+	}
+	return value
+}
+
+func valueOrProviderDefault(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "Provider default"
 	}
 	return value
 }

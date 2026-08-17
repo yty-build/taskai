@@ -70,6 +70,186 @@ func TestRuntimeClientUsesPublicRuntimeAndPrivateState(t *testing.T) {
 	}
 }
 
+func TestRuntimeProviderOptionsConfigureAfterIdentityWithGroupedCategoryOptionalOptions(t *testing.T) {
+	client, target, _ := runtimeFixture(t, "success")
+	arguments := filepath.Join(t.TempDir(), "config-arguments.log")
+	target.Profile.Environment["FAKE_ACPX_ARGS_LOG"] = arguments
+	target.Profile.Environment["FAKE_ACPX_CONFIG_OPTIONS"] = "grouped"
+	target.Profile.Environment["FAKE_ACPX_OMIT_MODEL_STATUS"] = "1"
+	spec := StartSpec{Target: target, Model: "model-selected", ReasoningEffort: "high"}
+	started, err := client.Start(context.Background(), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(arguments)
+	if strings.Contains(string(before), "--set-config") {
+		t.Fatalf("provider options were applied before identity persistence boundary: %s", before)
+	}
+	spec.ResumeACPSessionID = started.ACPSessionID
+	spec.ExpectedNativeSessionID = started.NativeSessionID
+	configured, err := client.Configure(context.Background(), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configured.ACPSessionID != started.ACPSessionID || configured.NativeSessionID != started.NativeSessionID {
+		t.Fatalf("configured identity = %#v, started = %#v", configured, started)
+	}
+	body, err := os.ReadFile(arguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"--set-config\nmodel\nmodel-selected", "--set-config\neffort\nhigh"} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("configuration log missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestRuntimeProviderOptionsRejectUnsupportedAndAmbiguousAdvertisingAfterIdentity(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		shape  string
+		model  string
+		effort string
+	}{
+		{name: "unsupported model", shape: "flat", model: "missing-model"},
+		{name: "unsupported effort", shape: "flat", effort: "ultra"},
+		{name: "ambiguous effort", shape: "ambiguous", effort: "high"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, target, _ := runtimeFixture(t, "success")
+			target.Profile.Environment["FAKE_ACPX_CONFIG_OPTIONS"] = test.shape
+			started, err := client.Start(context.Background(), StartSpec{Target: target, Model: test.model, ReasoningEffort: test.effort})
+			if err != nil || started.ACPSessionID == "" {
+				t.Fatalf("identity was not established before configuration: %#v, %v", started, err)
+			}
+			_, err = client.Configure(context.Background(), StartSpec{
+				Target: target, ResumeACPSessionID: started.ACPSessionID,
+				ExpectedNativeSessionID: started.NativeSessionID, Model: test.model, ReasoningEffort: test.effort,
+			})
+			var configurationError *ProviderConfigurationError
+			if !errors.As(err, &configurationError) {
+				t.Fatalf("Configure() error = %T %v", err, err)
+			}
+			for _, secret := range []string{test.model, test.effort, "exactly one", "did not advertise"} {
+				if secret != "" && strings.Contains(err.Error(), secret) {
+					t.Fatalf("Configure() exposed provider-controlled detail %q: %v", secret, err)
+				}
+			}
+			if _, promptErr := client.Prompt(context.Background(), PromptSpec{Target: target, Message: "must not use a partially configured bridge"}, nil); promptErr == nil {
+				t.Fatal("Prompt() remained available after provider configuration failure")
+			}
+		})
+	}
+}
+
+func TestRuntimeProviderOptionsPersistExplicitValuesAlreadyCurrent(t *testing.T) {
+	client, target, _ := runtimeFixture(t, "success")
+	arguments := filepath.Join(t.TempDir(), "config-arguments.log")
+	target.Profile.Environment["FAKE_ACPX_ARGS_LOG"] = arguments
+	target.Profile.Environment["FAKE_ACPX_CONFIG_OPTIONS"] = "flat"
+	spec := StartSpec{Target: target, Model: "provider-default", ReasoningEffort: "medium"}
+	started, err := client.Start(context.Background(), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec.ResumeACPSessionID = started.ACPSessionID
+	spec.ExpectedNativeSessionID = started.NativeSessionID
+	if _, err := client.Configure(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(arguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"--set-config\nmodel\nprovider-default", "--set-config\neffort\nmedium"} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("explicit current option was not persisted (%q):\n%s", want, body)
+		}
+	}
+}
+
+func TestRuntimeProviderOptionsVerifyFinalInterdependentConfiguration(t *testing.T) {
+	client, target, _ := runtimeFixture(t, "success")
+	target.Profile.Environment["FAKE_ACPX_CONFIG_OPTIONS"] = "flat"
+	target.Profile.Environment["FAKE_ACPX_EFFORT_RESETS_MODEL"] = "1"
+	spec := StartSpec{Target: target, Model: "model-selected", ReasoningEffort: "high"}
+	started, err := client.Start(context.Background(), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec.ResumeACPSessionID = started.ACPSessionID
+	spec.ExpectedNativeSessionID = started.NativeSessionID
+	if _, err := client.Configure(context.Background(), spec); err == nil {
+		t.Fatal("Configure() accepted an effort change that reset the requested model")
+	} else {
+		var configurationError *ProviderConfigurationError
+		if !errors.As(err, &configurationError) {
+			t.Fatalf("Configure() error = %T %v", err, err)
+		}
+	}
+	if _, err := client.Prompt(context.Background(), PromptSpec{Target: target, Message: "must not run with the reset model"}, nil); err == nil {
+		t.Fatal("Prompt() remained available after final provider configuration drift")
+	}
+}
+
+func TestRuntimeProviderConfigurationIdentityDriftQuarantinesBridge(t *testing.T) {
+	client, target, _ := runtimeFixture(t, "identity-drift-on-inspect")
+	target.Profile.Environment["FAKE_ACPX_NATIVE_ID"] = "native-canonical"
+	target.Profile.Environment["FAKE_ACPX_CONFIG_OPTIONS"] = "flat"
+	started, err := client.Start(context.Background(), StartSpec{Target: target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := StartSpec{
+		Target: target, ResumeACPSessionID: started.ACPSessionID,
+		ExpectedNativeSessionID: started.NativeSessionID, Model: "model-selected",
+	}
+	if _, err := client.Configure(context.Background(), spec); err == nil {
+		t.Fatal("Configure() accepted native identity drift")
+	} else {
+		var identityErr *IdentityError
+		if !errors.As(err, &identityErr) {
+			t.Fatalf("Configure() identity error = %T %v", err, err)
+		}
+	}
+	target.Profile.Environment["FAKE_ACPX_SCENARIO"] = "success"
+	if _, err := client.Resume(context.Background(), spec); err != nil {
+		t.Fatalf("Resume() after configuration quarantine = %v", err)
+	}
+}
+
+func TestRuntimeProviderOptionsAreReappliedAfterExactRefresh(t *testing.T) {
+	client, target, _ := runtimeFixture(t, "success")
+	arguments := filepath.Join(t.TempDir(), "config-arguments.log")
+	target.Profile.Environment["FAKE_ACPX_ARGS_LOG"] = arguments
+	target.Profile.Environment["FAKE_ACPX_CONFIG_OPTIONS"] = "flat"
+	target.Profile.Environment["FAKE_ACPX_RESET_CONFIG_ON_ENSURE"] = "1"
+	spec := StartSpec{Target: target, Model: "model-selected", ReasoningEffort: "high"}
+	started, err := client.Start(context.Background(), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec.ResumeACPSessionID = started.ACPSessionID
+	spec.ExpectedNativeSessionID = started.NativeSessionID
+	if _, err := client.Configure(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Refresh(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Configure(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(arguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(body), "--set-config\nmodel\nmodel-selected") != 2 || strings.Count(string(body), "--set-config\neffort\nhigh") != 2 {
+		t.Fatalf("options were not applied after both ensure and refresh:\n%s", body)
+	}
+}
+
 func TestRuntimeAgentConfigurationExpandsFriendlyBuiltinsOnly(t *testing.T) {
 	tests := []struct {
 		name        string

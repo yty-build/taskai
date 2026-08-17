@@ -60,6 +60,8 @@ func (m Model) renderSessionWizard(width, height int) string {
 	fields := []string{
 		wizardFieldLine(wizard.field == wizardAgent, "Agent", profile.Name+" · "+profile.Provider+"   ↑/↓ choose", width),
 		wizardFieldLine(wizard.field == wizardRole, "Role", wizardEditorValue(wizard.role, wizard.field == wizardRole, "worker"), width),
+		wizardFieldLine(wizard.field == wizardModel, "Model", wizardEditorValue(wizard.model, wizard.field == wizardModel, "Provider default"), width),
+		wizardFieldLine(wizard.field == wizardReasoningEffort, "Reasoning", wizardEditorValue(wizard.reasoningEffort, wizard.field == wizardReasoningEffort, "Provider default"), width),
 		wizardFieldLine(wizard.field == wizardRepo, "Repository", wizardEditorValue(wizard.repo, wizard.field == wizardRepo, "."), width),
 		wizardFieldLine(wizard.field == wizardWorktree, "Worktree", worktree+"   Space toggles", width),
 		wizardFieldLine(wizard.field == wizardPermission, "Permission", permission+"   Space toggles", width),
@@ -415,6 +417,8 @@ func (m Model) renderSession(width, height int) string {
 	current := m.current
 	provider := strings.ToUpper(valueOr(current.Agent, "agent"))
 	metadata := provider + " · " + valueOr(current.Role, "worker") + " · " + humanizeLabel(appservice.PermissionLabel(current))
+	providerOptions, _ := session.ParseProviderOptions(current.MetadataJSON)
+	metadata += " · model " + valueOr(providerOptions.Model, "provider default") + " · effort " + valueOr(providerOptions.ReasoningEffort, "provider default")
 	location := "Task " + safeText(current.TaskID) + " · " + compactSessionPath(current)
 	if width >= 92 {
 		metadata = fitSplitMetadata("  "+metadata, location, width)

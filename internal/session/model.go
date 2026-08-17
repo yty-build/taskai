@@ -5,9 +5,83 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
+
+const (
+	MetadataModelKey           = "model"
+	MetadataReasoningEffortKey = "reasoning_effort"
+)
+
+var (
+	reasoningEffortPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+)
+
+// ProviderOptions are optional, immutable provider controls stored in a
+// Session's metadata. They are ordinary Session configuration, not another
+// persistent entity. Empty values deliberately preserve the provider's own
+// defaults.
+type ProviderOptions struct {
+	Model           string
+	ReasoningEffort string
+}
+
+func (o ProviderOptions) Validate() error {
+	if o.Model != "" {
+		if len(o.Model) > 256 || !utf8.ValidString(o.Model) {
+			return fmt.Errorf("Session model must be a valid provider model ID of at most 256 bytes")
+		}
+		if strings.HasPrefix(o.Model, "-") {
+			return fmt.Errorf("Session model must not begin with '-'")
+		}
+		for _, value := range o.Model {
+			if !unicode.IsPrint(value) {
+				return fmt.Errorf("Session model must contain only printable characters")
+			}
+		}
+	}
+	if o.ReasoningEffort != "" && !reasoningEffortPattern.MatchString(o.ReasoningEffort) {
+		return fmt.Errorf("Session reasoning effort must be a provider value using only letters, numbers, '.', '_', or '-'")
+	}
+	return nil
+}
+
+// ParseProviderOptions reads the bounded public provider controls without
+// exposing unrelated Session metadata such as permission policy.
+func ParseProviderOptions(metadata json.RawMessage) (ProviderOptions, error) {
+	if len(metadata) == 0 {
+		return ProviderOptions{}, nil
+	}
+	var values map[string]any
+	if err := json.Unmarshal(metadata, &values); err != nil {
+		return ProviderOptions{}, fmt.Errorf("decode Session provider options: %w", err)
+	}
+	read := func(key string) (string, error) {
+		value, exists := values[key]
+		if !exists || value == nil {
+			return "", nil
+		}
+		text, ok := value.(string)
+		if !ok {
+			return "", fmt.Errorf("Session %s metadata must be a string", key)
+		}
+		return strings.TrimSpace(text), nil
+	}
+	model, err := read(MetadataModelKey)
+	if err != nil {
+		return ProviderOptions{}, err
+	}
+	effort, err := read(MetadataReasoningEffortKey)
+	if err != nil {
+		return ProviderOptions{}, err
+	}
+	options := ProviderOptions{Model: model, ReasoningEffort: effort}
+	return options, options.Validate()
+}
 
 type Status string
 

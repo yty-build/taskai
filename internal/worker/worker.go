@@ -52,6 +52,10 @@ type refreshableACPClient interface {
 	Refresh(context.Context, acp.StartSpec) (acp.SessionInfo, error)
 }
 
+type configurableACPClient interface {
+	Configure(context.Context, acp.StartSpec) (acp.SessionInfo, error)
+}
+
 type Config struct {
 	Session                     session.Session
 	Profile                     agents.Profile
@@ -85,6 +89,7 @@ type Worker struct {
 	acpSessionID           string
 	nativeSessionID        string
 	providerConversationID string
+	providerOptions        session.ProviderOptions
 	queue                  []queuedPrompt
 	active                 *queuedPrompt
 	activeCancel           context.CancelFunc
@@ -143,6 +148,10 @@ func New(config Config) (*Worker, error) {
 	if err != nil {
 		return nil, err
 	}
+	providerOptions, err := session.ParseProviderOptions(config.Session.MetadataJSON)
+	if err != nil {
+		return nil, err
+	}
 	target := acp.Target{
 		ConsoleSessionID: config.Session.ID, Profile: config.Profile,
 		WorkingDirectory: workingDirectory, Permission: permission,
@@ -154,6 +163,7 @@ func New(config Config) (*Worker, error) {
 		config: config, target: target, status: config.Session.Status, acpSessionID: config.Session.ACPSessionID,
 		nativeSessionID:        config.Session.NativeSessionID,
 		providerConversationID: config.Session.ProviderConversationID,
+		providerOptions:        providerOptions,
 		seenRequestIDs:         make(map[string]struct{}), permissions: make(map[string]*pendingPermission), wake: make(chan struct{}, 1),
 	}, nil
 }
@@ -255,6 +265,13 @@ func (w *Worker) Run(ctx context.Context) error {
 			err = w.persistRuntimeInfo(ctx, info)
 		}
 		if err == nil {
+			var current session.Session
+			current, err = w.currentIdentity(ctx)
+			if err == nil {
+				err = w.configureProviderOptions(ctx, current)
+			}
+		}
+		if err == nil {
 			w.mu.Lock()
 			w.acpConnected = true
 			if !restoredRefresh {
@@ -264,7 +281,13 @@ func (w *Worker) Run(ctx context.Context) error {
 		}
 	}
 	if err != nil {
-		_, _ = w.publish("", "worker_error", map[string]string{"message": err.Error()})
+		failure := map[string]string{"message": err.Error()}
+		var configurationError *acp.ProviderConfigurationError
+		if errors.As(err, &configurationError) {
+			failure["source"] = "provider"
+			failure["code"] = "configuration_failed"
+		}
+		_, _ = w.publish("", "worker_error", failure)
 		_, _ = w.config.Repository.UpdateSessionStatus(context.Background(), w.config.Session.ID, session.StatusFailed)
 		return err
 	}
@@ -338,12 +361,7 @@ func (w *Worker) Run(ctx context.Context) error {
 }
 
 func (w *Worker) connectACP(ctx context.Context) (acp.SessionInfo, error) {
-	spec := acp.StartSpec{
-		Target: w.target, ResumeACPSessionID: w.config.Session.ACPSessionID,
-		ExpectedProviderConversationID: w.config.Session.ProviderConversationID,
-		ExpectedNativeSessionID:        w.config.Session.NativeSessionID,
-		ProviderStoreVerified:          providerStoreVerified(w.config.Session),
-	}
+	spec := w.startSpec(w.config.Session)
 	if spec.ResumeACPSessionID != "" {
 		info, err := w.config.ACP.Resume(ctx, spec)
 		if err != nil {
@@ -358,6 +376,38 @@ func (w *Worker) connectACP(ctx context.Context) (acp.SessionInfo, error) {
 		return acp.SessionInfo{}, fmt.Errorf("Session %s has canonical provider conversation %q but no ACP Session ID; refusing to start a replacement conversation", w.config.Session.ID, spec.ExpectedProviderConversationID)
 	}
 	return w.config.ACP.Start(ctx, spec)
+}
+
+func (w *Worker) startSpec(current session.Session) acp.StartSpec {
+	return acp.StartSpec{
+		Target: w.target, ResumeACPSessionID: current.ACPSessionID,
+		ExpectedProviderConversationID: current.ProviderConversationID,
+		ExpectedNativeSessionID:        current.NativeSessionID,
+		ProviderStoreVerified:          providerStoreVerified(current),
+		Model:                          w.providerOptions.Model,
+		ReasoningEffort:                w.providerOptions.ReasoningEffort,
+	}
+}
+
+func (w *Worker) configureProviderOptions(ctx context.Context, current session.Session) error {
+	if w.providerOptions.Model == "" && w.providerOptions.ReasoningEffort == "" {
+		return nil
+	}
+	configurator, ok := w.config.ACP.(configurableACPClient)
+	if !ok {
+		return &acp.ProviderConfigurationError{}
+	}
+	info, err := configurator.Configure(ctx, w.startSpec(current))
+	if err != nil {
+		return err
+	}
+	if err := validateObservedIdentity("provider option configuration", info, current); err != nil {
+		return err
+	}
+	if err := w.persistRuntimeInfo(ctx, info); err != nil {
+		return err
+	}
+	return w.writeMetadata(info)
 }
 
 func (w *Worker) persistedRuntimeInfo() (acp.SessionInfo, error) {
@@ -901,12 +951,7 @@ func (w *Worker) rehydrateACPForPrompt(ctx context.Context, requestID string) (u
 	}
 
 	refreshContext, cancelRefresh := context.WithTimeout(ctx, w.refreshTimeout())
-	info, refreshErr := refresher.Refresh(refreshContext, acp.StartSpec{
-		Target: w.target, ResumeACPSessionID: current.ACPSessionID,
-		ExpectedProviderConversationID: current.ProviderConversationID,
-		ExpectedNativeSessionID:        current.NativeSessionID,
-		ProviderStoreVerified:          providerStoreVerified(current),
-	})
+	info, refreshErr := refresher.Refresh(refreshContext, w.startSpec(current))
 	cancelRefresh()
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -919,6 +964,13 @@ func (w *Worker) rehydrateACPForPrompt(ctx context.Context, requestID string) (u
 	}
 	if refreshErr == nil {
 		refreshErr = w.writeMetadata(info)
+	}
+	if refreshErr == nil {
+		var refreshed session.Session
+		refreshed, refreshErr = w.currentIdentity(ctx)
+		if refreshErr == nil {
+			refreshErr = w.configureProviderOptions(ctx, refreshed)
+		}
 	}
 	mode := "refreshed"
 	if refreshErr != nil {
@@ -1024,12 +1076,7 @@ func (w *Worker) refreshTimeout() time.Duration {
 func (w *Worker) resumeExact(ctx context.Context, current session.Session) (acp.SessionInfo, error) {
 	recoveryContext, cancelRecovery := context.WithTimeout(ctx, w.refreshTimeout())
 	defer cancelRecovery()
-	spec := acp.StartSpec{
-		Target: w.target, ResumeACPSessionID: current.ACPSessionID,
-		ExpectedProviderConversationID: current.ProviderConversationID,
-		ExpectedNativeSessionID:        current.NativeSessionID,
-		ProviderStoreVerified:          providerStoreVerified(current),
-	}
+	spec := w.startSpec(current)
 	var lastErr error
 	for attempt := 0; attempt < 2 && recoveryContext.Err() == nil; attempt++ {
 		info, err := w.config.ACP.Resume(recoveryContext, spec)
@@ -1041,6 +1088,13 @@ func (w *Worker) resumeExact(ctx context.Context, current session.Session) (acp.
 		}
 		if err == nil {
 			err = w.writeMetadata(info)
+		}
+		if err == nil {
+			var refreshed session.Session
+			refreshed, err = w.currentIdentity(recoveryContext)
+			if err == nil {
+				err = w.configureProviderOptions(recoveryContext, refreshed)
+			}
 		}
 		if err == nil {
 			w.mu.Lock()

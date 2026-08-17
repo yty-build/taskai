@@ -63,14 +63,23 @@ The HTTP API emits stable DTOs, not database rows. Worker PID/socket/log paths a
 ## Session creation
 
 1. Resolve the declarative agent profile.
-2. Validate the Git repository and optional existing worktree.
-3. Create a readable collision-resistant Session ID.
-4. Acquire a per-repository filesystem lock.
-5. Reject an active writer in the same checkout unless isolation or an explicit override was requested.
-6. Persist the Session under an existing Task. `acpctl start` atomically persists the Task and first Session together.
-7. Create an optional worktree at `$AGENT_HOME/worktrees/<task>-<session>` on branch `agent/<task>/<session>`.
-8. Spawn a detached hidden `acpctl _worker --session <id>` process.
-9. Submit a request-correlated initial prompt containing Task title/description, Session role, repository, worktree/branch, and optional Session instructions.
+2. Validate the Git repository and optional existing worktree. A bounded scan
+   may report one immediate child repository as an explicit suggestion, but it
+   does not retarget the request, start work, traverse child symlinks, or
+   initialize a directory.
+3. Validate optional bounded model/reasoning controls against the profile's
+   proven ACP/native parity. Empty values preserve the provider default.
+4. Create a readable collision-resistant Session ID.
+5. Acquire a per-repository filesystem lock.
+6. Reject an active writer in the same checkout unless isolation or an explicit override was requested.
+7. Persist the Session under an existing Task. `acpctl start` atomically persists the Task and first Session together.
+8. Create an optional worktree at `$AGENT_HOME/worktrees/<task>-<session>` on branch `agent/<task>/<session>`.
+9. Spawn a detached hidden `acpctl _worker --session <id>` process.
+10. Ensure or exactly resume ACP, persist the returned acpx/ACP/native identity,
+    then apply and verify any requested provider controls. A configuration
+    failure leaves that identity durable, marks the Session failed, and sends
+    no prompt.
+11. Submit a request-correlated initial prompt containing Task title/description, Session role, repository, worktree/branch, and optional Session instructions.
 
 If atomic Task/Session persistence fails, neither row survives. If later provisioning fails, the persisted state is marked failed rather than silently disappearing. User worktrees and branches are never automatically deleted.
 
@@ -83,6 +92,8 @@ The worker:
 - probes `acpx` 0.13.0 before operations;
 - owns one long-lived, private Node child using the public `acpx/runtime` API;
 - creates or resumes the same ACP Session;
+- reapplies and verifies immutable requested model/reasoning controls after
+  every exact refresh or resume and before a provider prompt;
 - allows at most one active ACP turn;
 - serializes later ACP prompts in a visible transport-local FIFO;
 - rejects ACP admission while an exclusive native owner or pre-launch

@@ -124,7 +124,7 @@ func TestServerRenderedPagesAndVersionedBrowserBoundary(t *testing.T) {
 
 	taskPage := webRequest(fixture.handler, "/tasks/T-web")
 	assertWebStatus(t, taskPage, http.StatusOK)
-	for _, expected := range []string{"Conversations", "/sessions/S-web", "Start a Session", "structured ACP conversation", "New Session", "Task → Sessions"} {
+	for _, expected := range []string{"Conversations", "/sessions/S-web", "Start a Session", "structured ACP conversation", "New Session", "Task → Sessions", `name="model" maxlength="256"`, `name="reasoning_effort" maxlength="64"`, "Provider default"} {
 		if !strings.Contains(taskPage.Body.String(), expected) {
 			t.Errorf("Task page does not contain %q", expected)
 		}
@@ -141,7 +141,7 @@ func TestServerRenderedPagesAndVersionedBrowserBoundary(t *testing.T) {
 
 	sessionPage := webRequest(fixture.handler, "/sessions/S-web")
 	assertWebStatus(t, sessionPage, http.StatusOK)
-	for _, expected := range []string{"Structured ACP", "canonical conversation", "Verified", "Loading history", "Conversation", "Message codex", "Stop response", "Resume", "Stop worker", "Create reviewer Session", "Closing this page only detaches", "Conversation details", "Session diagnostics", "/private/product"} {
+	for _, expected := range []string{"Structured ACP", "canonical conversation", "Verified", "Loading history", "Conversation", "Message codex", "Stop response", "Resume", "Stop worker", "Create reviewer Session", "Closing this page only detaches", "Conversation details", "Session diagnostics", "/private/product", "Reasoning effort", "Provider default"} {
 		if !strings.Contains(sessionPage.Body.String(), expected) {
 			t.Errorf("Session page does not contain %q", expected)
 		}
@@ -161,7 +161,7 @@ func TestServerRenderedPagesAndVersionedBrowserBoundary(t *testing.T) {
 
 	javascript := webRequest(fixture.handler, "/assets/app.js")
 	assertWebStatus(t, javascript, http.StatusOK)
-	for _, expected := range []string{"new EventSource", "/api/v1/tasks/", "/api/v1/sessions/", "/permissions/decision", "allow_always", "JSON.stringify(activity", "assistant_chunk", "thought_chunk", "tool_upsert", "plan_replace", "makeRollingTextRoom", "completedResponseBlock", "turnHasReasoning", "nearBottom", "patchTurnElement", "patchBlockElement", "blocksPerTurn", "beginFormSubmission"} {
+	for _, expected := range []string{"new EventSource", "/api/v1/tasks/", "/api/v1/sessions/", "/permissions/decision", "allow_always", "JSON.stringify(activity", "assistant_chunk", "thought_chunk", "tool_upsert", "plan_replace", "makeRollingTextRoom", "completedResponseBlock", "turnHasReasoning", "nearBottom", "patchTurnElement", "patchBlockElement", "blocksPerTurn", "beginFormSubmission", "reasoning_effort"} {
 		if !strings.Contains(javascript.Body.String(), expected) {
 			t.Errorf("browser client does not contain %q", expected)
 		}

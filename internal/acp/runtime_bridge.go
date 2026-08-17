@@ -85,6 +85,8 @@ type bridgeCommand struct {
 	CWD             string            `json:"cwd,omitempty"`
 	PermissionMode  PermissionMode    `json:"permissionMode,omitempty"`
 	ResumeSessionID string            `json:"resumeSessionId,omitempty"`
+	Model           string            `json:"model,omitempty"`
+	ReasoningEffort string            `json:"reasoningEffort,omitempty"`
 	RequestID       string            `json:"requestId,omitempty"`
 	Text            string            `json:"text,omitempty"`
 	PermissionID    string            `json:"permissionId,omitempty"`

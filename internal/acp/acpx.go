@@ -63,6 +63,8 @@ type StartSpec struct {
 	ExpectedProviderConversationID string
 	ExpectedNativeSessionID        string
 	ProviderStoreVerified          bool
+	Model                          string
+	ReasoningEffort                string
 }
 
 type SessionInfo struct {
@@ -212,6 +214,17 @@ type ProviderTurnError struct {
 	DetailCode string
 	Message    string
 	Retryable  bool
+}
+
+// ProviderConfigurationError is the bounded public failure returned when an
+// ACP adapter cannot apply an explicitly requested model or reasoning effort.
+// It intentionally does not unwrap the provider/bridge error: provider stderr,
+// credentials, paths, and opaque payloads must not escape through worker JSONL
+// or local HTTP/CLI transports.
+type ProviderConfigurationError struct{}
+
+func (e *ProviderConfigurationError) Error() string {
+	return "provider could not apply the requested model or reasoning effort; leave the controls on Provider default or choose values advertised by the provider"
 }
 
 func (e *ProviderTurnError) Error() string {

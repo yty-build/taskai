@@ -1222,9 +1222,19 @@ func TestTaskConsoleCreatesAndOpensSessionThroughWizard(t *testing.T) {
 	if model.wizard == nil || !strings.Contains(model.View(), "NEW SESSION") {
 		t.Fatalf("wizard did not open:\n%s", model.View())
 	}
-	// Move to the final field and submit. Defaults intentionally prove isolated
-	// worktree + read approval without requiring shell commands or copied IDs.
-	for range 5 {
+	// Populate both optional provider controls, then move to the final field and
+	// submit. Defaults still prove isolated worktree + read approval.
+	for model.wizard.field != wizardModel {
+		updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyTab})
+		model = updated.(Model)
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("model-selected")})
+	model = updated.(Model)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyTab})
+	model = updated.(Model)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("high")})
+	model = updated.(Model)
+	for model.wizard.field != wizardPrompt {
 		updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyTab})
 		model = updated.(Model)
 	}
@@ -1241,7 +1251,7 @@ func TestTaskConsoleCreatesAndOpensSessionThroughWizard(t *testing.T) {
 	backend.mu.Lock()
 	starts := append([]appservice.StartSessionParams(nil), backend.starts...)
 	backend.mu.Unlock()
-	if len(starts) != 1 || starts[0].TaskID != "T-1" || starts[0].Agent != "codex" || !starts[0].Worktree || starts[0].ApproveAll {
+	if len(starts) != 1 || starts[0].TaskID != "T-1" || starts[0].Agent != "codex" || starts[0].Model != "model-selected" || starts[0].ReasoningEffort != "high" || !starts[0].Worktree || starts[0].ApproveAll {
 		t.Fatalf("wizard start params = %#v", starts)
 	}
 }

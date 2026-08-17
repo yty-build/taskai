@@ -12,6 +12,7 @@ import (
 
 	"github.com/yty-build/acp-gateway/internal/agents"
 	gitrepo "github.com/yty-build/acp-gateway/internal/git"
+	"github.com/yty-build/acp-gateway/internal/session"
 )
 
 // PermissionResponder is implemented by ACP transports that can keep a real
@@ -102,6 +103,10 @@ func (c *RuntimeClient) Refresh(ctx context.Context, spec StartSpec) (SessionInf
 	if err != nil {
 		return SessionInfo{}, err
 	}
+	providerOptions := session.ProviderOptions{Model: strings.TrimSpace(spec.Model), ReasoningEffort: strings.TrimSpace(spec.ReasoningEffort)}
+	if err := providerOptions.Validate(); err != nil {
+		return SessionInfo{}, err
+	}
 	bridge, err := c.existingBridge(target)
 	if err != nil {
 		return SessionInfo{}, err
@@ -112,6 +117,7 @@ func (c *RuntimeClient) Refresh(ctx context.Context, spec StartSpec) (SessionInf
 		Type: "refresh", SessionKey: target.ConsoleSessionID, Agent: agentName, UseBuiltin: useBuiltin,
 		Argv: bridgeAgentArgv(target.Profile), Environment: cloneProfileEnvironment(target.Profile.Environment),
 		CWD: target.WorkingDirectory, PermissionMode: target.Permission, ResumeSessionID: spec.ResumeACPSessionID,
+		Model: providerOptions.Model, ReasoningEffort: providerOptions.ReasoningEffort,
 	}, &payload)
 	if err != nil {
 		c.discardBridge()
@@ -123,6 +129,43 @@ func (c *RuntimeClient) Refresh(ctx context.Context, spec StartSpec) (SessionInf
 		return SessionInfo{}, err
 	}
 	if err := ValidateSessionIdentity("runtime refresh", info, spec.ResumeACPSessionID, spec.ExpectedNativeSessionID, spec.ExpectedProviderConversationID, spec.ProviderStoreVerified); err != nil {
+		c.discardBridge()
+		return SessionInfo{}, err
+	}
+	c.bindIdentity(spec, info)
+	return info, nil
+}
+
+// Configure applies optional provider controls only after ensure/resume has
+// returned a stable identity to the worker for durable persistence. This
+// ordering prevents an invalid model or effort from orphaning a newly-created
+// provider conversation whose exact ID was never recorded.
+func (c *RuntimeClient) Configure(ctx context.Context, spec StartSpec) (SessionInfo, error) {
+	target, err := c.readyTarget(spec.Target)
+	if err != nil {
+		return SessionInfo{}, err
+	}
+	providerOptions := session.ProviderOptions{Model: strings.TrimSpace(spec.Model), ReasoningEffort: strings.TrimSpace(spec.ReasoningEffort)}
+	if err := providerOptions.Validate(); err != nil {
+		return SessionInfo{}, err
+	}
+	bridge, err := c.existingBridge(target)
+	if err != nil {
+		return SessionInfo{}, err
+	}
+	var payload bridgeSession
+	if err := bridge.call(ctx, bridgeCommand{
+		Type: "configure", Model: providerOptions.Model, ReasoningEffort: providerOptions.ReasoningEffort,
+	}, &payload); err != nil {
+		c.discardBridge()
+		return SessionInfo{}, &ProviderConfigurationError{}
+	}
+	info, err := bridgeSessionInfo(target, payload)
+	if err != nil {
+		c.discardBridge()
+		return SessionInfo{}, err
+	}
+	if err := ValidateSessionIdentity("runtime provider configuration", info, spec.ResumeACPSessionID, spec.ExpectedNativeSessionID, spec.ExpectedProviderConversationID, spec.ProviderStoreVerified); err != nil {
 		c.discardBridge()
 		return SessionInfo{}, err
 	}
@@ -166,6 +209,10 @@ func (c *RuntimeClient) ensure(ctx context.Context, spec StartSpec) (SessionInfo
 	if err != nil {
 		return SessionInfo{}, err
 	}
+	providerOptions := session.ProviderOptions{Model: strings.TrimSpace(spec.Model), ReasoningEffort: strings.TrimSpace(spec.ReasoningEffort)}
+	if err := providerOptions.Validate(); err != nil {
+		return SessionInfo{}, err
+	}
 	bridge, err := c.bridgeFor(ctx, target)
 	if err != nil {
 		return SessionInfo{}, err
@@ -176,6 +223,7 @@ func (c *RuntimeClient) ensure(ctx context.Context, spec StartSpec) (SessionInfo
 		Type: "ensure", SessionKey: target.ConsoleSessionID, Agent: agentName, UseBuiltin: useBuiltin,
 		Argv: bridgeAgentArgv(target.Profile), Environment: cloneProfileEnvironment(target.Profile.Environment),
 		CWD: target.WorkingDirectory, PermissionMode: target.Permission, ResumeSessionID: spec.ResumeACPSessionID,
+		Model: providerOptions.Model, ReasoningEffort: providerOptions.ReasoningEffort,
 	}, &payload)
 	if err != nil {
 		return SessionInfo{}, err

@@ -398,6 +398,107 @@ function configure(command) {
   });
 }
 
+function advertisedConfigOptions(status) {
+  const options = status?.details?.configOptions;
+  return Array.isArray(options) ? options : [];
+}
+
+function advertisedSelectValues(option) {
+  if (!option || option.type !== "select" || !Array.isArray(option.options)) {
+    return [];
+  }
+  const values = [];
+  for (const candidate of option.options) {
+    if (typeof candidate?.value === "string" && candidate.value.trim()) {
+      values.push(candidate.value.trim());
+      continue;
+    }
+    if (Array.isArray(candidate?.options)) {
+      for (const nested of candidate.options) {
+        if (typeof nested?.value === "string" && nested.value.trim()) values.push(nested.value.trim());
+      }
+    }
+  }
+  return values;
+}
+
+function uniqueConfigOption(status, category, fallbackIds, label) {
+  const options = advertisedConfigOptions(status);
+  const ids = new Set(fallbackIds);
+  const matches = options.filter(
+    (option) => option && typeof option.id === "string" && option.id.trim().length > 0 &&
+      (option.category === category || ids.has(option.id.trim())),
+  );
+  if (matches.length === 1) return matches[0];
+  throw new Error(
+    `the provider did not advertise exactly one ${label} option; leave ${label} on Provider default or update the provider adapter`,
+  );
+}
+
+function modelSelectionMatches(requested, effective) {
+  if (!requested) return true;
+  if (!effective) return false;
+  return effective === requested || effective.startsWith(`${requested}[`);
+}
+
+async function applyRequestedProviderOptions(command) {
+  let status = await runtime.getStatus({ handle });
+  const requestedModel = typeof command.model === "string" ? command.model.trim() : "";
+  if (requestedModel) {
+    const modelOption = uniqueConfigOption(status, "model", ["model"], "model");
+    if (!advertisedSelectValues(modelOption).includes(requestedModel)) {
+      throw new Error(`the provider did not advertise requested model ${JSON.stringify(requestedModel)}; choose Provider default or another advertised model`);
+    }
+    // Always set explicitly, even when the provider currently reports this
+    // value. acpx persists the requested control only through setConfigOption,
+    // and that durable intent is needed for its own reconnect path.
+    await runtime.setConfigOption({ handle, key: modelOption.id, value: requestedModel });
+    status = await runtime.getStatus({ handle });
+    const appliedModelOption = uniqueConfigOption(status, "model", ["model"], "model");
+    const appliedByOption = appliedModelOption.currentValue === requestedModel;
+    const appliedByStatus = modelSelectionMatches(requestedModel, status?.models?.currentModelId);
+    if (!appliedByOption && !appliedByStatus) {
+      throw new Error(`the provider did not apply requested model ${JSON.stringify(requestedModel)}`);
+    }
+  }
+
+  const requestedEffort = typeof command.reasoningEffort === "string" ? command.reasoningEffort.trim() : "";
+  if (requestedEffort) {
+    const effortOption = uniqueConfigOption(status, "thought_level", ["reasoning_effort", "effort", "thinking", "thought_level"], "reasoning effort");
+    if (!advertisedSelectValues(effortOption).includes(requestedEffort)) {
+      throw new Error(`the provider did not advertise requested reasoning effort ${JSON.stringify(requestedEffort)}; choose Provider default or another advertised effort`);
+    }
+    // See the model branch above: setting an already-effective value is still
+    // required so acpx records the explicit desired option for reconnects.
+    await runtime.setConfigOption({ handle, key: effortOption.id, value: requestedEffort });
+    status = await runtime.getStatus({ handle });
+    const applied = uniqueConfigOption(status, "thought_level", ["reasoning_effort", "effort", "thinking", "thought_level"], "reasoning effort");
+    if (applied.currentValue !== requestedEffort) {
+      throw new Error(`the provider did not apply requested reasoning effort ${JSON.stringify(requestedEffort)}`);
+    }
+  }
+
+  // Some adapters expose interdependent controls: applying effort may reset
+  // the model (or vice versa). Verify the complete requested tuple only after
+  // every mutation, immediately before the worker is allowed to send a turn.
+  status = await runtime.getStatus({ handle });
+  if (requestedModel) {
+    const finalModelOption = uniqueConfigOption(status, "model", ["model"], "model");
+    const finalModelByOption = finalModelOption.currentValue === requestedModel;
+    const finalModelByStatus = modelSelectionMatches(requestedModel, status?.models?.currentModelId);
+    if (!finalModelByOption && !finalModelByStatus) {
+      throw new Error(`the provider did not retain requested model ${JSON.stringify(requestedModel)}`);
+    }
+  }
+  if (requestedEffort) {
+    const finalEffortOption = uniqueConfigOption(status, "thought_level", ["reasoning_effort", "effort", "thinking", "thought_level"], "reasoning effort");
+    if (finalEffortOption.currentValue !== requestedEffort) {
+      throw new Error(`the provider did not retain requested reasoning effort ${JSON.stringify(requestedEffort)}`);
+    }
+  }
+  return status;
+}
+
 async function ensure(command) {
   configure(command);
   if (handle) {
@@ -422,6 +523,17 @@ async function ensure(command) {
     await runtime.setMode({ handle, mode: readApprovalMode });
   }
   const status = await runtime.getStatus({ handle });
+  emit({ type: "response", commandId: command.commandId, data: { handle, status } });
+}
+
+async function configureProviderOptions(command) {
+  if (!runtime || !handle) {
+    throw new Error("acpx runtime Session is not ensured");
+  }
+  if (activeTurn) {
+    throw new Error("cannot configure provider options while an acpx runtime turn is active");
+  }
+  const status = await applyRequestedProviderOptions(command);
   emit({ type: "response", commandId: command.commandId, data: { handle, status } });
 }
 
@@ -559,6 +671,9 @@ async function handleCommand(command) {
         break;
       case "refresh":
         await refresh(command);
+        break;
+      case "configure":
+        await configureProviderOptions(command);
         break;
       case "turn":
         await runTurn(command);

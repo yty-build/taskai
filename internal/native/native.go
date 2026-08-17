@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/yty-build/acp-gateway/internal/agents"
+	"github.com/yty-build/acp-gateway/internal/session"
 )
 
 type Invocation struct {
@@ -19,6 +20,41 @@ type Invocation struct {
 	Args             []string
 	WorkingDirectory string
 	Environment      map[string]string
+}
+
+type ProviderOptions = session.ProviderOptions
+
+// ValidateProviderOptions proves that every requested option has a documented,
+// argument-safe mapping for both the profile's ACP session and its exact native
+// resume command. Empty options remain valid for every profile because they
+// preserve provider defaults.
+func ValidateProviderOptions(profile agents.Profile, options ProviderOptions) error {
+	options.Model = strings.TrimSpace(options.Model)
+	options.ReasoningEffort = strings.TrimSpace(options.ReasoningEffort)
+	if err := options.Validate(); err != nil {
+		return err
+	}
+	if options.Model == "" && options.ReasoningEffort == "" {
+		return nil
+	}
+	switch profile.Name {
+	case "codex":
+		return nil
+	case "claude":
+		if strings.EqualFold(options.ReasoningEffort, "default") {
+			return fmt.Errorf("agent %q uses a blank reasoning effort for Provider default; leave reasoning effort empty", profile.Name)
+		}
+		return nil
+	case "grok", "grok-build":
+		return fmt.Errorf("agent %q does not advertise verifiable ACP model or reasoning controls; leave both controls on Provider default", profile.Name)
+	case "opencode":
+		if options.ReasoningEffort != "" {
+			return fmt.Errorf("agent %q does not advertise a provider-native reasoning effort option; leave reasoning effort on Provider default", profile.Name)
+		}
+		return nil
+	default:
+		return fmt.Errorf("agent %q does not declare documented provider-native model or reasoning effort flags; leave both controls on Provider default", profile.Name)
+	}
 }
 
 type Runner interface {
@@ -76,7 +112,7 @@ func (r *ExecRunner) Run(ctx context.Context, invocation Invocation, input io.Re
 // BuildResume returns only documented, ID-based resume invocations. Profiles
 // without a known mapping are unavailable instead of falling back to a new
 // provider conversation.
-func BuildResume(profile agents.Profile, conversationID, workingDirectory string) (Invocation, error) {
+func BuildResume(profile agents.Profile, conversationID, workingDirectory string, requested ...ProviderOptions) (Invocation, error) {
 	if err := profile.Validate(); err != nil {
 		return Invocation{}, err
 	}
@@ -87,16 +123,40 @@ func BuildResume(profile agents.Profile, conversationID, workingDirectory string
 	if strings.TrimSpace(workingDirectory) == "" {
 		return Invocation{}, fmt.Errorf("native working directory is required")
 	}
+	if len(requested) > 1 {
+		return Invocation{}, fmt.Errorf("native provider options may be supplied only once")
+	}
+	options := ProviderOptions{}
+	if len(requested) == 1 {
+		options.Model = strings.TrimSpace(requested[0].Model)
+		options.ReasoningEffort = strings.TrimSpace(requested[0].ReasoningEffort)
+	}
+	if err := ValidateProviderOptions(profile, options); err != nil {
+		return Invocation{}, err
+	}
 	arguments := append([]string(nil), profile.Args...)
 	command := profile.Command
 	switch profile.Name {
 	case "codex":
-		arguments = append(arguments, "resume", conversationID)
+		arguments = append(arguments, "resume")
+		arguments = appendNativeModel(arguments, options.Model)
+		if options.ReasoningEffort != "" {
+			arguments = append(arguments, "--config", `model_reasoning_effort="`+options.ReasoningEffort+`"`)
+		}
+		arguments = append(arguments, conversationID)
 	case "claude":
+		arguments = appendNativeModel(arguments, options.Model)
+		if options.ReasoningEffort != "" {
+			arguments = append(arguments, "--effort", options.ReasoningEffort)
+		}
 		arguments = append(arguments, "--resume", conversationID)
 	case "grok", "grok-build":
 		if filepathBase(command) == "grok-build" {
 			command = "grok"
+		}
+		arguments = appendNativeModel(arguments, options.Model)
+		if options.ReasoningEffort != "" {
+			arguments = append(arguments, "--reasoning-effort", options.ReasoningEffort)
 		}
 		arguments = append(arguments, "--resume", conversationID)
 	case "opencode":
@@ -110,6 +170,7 @@ func BuildResume(profile agents.Profile, conversationID, workingDirectory string
 		} else if filepathBase(command) != "opencode" {
 			command, arguments = "opencode", nil
 		}
+		arguments = appendNativeModel(arguments, options.Model)
 		arguments = append(arguments, "--session", conversationID)
 	default:
 		return Invocation{}, fmt.Errorf("agent %q does not declare a supported provider-native resume command", profile.Name)
@@ -118,6 +179,13 @@ func BuildResume(profile agents.Profile, conversationID, workingDirectory string
 		Command: command, Args: arguments, WorkingDirectory: workingDirectory,
 		Environment: cloneEnvironment(profile.Environment),
 	}, nil
+}
+
+func appendNativeModel(arguments []string, model string) []string {
+	if model == "" {
+		return arguments
+	}
+	return append(arguments, "--model", model)
 }
 
 func isOpenCodeNPX(arguments []string) bool {

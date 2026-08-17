@@ -81,6 +81,7 @@ func TestStartPersistsPermissionAndSendsCompleteInitialPrompt(t *testing.T) {
 	service := NewSessionService(repository, registry, home, runtime)
 	launched, err := service.Start(ctx, StartSessionParams{
 		TaskID: createdTask.ID, Agent: "codex", Role: "analyst", RepoPath: repo,
+		Model: "gpt-5.6-sol", ReasoningEffort: "high",
 		Prompt: "Check the one-hour horizon too", ApproveAll: true,
 	})
 	if err != nil {
@@ -95,6 +96,10 @@ func TestStartPersistsPermissionAndSendsCompleteInitialPrompt(t *testing.T) {
 	}
 	if PermissionLabel(current) != "approve-all" || current.TaskID != createdTask.ID || current.LogPath != filepath.Join(home.Logs, current.ID+".jsonl") {
 		t.Fatalf("Session = %#v", current)
+	}
+	providerOptions, err := session.ParseProviderOptions(current.MetadataJSON)
+	if err != nil || providerOptions.Model != "gpt-5.6-sol" || providerOptions.ReasoningEffort != "high" {
+		t.Fatalf("provider options = %#v, %v", providerOptions, err)
 	}
 	updatedTask, err := repository.GetTask(ctx, createdTask.ID)
 	if err != nil || updatedTask.Status != task.StatusWorking {
@@ -161,6 +166,12 @@ func TestPrepareDefaultsToReadApprovalAndValidatesProfileAndDirectory(t *testing
 	}
 	if _, err := service.Prepare(StartSessionParams{Agent: "codex", RepoPath: filepath.Join(root, "missing")}); err == nil {
 		t.Fatal("missing repository directory accepted")
+	}
+	if _, err := service.Prepare(StartSessionParams{Agent: "grok", RepoPath: repo, Model: "grok-4.6"}); err == nil || !strings.Contains(err.Error(), "verifiable ACP") {
+		t.Fatalf("Grok explicit controls were not rejected before Session creation: %v", err)
+	}
+	if _, err := service.Prepare(StartSessionParams{Agent: "claude", RepoPath: repo, ReasoningEffort: "default"}); err == nil || !strings.Contains(err.Error(), "leave reasoning effort empty") {
+		t.Fatalf("Claude explicit default sentinel was not rejected before Session creation: %v", err)
 	}
 }
 

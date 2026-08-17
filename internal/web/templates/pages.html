@@ -79,6 +79,11 @@
       <label>Agent<select name="agent" required>{{range .Agents}}<option value="{{.Name}}">{{.Name}} · {{.Provider}}</option>{{end}}</select></label>
       <label>Role<input name="role" value="worker" required autocomplete="off"></label>
     </div>
+    <div class="form-pair">
+      <label>Model <span>Optional</span><input name="model" maxlength="256" autocomplete="off" placeholder="Provider default"></label>
+      <label>Reasoning effort <span>Optional</span><input name="reasoning_effort" maxlength="64" autocomplete="off" placeholder="Provider default"></label>
+    </div>
+    <p class="field-help">Leave either control blank to use the provider default. Explicit values are validated against the provider before the first turn.</p>
     <label>Git repository<input name="repo_path" required autocomplete="off" placeholder="/absolute/path/to/repository"></label>
     <label>Instructions <span>Optional</span><textarea name="prompt" rows="4" placeholder="Additional instructions appended to the Task context"></textarea></label>
     <details class="advanced-options">
@@ -237,6 +242,8 @@
     <dl class="detail-list">
       <dt>Task</dt><dd>{{.Task.Title}}</dd>
       <dt>Session</dt><dd class="mono">{{.Session.ID}}</dd>
+      <dt>Model</dt><dd>{{if .Session.RequestedModel}}{{.Session.RequestedModel}}{{else}}Provider default{{end}}</dd>
+      <dt>Reasoning effort</dt><dd>{{if .Session.RequestedReasoningEffort}}{{.Session.RequestedReasoningEffort}}{{else}}Provider default{{end}}</dd>
       <dt>Repository</dt><dd class="mono">{{.Session.RepoPath}}</dd>
       {{if .Session.WorktreePath}}<dt>Worktree</dt><dd class="mono">{{.Session.WorktreePath}}</dd>{{end}}
       {{if .Session.Branch}}<dt>Branch</dt><dd class="mono">{{.Session.Branch}}</dd>{{end}}
@@ -254,6 +261,10 @@
     <div class="modal-heading"><span class="modal-icon">✓</span><div><p class="eyebrow">Independent verification</p><h2 id="review-title">Create a reviewer Session</h2><p>The reviewer receives evidence and repository context, not the producer's conversation.</p></div></div>
     <form id="review-form" class="stack-form">
       <label>Reviewer agent<select name="agent" required>{{range .Agents}}<option value="{{.Name}}">{{.Name}} · {{.Provider}}</option>{{end}}</select></label>
+      <div class="form-pair">
+        <label>Model <span>Optional</span><input name="model" maxlength="256" autocomplete="off" placeholder="Provider default"></label>
+        <label>Reasoning effort <span>Optional</span><input name="reasoning_effort" maxlength="64" autocomplete="off" placeholder="Provider default"></label>
+      </div>
       <label class="check"><input type="checkbox" name="allow_active_producer"><span><strong>Review while producer may change</strong><small>Normally the producer must be stopped or terminal.</small></span></label>
       <p id="review-notice" class="notice" role="status" aria-live="polite"></p>
       <div class="modal-actions"><button type="button" class="secondary" data-close-dialog>Cancel</button><button type="submit" class="primary">Create reviewer</button></div>

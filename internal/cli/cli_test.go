@@ -191,7 +191,7 @@ func TestStartCreatesTaskAndSession(t *testing.T) {
 	originalFactory := sessionRuntimeFactory
 	sessionRuntimeFactory = func(config.Home, string) appservice.Runtime { return fakeSessionRuntime{} }
 	t.Cleanup(func() { sessionRuntimeFactory = originalFactory })
-	code, stdout, stderr := runForTest(t, "start", "Fix login", "--agent", "codex", "--repo", repo, "--role", "implementer", "--description", "Production regression")
+	code, stdout, stderr := runForTest(t, "start", "Fix login", "--agent", "codex", "--repo", repo, "--role", "implementer", "--description", "Production regression", "--model", "gpt-5.6-sol", "--reasoning-effort", "high")
 	if code != ExitOK || stderr != "" {
 		t.Fatalf("start: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
@@ -200,6 +200,10 @@ func TestStartCreatesTaskAndSession(t *testing.T) {
 		t.Fatalf("start output = %q", stdout)
 	}
 	taskID, sessionID := fields[1], fields[3]
+	code, stdout, stderr = runForTest(t, "session", sessionID)
+	if code != ExitOK || stderr != "" || !strings.Contains(stdout, "Requested model: gpt-5.6-sol") || !strings.Contains(stdout, "Requested reasoning effort: high") {
+		t.Fatalf("session provider options: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
 	code, stdout, stderr = runForTest(t, "task", taskID)
 	if code != ExitOK || stderr != "" || !strings.Contains(stdout, sessionID) || !strings.Contains(stdout, "implementer") || !strings.Contains(stdout, "codex") || !strings.Contains(stdout, "starting") {
 		t.Fatalf("task show: code=%d stdout=%q stderr=%q", code, stdout, stderr)

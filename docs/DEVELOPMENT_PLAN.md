@@ -122,6 +122,12 @@ Commit: `feat: add declarative agent registry`
   that precede provider commit, post-turn identity inspection, and display
   reconciliation signals. Retain
   CLI-adapter fixtures for the legacy compatibility unit tests.
+- Support optional Session model/reasoning controls without a new model
+  abstraction: persist exact requested values only after profile-level
+  ACP/native parity validation, persist provider identity before applying
+  them, jointly verify them before prompting, and reapply them after exact
+  Refresh/Resume. Configuration failure must preserve the failed Session and
+  redact provider detail.
 - Run a focused live compatibility spike before locking the subprocess/queue behavior.
 
 Commit: `feat: add the acpx execution adapter`
@@ -162,6 +168,9 @@ Commit: `feat: add durable session workers`
 - Implement `acpctl session start`, detail, prompt, cancel, resume, stop, and logs.
 - Implement `acpctl task logs` aggregation.
 - Starting a Session must send an initial prompt containing Task title, description, role, and repo/worktree context; `--prompt` appends Session-specific instructions.
+- Expose the same optional `--model` and `--reasoning-effort` controls through
+  CLI, API, Web, reviewer creation, and the terminal wizard. Blank means
+  Provider default; unsupported profile combinations fail before creation.
 - Default to read approval. Require an explicit choice such as `--approve-all` for unattended writes and persist it in `metadata_json`.
 - `logs --follow` must support normalized and `--raw` gateway output and fall
   back to Session JSONL when the worker is unavailable. Label this as gateway
@@ -202,6 +211,9 @@ Commit: `feat: add session lifecycle controls`
   shelf, and a wrapping two-line composer. Do not imitate provider-native
   harness features.
 - New Sessions must appear without restarting the console.
+- The New Session wizard must display and submit the optional requested model
+  and reasoning effort, and Session detail must disclose requested values or
+  Provider default without claiming an inferred effective value.
 - Keyboard and mouse selection drill into a Session and allow return to the
   Task view with selection/filter/scroll state restored after native handoff.
 - Consume a semantic Session projection: provider snapshot as committed base,

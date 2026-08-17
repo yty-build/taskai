@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	gitrepo "github.com/yty-build/acp-gateway/internal/git"
 	"github.com/yty-build/acp-gateway/internal/presentation"
 	appservice "github.com/yty-build/acp-gateway/internal/service"
 	"github.com/yty-build/acp-gateway/internal/sessionlog"
@@ -138,6 +139,8 @@ func (s *Server) listTaskSessions(writer http.ResponseWriter, request *http.Requ
 type startSessionRequest struct {
 	Agent               string `json:"agent"`
 	Role                string `json:"role"`
+	Model               string `json:"model"`
+	ReasoningEffort     string `json:"reasoning_effort"`
 	RepoPath            string `json:"repo_path"`
 	Prompt              string `json:"prompt"`
 	Worktree            bool   `json:"worktree"`
@@ -153,9 +156,14 @@ func (s *Server) startSession(writer http.ResponseWriter, request *http.Request)
 	}
 	launched, err := s.sessions.Start(request.Context(), appservice.StartSessionParams{
 		TaskID: request.PathValue("taskID"), Agent: body.Agent, Role: body.Role, RepoPath: body.RepoPath,
+		Model: body.Model, ReasoningEffort: body.ReasoningEffort,
 		Prompt: body.Prompt, Worktree: body.Worktree, ApproveAll: body.ApproveAll, AllowSharedCheckout: body.AllowSharedCheckout,
 	})
 	if err != nil {
+		if launched.Session.ID != "" {
+			writePartialSessionCreated(writer, launched)
+			return
+		}
 		writeValidationError(writer, err)
 		return
 	}
@@ -292,6 +300,8 @@ func (s *Server) stop(writer http.ResponseWriter, request *http.Request) {
 
 type reviewRequest struct {
 	Agent               string `json:"agent"`
+	Model               string `json:"model"`
+	ReasoningEffort     string `json:"reasoning_effort"`
 	AllowActiveProducer bool   `json:"allow_active_producer"`
 }
 
@@ -302,14 +312,38 @@ func (s *Server) review(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	launched, err := s.sessions.Review(request.Context(), appservice.ReviewSessionParams{
-		ProducerID: request.PathValue("sessionID"), Agent: body.Agent, AllowActiveProducer: body.AllowActiveProducer,
+		ProducerID: request.PathValue("sessionID"), Agent: body.Agent, Model: body.Model,
+		ReasoningEffort: body.ReasoningEffort, AllowActiveProducer: body.AllowActiveProducer,
 	})
 	if err != nil {
+		if launched.Session.ID != "" {
+			writePartialSessionCreated(writer, launched)
+			return
+		}
 		writeValidationError(writer, err)
 		return
 	}
 	writeJSON(writer, http.StatusCreated, map[string]any{
 		"session": makeSessionDTO(launched.Session), "request_id": launched.RequestID, "state": launched.State,
+	})
+}
+
+func writePartialSessionCreated(writer http.ResponseWriter, launched appservice.LaunchResult) {
+	state := strings.TrimSpace(launched.State)
+	if state == "" {
+		state = string(launched.Session.Status)
+	}
+	code := "session_start_failed"
+	message := "The Session was created but could not start. Open it to inspect its saved provider identity and status before trying again."
+	if launched.Started {
+		code = "session_started_with_warning"
+		message = "The Session started, but a follow-up Task status update did not complete. Its conversation remains available."
+	}
+	writeJSON(writer, http.StatusCreated, map[string]any{
+		"session": makeSessionDTO(launched.Session), "request_id": launched.RequestID, "state": state,
+		"warning": map[string]string{
+			"code": code, "message": message,
+		},
 	})
 }
 
@@ -479,6 +513,14 @@ func writeValidationError(writer http.ResponseWriter, err error) {
 	}
 	if strings.Contains(err.Error(), "already used by active Session") || strings.Contains(err.Error(), "checkout may still change") {
 		writeJSONError(writer, http.StatusConflict, "checkout_conflict", err.Error())
+		return
+	}
+	var repositorySuggestion *gitrepo.RepositorySuggestionError
+	if errors.As(err, &repositorySuggestion) && repositorySuggestion.SuggestedRepositoryPath != "" {
+		writeJSON(writer, http.StatusUnprocessableEntity, map[string]any{"error": map[string]any{
+			"code": "repository_selection_required", "message": err.Error(),
+			"suggested_repo_path": repositorySuggestion.SuggestedRepositoryPath,
+		}})
 		return
 	}
 	writeJSONError(writer, http.StatusUnprocessableEntity, "validation_failed", err.Error())

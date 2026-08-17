@@ -7,10 +7,12 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -20,6 +22,8 @@ import (
 var idComponent = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
 const MaxReviewDiffBytes = 64 << 10
+
+const maxNestedRepositoryEntries = 256
 
 type Worktree struct {
 	Repository string
@@ -34,6 +38,29 @@ type ReviewSnapshot struct {
 	UnstagedDiff string
 	Truncated    bool
 }
+
+// RepositorySuggestionError reports a single, nearby checkout without
+// silently changing the repository the user selected. Transports can offer
+// SuggestedRepositoryPath as an explicit correction and require resubmission.
+type RepositorySuggestionError struct {
+	InputPath               string
+	SuggestedRepositoryPath string
+}
+
+func (e *RepositorySuggestionError) Error() string {
+	return fmt.Sprintf("validate Git repository %q: not a Git worktree; found one immediate Git repository at %q; use that exact path to continue", e.InputPath, e.SuggestedRepositoryPath)
+}
+
+type repositoryVerificationError struct {
+	Path  string
+	Cause error
+}
+
+func (e *repositoryVerificationError) Error() string {
+	return fmt.Sprintf("validate Git repository %q: Git metadata exists but could not be verified; check its ownership, permissions, and metadata", e.Path)
+}
+
+func (e *repositoryVerificationError) Unwrap() error { return e.Cause }
 
 // ValidateRepository resolves path to the root of a non-bare Git worktree.
 func ValidateRepository(ctx context.Context, path string) (string, error) {
@@ -51,16 +78,69 @@ func ValidateRepository(ctx context.Context, path string) (string, error) {
 	if !info.IsDir() {
 		return "", fmt.Errorf("repository %q is not a directory", resolved)
 	}
-	inside, err := run(ctx, resolved, "rev-parse", "--is-inside-work-tree")
-	if err != nil || strings.TrimSpace(inside) != "true" {
-		if err == nil {
-			err = fmt.Errorf("not a Git worktree")
-		}
-		return "", fmt.Errorf("validate Git repository %q: %w", resolved, err)
+	if _, err := exec.LookPath("git"); err != nil {
+		return "", fmt.Errorf("validate Git repository %q: the Git executable is unavailable", resolved)
 	}
-	root, err := run(ctx, resolved, "rev-parse", "--show-toplevel")
+	hasMarker, err := hasRepositoryMarker(resolved)
 	if err != nil {
-		return "", fmt.Errorf("resolve Git repository root %q: %w", resolved, err)
+		return "", &repositoryVerificationError{Path: resolved, Cause: err}
+	}
+	if hasMarker {
+		root, err := repositoryRoot(ctx, resolved)
+		if err == nil {
+			return root, nil
+		}
+		if ctx.Err() != nil {
+			return "", fmt.Errorf("validate Git repository %q: %w", resolved, ctx.Err())
+		}
+		return "", &repositoryVerificationError{Path: resolved, Cause: err}
+	}
+
+	nested, truncated, discoveryErr := immediateRepositories(ctx, resolved)
+	if discoveryErr != nil {
+		var verification *repositoryVerificationError
+		if errors.As(discoveryErr, &verification) {
+			return "", verification
+		}
+		return "", fmt.Errorf("validate Git repository %q: not a Git worktree; inspect immediate child repositories: %w", resolved, discoveryErr)
+	}
+	if truncated {
+		return "", fmt.Errorf("validate Git repository %q: not a Git worktree; automatic child-repository discovery is limited to folders with at most %d entries, so enter the exact repository folder or a path inside it", resolved, maxNestedRepositoryEntries)
+	}
+	if len(nested) == 1 {
+		return "", &RepositorySuggestionError{InputPath: resolved, SuggestedRepositoryPath: nested[0]}
+	}
+	if len(nested) > 1 {
+		return "", fmt.Errorf("validate Git repository %q: not a Git worktree and contains multiple immediate Git repositories; enter one explicitly: %s", resolved, summarizeRepositoryPaths(nested))
+	}
+	return "", fmt.Errorf("validate Git repository %q: not a Git worktree; enter the repository folder itself or a path inside it", resolved)
+}
+
+func hasRepositoryMarker(path string) (bool, error) {
+	for candidate := path; ; candidate = filepath.Dir(candidate) {
+		if _, err := os.Lstat(filepath.Join(candidate, ".git")); err == nil {
+			return true, nil
+		} else if !os.IsNotExist(err) {
+			return false, err
+		}
+		parent := filepath.Dir(candidate)
+		if parent == candidate {
+			return false, nil
+		}
+	}
+}
+
+func repositoryRoot(ctx context.Context, path string) (string, error) {
+	inside, err := run(ctx, path, "rev-parse", "--is-inside-work-tree")
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(inside) != "true" {
+		return "", fmt.Errorf("not a Git worktree")
+	}
+	root, err := run(ctx, path, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return "", fmt.Errorf("resolve Git repository root %q: %w", path, err)
 	}
 	root = strings.TrimSpace(root)
 	canonical, err := canonicalExisting(root)
@@ -68,6 +148,64 @@ func ValidateRepository(ctx context.Context, path string) (string, error) {
 		return "", fmt.Errorf("resolve Git repository root %q: %w", root, err)
 	}
 	return canonical, nil
+}
+
+// immediateRepositories performs a deliberately shallow and bounded fallback
+// for chooser-style input. A directory that contains exactly one checkout is
+// unambiguous; deeper trees and multi-repository folders still require an
+// explicit path from the caller.
+func immediateRepositories(ctx context.Context, parent string) ([]string, bool, error) {
+	directory, err := os.Open(parent)
+	if err != nil {
+		return nil, false, err
+	}
+	defer directory.Close()
+
+	entries, err := directory.ReadDir(maxNestedRepositoryEntries + 1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, false, err
+	}
+	if len(entries) > maxNestedRepositoryEntries {
+		return nil, true, nil
+	}
+
+	var repositories []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		candidate := filepath.Join(parent, entry.Name())
+		if _, err := os.Lstat(filepath.Join(candidate, ".git")); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, false, err
+		}
+		root, err := repositoryRoot(ctx, candidate)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, false, ctx.Err()
+			}
+			return nil, false, &repositoryVerificationError{Path: candidate, Cause: err}
+		}
+		repositories = append(repositories, root)
+	}
+	sort.Strings(repositories)
+	return repositories, false, nil
+}
+
+func summarizeRepositoryPaths(paths []string) string {
+	const displayed = 4
+	limit := min(len(paths), displayed)
+	quoted := make([]string, 0, limit)
+	for _, path := range paths[:limit] {
+		quoted = append(quoted, fmt.Sprintf("%q", path))
+	}
+	summary := strings.Join(quoted, ", ")
+	if remaining := len(paths) - limit; remaining > 0 {
+		summary += fmt.Sprintf(", and %d more", remaining)
+	}
+	return summary
 }
 
 func CurrentBranch(ctx context.Context, repository string) (string, error) {

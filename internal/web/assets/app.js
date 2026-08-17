@@ -26,6 +26,7 @@ async function apiRequest(path, method = "GET", body) {
     const error = new Error(message);
     error.status = response.status;
     error.code = payload.error?.code || "";
+    error.details = payload.error || {};
     throw error;
   }
   return payload;
@@ -35,6 +36,59 @@ function setNotice(element, message, isError = false) {
   if (!element) return;
   element.textContent = message || "";
   element.classList.toggle("error", isError);
+  element.classList.toggle("has-action", false);
+}
+
+function offerRepositorySuggestion(notice, input, error) {
+  const path = error?.code === "repository_selection_required" ? error?.details?.suggested_repo_path : "";
+  if (!notice || !input || typeof path !== "string" || path.length === 0) return false;
+  setNotice(notice, "");
+  const explanation = document.createTextNode("That folder contains one Git repository. ");
+  const use = document.createElement("button");
+  use.type = "button";
+  use.className = "repository-suggestion-button";
+  use.textContent = `Use ${path}`;
+  use.addEventListener("click", () => {
+    input.value = path;
+    input.focus();
+    setNotice(notice, "Repository selected. Review the path, then press Start Session again.");
+  });
+  notice.classList.toggle("has-action", true);
+  notice.replaceChildren(explanation, use);
+  return true;
+}
+
+const sessionStartWarningMessages = Object.freeze({
+  session_start_failed: "This Session was created but could not start. Its saved status and any established provider identity are shown here; inspect them before trying again.",
+  session_started_with_warning: "This Session started, but its Task status update did not complete. The conversation remains available.",
+});
+
+function rememberSessionStartWarning(result) {
+  const sessionID = typeof result?.session?.id === "string" ? result.session.id : "";
+  const code = typeof result?.warning?.code === "string" ? result.warning.code : "";
+  if (!sessionID || sessionID.length > 256 || !sessionStartWarningMessages[code]) return false;
+  try {
+    window.sessionStorage?.setItem(`session-start-warning:${sessionID}`, code);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function restoreSessionStartWarning(sessionID, notice = document.querySelector("#action-notice")) {
+  if (!sessionID || !notice) return false;
+  const key = `session-start-warning:${sessionID}`;
+  let code = "";
+  try {
+    code = window.sessionStorage?.getItem(key) || "";
+    window.sessionStorage?.removeItem(key);
+  } catch (_) {
+    return false;
+  }
+  const message = sessionStartWarningMessages[code];
+  if (!message) return false;
+  setNotice(notice, message, code === "session_start_failed");
+  return true;
 }
 
 function permissionActionErrorMessage(error) {
@@ -206,11 +260,14 @@ function bindSessionCreation(taskID) {
       const data = new FormData(form);
       const result = await apiRequest(`/api/v1/tasks/${encodeURIComponent(taskID)}/sessions`, "POST", {
         agent: data.get("agent"), role: data.get("role"), repo_path: data.get("repo_path"), prompt: data.get("prompt"),
+        model: data.get("model"), reasoning_effort: data.get("reasoning_effort"),
         worktree: data.has("worktree"), approve_all: data.has("approve_all"), allow_shared_checkout: data.has("allow_shared_checkout")
       });
+      rememberSessionStartWarning(result);
       window.location.assign(`/sessions/${encodeURIComponent(result.session.id)}`);
     } catch (error) {
-      setNotice(notice, error.message, true);
+      const repoInput = form.querySelector('input[name="repo_path"]');
+      if (!offerRepositorySuggestion(notice, repoInput, error)) setNotice(notice, error.message, true);
       submit.disabled = false;
     }
   });
@@ -2371,8 +2428,10 @@ function bindSessionControls(sessionID) {
     try {
       const data = new FormData(reviewForm);
       const result = await apiRequest(`/api/v1/sessions/${encodeURIComponent(sessionID)}/review`, "POST", {
-        agent: data.get("agent"), allow_active_producer: data.has("allow_active_producer")
+        agent: data.get("agent"), model: data.get("model"), reasoning_effort: data.get("reasoning_effort"),
+        allow_active_producer: data.has("allow_active_producer")
       });
+      rememberSessionStartWarning(result);
       window.location.assign(`/sessions/${encodeURIComponent(result.session.id)}`);
     } catch (error) {
       setNotice(reviewNotice, error.message, true);
@@ -2417,6 +2476,7 @@ if (page === "session") {
   bindSessionCreation(taskID);
   bindComposer(sessionID);
   bindSessionControls(sessionID);
+  restoreSessionStartWarning(sessionID);
   updateActionVisibility(document.body.dataset.sessionStatus);
   (async () => {
     await reconcileConversation(sessionID, { initial: true });

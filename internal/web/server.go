@@ -37,23 +37,25 @@ type Server struct {
 }
 
 type sessionView struct {
-	ID                     string
-	TaskID                 string
-	Role                   string
-	Agent                  string
-	Provider               string
-	RepoPath               string
-	WorktreePath           string
-	CheckoutLabel          string
-	Branch                 string
-	Status                 string
-	Permission             string
-	WorkerRunning          bool
-	ConversationReady      bool
-	ConversationVerified   bool
-	ConversationVerifiedAt *time.Time
-	UpdatedAt              time.Time
-	LastActivityAt         *time.Time
+	ID                       string
+	TaskID                   string
+	Role                     string
+	Agent                    string
+	Provider                 string
+	RequestedModel           string
+	RequestedReasoningEffort string
+	RepoPath                 string
+	WorktreePath             string
+	CheckoutLabel            string
+	Branch                   string
+	Status                   string
+	Permission               string
+	WorkerRunning            bool
+	ConversationReady        bool
+	ConversationVerified     bool
+	ConversationVerifiedAt   *time.Time
+	UpdatedAt                time.Time
+	LastActivityAt           *time.Time
 }
 
 type navigationTask struct {
@@ -232,6 +234,7 @@ func (s *Server) execute(writer http.ResponseWriter, name string, data any) {
 }
 
 func makeSessionView(current session.Session) sessionView {
+	providerOptions, _ := session.ParseProviderOptions(current.MetadataJSON)
 	label := filepath.Base(current.RepoPath)
 	if label == "." || label == string(filepath.Separator) || strings.TrimSpace(label) == "" {
 		label = current.RepoPath
@@ -241,6 +244,7 @@ func makeSessionView(current session.Session) sessionView {
 	}
 	return sessionView{
 		ID: current.ID, TaskID: current.TaskID, Role: current.Role, Agent: current.Agent, Provider: current.Provider,
+		RequestedModel: providerOptions.Model, RequestedReasoningEffort: providerOptions.ReasoningEffort,
 		RepoPath: current.RepoPath, WorktreePath: current.WorktreePath, CheckoutLabel: label, Branch: current.Branch,
 		Status: string(current.Status), Permission: appservice.PermissionLabel(current), WorkerRunning: current.WorkerSocket != "",
 		ConversationReady: current.ProviderConversationID != "", ConversationVerified: current.ConversationIDVerifiedAt != nil,

@@ -114,7 +114,7 @@ Task and structured conversation controls (provider-native keys remain owned by 
 | `↑`/`↓`, `j`/`k`, click | Select a Session |
 | `Enter` | Open the selected Session in its real provider-native harness |
 | `a` (Task screen) | Open the selected Session's structured conversation view |
-| `n` (Task screen) | Open the in-console New Session wizard; choose agent, role, repository, worktree, permission mode, and optional prompt |
+| `n` (Task screen) | Open the in-console New Session wizard; choose agent, role, optional model/effort, repository, worktree, permission mode, and optional prompt |
 | `n` (conversation screen) | Open the current Session's exact provider-native harness; from tmux, switch to its stable `agent-<session-id>` session |
 | `p` | Prompt the selected/current Session only |
 | `/` | Filter the Session list |

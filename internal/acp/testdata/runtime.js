@@ -38,6 +38,47 @@ export function createAcpRuntime(options = {}) {
   let active;
   let ensureCount = 0;
   let statusCount = 0;
+  let configuredModel = "provider-default";
+  let configuredEffort = "medium";
+
+  function configOptions() {
+    const shape = process.env.FAKE_ACPX_CONFIG_OPTIONS;
+    if (!shape || shape === "none") return undefined;
+    const grouped = shape === "grouped";
+    const wrap = (values) => grouped ? [{ group: "available", name: "Available", options: values }] : values;
+    const result = [
+      {
+        id: "model",
+        name: "Model",
+        ...(grouped ? {} : { category: "model" }),
+        type: "select",
+        currentValue: configuredModel,
+        options: wrap([
+          { value: "provider-default", name: "Provider default" },
+          { value: "model-selected", name: "Selected model" },
+        ]),
+      },
+      {
+        id: "effort",
+        name: "Reasoning effort",
+        ...(grouped ? {} : { category: "thought_level" }),
+        type: "select",
+        currentValue: configuredEffort,
+        options: wrap([
+          { value: "low", name: "Low" },
+          { value: "medium", name: "Medium" },
+          { value: "high", name: "High" },
+        ]),
+      },
+    ];
+    if (shape === "ambiguous") {
+      result.push({
+        id: "reasoning_effort", name: "Other effort", type: "select", currentValue: configuredEffort,
+        options: [{ value: "high", name: "High" }],
+      });
+    }
+    return result;
+  }
 
   return {
     async ensureSession(session) {
@@ -77,6 +118,10 @@ export function createAcpRuntime(options = {}) {
         }
       }
       ensureCount += 1;
+      if (ensureCount > 1 && process.env.FAKE_ACPX_RESET_CONFIG_ON_ENSURE === "1") {
+        configuredModel = "provider-default";
+        configuredEffort = "medium";
+      }
       if (
         process.env.FAKE_ACPX_SCENARIO === "activation-conflict" ||
         (process.env.FAKE_ACPX_SCENARIO === "activation-conflict-on-refresh" && ensureCount > 1)
@@ -241,7 +286,26 @@ export function createAcpRuntime(options = {}) {
         acpxRecordId: handle?.acpxRecordId,
         backendSessionId: handle?.backendSessionId,
 	    agentSessionId: inspectedNativeId,
+        ...(process.env.FAKE_ACPX_OMIT_MODEL_STATUS === "1" ? {} : {
+          models: { currentModelId: configuredModel, availableModelIds: ["provider-default", "model-selected"] },
+        }),
+        details: { configOptions: configOptions() },
       };
+    },
+
+    async setConfigOption({ key, value }) {
+      const option = configOptions()?.find((candidate) => candidate.id === key);
+      const values = option?.options?.flatMap((candidate) => Array.isArray(candidate?.options) ? candidate.options : [candidate])
+        .map((candidate) => candidate?.value);
+      if (!option || !values?.includes(value)) {
+        throw new Error(`fixture rejected config ${key}=${value}`);
+      }
+      if (key === "model") configuredModel = value;
+      else {
+        configuredEffort = value;
+        if (process.env.FAKE_ACPX_EFFORT_RESETS_MODEL === "1") configuredModel = "provider-default";
+      }
+      appendArguments(["--set-config", key, value]);
     },
 
     async setMode({ mode }) {

@@ -63,6 +63,15 @@ Embedded profiles:
 | `grok-build` | `xai` | `grok-build` (compatibility profile name) |
 | `opencode` | `opencode` | `npx -y opencode-ai@1.18.18 acp` |
 
+Optional Session provider controls use `--model` and `--reasoning-effort` in
+the CLI and matching fields in Web/API. Leave either blank for Provider
+default. Codex supports both advertised controls; Claude supports both but its
+default effort must be represented by a blank field; OpenCode supports model
+only. The pinned Grok adapter exposes no verifiable ACP configuration control,
+so Grok/Grok Build require both fields blank. Gemini and custom profiles also
+remain provider-default-only until their profiles declare proven native parity.
+Requested values are stored on the Session and shown by every transport.
+
 Place overrides or custom profiles in `$AGENT_HOME/agents/*.yaml`:
 
 ```yaml
@@ -311,6 +320,14 @@ Supported exact resume mappings:
 | `grok` / `grok-build` | `grok --resume <provider-conversation-id>` |
 | `opencode` | pinned `npx -y opencode-ai@1.18.18 --session <provider-conversation-id>` |
 
+When a Session has explicit supported controls, the native invocation carries
+the same values while resuming this exact ID. ACP first persists the exact
+provider identity, applies/validates the controls before the first prompt, and
+reapplies them after refresh or exact resume. If configuration fails, the
+Session remains saved as failed with its provider identity; Web/API navigate to
+that resource and show a fixed actionable message without provider stderr,
+credentials, paths, or raw configuration payloads.
+
 Gemini and custom profiles remain usable through ACP but do not have V1 provider-store verification for native attachment.
 
 `acpctl session <id>` shows the Task Console ID, immutable canonical provider conversation, identity source, and adapter evidence. Native attach requires a canonical ID and verifies that exact ID plus checkout in the provider's local store. It never picks the most recent conversation and never starts a replacement when verification fails.
@@ -506,7 +523,11 @@ resend it while its recorded state is unresolved.
 
 ### Git
 
-**Not a repository:** pass any path inside a real Git worktree; the service resolves its root.
+**Not a repository:** pass the repository folder or any path inside a real Git
+worktree; the service resolves its root. When a selected parent contains
+exactly one immediate repository, Web offers its canonical path but requires
+you to choose it and submit again. Multiple or deeply nested repositories need
+an exact path. Agent Task Console never runs `git init` for this field.
 
 **Checkout conflict:** choose `--worktree`, stop the owner, or knowingly use `--allow-shared-checkout`.
 

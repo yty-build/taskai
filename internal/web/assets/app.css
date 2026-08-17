@@ -350,6 +350,7 @@ dialog { color: var(--text); }
 .stack-form input:focus, .stack-form textarea:focus, .stack-form select:focus { border-color: rgba(215, 156, 102, .45); box-shadow: 0 0 0 3px rgba(215, 156, 102, .06); }
 .stack-form textarea { resize: vertical; line-height: 1.5; }
 .form-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.field-help { margin: -5px 0 0; color: var(--faint); font-size: 10px; line-height: 1.45; }
 .advanced-options { border: 1px solid var(--line-soft); border-radius: 10px; }
 .advanced-options summary { padding: 10px 12px; color: var(--muted); font-size: 11px; cursor: pointer; }
 .check-list { display: grid; gap: 1px; padding: 0 10px 10px; }
@@ -361,6 +362,9 @@ dialog { color: var(--text); }
 .check strong { color: var(--text-soft); font-size: 11px; }
 .check small { margin-top: 2px; color: var(--faint); font-size: 10px; font-weight: 450; }
 .notice { min-height: 18px; margin: 0; color: var(--muted); font-size: 11px; }
+.notice.has-action { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+.repository-suggestion-button { max-width: 100%; padding: 4px 8px; overflow: hidden; border: 1px solid rgba(215, 156, 102, .38); border-radius: 7px; color: var(--accent); background: var(--accent-soft); font: 10px/1.35 var(--mono); text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.repository-suggestion-button:hover { border-color: rgba(215, 156, 102, .62); color: var(--text); }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 5px; }
 .detail-list { display: grid; grid-template-columns: 105px minmax(0, 1fr); gap: 12px 16px; margin: 25px 0 0; padding: 17px; border: 1px solid var(--line-soft); border-radius: 11px; background: var(--bg); font-size: 11px; }
 .detail-list dt { color: var(--faint); }

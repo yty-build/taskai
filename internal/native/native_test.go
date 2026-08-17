@@ -55,6 +55,48 @@ func TestBuildResumeRejectsMissingIDAndUnsupportedProfile(t *testing.T) {
 	}
 }
 
+func TestBuildResumeCarriesSessionProviderOptions(t *testing.T) {
+	tests := []struct {
+		name string
+		want []string
+	}{
+		{name: "codex", want: []string{"resume", "--model", "gpt-5.6-sol", "--config", `model_reasoning_effort="high"`, "native-123"}},
+		{name: "claude", want: []string{"--model", "opus[1m]", "--effort", "high", "--resume", "native-123"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			model := map[string]string{"codex": "gpt-5.6-sol", "claude": "opus[1m]", "grok": "grok-4.6"}[test.name]
+			invocation, err := BuildResume(
+				agents.Profile{Name: test.name, Provider: "provider", Command: test.name},
+				"native-123", "/repo", ProviderOptions{Model: model, ReasoningEffort: "high"},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(invocation.Args, test.want) {
+				t.Fatalf("Args = %q, want %q", invocation.Args, test.want)
+			}
+		})
+	}
+	grok := agents.Profile{Name: "grok", Provider: "xai", Command: "grok"}
+	if _, err := BuildResume(grok, "native-123", "/repo", ProviderOptions{Model: "grok-4.6", ReasoningEffort: "high"}); err == nil || !strings.Contains(err.Error(), "verifiable ACP") {
+		t.Fatalf("Grok explicit options error = %v", err)
+	}
+	claude := agents.Profile{Name: "claude", Provider: "anthropic", Command: "claude"}
+	if _, err := BuildResume(claude, "native-123", "/repo", ProviderOptions{ReasoningEffort: "DeFaUlT"}); err == nil || !strings.Contains(err.Error(), "leave reasoning effort empty") {
+		t.Fatalf("Claude default effort error = %v", err)
+	}
+
+	opencode := agents.Profile{Name: "opencode", Provider: "opencode", Command: "opencode"}
+	invocation, err := BuildResume(opencode, "native-123", "/repo", ProviderOptions{Model: "opencode/model"})
+	if err != nil || !reflect.DeepEqual(invocation.Args, []string{"--model", "opencode/model", "--session", "native-123"}) {
+		t.Fatalf("OpenCode invocation = %#v, %v", invocation, err)
+	}
+	if _, err := BuildResume(opencode, "native-123", "/repo", ProviderOptions{ReasoningEffort: "high"}); err == nil || !strings.Contains(err.Error(), "does not advertise") {
+		t.Fatalf("OpenCode effort error = %v", err)
+	}
+}
+
 func TestBuildResumeMapsLegacyGrokAndACPOpenCodeProfiles(t *testing.T) {
 	grok, err := BuildResume(agents.Profile{Name: "grok-build", Provider: "xai", Command: "grok-build"}, "grok-id", "/repo")
 	if err != nil || grok.Command != "grok" || !reflect.DeepEqual(grok.Args, []string{"--resume", "grok-id"}) {

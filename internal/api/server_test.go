@@ -38,15 +38,21 @@ type apiRuntime struct {
 	pending     map[string][]worker.PendingPermission
 	stale       bool
 	nativeOwned bool
+	spawnErr    error
 }
 
 func (r *apiRuntime) Spawn(ctx context.Context, sessionID string) (worker.SpawnResult, error) {
 	r.mu.Lock()
+	spawnErr := r.spawnErr
 	r.nextPID++
 	pid := 7000 + r.nextPID
 	socket := filepath.Join(r.home.Workers, sessionID+".sock")
 	r.sockets[socket] = sessionID
 	r.mu.Unlock()
+	if spawnErr != nil {
+		_, _ = r.repository.UpdateSessionRuntimeIDs(ctx, sessionID, "acpx-partial", "acp-partial", "native-partial")
+		return worker.SpawnResult{}, spawnErr
+	}
 	current, err := r.repository.UpdateSessionWorker(ctx, sessionID, pid, socket, filepath.Join(r.home.Logs, sessionID+".jsonl"), session.StatusWaiting)
 	if err != nil {
 		return worker.SpawnResult{}, err
@@ -163,6 +169,86 @@ func newAPIFixture(t *testing.T) *apiFixture {
 	sessions := appservice.NewSessionService(repository, registry, home, runtime)
 	server := New(task.NewService(repository), sessions)
 	return &apiFixture{handler: server.Handler(), repository: repository, runtime: runtime, home: home, repo: repo}
+}
+
+func TestSessionStartOffersUniqueNestedRepositoryWithoutSideEffects(t *testing.T) {
+	fixture := newAPIFixture(t)
+	createdTask, err := fixture.repository.CreateTask(context.Background(), task.CreateParams{ID: "T-repo-choice", Title: "Choose repository"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response := performJSON(t, fixture.handler, http.MethodPost, "/api/v1/tasks/"+createdTask.ID+"/sessions", map[string]any{
+		"agent": "codex", "role": "worker", "repo_path": filepath.Dir(fixture.repo),
+	})
+	assertStatus(t, response, http.StatusUnprocessableEntity)
+	var payload struct {
+		Error struct {
+			Code              string `json:"code"`
+			Message           string `json:"message"`
+			SuggestedRepoPath string `json:"suggested_repo_path"`
+		} `json:"error"`
+	}
+	decodeResponse(t, response, &payload)
+	want, err := filepath.EvalSymlinks(fixture.repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload.Error.Code != "repository_selection_required" || payload.Error.SuggestedRepoPath != want {
+		t.Fatalf("repository selection response = %#v, want canonical suggestion %q", payload.Error, want)
+	}
+	if !strings.Contains(payload.Error.Message, "use that exact path") || strings.Contains(payload.Error.Message, "fatal:") {
+		t.Fatalf("repository selection message is not actionable: %q", payload.Error.Message)
+	}
+	sessions, err := fixture.repository.ListSessions(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.runtime.mu.Lock()
+	spawns, commands, sockets := fixture.runtime.nextPID, len(fixture.runtime.commands), len(fixture.runtime.sockets)
+	fixture.runtime.mu.Unlock()
+	if len(sessions) != 0 || spawns != 0 || commands != 0 || sockets != 0 {
+		t.Fatalf("repository suggestion started work: sessions=%d spawns=%d commands=%d sockets=%d", len(sessions), spawns, commands, sockets)
+	}
+}
+
+func TestSessionStartReturnsPersistedFailedResourceWithoutLeakingStartupError(t *testing.T) {
+	fixture := newAPIFixture(t)
+	createdTask, err := fixture.repository.CreateTask(context.Background(), task.CreateParams{ID: "T-partial-start", Title: "Partial start"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.runtime.mu.Lock()
+	fixture.runtime.spawnErr = errors.New("SECRET provider configuration payload /private/provider/path")
+	fixture.runtime.mu.Unlock()
+	response := performJSON(t, fixture.handler, http.MethodPost, "/api/v1/tasks/"+createdTask.ID+"/sessions", map[string]any{
+		"agent": "codex", "role": "worker", "repo_path": fixture.repo,
+		"model": "model-selected", "reasoning_effort": "high",
+	})
+	assertStatus(t, response, http.StatusCreated)
+	var payload struct {
+		Session SessionDTO `json:"session"`
+		State   string     `json:"state"`
+		Warning struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"warning"`
+	}
+	decodeResponse(t, response, &payload)
+	if payload.Session.ID == "" || payload.Session.Status != "failed" || payload.State != "failed" || payload.Warning.Code != "session_start_failed" ||
+		payload.Session.RequestedModel != "model-selected" || payload.Session.RequestedReasoningEffort != "high" {
+		t.Fatalf("partial Session response = %#v", payload)
+	}
+	encoded := response.Body.String()
+	for _, secret := range []string{"SECRET", "/private/provider/path", "provider configuration payload"} {
+		if strings.Contains(encoded, secret) {
+			t.Fatalf("partial Session response leaked %q: %s", secret, encoded)
+		}
+	}
+	current, err := fixture.repository.GetSession(context.Background(), payload.Session.ID)
+	if err != nil || current.ACPSessionID != "acp-partial" || current.NativeSessionID != "native-partial" || current.Status != session.StatusFailed {
+		t.Fatalf("persisted partial Session = %#v, %v", current, err)
+	}
 }
 
 func TestVersionedTaskAndSessionAPI(t *testing.T) {
@@ -389,14 +475,17 @@ func TestVersionedTaskAndSessionAPI(t *testing.T) {
 	if !seen[sessionID] || !seen[secondSessionID] {
 		t.Fatalf("Task replay did not aggregate every Session: %#v", replayedTaskEvents)
 	}
-	reviewResponse := performJSON(t, fixture.handler, http.MethodPost, "/api/v1/sessions/"+sessionID+"/review", map[string]any{"agent": "claude"})
+	reviewResponse := performJSON(t, fixture.handler, http.MethodPost, "/api/v1/sessions/"+sessionID+"/review", map[string]any{
+		"agent": "claude", "model": "opus[1m]", "reasoning_effort": "high",
+	})
 	assertStatus(t, reviewResponse, http.StatusCreated)
 	var reviewStarted struct {
 		Session   SessionDTO `json:"session"`
 		RequestID string     `json:"request_id"`
 	}
 	decodeResponse(t, reviewResponse, &reviewStarted)
-	if reviewStarted.Session.TaskID != taskID || reviewStarted.Session.Role != "reviewer" || reviewStarted.Session.Agent != "claude" || reviewStarted.RequestID == "" {
+	if reviewStarted.Session.TaskID != taskID || reviewStarted.Session.Role != "reviewer" || reviewStarted.Session.Agent != "claude" || reviewStarted.RequestID == "" ||
+		reviewStarted.Session.RequestedModel != "opus[1m]" || reviewStarted.Session.RequestedReasoningEffort != "high" {
 		t.Fatalf("review response = %#v", reviewStarted)
 	}
 	assertStatus(t, performRequest(t, fixture.handler, http.MethodPost, "/api/v1/sessions/"+reviewStarted.Session.ID+"/stop", nil, nil), http.StatusOK)

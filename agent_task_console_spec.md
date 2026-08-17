@@ -399,6 +399,13 @@ The same Session may later be resumed.
 
 Do **not** model each restart as a separate Run in V1.
 
+Optional requested provider model and reasoning-effort values are immutable
+Session configuration stored in `metadata_json`; they are not a model catalog
+or another entity. Blank means Provider default. V1 accepts an explicit value
+only when the pinned ACP adapter advertises it and the exact provider-native
+resume path can preserve it. Public transports expose these as requested
+values, not as a guessed effective-provider state.
+
 ---
 
 # 6. Relationship Model
@@ -548,6 +555,18 @@ The product uses the public runtime to:
 - stream structured output,
 - cancel sessions,
 - invoke custom ACP-compatible agents.
+
+When a Session requests supported provider controls, ACP must first ensure or
+exactly resume the conversation and durably persist its acpx/ACP/native
+identity. Only then may it set and jointly verify the requested model and
+reasoning effort. The worker repeats that configuration after every exact
+Refresh or fallback Resume and before a prompt. Configuration failure sends no
+prompt, discards the partially configured bridge, marks the saved Session
+failed, and exposes only a bounded gateway-owned explanation. Codex supports
+advertised model and effort values; Claude supports both but uses blank for its
+default effort; OpenCode supports advertised model only; the pinned Grok,
+Gemini, and custom paths remain Provider-default-only until both ACP and native
+parity can be proved.
 
 Resolve `acpx/runtime` from the installed, pinned package associated with the configured `acpx` binary. Runtime state and the materialized bridge script live under private `AGENT_HOME` state with `0700`/`0600` permissions. Provider authentication remains provider-managed and is never copied into Session options, SQLite, or logs.
 
@@ -1053,12 +1072,21 @@ Start:
 
 ```bash
 acpctl session start PM-42 \
-  --agent gemini \
+  --agent codex \
   --repo ~/repos/polymarket \
-  --role researcher
+  --role researcher \
+  --model gpt-5.6-sol \
+  --reasoning-effort high
 ```
 
 Starting a Session sends an initial prompt constructed from the Task title, Task description, Session role, and repo/worktree context. `--prompt` may append Session-specific instructions.
+
+`--model` and `--reasoning-effort` are optional exact provider values. Leaving
+either blank preserves that provider's default. The Web creation and reviewer
+forms and the terminal New Session wizard expose the same bounded controls;
+unsupported combinations fail before Session creation. Because provider
+catalogs are account- and adapter-dependent, V1 does not invent a hard-coded
+cross-provider model abstraction.
 
 ACP permissions default to read approval. A write-capable unattended Session must be started with an explicit permission choice such as `--approve-all`; persist that choice in `metadata_json` without adding a new table or first-class object.
 
@@ -1543,6 +1571,14 @@ GET    /healthz
 ```
 
 Prompt submission returns a request ID. Task and Session streams carry monotonic positions and request IDs so a client can correlate responses and reconnect without losing output. Server-Sent Events should support `Last-Event-ID` or an equivalent cursor.
+
+Session and reviewer creation accept optional `model` and
+`reasoning_effort`. Session DTOs return the non-secret requested values as
+`requested_model` and `requested_reasoning_effort`. If provider configuration
+fails only after the exact conversation identity has been persisted, creation
+still returns the created failed Session with an allowlisted
+`session_start_failed` warning; clients must open that resource rather than
+creating a duplicate. Raw provider configuration errors never cross the API.
 
 `GET /api/v1/sessions/{id}/conversation` exposes the shared semantic
 conversation projection rather than making HTTP clients join provider files
@@ -2153,6 +2189,14 @@ V1 is complete when all of these work.
 - [ ] Session keeps running after CLI exits.
 - [ ] Prompt an existing Session.
 - [ ] Starting a Session sends Task, role, and repo/worktree context as its initial prompt.
+- [ ] Optional model/reasoning controls are persisted only on the Session,
+      applied after exact identity persistence, jointly verified before the
+      first prompt, and reapplied after exact Refresh/Resume.
+- [ ] Unsupported provider controls fail before Session creation; a
+      post-identity configuration failure preserves and returns the failed
+      Session, sends no prompt, and exposes no raw provider detail.
+- [ ] Supported provider-native resume carries the same requested controls;
+      Provider-default-only agents reject explicit overrides.
 - [ ] Unattended write access requires an explicit permission choice.
 - [ ] A write/execute permission remains pending across viewer detach and can be decided after reattach.
 - [ ] Concurrent permission decisions produce exactly one accepted provider response.
@@ -2216,6 +2260,8 @@ V1 is complete when all of these work.
 - [ ] `acpctl serve` starts local web UI.
 - [ ] Web lists Tasks.
 - [ ] Web shows Task Sessions.
+- [ ] Web Session and reviewer creation expose optional bounded model and
+      reasoning-effort controls, with blank meaning Provider default.
 - [ ] Selecting a web Session shows the same provider snapshot, gateway
       overlay/fallback, and live ACP activity as terminal attachment.
 - [ ] Web streams live Session output.
@@ -2234,6 +2280,9 @@ V1 is complete when all of these work.
 ## API and future clients
 
 - [ ] `/api/v1` exposes Task and Session DTOs rather than database rows.
+- [ ] Session creation accepts optional provider controls and DTOs expose only
+      their requested values; partial-created failure responses are explicit
+      and safe to follow without duplicate creation.
 - [ ] Task streams aggregate activity from all Sessions.
 - [ ] Session streams expose monotonic replay positions and request IDs.
 - [ ] Session reads expose one semantic provider-snapshot-plus-overlay

@@ -95,6 +95,31 @@ testAssert(
   "browser API client discarded the typed worker-upgrade conflict"
 );
 fetch = async () => ({
+  ok:false, status:422,
+  async text(){ return JSON.stringify({error:{code:"repository_selection_required",message:"Choose the nested repository",suggested_repo_path:"/projects/site"}}); },
+});
+let repositoryChoice;
+try {
+  await apiRequest("/nested-repository", "POST", {});
+} catch (error) {
+  repositoryChoice = error;
+}
+testAssert(repositoryChoice?.details?.suggested_repo_path === "/projects/site", "browser API client discarded the repository suggestion");
+const repositoryNotice = document.createElement("p");
+const repositoryInput = {value:"/projects", focused:false, focus(){this.focused = true;}};
+testAssert(offerRepositorySuggestion(repositoryNotice, repositoryInput, repositoryChoice), "repository suggestion was not offered");
+testAssert(repositoryInput.value === "/projects" && repositoryNotice.children[1]?.textContent === "Use /projects/site", "repository suggestion silently rewrote the path or hid the explicit action");
+repositoryNotice.children[1].listeners.click[0]();
+testAssert(repositoryInput.value === "/projects/site" && repositoryInput.focused, "explicit repository choice did not fill and focus the path");
+const failedStartResult = {session:{id:"S-FAILED"},warning:{code:"session_start_failed",message:"SECRET provider stderr"}};
+testAssert(rememberSessionStartWarning(failedStartResult), "safe partial-Session warning was not retained across navigation");
+testAssert(sessionStorageData.get("session-start-warning:S-FAILED") === "session_start_failed", "partial-Session handoff retained raw provider detail");
+const failedStartNotice = document.createElement("p");
+testAssert(restoreSessionStartWarning("S-FAILED", failedStartNotice), "partial-Session warning was not restored on its Session page");
+testAssert(failedStartNotice.textContent.includes("could not start") && !failedStartNotice.textContent.includes("SECRET"), "partial-Session warning was unsafe or unhelpful");
+testAssert(!sessionStorageData.has("session-start-warning:S-FAILED"), "partial-Session warning was not one-shot");
+testAssert(!rememberSessionStartWarning({session:{id:"S-UNKNOWN"},warning:{code:"provider_raw",message:"SECRET"}}), "unknown partial-Session warning code was retained");
+fetch = async () => ({
   ok:false, status:409,
   async text(){ return JSON.stringify({error:{code:"session_conflict",message:"Native harness is running; ACP prompt was not accepted. Exit it, then retry."}}); },
 });
@@ -602,6 +627,7 @@ const fs = require("node:fs");
 const vm = require("node:vm");
 const createdEventSources = [];
 const scheduledTimeouts = [];
+const sessionStorageData = new Map();
 const draftTextarea = {value:""};
 class FakeElement {
   constructor(tagName) {
@@ -609,6 +635,7 @@ class FakeElement {
     this.children = [];
     this.dataset = {};
     this.attributes = {};
+    this.listeners = {};
     this.className = "";
     this.classList = {
       toggle: (name, force) => {
@@ -621,7 +648,8 @@ class FakeElement {
     this._textContent = "";
   }
   append(...children) { this.children.push(...children); }
-  addEventListener() {}
+  replaceChildren(...children) { this.children = [...children]; this._textContent = ""; }
+  addEventListener(type, listener) { (this.listeners[type] ||= []).push(listener); }
   matches(selector) { return selector === "details[data-detail-key]" && this.tagName === "DETAILS" && Boolean(this.dataset.detailKey); }
   setAttribute(name, value) { this.attributes[name] = String(value); }
   set textContent(value) { this._textContent = String(value); this.children = []; }
@@ -633,7 +661,7 @@ class FakeEventSource {
   close() {}
 }
 const sandbox = {
-  TextEncoder, console, EventSource: FakeEventSource, createdEventSources, scheduledTimeouts, draftTextarea,
+  TextEncoder, console, EventSource: FakeEventSource, createdEventSources, scheduledTimeouts, sessionStorageData, draftTextarea,
   fetch: async () => ({
     ok:false, status:409,
     async text(){ return JSON.stringify({error:{code:"worker_upgrade_required",message:"Recover the worker"}}); },
@@ -643,7 +671,11 @@ const sandbox = {
     createElement(tagName){return new FakeElement(tagName);}, createTextNode(value){return {data:String(value),textContent:String(value)};},
     querySelectorAll(){return [];}, querySelector(){return null;}, getElementById(){return null;}, addEventListener(){},
   },
-  window: {EventSource:FakeEventSource, setTimeout(_callback, delay = 0){scheduledTimeouts.push(delay);return scheduledTimeouts.length;}, clearTimeout(){}, setInterval(){return 0;}, addEventListener(){}, matchMedia(){return {matches:false};}},
+  window: {
+    EventSource:FakeEventSource,
+    sessionStorage:{setItem(key,value){sessionStorageData.set(String(key),String(value));},getItem(key){return sessionStorageData.get(String(key)) ?? null;},removeItem(key){sessionStorageData.delete(String(key));}},
+    setTimeout(_callback, delay = 0){scheduledTimeouts.push(delay);return scheduledTimeouts.length;}, clearTimeout(){}, setInterval(){return 0;}, addEventListener(){}, matchMedia(){return {matches:false};}
+  },
   HTMLDialogElement: class {}, FormData: class {},
 };
 vm.createContext(sandbox);

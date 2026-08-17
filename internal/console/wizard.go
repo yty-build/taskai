@@ -17,6 +17,8 @@ type wizardField uint8
 const (
 	wizardAgent wizardField = iota
 	wizardRole
+	wizardModel
+	wizardReasoningEffort
 	wizardRepo
 	wizardWorktree
 	wizardPermission
@@ -25,16 +27,18 @@ const (
 )
 
 type sessionWizard struct {
-	agents      []agents.Profile
-	agentIndex  int
-	field       wizardField
-	role        composerState
-	repo        composerState
-	prompt      composerState
-	worktree    bool
-	approveAll  bool
-	submitting  bool
-	errorNotice string
+	agents          []agents.Profile
+	agentIndex      int
+	field           wizardField
+	role            composerState
+	model           composerState
+	reasoningEffort composerState
+	repo            composerState
+	prompt          composerState
+	worktree        bool
+	approveAll      bool
+	submitting      bool
+	errorNotice     string
 }
 
 type wizardReadyMsg struct {
@@ -128,6 +132,10 @@ func (m Model) handleWizardKey(key tea.KeyMsg) (tea.Model, tea.Cmd) { //nolint:g
 		}
 	case wizardRole:
 		handleWizardTextKey(&wizard.role, key, false)
+	case wizardModel:
+		handleWizardTextKey(&wizard.model, key, false)
+	case wizardReasoningEffort:
+		handleWizardTextKey(&wizard.reasoningEffort, key, false)
 	case wizardRepo:
 		handleWizardTextKey(&wizard.repo, key, false)
 	case wizardWorktree:
@@ -208,13 +216,14 @@ func (m Model) submitWizard() (tea.Model, tea.Cmd) {
 	profile := wizard.agents[wizard.agentIndex]
 	params := appservice.StartSessionParams{
 		TaskID: m.task.Task.ID, Agent: profile.Name, Role: role, RepoPath: repo,
+		Model: strings.TrimSpace(wizard.model.text()), ReasoningEffort: strings.TrimSpace(wizard.reasoningEffort.text()),
 		Prompt: wizard.prompt.text(), Worktree: wizard.worktree, ApproveAll: wizard.approveAll,
 	}
 	return m, startWizardSessionCmd(m.ctx, m.backend, params)
 }
 
 func (m Model) handleSessionStarted(message sessionStartedMsg) (tea.Model, tea.Cmd) {
-	if message.err != nil {
+	if message.err != nil && message.result.Session.ID == "" {
 		if m.wizard != nil {
 			m.wizard.submitting = false
 			m.wizard.errorNotice = message.err.Error()
@@ -240,7 +249,15 @@ func (m Model) handleSessionStarted(message sessionStartedMsg) (tea.Model, tea.C
 	m.mode = sessionView
 	m.direct = false
 	m.scroll, m.unread = 0, 0
-	m.notice = fmt.Sprintf("Started %s with %s. Initial message %s.", created.ID, created.Agent, valueOr(message.result.State, "accepted"))
+	if message.err != nil {
+		if message.result.Started {
+			m.notice = fmt.Sprintf("Started %s, but its Task status update did not complete. The conversation remains available.", created.ID)
+		} else {
+			m.notice = fmt.Sprintf("Created %s, but it did not start. Its saved status and provider identity are open for inspection.", created.ID)
+		}
+	} else {
+		m.notice = fmt.Sprintf("Started %s with %s. Initial message %s.", created.ID, created.Agent, valueOr(message.result.State, "accepted"))
+	}
 	m.manager.ensure(created, m.cursors[created.ID])
 	return m, m.refreshCmd()
 }
