@@ -141,6 +141,25 @@ func TestProjectOmitsDiagnosticOnlyACPActivity(t *testing.T) {
 	}
 }
 
+func TestDiagnosticSummaryNamesACPMetadataWithoutRawPayload(t *testing.T) {
+	tests := []struct {
+		line sessionlog.Line
+		want string
+	}{
+		{acpLine(t, "agent_message_chunk", `{"params":{"update":{"content":{"text":"SECRET-OUTPUT"}}}}`), "ACP output chunk"},
+		{acpLine(t, "usage_update", `{"params":{"update":{"used":31144,"size":258400,"token":"SECRET-USAGE"}}}`), "ACP context usage · 31144 / 258400"},
+		{acpLine(t, "available_commands_update", `{"params":{"update":{"availableCommands":[{"name":"SECRET-COMMAND"},{"name":"two"}]}}}`), "ACP capabilities updated · 2 commands"},
+		{acpLine(t, "session_info_update", `{"params":{"update":{"modelId":"SECRET-MODEL"}}}`), "ACP session metadata updated"},
+		{acpLine(t, "SECRET_UNKNOWN\n"+strings.Repeat("x", 4096), `{"params":{"update":{"secret":"SECRET-TYPE"}}}`), "ACP update"},
+	}
+	for _, test := range tests {
+		got := DiagnosticSummary(test.line)
+		if got != test.want || strings.Contains(got, "SECRET") {
+			t.Fatalf("diagnostic summary = %q, want %q", got, test.want)
+		}
+	}
+}
+
 func TestProjectRedactsProviderAndWorkerErrors(t *testing.T) {
 	secret := `TOKEN=top-secret /Users/private/provider stderr`
 	lines := []sessionlog.Line{

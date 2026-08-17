@@ -612,6 +612,9 @@ func TestConversationAPIUsesOpaqueCommittedProviderHistory(t *testing.T) {
 	if !snapshot.Turns[0].Committed || snapshot.Turns[1].Committed || len(snapshot.Turns[0].Activities) != 3 || len(snapshot.Turns[1].Activities) != 1 {
 		t.Fatalf("conversation turns = %#v", snapshot.Turns)
 	}
+	if snapshot.Turns[0].Surface != "unknown" || snapshot.Turns[1].Surface != "acp" {
+		t.Fatalf("conversation turn surfaces = %q/%q", snapshot.Turns[0].Surface, snapshot.Turns[1].Surface)
+	}
 	if snapshot.Turns[0].Activities[0].Display == nil || snapshot.Turns[0].Activities[0].Display.Type != "user_message" ||
 		snapshot.Turns[0].Activities[1].Display == nil || snapshot.Turns[0].Activities[1].Display.Type != "assistant_chunk" {
 		t.Fatalf("conversation activities = %#v", snapshot.Turns[0].Activities)

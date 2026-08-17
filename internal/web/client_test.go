@@ -32,8 +32,8 @@ function resetTranscript() {
   transcriptState.permissionOverflow = false;
   transcriptState.retainedBytes = 0;
 }
-function activity(position, type, display, permission, requestID = "REQ") {
-  return {session_id:"S", position, request_id:requestID, kind:type, activity:type, display, permission};
+function activity(position, type, display, permission, requestID = "REQ", timestamp = "") {
+  return {session_id:"S", position, request_id:requestID, kind:type, activity:type, timestamp, display, permission};
 }
 
 const savedHistorySummary = conversationHistorySummary({turns:[{committed:true,blocks:[]},{committed:true,blocks:[]},{committed:true,blocks:[]}],snapshotTruncated:false,historyClipped:false});
@@ -43,8 +43,26 @@ testAssert(liveHistorySummary.short === "1 live turn · 2 steps" && liveHistoryS
 const stoppedHistorySummary = conversationHistorySummary({turns:[{committed:false,state:"cancelled",blocks:[]},{committed:false,state:"error",blocks:[]},{committed:false,state:"failed",blocks:[]}],snapshotTruncated:false,historyClipped:false});
 testAssert(stoppedHistorySummary.short === "3 unsaved" && stoppedHistorySummary.active === 0 && stoppedHistorySummary.stopped === 3, "terminal unsaved history was misclassified as live");
 testAssert(stoppedHistorySummary.detail.includes("remain unsaved gateway history") && !stoppedHistorySummary.detail.includes("can be saved"), "terminal unsaved history promised an impossible provider save");
-const liveWithoutReasoning = renderTurnTail({state:"working",reasoningSeen:false,permissionIDs:[],blocks:[],contentClipped:false});
-testAssert(liveWithoutReasoning.textContent.includes("has not exposed a separate reasoning stream"), "live provider reasoning absence was not disclosed");
+const liveWithoutReasoning = {surface:"acp",state:"working",reasoningSeen:false,permissionIDs:new Set(),tools:new Map(),lifecycle:[{state:"queued"},{state:"working"}],firstTimestamp:1000,lastTimestamp:2300,committed:false};
+const liveOverview = turnOverviewElement(liveWithoutReasoning);
+testAssert(liveOverview.textContent.includes("ACP turn") && liveOverview.textContent.includes("Working") && liveOverview.textContent.includes("No tools") && liveOverview.textContent.includes("Reasoning not provided"), "live invocation overview was incomplete");
+testAssert(liveOverview.textContent.includes("Queued → Working") && !liveOverview.textContent.includes("1.3s"), "live invocation lifecycle used a misleading frozen duration");
+const finalResponse = messageElement({source:"provider",text:"done",revision:1}, "codex", {final:true});
+testAssert(finalResponse.textContent.includes("Final response · saved"), "committed assistant output was not identified as the final response");
+transcriptState.permissions.set("PENDING", {id:"PENDING",state:"waiting"});
+const approvalOverview = turnOverviewElement({surface:"acp",state:"working",reasoningSeen:true,permissionIDs:new Set(["PENDING"]),tools:new Map([["tool",{}]]),lifecycle:[{state:"working"}],firstTimestamp:0,lastTimestamp:0,committed:false});
+testAssert(approvalOverview.textContent.includes("Approval required") && approvalOverview.className.includes("surface-acp"), "pending approval was hidden from the invocation overview");
+testAssert(approvalOverview.children[0].children[1].className.includes("status-approval"), "pending approval lacked its warning state");
+const failedOverview = turnOverviewElement({surface:"unknown",state:"error",reasoningSeen:false,permissionIDs:new Set(),tools:new Map(),lifecycle:[{state:"working"},{state:"error"}],firstTimestamp:0,lastTimestamp:0,committed:false});
+testAssert(failedOverview.textContent.includes("Provider turn") && failedOverview.textContent.includes("Failed") && failedOverview.textContent.includes("Working → Failed"), "failed provider invocation was misrepresented");
+testAssert(!failedOverview.textContent.includes("REQ-") && !failedOverview.textContent.includes("provider_transcript"), "invocation overview exposed internal identifiers");
+const stableOverviewTurn = {surface:"acp",state:"working",reasoningSeen:false,permissionIDs:new Set(),tools:new Map(),lifecycle:[{state:"working"}],firstTimestamp:0,lastTimestamp:0,committed:false,overviewElement:null};
+const stableOverview = turnOverviewElement(stableOverviewTurn);
+stableOverviewTurn.state = "complete";
+stableOverviewTurn.lifecycle.push({state:"complete"});
+testAssert(turnOverviewElement(stableOverviewTurn) === stableOverview && stableOverview.textContent.includes("Working → Complete"), "stream updates replaced the invocation overview DOM surface");
+testAssert(turnDurationLabel({state:"complete",firstTimestamp:0,lastTimestamp:119800}) === "2m 0s", "completed duration rounded to an invalid 60-second remainder");
+transcriptState.permissions.clear();
 
 testAssert(
   permissionActionErrorMessage({status:409, code:"worker_upgrade_required", message:"Exact worker recovery instructions"}) === "Exact worker recovery instructions",
@@ -277,15 +295,20 @@ resetTranscript();
 const committedSnapshot = {
   source:"provider-store", checkpoint:"pt1-three-turns", gateway_cursor:40,
   turns:[
-    {key:"u1",committed:true,activities:[activity(0,"provider_transcript",{type:"user_message",text:"ACP one"}),activity(0,"provider_transcript",{type:"assistant_chunk",text:"ONE"}),activity(0,"provider_turn_completed",{type:"turn_state",state:"complete"})]},
-    {key:"u2",committed:true,activities:[activity(0,"provider_transcript",{type:"user_message",text:"Native middle"}),activity(0,"provider_transcript",{type:"thought_chunk",text:"native reasoning"}),activity(0,"provider_transcript",{type:"assistant_chunk",text:"TWO"}),activity(0,"provider_turn_completed",{type:"turn_state",state:"complete"})]},
-    {key:"u3",committed:true,activities:[activity(0,"provider_transcript",{type:"user_message",text:"ACP three"}),activity(0,"provider_transcript",{type:"assistant_chunk",text:"THREE"}),activity(0,"provider_turn_completed",{type:"turn_state",state:"complete"})]}
+    {key:"u1",committed:true,surface:"acp",activities:[activity(0,"provider_transcript",{type:"user_message",text:"ACP one"},null,"REQ-1","2026-08-16T00:00:00Z"),activity(1,"prompt_queued",{type:"turn_state",state:"queued"},null,"REQ-1","2026-08-16T00:00:00Z"),activity(2,"turn_started",{type:"turn_state",state:"working"},null,"REQ-1","2026-08-16T00:00:01Z"),activity(0,"provider_transcript",{type:"assistant_chunk",text:"ONE"},null,"REQ-1","2026-08-16T00:00:03Z"),activity(3,"turn_completed",{type:"turn_state",state:"complete"},null,"REQ-1","2026-08-16T00:00:04Z")]},
+    {key:"u2",committed:true,surface:"native",activities:[activity(0,"provider_transcript",{type:"user_message",text:"Native middle"},null,"provider-2","2026-08-16T00:01:00Z"),activity(0,"provider_transcript",{type:"thought_chunk",text:"native reasoning"},null,"provider-2","2026-08-16T00:01:01Z"),activity(0,"provider_transcript",{type:"assistant_chunk",text:"TWO"},null,"provider-2","2026-08-16T00:01:02.2Z"),activity(0,"provider_turn_completed",{type:"turn_state",state:"complete"},null,"provider-2","")]},
+    {key:"u3",committed:true,surface:"acp",activities:[activity(0,"provider_transcript",{type:"user_message",text:"ACP three"}),activity(0,"provider_transcript",{type:"assistant_chunk",text:"THREE"}),activity(0,"provider_turn_completed",{type:"turn_state",state:"complete"})]}
   ], diagnostics:[]
 };
 const savedOnlyCandidate = buildConversationSnapshot(committedSnapshot, []);
 const savedOnlySummary = conversationHistorySummary(savedOnlyCandidate);
 testAssert(savedOnlyCandidate.turns.length === 3 && savedOnlyCandidate.turns.every((turn) => turn.committed), "ACP-native-ACP provider history was not fully loaded");
 testAssert(savedOnlyCandidate.turns[1].blocks.some((block) => block.type === "user" && block.text === "Native middle"), "native middle turn disappeared from the structured conversation");
+testAssert(savedOnlyCandidate.turns.map((turn) => turn.surface).join(",") === "acp,native,acp", "turn invocation surfaces were not preserved");
+const savedInvocationOverviews = savedOnlyCandidate.turns.map((turn) => turnOverviewElement(turn).textContent);
+testAssert(savedInvocationOverviews[0].includes("ACP turn") && savedInvocationOverviews[0].includes("Queued → Working → Complete") && savedInvocationOverviews[0].includes("4.0s"), "saved ACP invocation lifecycle was hidden");
+testAssert(savedInvocationOverviews[1].includes("Native CLI turn") && savedInvocationOverviews[1].includes("Provider history → Complete") && savedInvocationOverviews[1].includes("2.2s"), "saved native invocation lifecycle was hidden");
+testAssert(savedOnlyCandidate.turns[0].overviewElement.attributes["aria-label"].includes("Duration 4.0 seconds"), "completed invocation timing was omitted from its accessible label");
 testAssert(savedOnlySummary.short === "3 saved turns" && !savedOnlySummary.bounded, "complete three-turn history was not disclosed as fully loaded");
 const candidate = buildConversationSnapshot(committedSnapshot, [activity(41, "turn_started", {type:"turn_state",state:"working"}, null, "LIVE")]);
 testAssert(candidate.source === "provider-store" && candidate.checkpoint === "pt1-three-turns", "provider snapshot identity was not retained");
@@ -294,6 +317,16 @@ testAssert(candidate.turns[1].blocks.filter((block) => ["thought","assistant"].i
 testAssert(candidate.lastPosition === 41 && candidate.byRequest.get("LIVE")?.state === "working", "live activity crossing snapshot capture was lost");
 testAssert(candidate.turns.slice(0, 3).every((turn) => turn.state === "complete" && turn.committed), "committed provider turns were not marked complete");
 testAssert(!candidate.byRequest.get("LIVE").committed, "buffered ACP turn was falsely marked provider-committed");
+
+resetTranscript();
+for (let toolIndex = 0; toolIndex < 36; toolIndex += 1) {
+  for (let patchIndex = 0; patchIndex < 5; patchIndex += 1) {
+    applyActivity(activity(toolIndex * 5 + patchIndex + 1, "acp", {type:"tool_upsert",tool:{id:"tool-" + toolIndex,title:"Tool " + toolIndex,status:patchIndex === 4 ? "completed" : "in_progress"}}));
+  }
+}
+const richToolTurn = transcriptState.turns[0];
+const richToolOverview = turnOverviewElement(richToolTurn);
+testAssert(richToolTurn.tools.size === 36 && richToolOverview.textContent.includes("36 tools"), "tool update patches were not reported as logical invocations");
 
 const providerReasoningCard = thoughtElement({source:"provider",text:"First stored line\nSecond stored line",revision:1}, {streaming:false});
 testAssert(providerReasoningCard.open, "stored provider reasoning was not open by default");
@@ -477,6 +510,13 @@ class FakeElement {
     this.dataset = {};
     this.attributes = {};
     this.className = "";
+    this.classList = {
+      toggle: (name, force) => {
+        const classes = new Set(this.className.split(/\s+/).filter(Boolean));
+        if (force === undefined ? !classes.has(name) : force) classes.add(name); else classes.delete(name);
+        this.className = [...classes].join(" ");
+      }
+    };
     this.open = false;
     this._textContent = "";
   }

@@ -71,6 +71,7 @@ type ConversationDTO struct {
 type ConversationTurnDTO struct {
 	Key        string        `json:"key"`
 	Committed  bool          `json:"committed"`
+	Surface    string        `json:"surface"`
 	Activities []ActivityDTO `json:"activities"`
 }
 
@@ -145,7 +146,10 @@ func makeConversationDTO(snapshot appservice.ConversationSnapshot) ConversationD
 		Diagnostics: make([]ActivityDTO, 0, len(snapshot.Diagnostics)),
 	}
 	for _, turn := range snapshot.Turns {
-		current := ConversationTurnDTO{Key: turn.Key, Committed: turn.Committed, Activities: make([]ActivityDTO, 0, len(turn.Activities))}
+		current := ConversationTurnDTO{
+			Key: turn.Key, Committed: turn.Committed, Surface: string(turn.Surface),
+			Activities: make([]ActivityDTO, 0, len(turn.Activities)),
+		}
 		for _, activity := range turn.Activities {
 			current.Activities = append(current.Activities, makeConversationActivityDTO(activity))
 		}

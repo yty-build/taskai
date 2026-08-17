@@ -144,6 +144,77 @@ func Summary(line sessionlog.Line, display *Activity) string {
 	return strings.ReplaceAll(line.Type, "_", " ")
 }
 
+// DiagnosticSummary names gateway and ACP activity without forwarding raw
+// envelopes or their provider-controlled text. It gives advanced viewers a
+// useful bounded timeline while keeping protocol data in the trusted log.
+func DiagnosticSummary(line sessionlog.Line) string {
+	if line.Type != "acp" {
+		return Summary(sessionlog.Line{Type: line.Type}, nil)
+	}
+	var event acp.Event
+	if json.Unmarshal(line.Data, &event) != nil {
+		return "ACP update"
+	}
+	var raw map[string]any
+	if json.Unmarshal(event.Raw, &raw) != nil {
+		return "ACP update"
+	}
+	update := object(object(raw["params"])["update"])
+	switch event.Type {
+	case "agent_message_chunk":
+		return "ACP output chunk"
+	case "agent_thought_chunk":
+		return "ACP reasoning chunk"
+	case "tool_call":
+		return "ACP tool call"
+	case "tool_call_update":
+		return "ACP tool update"
+	case "plan", "plan_update":
+		return "ACP plan update"
+	case "available_commands_update":
+		count := len(arrayValue(update["availableCommands"]))
+		if count > 0 {
+			return fmt.Sprintf("ACP capabilities updated · %d commands", count)
+		}
+		return "ACP capabilities updated"
+	case "usage_update":
+		used, usedOK := safeWholeNumber(update["used"])
+		limit, limitOK := safeWholeNumber(update["size"])
+		if usedOK && limitOK {
+			return fmt.Sprintf("ACP context usage · %d / %d", used, limit)
+		}
+		if usedOK {
+			return fmt.Sprintf("ACP context usage · %d", used)
+		}
+		return "ACP context usage updated"
+	case "session_info_update":
+		return "ACP session metadata updated"
+	case "session_request_permission":
+		return "ACP permission requested"
+	case "prompt_result":
+		return "ACP turn result"
+	case "error":
+		return "ACP error"
+	case "session_prompt", "user_message_chunk":
+		return "ACP user message update"
+	default:
+		return "ACP update"
+	}
+}
+
+func arrayValue(value any) []any {
+	result, _ := value.([]any)
+	return result
+}
+
+func safeWholeNumber(value any) (int64, bool) {
+	number, ok := value.(float64)
+	if !ok || number < 0 || number > float64(1<<62) {
+		return 0, false
+	}
+	return int64(number), true
+}
+
 func summaryText(value string) string {
 	value, clipped := truncateUTF8(cleanDisplay(value), 2048)
 	if clipped {

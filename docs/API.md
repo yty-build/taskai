@@ -95,11 +95,13 @@ Conversation projection:
     {
       "key": "opaque-presentation-key",
       "committed": true,
+      "surface": "native",
       "activities": []
     },
     {
       "key": "REQ-…",
       "committed": false,
+      "surface": "acp",
       "activities": []
     }
   ],
@@ -115,6 +117,11 @@ it never claims that gateway JSONL is the provider's committed transcript.
 `committed: false` identifies a provisional ACP turn that has not yet matched a
 provider-store commit. `checkpoint`, turn `key`, and activity IDs are opaque
 presentation/reconnect values, not new domain entities or provider IDs.
+Turn `surface` is transient presentation attribution: `acp` is backed by a
+gateway invocation, `native` is a provider-store turn with no gateway match
+only when matched ACP turns on both sides and complete gateway history prove
+that distinction, and `unknown` is used for leading, trailing, repeated,
+ambiguous, or bounded history that cannot support a safe attribution.
 
 The service reads one bounded provider snapshot, joins gateway activity through
 the returned `gateway_cursor`, and returns the result as one bounded object. If

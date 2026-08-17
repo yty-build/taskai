@@ -204,6 +204,11 @@ func TestConversationGatewayFallbackDisclosesBoundedHistoryEviction(t *testing.T
 	if snapshot.Turns[0].Key != "REQ-bounded-044" || !strings.Contains(snapshot.Warning, "Earlier gateway history was omitted") {
 		t.Fatalf("bounded gateway fallback first=%q warning=%q", snapshot.Turns[0].Key, snapshot.Warning)
 	}
+	for _, turn := range snapshot.Turns {
+		if turn.Surface != ConversationSurfaceACP {
+			t.Fatalf("gateway fallback surface = %q, want ACP", turn.Surface)
+		}
+	}
 }
 
 func TestConversationMergeDoesNotLetARepeatedAnswerCommitTheNewerTurn(t *testing.T) {
@@ -268,6 +273,9 @@ func TestConversationMergeRequiresPromptIdentityForShortAnswers(t *testing.T) {
 	if len(merged) != 2 || !merged[0].Committed || merged[1].Committed || merged[1].Key != gateway.id {
 		t.Fatalf("short answer with a different prompt was falsely committed: %#v", merged)
 	}
+	if merged[0].Surface != ConversationSurfaceUnknown || merged[1].Surface != ConversationSurfaceACP {
+		t.Fatalf("ambiguous provider/gateway surfaces = %q/%q", merged[0].Surface, merged[1].Surface)
+	}
 }
 
 func TestConversationMergeRecognizesCleanPromptInsideInjectedEnvelope(t *testing.T) {
@@ -287,7 +295,7 @@ func TestConversationMergeRecognizesCleanPromptInsideInjectedEnvelope(t *testing
 		t.Fatalf("unique short wrapped prompt did not reconcile safely: %#v", merged)
 	}
 	providerOnly := mergeConversationTurns(provider, nil)
-	if len(providerOnly) != 1 || providerOnly[0].Activities[0].Display == nil || providerOnly[0].Activities[0].Display.Text != clean {
+	if len(providerOnly) != 1 || providerOnly[0].Surface != ConversationSurfaceUnknown || providerOnly[0].Activities[0].Display == nil || providerOnly[0].Activities[0].Display.Text != clean {
 		t.Fatalf("unmatched provider envelope was exposed instead of cleaned: %#v", providerOnly)
 	}
 	for _, secret := range []string{"T-private", "S-private", "/private/repo", "/private/worktree", "private/branch"} {
@@ -326,6 +334,25 @@ func TestConversationMergeReconcilesACPThenNativeThenRepeatedACPAnswer(t *testin
 	if !hasConversationDisplayKind(merged[2].Activities, "assistant_chunk", "provider_transcript") ||
 		!hasConversationDisplayKind(merged[2].Activities, "thought_chunk", "acp") {
 		t.Fatalf("matched answer and supplemental ACP reasoning provenance was conflated: %#v", merged[2])
+	}
+	if merged[0].Surface != ConversationSurfaceACP || merged[1].Surface != ConversationSurfaceNative || merged[2].Surface != ConversationSurfaceACP {
+		t.Fatalf("ACP/native/ACP surfaces = %q/%q/%q", merged[0].Surface, merged[1].Surface, merged[2].Surface)
+	}
+	bounded := mergeConversationTurnsWithGatewayState(provider, []*conversationTurn{firstACP, secondACP}, true)
+	if bounded[0].Surface != ConversationSurfaceACP || bounded[1].Surface != ConversationSurfaceUnknown || bounded[2].Surface != ConversationSurfaceACP {
+		t.Fatalf("bounded ACP/unknown/ACP surfaces = %q/%q/%q", bounded[0].Surface, bounded[1].Surface, bounded[2].Surface)
+	}
+	ambiguousGateway := conversationGatewayFixture("REQ-ambiguous", 2, "An unmatched ACP prompt", "AN-UNMATCHED-ACP-ANSWER", true)
+	withAmbiguousGateway := mergeConversationTurns(provider, []*conversationTurn{firstACP, ambiguousGateway, secondACP})
+	var middleProvider *ConversationTurn
+	for index := range withAmbiguousGateway {
+		if withAmbiguousGateway[index].Key == "provider-user-2" {
+			middleProvider = &withAmbiguousGateway[index]
+			break
+		}
+	}
+	if middleProvider == nil || middleProvider.Surface != ConversationSurfaceUnknown {
+		t.Fatalf("provider turn bracketed around an unmatched gateway invocation was falsely native: %#v", withAmbiguousGateway)
 	}
 }
 

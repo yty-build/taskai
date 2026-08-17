@@ -40,6 +40,17 @@ const (
 	ConversationSourceGateway  ConversationSource = "gateway-log"
 )
 
+// ConversationSurface identifies how a viewer-visible turn entered the
+// canonical provider conversation. It is transient presentation state, not a
+// persisted domain model or a concurrency primitive.
+type ConversationSurface string
+
+const (
+	ConversationSurfaceACP     ConversationSurface = "acp"
+	ConversationSurfaceNative  ConversationSurface = "native"
+	ConversationSurfaceUnknown ConversationSurface = "unknown"
+)
+
 // ConversationActivity is the bounded, browser-safe projection of one gateway
 // log record retained around an uncommitted ACP turn. Raw ACP envelopes and
 // provider payloads never cross this service boundary.
@@ -81,6 +92,7 @@ type ConversationSnapshot struct {
 type ConversationTurn struct {
 	Key        string
 	Committed  bool
+	Surface    ConversationSurface
 	Activities []ConversationActivity
 }
 
@@ -150,7 +162,7 @@ func (s *SessionService) Conversation(ctx context.Context, id string) (Conversat
 		return ConversationSnapshot{}, fmt.Errorf("project gateway history for provider reconciliation: %w", err)
 	}
 	return ConversationSnapshot{
-		Source: ConversationSourceProvider, Provider: provider, Turns: mergeConversationTurns(provider, turns),
+		Source: ConversationSourceProvider, Provider: provider, Turns: mergeConversationTurnsWithGatewayState(provider, turns, gatewayTruncated),
 		Diagnostics: diagnostics, GatewayCursor: cursor, Truncated: provider.Truncated || gatewayTruncated,
 	}, nil
 }
@@ -169,7 +181,8 @@ func (s *SessionService) gatewayConversationSnapshot(ctx context.Context, sessio
 			continue
 		}
 		projection = append(projection, ConversationTurn{
-			Key: turn.id, Committed: false, Activities: append([]ConversationActivity(nil), turn.activities...),
+			Key: turn.id, Committed: false, Surface: ConversationSurfaceACP,
+			Activities: append([]ConversationActivity(nil), turn.activities...),
 		})
 	}
 	if truncated {
@@ -220,7 +233,7 @@ func (s *SessionService) gatewayConversationState(ctx context.Context, _ string,
 		}
 		diagnostic := ConversationActivity{
 			Position: line.Seq, RequestID: line.RequestID, Kind: line.Type, Timestamp: line.Timestamp,
-			Summary: presentation.Summary(sessionlog.Line{Type: line.Type}, nil),
+			Summary: presentation.DiagnosticSummary(line),
 		}
 		diagnosticSize := conversationActivityBytes(diagnostic)
 		for len(diagnostics) > 0 && (len(diagnostics) >= conversationDiagnostics || diagnosticBytes+diagnosticSize > conversationDiagnosticBudget) {
@@ -352,6 +365,10 @@ type providerConversationTurn struct {
 }
 
 func mergeConversationTurns(provider native.TranscriptSnapshot, gateway []*conversationTurn) []ConversationTurn {
+	return mergeConversationTurnsWithGatewayState(provider, gateway, false)
+}
+
+func mergeConversationTurnsWithGatewayState(provider native.TranscriptSnapshot, gateway []*conversationTurn, gatewayTruncated bool) []ConversationTurn {
 	providerTurns := groupProviderTurns(provider.Records)
 	matchedProvider := make(map[int]*conversationTurn)
 	matchedGateway := make(map[*conversationTurn]bool)
@@ -381,7 +398,10 @@ func mergeConversationTurns(provider native.TranscriptSnapshot, gateway []*conve
 			if matchedGateway[turn] || len(turn.activities) == 0 {
 				continue
 			}
-			result = append(result, ConversationTurn{Key: turn.id, Committed: false, Activities: append([]ConversationActivity(nil), turn.activities...)})
+			result = append(result, ConversationTurn{
+				Key: turn.id, Committed: false, Surface: ConversationSurfaceACP,
+				Activities: append([]ConversationActivity(nil), turn.activities...),
+			})
 		}
 	}
 	for index, turn := range providerTurns {
@@ -394,13 +414,43 @@ func mergeConversationTurns(provider native.TranscriptSnapshot, gateway []*conve
 			} else {
 				activities = matchedCommittedActivities(turn, gatewayTurn)
 			}
-			result = append(result, ConversationTurn{Key: turn.key, Committed: true, Activities: activities})
+			result = append(result, ConversationTurn{Key: turn.key, Committed: true, Surface: ConversationSurfaceACP, Activities: activities})
 			continue
 		}
-		result = append(result, ConversationTurn{Key: turn.key, Committed: turn.complete, Activities: providerTurnActivities(turn, turn.complete)})
+		surface := inferUnmatchedProviderSurface(index, matchedProvider, gatewayIndex, gatewayTruncated)
+		result = append(result, ConversationTurn{
+			Key: turn.key, Committed: turn.complete, Surface: surface,
+			Activities: providerTurnActivities(turn, turn.complete),
+		})
 	}
 	appendUnmatchedGatewayBefore(len(gateway))
 	return result
+}
+
+func inferUnmatchedProviderSurface(index int, matched map[int]*conversationTurn, gatewayIndex map[*conversationTurn]int, gatewayTruncated bool) ConversationSurface {
+	if gatewayTruncated {
+		return ConversationSurfaceUnknown
+	}
+	previousProvider, nextProvider := -1, -1
+	for candidate := range matched {
+		if candidate < index && candidate > previousProvider {
+			previousProvider = candidate
+		}
+		if candidate > index && (nextProvider < 0 || candidate < nextProvider) {
+			nextProvider = candidate
+		}
+	}
+	if previousProvider < 0 || nextProvider < 0 {
+		return ConversationSurfaceUnknown
+	}
+	// A complete unmatched provider turn is positively attributable to the
+	// native surface only when it is bracketed by two matched ACP turns with no
+	// gateway turn between them. Leading, trailing, repeated, or ambiguous
+	// unmatched records remain an honest generic provider turn.
+	if gatewayIndex[matched[nextProvider]] == gatewayIndex[matched[previousProvider]]+1 {
+		return ConversationSurfaceNative
+	}
+	return ConversationSurfaceUnknown
 }
 
 func groupProviderTurns(records []native.TranscriptRecord) []*providerConversationTurn {

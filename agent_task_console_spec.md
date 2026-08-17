@@ -1435,7 +1435,7 @@ VID-17  Create property walkthrough       ✓ Done
 └─────────────────────────┴────────────────────────────────────────┘
 ```
 
-The browser is a conversation-first structured ACP client over the same Task/Session state as CLI. The selected Session owns the main canvas. User and assistant turns are primary. Provider-exposed reasoning streams in event order inside a collapsible surface that is open by default; successful tools, plan detail, IDs, checkout paths, and diagnostics use progressive disclosure. Actionable permissions are pinned above the sticky composer and must not disappear when the transcript scrolls.
+The browser is a conversation-first structured ACP client over the same Task/Session state as CLI. The selected Session owns the main canvas. User and assistant turns are primary. A compact per-turn invocation strip identifies ACP, provider-native, or safely unknown origin and shows lifecycle, completed elapsed time when known, logical tool count, reasoning availability, and approval state without rendering raw transport chunks. Provider-exposed reasoning streams in event order inside a collapsible surface that is open by default; successful tools, plan detail, IDs, checkout paths, and diagnostics use progressive disclosure. Actionable permissions are pinned above the sticky composer and must not disappear when the transcript scrolls.
 
 Desktop keeps Task/Session navigation visible. Mobile uses a focus-managed navigation drawer and one full-height conversation pane, but retains response cancel/resume controls and an explicit Send action. Streamed updates preserve reader position, expanded tool/reasoning state, focus, and text selection. The transcript and approval shelf expose live-region/author semantics for assistive technology.
 

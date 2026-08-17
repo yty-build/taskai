@@ -93,6 +93,7 @@ Primary end-to-end evidence:
 | Prompt/cancel/resume/stop | versioned API route test plus browser client control bindings | Click controls |
 | Review and bounded sanitized diagnostics | API review test, rendered controls/asset assertions, semantic projection/error/tool redaction tests | Click controls |
 | Conversation-first streamed transcript | `TestBrowserTranscriptReducerIsBoundedAndDeterministic`, semantic projection tests | Observe prompt, assistant, reasoning, tool, plan, and permission states |
+| Every visible turn identifies its invocation surface and safe execution state | ACP/native/unknown conversation-surface service/API assertions and browser invocation-overview reducer assertions | Confirm ACP → Native CLI → ACP, lifecycle, completed elapsed time, logical tool count, reasoning availability, and approval state without raw protocol IDs |
 | Responsive structured ACP view exposes only linked/verified continuity state | web rendering/DTO tests; named mobile actions and live-region assertions | 1440/1024/390 visual and accessibility smoke |
 | Web shutdown leaves workers running | `TestStoppingWebServerLeavesSessionWorkerUntouched` proves unchanged PID/socket/status and zero runtime commands | Stop server during live turn |
 | Browser hardening | DNS-rebinding/cross-origin test, CSP/escaping assertions | Inspect response headers |

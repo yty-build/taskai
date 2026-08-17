@@ -400,6 +400,7 @@ function endFormSubmission(form) {
 function applyOptimisticPromptState(turn, acceptedState) {
   if (turn.lifecycleSeen) return false;
   turn.state = acceptedState === "queued" ? "queued" : "working";
+  recordTurnLifecycle(turn, turn.state, {});
   return true;
 }
 
@@ -476,6 +477,31 @@ function activityPosition(activity) {
 
 function orderedTurns() {
   return [...transcriptState.turns].sort((left, right) => left.firstPosition - right.firstPosition);
+}
+
+function activityTimestamp(activity) {
+  const value = Date.parse(activity?.timestamp || "");
+  return Number.isFinite(value) ? value : 0;
+}
+
+function recordTurnActivityTime(turn, activity) {
+  const value = activityTimestamp(activity);
+  if (!value) return;
+  if (!turn.firstTimestamp || value < turn.firstTimestamp) turn.firstTimestamp = value;
+  if (!turn.lastTimestamp || value > turn.lastTimestamp) turn.lastTimestamp = value;
+}
+
+function recordTurnLifecycle(turn, state, activity) {
+  state = String(state || "").trim().toLowerCase();
+  if (!state) return;
+  const timestamp = activityTimestamp(activity);
+  const previous = turn.lifecycle[turn.lifecycle.length - 1];
+  if (previous?.state === state) {
+    if (timestamp) previous.timestamp = timestamp;
+    return;
+  }
+  if (turn.lifecycle.length >= 16) turn.lifecycle.shift();
+  turn.lifecycle.push({ state, timestamp });
 }
 
 function turnRetainedBytes(turn) {
@@ -557,14 +583,17 @@ function turnFor(activity) {
   let turn = transcriptState.byRequest.get(requestID);
   if (turn) {
     turn.firstPosition = Math.min(turn.firstPosition, activityPosition(activity));
+    recordTurnActivityTime(turn, activity);
     return turn;
   }
   turn = {
     id: requestID, firstPosition: activityPosition(activity), state: "", stopReason: "", blocks: [],
     tools: new Map(), plan: null, error: null, permissionIDs: new Set(),
     assistantBytes: 0, thoughtBytes: 0, toolBytes: 0, retainedBytes: 0, assistantSeen: false, reasoningSeen: false,
-    lifecycleSeen: false, committed: false, contentClipped: false, dirty: true, element: null
+    lifecycle: [], firstTimestamp: 0, lastTimestamp: 0, surface: "acp",
+    lifecycleSeen: false, committed: false, contentClipped: false, dirty: true, element: null, overviewElement: null
   };
+  recordTurnActivityTime(turn, activity);
   transcriptState.byRequest.set(requestID, turn);
   transcriptState.turns.push(turn);
   return turn;
@@ -708,6 +737,7 @@ function applyDisplay(activity, turn) {
     turn.error.text = truncateUTF8(display.text || "The provider turn failed.", LIMITS.assistant).text;
     touchBlock(turn.error);
     turn.state = "error";
+    recordTurnLifecycle(turn, "error", activity);
     turn.lifecycleSeen = true;
     turn.dirty = true;
     updateRuntimeStatusFromDisplay(display);
@@ -716,6 +746,7 @@ function applyDisplay(activity, turn) {
   case "turn_state":
     turn.state = display.state || turn.state;
     turn.stopReason = display.stop_reason || turn.stopReason;
+    recordTurnLifecycle(turn, turn.state, activity);
     turn.lifecycleSeen = true;
     turn.dirty = true;
     updateRuntimeStatusFromDisplay(display);
@@ -823,9 +854,13 @@ function buildConversationSnapshot(snapshot, buffered = []) {
         applySnapshotActivity({ ...activity, position: snapshotPosition, request_id: requestID });
       }
       const turn = candidate.byRequest.get(requestID);
-      if (turn) turn.committed = Boolean(snapshotTurn.committed);
+      if (turn) {
+        turn.committed = Boolean(snapshotTurn.committed);
+        turn.surface = ["acp", "native", "unknown"].includes(snapshotTurn.surface) ? snapshotTurn.surface : "unknown";
+      }
       if (turn && snapshotTurn.committed && !turn.lifecycleSeen) {
         turn.state = "complete";
+        recordTurnLifecycle(turn, "complete", {});
         turn.lifecycleSeen = true;
         turn.dirty = true;
       }
@@ -908,6 +943,7 @@ function adoptConversationPresentation(previous, candidate) {
     if (!oldTurn) continue;
     usedTurns.add(oldTurn);
     turn.element = oldTurn.element;
+    turn.overviewElement = oldTurn.overviewElement;
     const usedBlocks = new Set();
     for (const block of turn.blocks) {
       const oldBlock = matchingOldBlock(block, oldTurn.blocks, usedBlocks);
@@ -1009,7 +1045,7 @@ function updateHistorySource(source, warning = "") {
 function snapshotSignature(snapshot) {
   return JSON.stringify([
     snapshot.source, snapshot.checkpoint, snapshot.gateway_cursor, snapshot.warning, snapshot.truncated,
-    (snapshot.turns || []).map((turn) => [turn.key, turn.committed, (turn.activities || []).map((item) => [item.position, item.kind, item.request_id])]),
+    (snapshot.turns || []).map((turn) => [turn.key, turn.committed, turn.surface, (turn.activities || []).map((item) => [item.position, item.kind, item.request_id])]),
   ]);
 }
 
@@ -1214,7 +1250,7 @@ function messageElement(block, assistantName, context = {}) {
   author.textContent = assistantName;
   const phase = document.createElement("span");
   phase.textContent = context.final
-    ? (block.source === "provider" ? "Response · saved" : "Response · complete")
+    ? (block.source === "provider" ? "Final response · saved" : "Final response")
     : block.source === "provider" ? "Earlier response" : context.streaming ? "Working" : "Earlier update";
   meta.append(author, phase);
   const body = document.createElement("div");
@@ -1368,6 +1404,104 @@ function turnHasReasoning(turn) {
   return turn.reasoningSeen;
 }
 
+function turnHasWaitingPermission(turn) {
+  for (const permissionID of turn.permissionIDs || []) {
+    if (transcriptState.permissions.get(permissionID)?.state === "waiting") return true;
+  }
+  return false;
+}
+
+function turnSurfaceLabel(turn) {
+  if (turn.surface === "native") return "Native CLI turn";
+  if (turn.surface === "unknown") return "Provider turn";
+  return "ACP turn";
+}
+
+function turnStatusLabel(turn) {
+  if (turnHasWaitingPermission(turn)) return "Approval required";
+  return ({
+    queued: "Queued", working: "Working", cancelling: "Stopping", cancelled: "Stopped",
+    error: "Failed", failed: "Failed", complete: "Complete"
+  })[turn.state] || (turn.committed ? "Complete" : "Pending");
+}
+
+function turnStatusTone(turn) {
+  if (turnHasWaitingPermission(turn)) return "approval";
+  return turn.state || "pending";
+}
+
+function turnDurationLabel(turn) {
+  if (!["complete", "cancelled", "error", "failed"].includes(turn.state)) return "";
+  const elapsed = Math.max(0, (turn.lastTimestamp || 0) - (turn.firstTimestamp || 0));
+  if (!elapsed) return "";
+  if (elapsed < 1000) return `${elapsed}ms`;
+  if (elapsed < 10000) return `${(elapsed / 1000).toFixed(1)}s`;
+  if (elapsed < 60000) return `${Math.round(elapsed / 1000)}s`;
+  const totalSeconds = Math.round(elapsed / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}m ${seconds}s`;
+}
+
+function turnLifecycleLabel(turn) {
+  const labels = ({
+    queued: "Queued", working: "Working", cancelling: "Stopping", cancelled: "Stopped",
+    error: "Failed", failed: "Failed", complete: "Complete"
+  });
+  const states = (turn.lifecycle || []).map((item) => labels[item.state] || "").filter(Boolean);
+  if (turn.surface !== "acp" && states.length === 1 && states[0] === "Complete") {
+    return "Provider history → Complete";
+  }
+  return states.join(" → ") || turnStatusLabel(turn);
+}
+
+function setTextIfChanged(element, value) {
+  if (element.textContent !== value) element.textContent = value;
+}
+
+function accessibleDurationLabel(duration) {
+  if (!duration) return "";
+  const milliseconds = duration.match(/^(\d+)ms$/);
+  if (milliseconds) return `Duration ${milliseconds[1]} milliseconds. `;
+  const seconds = duration.match(/^(\d+(?:\.\d+)?)s$/);
+  if (seconds) return `Duration ${seconds[1]} seconds. `;
+  const minutes = duration.match(/^(\d+)m (\d+)s$/);
+  if (minutes) return `Duration ${minutes[1]} minutes ${minutes[2]} seconds. `;
+  return "";
+}
+
+function turnOverviewElement(turn) {
+  const overview = turn.overviewElement || document.createElement("div");
+  if (!turn.overviewElement) {
+    overview.setAttribute("role", "group");
+    const main = document.createElement("div");
+    main.className = "turn-overview-main";
+    overview._surfaceLabel = document.createElement("strong");
+    overview._statusLabel = document.createElement("span");
+    overview._durationLabel = document.createElement("span");
+    overview._toolsLabel = document.createElement("span");
+    overview._reasoningLabel = document.createElement("span");
+    main.append(overview._surfaceLabel, overview._statusLabel, overview._durationLabel, overview._toolsLabel, overview._reasoningLabel);
+    overview._lifecycleLabel = document.createElement("div");
+    overview._lifecycleLabel.className = "turn-overview-lifecycle";
+    overview.append(main, overview._lifecycleLabel);
+    turn.overviewElement = overview;
+  }
+  overview.className = `turn-overview surface-${turn.surface || "unknown"}`;
+  setTextIfChanged(overview._surfaceLabel, turnSurfaceLabel(turn));
+  overview._statusLabel.className = `turn-overview-status status-${turnStatusTone(turn)}`;
+  setTextIfChanged(overview._statusLabel, turnStatusLabel(turn));
+  const duration = turnDurationLabel(turn);
+  overview._durationLabel.hidden = !duration;
+  setTextIfChanged(overview._durationLabel, duration);
+  const toolCount = turn.tools?.size || 0;
+  setTextIfChanged(overview._toolsLabel, toolCount ? `${toolCount} ${toolCount === 1 ? "tool" : "tools"}` : "No tools");
+  setTextIfChanged(overview._reasoningLabel, turnHasReasoning(turn) ? "Reasoning available" : "Reasoning not provided");
+  setTextIfChanged(overview._lifecycleLabel, turnLifecycleLabel(turn));
+  overview.setAttribute("aria-label", `${turnSurfaceLabel(turn)}. ${turnStatusLabel(turn)}. ${accessibleDurationLabel(duration)}${overview._toolsLabel.textContent}. ${overview._reasoningLabel.textContent}. ${overview._lifecycleLabel.textContent}.`);
+  return overview;
+}
+
 function renderTurnTail(turn) {
   const tail = document.createElement("div");
   tail.className = "turn-tail";
@@ -1387,21 +1521,10 @@ function renderTurnTail(turn) {
     state.append(dot, document.createTextNode(copy));
     tail.append(state);
   }
-  if (turn.state === "working" && !turnHasReasoning(turn)) {
-    const unavailable = document.createElement("div");
-    unavailable.className = "reasoning-unavailable";
-    unavailable.textContent = "This provider has not exposed a separate reasoning stream for the live turn.";
-    tail.append(unavailable);
-  }
   if (turn.state === "complete") {
     const retainedResponse = completedResponseBlock(turn);
     const retainedReasoning = turn.blocks.some((block) => block.type === "thought" && block.text.trim());
-    if (!turnHasReasoning(turn)) {
-      const unavailable = document.createElement("div");
-      unavailable.className = "reasoning-unavailable";
-      unavailable.textContent = "No separate reasoning summary was available for this turn.";
-      tail.append(unavailable);
-    } else if (!retainedReasoning) {
+    if (turnHasReasoning(turn) && !retainedReasoning) {
       const unavailable = document.createElement("div");
       unavailable.className = "reasoning-unavailable";
       unavailable.textContent = "Earlier reasoning is outside this bounded view; committed provider history remains unchanged.";
@@ -1600,14 +1723,23 @@ function patchTurnElement(turn, assistantName) {
   article.dataset.state = turn.state || "";
   const blocks = article.querySelector(".turn-blocks");
   const desired = [];
+  const overview = turnOverviewElement(turn);
   const completedResponse = completedResponseBlock(turn);
+  let overviewInserted = false;
   for (const block of turn.blocks) {
     const element = patchBlockElement(block, assistantName, {
       streaming: turn.state === "working",
       final: block === completedResponse
     });
-    if (element) desired.push(element);
+    if (element) {
+      desired.push(element);
+      if (block.type === "user") {
+        desired.push(overview);
+        overviewInserted = true;
+      }
+    }
   }
+  if (!overviewInserted) desired.unshift(overview);
   for (let index = 0; index < desired.length; index += 1) {
     if (blocks.children[index] !== desired[index]) blocks.insertBefore(desired[index], blocks.children[index] || null);
   }

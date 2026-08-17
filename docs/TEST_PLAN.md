@@ -194,6 +194,12 @@ For `acpctl session attach --acp`:
 - Verify semantic user/assistant reconstruction from committed provider history
   plus provisional ACP, cumulative transcript bounds, merged tool/plan updates,
   and diagnostic-only records creating no blank turns.
+- Verify each turn shows a compact, sanitized invocation overview: conservative
+  ACP/native/unknown surface attribution, lifecycle, completed elapsed time,
+  deduplicated
+  logical tool count, reasoning availability, and pending approval. Confirm
+  output chunks remain coalesced and raw ACP envelopes/opaque IDs remain only in
+  bounded local diagnostics.
 - Verify reconnect after stop/resume does not pin a stale query cursor, rapid Enter cannot duplicate a prompt, and late replay remains ordered before an optimistic prompt.
 - Verify streaming preserves expanded tool/reasoning state, focus, text selection, and a reader's scroll anchor; verify mobile keeps named cancel/resume actions and announces conversation/approval updates.
 - Stop the web server and confirm workers continue.
