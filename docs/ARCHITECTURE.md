@@ -102,6 +102,16 @@ The runtime bridge uses a bounded NDJSON control pipe on child fd 3. Child stdin
 
 The spawning CLI is not the worker's parent lifecycle owner. Terminal and web connections may exit without affecting it. Every normal CLI invocation reconciles stale persisted PID/socket state and removes stale runtime files.
 
+Every provider-writing operation against a live worker first negotiates the
+current worker protocol and `exclusive-native-owner-v1` capability. This gate
+covers prompts, permission decisions, provider-native attachment, and Resume
+when a worker socket is already live. A responsive older worker receives no
+provider command and returns a typed upgrade conflict instead of being assumed
+safe. Cancel, Stop, status/read, conversation/history, and stream operations
+remain available so the user can inspect and migrate safely: exit any provider
+CLI in `agent-<session-id>`, stop that Session, then resume it with the current
+binary.
+
 ## Conversation sources, projection, and reconnect
 
 One canonical provider conversation has three distinct data paths:
@@ -116,6 +126,13 @@ The provider store may itself be JSONL, SQLite, or another provider format; it
 is accessed only through verified provider adapters in `internal/native`.
 Gateway JSONL is not promoted into a canonical transcript merely because a
 provider snapshot is temporarily unavailable.
+
+After reconciliation, provider-exposed user, reasoning, and assistant records
+are authoritative for the committed turn. Distinct ACP-only reasoning may
+remain as explicitly ACP-sourced supplemental context; when the provider has
+no readable reasoning, the ACP reasoning remains the visible fallback. During
+a gateway-history fallback, all reasoning remains provisional gateway evidence
+and is never labelled provider-committed.
 
 Session JSONL is the recovery boundary for gateway-visible activity. Each line contains:
 
@@ -199,7 +216,28 @@ canonical provider ID ── exact local-store verification ── native CLI re
                                               release queued ACP write
 ```
 
-When tmux is available, the native CLI runs in a stable per-Session tmux session; detaching the viewer leaves it running. The gateway tags that tmux session with a hash of the canonical state root plus Session identity, explicitly passes the selected `AGENT_HOME` and current `PATH` to defeat stale tmux-server environment, and refuses an unowned name collision. A direct execution fallback is used outside a TTY, inside tmux, or when tmux is unavailable.
+When tmux is available, the native CLI runs in a stable per-Session tmux session; detaching the viewer leaves it running. The gateway tags that tmux session with a hash of the canonical state root plus Session identity, explicitly passes the selected `AGENT_HOME` and current `PATH` to defeat stale tmux-server environment, and refuses an unowned name collision. From a gateway console already inside tmux, attachment switches that client to the same stable harness; `Ctrl-B L` returns to the previous console client view. Direct execution is allowed only outside tmux when the terminal is non-interactive or the tmux binary is unavailable; a nested tmux handoff always fails closed rather than launching a second provider.
+
+Native handoff uses a private, generation-scoped lifecycle inside the worker:
+
+```text
+none -> reserved(g) -> active(g) -> refresh_pending -> none
+                   \-> recovered -> refresh_pending -> none
+```
+
+The outer viewer first reserves a fresh opaque generation. The hidden tmux
+process, or a direct foreground runner, must atomically activate that exact
+generation immediately before provider start and present it again on release.
+A delayed process from an older generation cannot activate or release a newer
+lifecycle. A collision that never activated remains `reserved` and can be
+recovered explicitly only after exact `=agent-<session-id>` tmux absence is
+verified. Recovery that revokes the reservation schedules exact refresh and
+provider-store reconciliation because the colliding harness may have changed
+provider history. If a concurrent safe release wins first, recovery reports
+`already_released` and does not invent a refresh event to wait for. Once
+`active`, tmux disappearance does not prove that the provider
+tree exited, so ownership stays fail-closed. Legacy ownership markers are also
+treated as active.
 
 Viewer connections are non-exclusive, but provider writes are exclusive per
 Session. If an ACP turn owns the writer gate, native attach waits or fails

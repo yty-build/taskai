@@ -140,8 +140,9 @@ Commit: `feat: add the acpx execution adapter`
   new product entity or table. A tmux viewer detach must not falsely release a
   still-running native owner.
 - Test FIFO acquisition, wait/fail behavior, prompt queueing behind native,
-  native reattach, owner crash/stale recovery, and proof that two surfaces never
-  dispatch provider input concurrently.
+  native reattach, stale pre-launch reservation recovery, fail-closed
+  active-owner crash preservation, and proof that two surfaces never dispatch
+  provider input concurrently. Missing tmux must never clear active ownership.
 
 Commit: `feat: add durable session workers`
 
@@ -270,8 +271,9 @@ Commit: `feat: add isolated git worktrees`
   partially swap the view.
 - Test exact provider argv and store verification; provider snapshot + overlay
   deduplication; turn/tool/reasoning ordering; first-turn-before-commit;
-  malformed/partial stores; fallback disclosures; native detach/reattach and
-  owner crash; ACP → native → ACP continuity; and atomic no-blank/no-duplicate
+  malformed/partial stores; fallback disclosures; native detach/reattach,
+  recoverable pre-launch collision reservations, and fail-closed active-owner
+  loss; ACP → native → ACP continuity; and atomic no-blank/no-duplicate
   replacement for Codex, Claude, Grok, and OpenCode.
 
 Commit: `feat: make native harness the default session attachment`

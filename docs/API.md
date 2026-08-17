@@ -237,6 +237,16 @@ Cancel and stop require an empty request body. Resume accepts an empty body or:
 {"allow_shared_checkout": true}
 ```
 
+Prompt, permission decision, and Resume against an already-live worker first
+negotiate the current worker protocol and `exclusive-native-owner-v1`
+capability. A responsive older worker returns `409` with error code
+`worker_upgrade_required`; the requested provider write is not sent and Resume
+does not spawn a replacement worker. Read endpoints, conversation/history and
+SSE, permission listing, Cancel, and Stop remain available for safe migration.
+Exit any provider CLI in `agent-<session-id>` first, then run the exact
+`acpctl session stop <session-id>` and `acpctl session resume <session-id>`
+commands carried in the sanitized error.
+
 Review:
 
 ```json
@@ -316,7 +326,7 @@ Common statuses:
 | --- | --- |
 | `400` | malformed JSON/body/cursor |
 | `404` | Task or Session not found |
-| `409` | worker, checkout, active-producer, or lifecycle conflict |
+| `409` | worker upgrade required, checkout, active-producer, permission race, or lifecycle conflict |
 | `422` | valid JSON with invalid domain/profile/repository input |
 | `502` | worker operation failed; internal socket detail is suppressed |
 | `500` | internal storage/server failure with sanitized message |

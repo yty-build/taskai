@@ -45,6 +45,17 @@ Using the fake ACP/acpx fixtures:
 - Prove worker survival after parent CLI exit.
 - Connect multiple viewers.
 - Prove one active turn and ordered queued prompts.
+- Against a responsive mixed-version worker, prove Prompt, permission
+  decision, provider-native attach, and live Resume negotiate both the current
+  protocol and `exclusive-native-owner-v1`, then fail before any provider command or
+  replacement spawn. Verify HTTP writes return sanitized `409` responses with
+  code `worker_upgrade_required`, while Cancel, Stop, reads, conversation/history,
+  permission listing, and streams remain usable for migration. Cover
+  `TestPromptNegotiatesCurrentWorkerBeforeSending`,
+  `TestStaleWorkerPermissionDecisionIsNotSent`,
+  `TestResumeLiveWorkerNegotiatesCurrentOrRequiresUpgradeWithoutSpawn`,
+  `TestNativeAttachRejectsStaleWorkerBeforeAcquireOrProviderStart`, and
+  `TestStaleWorkerProviderWritesReturnConflictWithoutSendingProviderCommand`.
 - Verify request IDs and response routing.
 - Verify JSONL validity, monotonic positions, replay, and its role as
   lifecycle/audit/provisional-overlay/fallback data rather than committed
@@ -75,6 +86,29 @@ For `acpctl task attach`:
 - Detaching does not affect workers.
 - Enter opens the selected provider-native harness and `a` opens structured
   ACP; neither action silently substitutes the other.
+- From Structured ACP, `n` opens that Session's exact native harness and is
+  present in both the contextual footer and help.
+- When Task/Session attachment already runs inside tmux, native handoff
+  switches to the single stable `agent-<session-id>` harness; it never launches
+  a second provider process. `Ctrl-b L` returns to the preserved console and
+  `Ctrl-b d` leaves the provider running.
+- A responsive worker outside the required protocol/capability contract fails closed before native
+  acquisition or provider launch and reports exact stop/resume migration
+  commands.
+- Once native ownership already exists, missing tmux, noninteractive I/O, or a
+  missing stable harness all fail closed; a second outer viewer cannot use
+  direct execution, create a replacement provider, or release the live owner.
+- Prove the outer handoff persists `reserved(generation)` before provider start,
+  and the hidden/direct provider atomically activates that exact generation.
+  A failed or delayed activation must launch no provider process.
+- Reproduce an unowned tmux collision, remove the exact colliding harness,
+  recover the stale reservation, wait for reconciliation, then complete a new
+  native attach/exit and queued ACP continuation. Existing/uncertain tmux,
+  active ownership, stale generation activation/release, and legacy ownership
+  markers all fail closed. Missing tmux never clears an active owner. Race a
+  reserved-status probe against a safe concurrent release and prove CLI output
+  reports `already_released` without instructing the operator to wait for a
+  nonexistent refresh event.
 
 For `acpctl session attach --acp`:
 
@@ -85,6 +119,14 @@ For `acpctl session attach --acp`:
   disclosed gateway fallback. A transient refresh failure leaves an already-open
   viewer's current in-memory presentation visible with a delayed-refresh notice.
   JSONL is never labelled canonical provider history.
+- After reconciliation, provider-store user/reasoning/assistant records are the
+  committed semantic authority. Retain distinct ACP-only reasoning as labelled
+  supplemental context; if the provider exposes no readable reasoning, retain
+  ACP reasoning as the fallback. In a gateway-only snapshot, reasoning remains
+  explicitly provisional. Cover this with
+  `TestConversationMergeUsesProviderSemanticHistoryWhenBothSourcesContainReasoning`,
+  `TestConversationMergeKeepsOnlyGenuinelySupplementalACPReasoning`, and
+  `TestConversationMergePreservesACPReasoningWhenProviderHasNoReadableReasoning`.
 - Prompts reach the correct Session.
 - Busy steering is queued visibly.
 - `Esc` cancels the current turn and a follow-up continues the same Session.
@@ -124,7 +166,9 @@ For `acpctl session attach --acp`:
 - Prove actual native exit/stop requests exact ACP refresh and provider-store
   reconciliation while retaining native ownership and keeping queued ACP
   prompts behind the boundary. Only a successful atomic reconciliation may
-  release ownership and the next queued prompt.
+  release ownership and the next queued prompt. Require the sanitized
+  `provider_transcript_reconciled` lifecycle line after the exact provider read
+  and before the queued turn starts; a failed read must emit no success line.
 - Inject post-turn and post-native identity drift. Prove bounded exact recovery
   completes before later work; if recovery fails, queued requests receive
   correlated errors, no later prompt reaches the suspect bridge, the entire old

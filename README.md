@@ -115,6 +115,7 @@ Task and structured ACP console controls (provider-native keys remain owned by t
 | `Enter` | Open the selected Session in its real provider-native harness |
 | `a` (Task screen) | Open the selected Session's structured ACP console |
 | `n` (Task screen) | Open the in-console New Session wizard; choose agent, role, repository, worktree, permission mode, and optional prompt |
+| `n` (Structured ACP screen) | Open the current Session's exact provider-native harness; from tmux, switch to its stable `agent-<session-id>` session |
 | `p` | Prompt the selected/current Session only |
 | `/` | Filter the Session list |
 | `:` | Open the searchable command palette |
@@ -135,7 +136,7 @@ Native attachment resumes one immutable canonical provider conversation ID after
 acpctl session attach <session-id>
 ```
 
-With tmux installed, `Ctrl-B d` detaches the terminal while the provider continues running; attaching again reopens the same tmux session. Viewers may coexist, but writes to one provider conversation are exclusive. Native attach waits or fails visibly while an ACP turn owns the writer gate and never cancels that turn. While the provider-native process owns the gate, ACP prompts remain visibly queued and do not reach the provider. Detaching tmux leaves both the native process and its ownership intact. Process exit/stop releases ownership only after the provider snapshot is reconciled, before queued ACP work crosses the boundary. See [native operations](docs/OPERATIONS.md#provider-native-mode) and the [real Codex smoke procedure](docs/CODEX_NATIVE_SMOKE.md).
+With tmux installed, `Ctrl-B d` detaches the terminal while the provider continues running; attaching again reopens the same tmux session. When Structured ACP switches an existing tmux client to the native harness, `Ctrl-B L` returns to the previous console view. Viewers may coexist, but writes to one provider conversation are exclusive. Native attach waits or fails visibly while an ACP turn owns the writer gate and never cancels that turn. While the provider-native process owns the gate, ACP prompts remain visibly queued and do not reach the provider. Detaching tmux leaves both the native process and its ownership intact. Process exit/stop releases ownership only after the provider snapshot is reconciled, before queued ACP work crosses the boundary. See [native operations](docs/OPERATIONS.md#provider-native-mode) and the [real Codex smoke procedure](docs/CODEX_NATIVE_SMOKE.md).
 
 ## Logs and review
 
@@ -239,6 +240,7 @@ Do not place provider authentication files, credentials, databases, sockets, log
 - **Agent profile not found** — run `acpctl agents`; ensure the YAML filename ends in `.yaml` and its schema has no unknown fields.
 - **Checkout already used** — use `--worktree`, stop the existing Session, or use `--allow-shared-checkout` only when concurrent writers are intentional.
 - **Session has no live worker** — inspect `acpctl session <id>`, then run `acpctl session resume <id>`.
+- **Prompt, permission, native attach, or live Resume says `worker upgrade required`** — the responsive worker does not satisfy the current protocol-and-capability contract; it may advertise an earlier version of `exclusive-native-owner-v1`, so capability presence alone is insufficient. No provider write was sent (HTTP returns `409`). Cancel, Stop, Session reads, conversation/history, and streams remain available. Exit any provider process in `agent-<session-id>` first, then run the exact `acpctl session stop <id>` and `acpctl session resume <id>` commands from the error. Replacing `bin/acpctl` does not upgrade an already-running worker.
 - **Legacy CLI transport Session** — available provider history and gateway
   journal remain readable, but the new binary refuses a blind resume while an
   old detached acpx queue owner may exist. Create a fresh runtime-backed Session
@@ -247,6 +249,9 @@ Do not place provider authentication files, credentials, databases, sockets, log
 - **Canonical provider conversation unavailable** — wait for the first ACP turn to establish one exact identity. Continue through `--acp`; never guess or substitute another ID.
 - **Native verification failed** — the exact canonical ID was not found in that provider's local store for the Session checkout. Continue through `--acp` and diagnose provider state; the gateway will not open a replacement conversation.
 - **Native attach is waiting/busy** — an ACP turn currently owns the Session's provider-writer gate. Let it settle or cancel it explicitly; native attach never cancels it on your behalf.
+- **Native attach reports a missing harness with a pre-launch reservation** — run `acpctl session recover-native <id>`, wait for `native_refreshed` when the command says refresh was scheduled, then attach again. Recovery verifies exact tmux absence and schedules provider-store reconciliation; it has no force mode. If a concurrent safe release already completed, the command says no recovery refresh was scheduled instead of telling you to wait for a nonexistent event.
+- **Native attach reports an owner protocol/state-root/generation mismatch** — do not kill that tmux Session from the mismatch alone; it may be a legitimate newer harness seen by a stale viewer. Return to the console, inspect Session status, and retry. Use `recover-native` only when the worker reports a pre-launch reservation and the exact harness is independently known absent.
+- **Native recovery says ownership is active** — tmux disappearance does not prove the provider process tree exited. ACP remains blocked and `recover-native` refuses to clear the marker. Let the real native owner exit and release normally; legacy ownership markers follow this same fail-closed boundary.
 - **ACP prompt says queued behind native** — the provider-native process still owns the writer gate. Detaching its tmux viewer is not process exit. Exit/stop the native process, then allow exact provider reconciliation to finish before the queued prompt dispatches.
 - **ACP refresh/recovery warning after native exit** — the ownership boundary remains closed to queued writes until exact reconciliation/recovery succeeds. If bounded exact recovery failed, queued prompts receive correlated errors and the worker stops; run `acpctl session resume <id>` before sending more work.
 - **Web server refuses address/Host** — use the exact `http://127.0.0.1:<port>` URL printed by `acpctl serve`.

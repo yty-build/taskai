@@ -673,11 +673,21 @@ Commands:
 Responses:
 
 ```json
+{"type":"pong","protocol_version":2,"capabilities":["exclusive-native-owner-v1"]}
 {"type":"accepted","request_id":"req-42","state":"queued"}
 {"type":"status","status":"working"}
 {"type":"line","seq":101,"request_id":"req-42","data":{...}}
 {"type":"error","message":"..."}
 ```
+
+Before Prompt, permission decision, provider-native attachment, or Resume
+against an already-live worker can write or spawn, the current client sends
+`ping` and requires both the current protocol version and
+`exclusive-native-owner-v1`. A responsive older worker fails closed with a
+typed upgrade-required result and exact `agent-<session-id>` exit plus
+stop/resume instructions; none of the requested provider input is sent. Cancel,
+Stop, status/read, conversation/history, permission-list, and stream operations
+remain available so the operator can inspect and migrate the Session safely.
 
 Closing a subscriber connection only detaches that viewer. It must not cancel a turn, stop the worker, or close the ACP Session.
 
@@ -691,6 +701,22 @@ ownership. Detaching a viewer from a tmux-backed native harness leaves the
 native process and its ownership intact. Native process exit/stop begins the
 release sequence, but ownership remains held through exact refresh and
 provider-snapshot reconciliation.
+
+The worker represents native startup as a generation-scoped private lifecycle:
+`reserved(g) -> active(g) -> refresh_pending -> none`. The outer viewer obtains
+a fresh opaque generation before creating or inspecting the stable tmux
+harness. The hidden native process, or direct foreground runner, must atomically
+activate that exact generation immediately before provider start and present it
+again on release. Old delayed processes cannot activate or release a newer
+generation. An unactivated reservation may be explicitly recovered only after
+exact `=agent-<session-id>` tmux absence is verified; recovery that wins the
+reservation race conservatively schedules exact refresh and provider
+reconciliation. If a concurrent safe release wins first, the command reports
+`already_released` and must not tell the operator to wait for a refresh event
+that will not exist. Active ownership is never
+cleared from tmux absence, because that does not prove provider-process exit.
+Legacy ownership state is treated as active and remains fail-closed. This is
+worker/runtime state, not a new persistent product entity.
 
 A `refresh` request made after native process exit/stop runs before native
 ownership ends and before the next queued ACP provider write. Refresh and
@@ -1099,7 +1125,7 @@ A Task is not itself an agent. A message entered at Task scope must target an ex
 
 ## 14.2 Session attachment
 
-`acpctl session attach <session-id> --acp` opens the structured ACP Session console directly. Web and mobile Session selection always opens this same structured ACP view because those clients cannot embed a local provider terminal.
+`acpctl session attach <session-id> --acp` opens the structured ACP Session console directly. Pressing `n` from this console hands the terminal to the same Session's exact provider-native CLI; the contextual footer and help always expose this action, or label it unavailable with a reason. Web and mobile Session selection always opens this same structured ACP view because those clients cannot embed a local provider terminal.
 
 The console loads the reconciled projection defined in Section 11: committed
 provider history first, gateway lifecycle/uncommitted ACP activity as an
@@ -1180,12 +1206,36 @@ process running. Because that process can still write the provider
 conversation, its exclusive provider-write ownership remains active until the
 process exits or is explicitly stopped and the resulting exact refresh plus
 provider reconciliation succeeds; ACP prompts stay queued in the meantime.
+When the gateway console itself runs inside tmux, native attachment switches
+the current tmux client to that same stable `agent-<session-id>` harness rather
+than starting a second provider process. `Ctrl-b L` returns to the console;
+`Ctrl-b d` detaches the viewer while the provider continues.
 
 This behavior applies equally to terminal, web, mobile, automation, and agent-to-agent callers.
 
 ## 14.4 Provider-native mode
 
 `acpctl session attach <session-id>` opens the provider's real native CLI and resumes the Session's canonical provider conversation. `--native` is accepted as a compatibility alias. This is the default terminal experience; the gateway does not attempt to reproduce Codex, Claude, Grok, or OpenCode's native harness.
+
+Before any native process starts, attachment requires a worker protocol
+capability that proves durable exclusive native/ACP ownership. A worker from an
+older binary fails closed with exact stop/resume migration commands; it must
+never be treated as safe merely because its socket still answers ping.
+After ownership already exists, every additional outer viewer is attach-only:
+it may attach or switch to the verified stable tmux harness, but it must never
+fall back to direct execution or create a replacement provider process.
+
+If a tmux name collision strands only the pre-launch reservation, the local
+operator may run
+`acpctl session recover-native <session-id>`. The command has no force mode: it
+requires a current worker, a still-reserved exact generation, and verified
+absence of `=agent-<session-id>`, then schedules refresh/reconciliation before
+another attach. It refuses active or legacy ownership even when tmux is gone.
+An owner-tag mismatch alone must never instruct the operator to kill the tmux
+Session because a stale viewer may be observing a legitimate newer generation;
+the operator returns to the console, inspects status, and retries. Recovery is
+appropriate only after the worker reports a pre-launch reservation and the
+exact harness is independently known absent.
 
 Examples:
 

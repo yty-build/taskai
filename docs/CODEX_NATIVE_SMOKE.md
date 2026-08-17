@@ -66,12 +66,14 @@ Use this only in a disposable Git repository with authenticated Codex and acpx 0
    bin/acpctl session logs <session-id> --raw
    ```
 
-   Expect `native_refresh_started`, followed by `native_refreshed` before the
-   queued ACP request begins. `native_refreshed` is the success boundary: the
-   worker emits it only after exact provider-store reconciliation completes and
-   native ownership is safe to release. A `native_refresh_warning` is
-   actionable; queued writes must not cross the unresolved
-   ownership/reconciliation boundary.
+   Expect `native_refresh_started`, then `provider_transcript_reconciled`, then
+   `native_refreshed` before the queued ACP request begins.
+   `provider_transcript_reconciled` proves the bounded exact provider read
+   succeeded while the durable ownership marker was still closed;
+   `native_refreshed` proves the marker was released and queued ACP is safe to
+   dispatch. A `native_refresh_warning` is actionable, and a failed provider
+   read must not emit `provider_transcript_reconciled`; queued writes must not
+   cross the unresolved ownership/reconciliation boundary.
 
 9. Reopen the structured ACP console and ask for the native-only nonce:
 

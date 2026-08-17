@@ -207,11 +207,33 @@ acpctl session attach <session-id>
 acpctl session attach <session-id> --acp
 ```
 
-Use `q`/`Ctrl-C` to detach a gateway view. With a tmux-backed native terminal,
-use `Ctrl-B d`; the provider keeps running and `acpctl session attach <id>`
+Use `q`/`Ctrl-C` to detach a gateway view. In Structured ACP, `n` opens that
+Session's exact provider-native CLI. When the console itself is inside tmux,
+native attachment switches to the one stable `agent-<session-id>` tmux
+Session: use `Ctrl-B L` to return to the console or `Ctrl-B d` to detach the
+client while the provider keeps running. `acpctl session attach <id>`
 reconnects to it. Detaching either view never stops the worker, cancels an ACP
 turn, or releases provider-write ownership held by a still-running native
 process. Do not use `stop` merely to close a UI.
+
+Prompt, permission decision, provider-native attachment, and Resume against a
+live worker all negotiate the current worker protocol and
+`exclusive-native-owner-v1` capability before sending provider input or
+spawning anything. If a worker does not satisfy that complete contract, those
+operations fail closed; HTTP provider-write calls return `409` with code
+`worker_upgrade_required`, and no prompt, permission decision, native process,
+or replacement worker is sent or started. Cancel, Stop, status/read,
+conversation/history, permission-list, and stream operations remain available
+for inspection and safe migration. First exit any provider CLI in tmux Session
+`agent-<session-id>`. Then run, in order:
+
+```bash
+acpctl session stop <session-id>
+acpctl session resume <session-id>
+```
+
+Use the exact Session ID and commands printed by the error. Replacing
+`bin/acpctl` on disk does not upgrade an already-running worker process.
 
 Task attach targets one selected Session for every prompt or control action;
 there is no broadcast. At wide widths it uses one cohesive two-pane cockpit
@@ -305,6 +327,31 @@ read-only viewers may coexist, but writes are exclusive per Session:
 - native process exit/stop begins exact refresh and provider-store
   reconciliation while native ownership remains held; ownership releases and
   queued ACP dispatch resumes only after that boundary is complete.
+
+If an owner-tag mismatch prevents attachment, do not kill the tmux Session from
+that error alone: it may be a legitimate newer generation observed by a stale
+viewer. Return to the console, inspect Session/worker status, and retry. If the
+worker reports a generation-scoped pre-launch reservation and the exact
+`agent-<session-id>` harness is independently known to be absent (for example,
+after an unrelated name collision was deliberately closed or renamed), recover
+only that reservation:
+
+```bash
+acpctl session recover-native <session-id>
+acpctl session logs <session-id> --raw
+# if recovery reports a scheduled refresh, wait for native_refreshed; then:
+acpctl session attach <session-id>
+```
+
+Recovery refuses while the exact tmux harness exists, tmux inspection is
+unavailable or uncertain, or the worker says the generation became active. A
+successful recovery that revokes the reservation schedules exact refresh and
+provider-store reconciliation before another attachment. If a concurrent safe
+release already won, the command explicitly says no recovery refresh was
+scheduled; do not wait for a nonexistent `native_refreshed` event. Missing tmux
+is never evidence that an active provider process exited: active ownership,
+including a legacy ownership marker, remains blocked until the real provider
+owner completes its normal release. There is intentionally no force flag.
 
 The tmux Session receives the invoking `AGENT_HOME` and `PATH`, rather than
 inheriting stale values from an older tmux server. Refresh and reconciliation
@@ -443,7 +490,7 @@ early.
 
 **Provider-store verification fails:** the gateway found no exact canonical-ID/check-out match and intentionally did not launch native mode. Diagnose the provider's local state or continue with `--acp`.
 
-**tmux name collision:** an existing `agent-<session-id>` tmux Session lacks the private owner tag for this `AGENT_HOME`. The gateway refuses to attach. Inspect that tmux Session and close or rename it deliberately; never attach by name alone.
+**tmux owner mismatch/name collision:** an existing `agent-<session-id>` tmux Session has a different protocol, state-root, or generation tag. The gateway refuses to attach. Return to the console, inspect Session status, and retry; do not kill it from the mismatch alone because it may be a legitimate newer harness. Close or rename only a separately verified unrelated collision. Run `recover-native` only when the worker reports a pre-launch reservation and the exact harness is known absent.
 
 **Refresh/recovery warning after native exit:** inspect raw logs and the
 conversation source state. The writer gate remains closed to queued provider
