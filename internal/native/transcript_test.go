@@ -238,6 +238,87 @@ func TestReadOpenCodeProviderTranscript(t *testing.T) {
 	assertNoTranscriptSecret(t, snapshot, "SECRET_AUTH", "SECRET_ENCRYPTED", "SECRET_TOOL_OUTPUT")
 }
 
+func TestReadOpenCodeProviderTranscriptCoalescesUserTextPartsByMessage(t *testing.T) {
+	t.Parallel()
+	root, workingDirectory := t.TempDir(), t.TempDir()
+	conversationID := "opencode-multipart-user"
+	databasePath := filepath.Join(root, "opencode.db")
+	database, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL)`,
+		`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL)`,
+		`CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL)`,
+		`INSERT INTO session (id, directory) VALUES ('opencode-multipart-user', '` + strings.ReplaceAll(workingDirectory, "'", "''") + `')`,
+		`INSERT INTO message VALUES ('user-message', 'opencode-multipart-user', 1000, '{"role":"user"}')`,
+		`INSERT INTO message VALUES ('assistant-message', 'opencode-multipart-user', 2000, '{"role":"assistant","time":{"completed":2100},"finish":"stop"}')`,
+		`INSERT INTO part VALUES ('user-text-z', 'user-message', 'opencode-multipart-user', 1001, '{"type":"text","text":"first fragment"}')`,
+		`INSERT INTO part VALUES ('user-reasoning', 'user-message', 'opencode-multipart-user', 1002, '{"type":"reasoning","text":"SECRET_USER_REASONING"}')`,
+		`INSERT INTO part VALUES ('user-text-a', 'user-message', 'opencode-multipart-user', 1003, '{"type":"text","text":"second fragment"}')`,
+		`INSERT INTO part VALUES ('assistant-text', 'assistant-message', 'opencode-multipart-user', 2001, '{"type":"text","text":"complete answer"}')`,
+	} {
+		if _, err := database.Exec(statement); err != nil {
+			database.Close()
+			t.Fatalf("OpenCode multipart fixture: %v", err)
+		}
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	profile := agents.Profile{Name: "opencode", Environment: map[string]string{"OPENCODE_DB": databasePath}}
+	snapshot, err := ReadProviderTranscript(context.Background(), profile, conversationID, workingDirectory)
+	if err != nil {
+		t.Fatalf("read OpenCode multipart transcript: %v", err)
+	}
+	assertTranscript(t, snapshot,
+		[]TranscriptKind{TranscriptUser, TranscriptAssistant},
+		[]string{"first fragment\nsecond fragment", "complete answer"},
+	)
+	if snapshot.Truncated || snapshot.Records[0].Truncated {
+		t.Fatalf("short multipart user message was truncated: %#v", snapshot)
+	}
+	wantKey := opaqueTranscriptKey("opencode", conversationID, string(TranscriptUser), "user-message")
+	if snapshot.Records[0].Key != wantKey || !snapshot.Records[0].Timestamp.Equal(time.UnixMilli(1000).UTC()) {
+		t.Fatalf("OpenCode multipart user identity/order = %#v, want key %q at message time", snapshot.Records[0], wantKey)
+	}
+	assertNoTranscriptSecret(t, snapshot, "SECRET_USER_REASONING")
+
+	database, err = sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO part VALUES ('user-text-new', 'user-message', 'opencode-multipart-user', 1004, '{"type":"text","text":"third fragment"}')`); err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := ReadProviderTranscript(context.Background(), profile, conversationID, workingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Records[0].Key != snapshot.Records[0].Key || reloaded.Records[0].Text != "first fragment\nsecond fragment\nthird fragment" || reloaded.Checkpoint == snapshot.Checkpoint {
+		t.Fatalf("OpenCode multipart user update lost its stable identity or content revision: %#v / %#v", snapshot, reloaded)
+	}
+}
+
+func TestOpenCodeUserMessageCoalescingPreservesTextTruncation(t *testing.T) {
+	message := &openCodeUserMessage{messageID: "bounded-user", created: 1000}
+	message.appendText(strings.Repeat("a", maxProviderTranscriptTextBytes), false)
+	message.appendText("must be truncated", false)
+	builder := newTranscriptBuilder("opencode", "bounded-conversation")
+	message.addTo(builder)
+	snapshot := builder.snapshot()
+	if len(snapshot.Records) != 1 || len(snapshot.Records[0].Text) != maxProviderTranscriptTextBytes ||
+		!snapshot.Records[0].Truncated || !snapshot.Truncated {
+		t.Fatalf("bounded OpenCode multipart user record = %#v", snapshot)
+	}
+}
+
 func TestReadOpenCodeProviderTranscriptMarksActiveAssistantCommentary(t *testing.T) {
 	t.Parallel()
 	root, workingDirectory := t.TempDir(), t.TempDir()

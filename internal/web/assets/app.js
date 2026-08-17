@@ -5,7 +5,8 @@ const textEncoder = new TextEncoder();
 const LIMITS = Object.freeze({
   assistant: 128 << 10, thought: 32 << 10, tool: 64 << 10, toolTotal: 256 << 10,
   plan: 128 << 10, diagnostics: 1000, turns: 256, blocksPerTurn: 512,
-  toolsPerTurn: 256, permissions: 128, retained: 16 << 20, announcement: 768
+  toolsPerTurn: 256, permissions: 128, retained: 16 << 20, announcement: 768,
+  reconcileEvents: 2048, reconcileBytes: 4 << 20
 });
 
 async function apiRequest(path, method = "GET", body) {
@@ -399,9 +400,17 @@ function endFormSubmission(form) {
 
 function applyOptimisticPromptState(turn, acceptedState) {
   if (turn.lifecycleSeen) return false;
-  turn.state = acceptedState === "queued" ? "queued" : "working";
+  turn.state = acceptedState === "queued" ? "queued" : acceptedState === "ready" ? "ready" : "working";
   recordTurnLifecycle(turn, turn.state, {});
   return true;
+}
+
+function applyOptimisticPromptReceipt(turn, acceptedState) {
+  const applied = applyOptimisticPromptState(turn, acceptedState);
+  if (applied && turn.state === "working") setRuntimeStatus("working");
+  else reconcileRuntimeStatusSoon();
+  if (applied) updateActionVisibility(currentSessionRuntimeStatus);
+  return applied;
 }
 
 function newTranscriptState() {
@@ -728,13 +737,16 @@ function applyDisplay(activity, turn) {
   }
   case "error_upsert": {
     if (!turn.error) {
-      turn.error = { type: "error", text: "" };
+	  turn.error = { type: "error", text: "", errorSource: "", errorCode: "", retryable: false };
       if (!appendTurnBlock(turn, turn.error)) {
         turn.error = null;
         break;
       }
     }
     turn.error.text = truncateUTF8(display.text || "The provider turn failed.", LIMITS.assistant).text;
+	turn.error.errorSource = display.error_source || "";
+	turn.error.errorCode = display.error_code || "";
+	turn.error.retryable = Boolean(display.retryable);
     touchBlock(turn.error);
     turn.state = "error";
     recordTurnLifecycle(turn, "error", activity);
@@ -822,6 +834,7 @@ function applyActivity(activity) {
   const turn = turnFor(activity);
   rememberPermission(activity, turn);
   applyDisplay(activity, turn);
+  updateActionVisibility(currentSessionRuntimeStatus);
   updateTurnRetention(turn);
   trimTurns();
   return true;
@@ -972,8 +985,11 @@ let conversationSnapshotSignature = "";
 let conversationReconcileInFlight = false;
 let conversationReconcilePending = false;
 let conversationReconcileBuffer = [];
+let conversationReconcileBufferBytes = 0;
+let conversationReconcileOverflow = false;
 let conversationReconcileTimer = 0;
 let conversationReconcileAttempts = 0;
+let providerAuthorityRetryTimer = 0;
 
 function hasUncommittedTerminalTurns(state = transcriptState) {
   // Cancelled and failed turns are intentionally never committed as provider
@@ -994,13 +1010,29 @@ function scheduleProviderCommitRetry(sessionID) {
   scheduleConversationReconcile(sessionID, delay);
 }
 
+function clearProviderAuthorityRetry() {
+  if (providerAuthorityRetryTimer) window.clearTimeout?.(providerAuthorityRetryTimer);
+  providerAuthorityRetryTimer = 0;
+}
+
+function scheduleProviderAuthorityRetry(sessionID) {
+  if (providerAuthorityRetryTimer) return;
+  // This retry is intentionally independent from completed-turn commit
+  // polling. An idle or empty gateway fallback still needs to discover later
+  // native/provider history without requiring another ACP event.
+  providerAuthorityRetryTimer = window.setTimeout(() => {
+    providerAuthorityRetryTimer = 0;
+    reconcileConversation(sessionID).catch(() => {});
+  }, 10000);
+}
+
 function conversationHistorySummary(state = transcriptState) {
   const turns = state?.turns || [];
   const saved = turns.filter((turn) => turn.committed).length;
   const unsaved = turns.filter((turn) => !turn.committed);
-  const active = unsaved.filter((turn) => !["complete", "cancelled", "error", "failed"].includes(turn.state)).length;
+  const active = unsaved.filter((turn) => !["complete", "cancelled", "incomplete", "interrupted", "error", "failed"].includes(turn.state)).length;
   const saving = unsaved.filter((turn) => turn.state === "complete").length;
-  const stopped = unsaved.filter((turn) => ["cancelled", "error", "failed"].includes(turn.state)).length;
+  const stopped = unsaved.filter((turn) => ["cancelled", "incomplete", "interrupted", "error", "failed"].includes(turn.state)).length;
   const tools = turns.reduce((count, turn) => count + (turn.blocks || []).filter((block) => block.type === "tool").length, 0);
   const bounded = Boolean(state?.snapshotTruncated || state?.historyClipped);
   const shortParts = [];
@@ -1015,7 +1047,7 @@ function conversationHistorySummary(state = transcriptState) {
   let detail = saved > 0 ? savedCopy : "No saved provider turns yet";
   if (active > 0) detail += ` · ${active} live ${active === 1 ? "turn" : "turns"} can be saved after successful completion`;
   if (saving > 0) detail += ` · ${saving} completed ${saving === 1 ? "turn is" : "turns are"} waiting for provider commit`;
-  if (stopped > 0) detail += ` · ${stopped} failed or cancelled ${stopped === 1 ? "turn remains" : "turns remain"} unsaved gateway history`;
+  if (stopped > 0) detail += ` · ${stopped} failed, interrupted, or cancelled ${stopped === 1 ? "turn remains" : "turns remain"} unsaved history`;
   if (tools > 0) detail += ` · ${tools} tool ${tools === 1 ? "step" : "steps"} loaded`;
   detail += bounded ? " · older content is outside this bounded view" : " · all available history is loaded";
   return { short, detail, saved, active, saving, stopped, tools, bounded };
@@ -1065,9 +1097,20 @@ async function reconcileConversation(sessionID, { initial = false } = {}) {
   }
   conversationReconcileInFlight = true;
   conversationReconcileBuffer = [];
+  conversationReconcileBufferBytes = 0;
+  conversationReconcileOverflow = false;
   try {
     const snapshot = await apiRequest(`/api/v1/sessions/${encodeURIComponent(sessionID)}/conversation`);
+    if (conversationReconcileOverflow) {
+      transcriptState.sourceWarning = "Provider history refresh was deferred while live activity was busy; live output remains current.";
+      updateHistorySource(transcriptState.source, transcriptState.sourceWarning);
+      scheduleTranscriptRender();
+      conversationReconcilePending = true;
+      return false;
+    }
     const signature = snapshotSignature(snapshot);
+    if (snapshot.source === "provider-store") clearProviderAuthorityRetry();
+    else scheduleProviderAuthorityRetry(sessionID);
     // A gateway snapshot is authoritative enough to bootstrap one atomic,
     // bounded view and seed SSE from its captured cursor. On later refreshes,
     // however, it represents a transient loss of provider-store authority;
@@ -1103,15 +1146,36 @@ async function reconcileConversation(sessionID, { initial = false } = {}) {
       scheduleTranscriptRender();
     }
     scheduleProviderCommitRetry(sessionID);
+    scheduleProviderAuthorityRetry(sessionID);
     return false;
   } finally {
     conversationReconcileBuffer = [];
+    conversationReconcileBufferBytes = 0;
+    conversationReconcileOverflow = false;
     conversationReconcileInFlight = false;
     if (conversationReconcilePending) {
       conversationReconcilePending = false;
       scheduleConversationReconcile(sessionID, 120);
     }
   }
+}
+
+function bufferConversationActivity(activity) {
+  if (!conversationReconcileInFlight || conversationReconcileOverflow) return;
+  let bytes = 0;
+  try {
+    bytes = textEncoder.encode(JSON.stringify(activity)).length;
+  } catch (_) {
+    conversationReconcileOverflow = true;
+  }
+  if (conversationReconcileOverflow || conversationReconcileBuffer.length >= LIMITS.reconcileEvents || conversationReconcileBufferBytes + bytes > LIMITS.reconcileBytes) {
+    conversationReconcileBuffer = [];
+    conversationReconcileBufferBytes = 0;
+    conversationReconcileOverflow = true;
+    return;
+  }
+  conversationReconcileBuffer.push(activity);
+  conversationReconcileBufferBytes += bytes;
 }
 
 function scheduleConversationReconcile(sessionID, delay = 140) {
@@ -1389,6 +1453,12 @@ function renderBlockElement(block, assistantName, context = {}) {
     const error = document.createElement("div");
     error.className = "error-card";
     error.textContent = block.text;
+	if (block.errorSource === "provider" && block.errorCode) {
+	  const detail = document.createElement("small");
+	  const label = ({busy:"Provider busy", conflict:"Provider conflict", rate_limited:"Rate limited", rejected:"Provider rejected", provider_error:"Provider error"})[block.errorCode] || "Provider error";
+	  detail.textContent = `${label} · ${block.retryable ? "Retryable" : "Not marked retryable"}`;
+	  error.append(detail);
+	}
     return error;
   }
   return null;
@@ -1420,8 +1490,8 @@ function turnSurfaceLabel(turn) {
 function turnStatusLabel(turn) {
   if (turnHasWaitingPermission(turn)) return "Approval required";
   return ({
-    queued: "Queued", working: "Working", cancelling: "Stopping", cancelled: "Stopped",
-    error: "Failed", failed: "Failed", complete: "Complete"
+    ready: "Accepted", queued: "Queued", working: "Working", cancelling: "Stopping", cancelled: "Stopped",
+    incomplete: "Incomplete", interrupted: "Interrupted", error: "Failed", failed: "Failed", complete: "Complete"
   })[turn.state] || (turn.committed ? "Complete" : "Pending");
 }
 
@@ -1445,8 +1515,8 @@ function turnDurationLabel(turn) {
 
 function turnLifecycleLabel(turn) {
   const labels = ({
-    queued: "Queued", working: "Working", cancelling: "Stopping", cancelled: "Stopped",
-    error: "Failed", failed: "Failed", complete: "Complete"
+    ready: "Accepted", queued: "Queued", working: "Working", cancelling: "Stopping", cancelled: "Stopped",
+    incomplete: "Incomplete", interrupted: "Interrupted", error: "Failed", failed: "Failed", complete: "Complete"
   });
   const states = (turn.lifecycle || []).map((item) => labels[item.state] || "").filter(Boolean);
   if (turn.surface !== "acp" && states.length === 1 && states[0] === "Complete") {
@@ -2073,6 +2143,18 @@ function renderDiagnostics() {
 }
 
 let activeEventSource = null;
+function shouldReconcileConversationKind(kind) {
+  return ["turn_completed", "turn_error", "native_refreshed", "native_refresh_recovered", "provider_transcript_reconciled", "acp_rehydrated"].includes(kind);
+}
+
+function noteProviderTranscriptReconcileWarning(kind, sessionID = document.body.dataset.sessionId) {
+  if (kind !== "provider_transcript_reconcile_warning") return false;
+  transcriptState.sourceWarning = "Provider transcript reload is delayed; live ACP output remains current.";
+  updateHistorySource(transcriptState.source, transcriptState.sourceWarning);
+  if (sessionID) scheduleProviderAuthorityRetry(sessionID);
+  return true;
+}
+
 function attachActivityStream(path) {
   if (!window.EventSource) return;
   activeEventSource?.close();
@@ -2093,10 +2175,11 @@ function attachActivityStream(path) {
   source.addEventListener("activity", (event) => {
     try {
       const activity = JSON.parse(event.data);
-      if (conversationReconcileInFlight) conversationReconcileBuffer.push(activity);
+      bufferConversationActivity(activity);
       noteStreamActivity(activity);
       if (applyActivity(activity)) scheduleTranscriptRender();
-      if (["turn_completed", "turn_error", "native_refreshed", "native_refresh_recovered"].includes(activity.kind)) {
+      if (noteProviderTranscriptReconcileWarning(activity.kind)) scheduleTranscriptRender();
+      if (shouldReconcileConversationKind(activity.kind)) {
         conversationReconcileAttempts = 0;
         scheduleConversationReconcile(document.body.dataset.sessionId, activity.kind === "turn_completed" ? 100 : 180);
       }
@@ -2128,10 +2211,18 @@ function reconcileStreamAvailability(sessionID, running) {
   }
 }
 
+function hasLocallyPreparingTurn() {
+  return transcriptState.turns.some((turn) => !turn.committed && ["ready", "working", "cancelling"].includes(turn.state));
+}
+
+function sessionActionVisible(action, visibleStatuses, status) {
+  return visibleStatuses.includes(status) || (action === "cancel" && hasLocallyPreparingTurn());
+}
+
 function updateActionVisibility(status) {
   document.body.dataset.sessionStatus = status;
   for (const action of document.querySelectorAll("[data-visible-status]")) {
-    const visible = action.dataset.visibleStatus.split(",").includes(status);
+    const visible = sessionActionVisible(action.dataset.action || "", action.dataset.visibleStatus.split(","), status);
     action.dataset.statusHidden = visible ? "false" : "true";
   }
   const submitCopy = document.querySelector(".send-button span");
@@ -2230,15 +2321,13 @@ function bindComposer(sessionID) {
         const value = truncateUTF8(message, LIMITS.assistant);
         if (turn.blocks.length < LIMITS.blocksPerTurn) turn.blocks.unshift({ type: "user", text: value.text, bytes: value.bytes, clipped: value.clipped });
       }
-      const optimisticStateApplied = applyOptimisticPromptState(turn, result.state);
+      applyOptimisticPromptReceipt(turn, result.state);
       turn.dirty = true;
       updateTurnRetention(turn);
       trimTurns();
-      if (optimisticStateApplied) setRuntimeStatus("working");
-      else reconcileRuntimeStatusSoon();
       textarea.value = "";
       resize();
-      setNotice(notice, result.state === "queued" ? "Message queued for the next turn." : "Message sent.");
+      setNotice(notice, result.state === "queued" ? "Message queued for the next ACP turn." : "Message accepted; loading the exact conversation before dispatch.");
       transcriptState.shouldStick = true;
       scheduleTranscriptRender();
     } catch (error) {

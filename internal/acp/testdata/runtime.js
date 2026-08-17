@@ -77,6 +77,16 @@ export function createAcpRuntime(options = {}) {
         }
       }
       ensureCount += 1;
+      if (
+        process.env.FAKE_ACPX_SCENARIO === "activation-conflict" ||
+        (process.env.FAKE_ACPX_SCENARIO === "activation-conflict-on-refresh" && ensureCount > 1)
+      ) {
+        const error = new Error("SECRET provider activation conflict detail");
+        error.code = "turn_failed";
+        error.detailCode = "conversation_conflict";
+        error.retryable = true;
+        throw error;
+      }
       const nativeSessionId =
         process.env.FAKE_ACPX_SCENARIO === "identity-drift-on-refresh" && ensureCount > 1
           ? "native-replacement"
@@ -100,6 +110,18 @@ export function createAcpRuntime(options = {}) {
       let cancelled = false;
       const abort = new AbortController();
       appendArguments([turn.text]);
+      if (process.env.FAKE_ACPX_SCENARIO === "prompt-provider-conflict") {
+        const error = new Error("SECRET provider prompt conflict detail");
+        error.code = "turn_failed";
+        error.detailCode = "provider_busy";
+        error.retryable = true;
+        throw error;
+      }
+      if (process.env.FAKE_ACPX_SCENARIO === "prompt-bridge-frame-error") {
+        const error = new Error("invalid bridge frame");
+        error.code = "bridge_frame_too_large";
+        throw error;
+      }
       const completion = {};
       let finishEvents;
       const eventsFinished = new Promise((resolve) => {

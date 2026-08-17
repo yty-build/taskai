@@ -12,11 +12,12 @@ import (
 const (
 	// ProtocolVersion is incremented when a new client-visible worker contract
 	// must be detected before an operation can be performed safely.
-	ProtocolVersion = 2
+	ProtocolVersion = 3
 
-	// CapabilityExclusiveNativeOwner means the worker durably serializes ACP
-	// and provider-native writers across viewer detach and worker restart.
-	CapabilityExclusiveNativeOwner = "exclusive-native-owner-v1"
+	// CapabilityExclusiveNativeOwner means the worker durably prevents both a
+	// second native process and concurrent ACP/native writes across detach and
+	// worker restart, while retaining exact provider-conversation freshness.
+	CapabilityExclusiveNativeOwner = "exclusive-native-owner-v2"
 
 	// NativeOwnerRoleReservation is used by an outer tmux viewer before it has
 	// started the private provider-owning process. Only this phase is eligible
@@ -74,11 +75,8 @@ type Message struct {
 	Timestamp        time.Time           `json:"timestamp,omitempty"`
 	LineType         string              `json:"line_type,omitempty"`
 	Queued           int                 `json:"queued,omitempty"`
-	RefreshPending   bool                `json:"refresh_pending,omitempty"`
-	Refreshing       bool                `json:"refreshing,omitempty"`
 	NativeOwned      bool                `json:"native_owned,omitempty"`
 	NativeGeneration string              `json:"native_generation,omitempty"`
-	ProviderWriter   string              `json:"provider_writer,omitempty"`
 	Permissions      []PendingPermission `json:"permissions,omitempty"`
 	Data             json.RawMessage     `json:"data,omitempty"`
 	Message          string              `json:"message,omitempty"`

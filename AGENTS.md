@@ -9,7 +9,7 @@ The product contract is defined by `agent_task_console_spec.md`; the ordered bui
 - Do not add Run, Event, Artifact, workflow, broker, or daemon domain models.
 - Keep all `acpx` behavior behind `internal/acp`.
 - Treat attachment as a disposable viewer connection. Detaching must never stop a worker or cancel a turn.
-- Persist one canonical provider conversation identity per Session and use it on every native or ACP continuation.
+- Keep one canonical provider conversation identity per Session. The verified provider store is committed history; Session JSONL is the gateway lifecycle/audit/provisional overlay and disclosed fallback. Structured loads join both sources, ACP refreshes or exactly resumes that persisted conversation before dispatch, and a fresh native process uses the provider's exact ID-based resume command.
 - Treat provider-native attachment as exclusive; ACP and a native CLI must never write concurrently.
 - Keep HTTP, CLI, and terminal UIs as transports over shared application services.
 

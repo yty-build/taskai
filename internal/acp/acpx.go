@@ -205,6 +205,26 @@ type ProtocolError struct {
 	Message   string
 }
 
+// ProviderTurnError is a correlated, terminal result for one prompt. It does
+// not mean the ACP transport or canonical conversation identity was lost.
+type ProviderTurnError struct {
+	Code       string
+	DetailCode string
+	Message    string
+	Retryable  bool
+}
+
+func (e *ProviderTurnError) Error() string {
+	detail := strings.TrimSpace(e.Message)
+	if detail == "" {
+		detail = "provider turn failed"
+	}
+	if code := strings.TrimSpace(e.Code); code != "" {
+		return code + ": " + detail
+	}
+	return detail
+}
+
 func (e *ProtocolError) Error() string {
 	return fmt.Sprintf("acpx %s protocol error: %s", e.Operation, e.Message)
 }

@@ -509,7 +509,7 @@ func writeActionError(writer http.ResponseWriter, err error) {
 	message := err.Error()
 	for _, expected := range []string{
 		"has no live worker", "worker is already running", "already used by active Session", "no active turn",
-		"no longer pending", "was not offered", "no longer belongs",
+		"no longer pending", "was not offered", "no longer belongs", "native harness", "has accepted ACP work",
 	} {
 		if strings.Contains(message, expected) {
 			writeJSONError(writer, http.StatusConflict, "session_conflict", message)

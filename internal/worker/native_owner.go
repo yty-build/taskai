@@ -21,16 +21,17 @@ const (
 )
 
 type nativeOwnerMarker struct {
-	Version    int    `json:"version"`
-	SessionID  string `json:"session_id"`
-	State      string `json:"state"`
-	OwnerToken string `json:"owner_token"`
-	Generation string `json:"generation,omitempty"`
+	Version       int    `json:"version"`
+	SessionID     string `json:"session_id"`
+	State         string `json:"state"`
+	OwnerToken    string `json:"owner_token"`
+	Generation    string `json:"generation,omitempty"`
+	StaleAfterACP *bool  `json:"stale_after_acp,omitempty"`
 }
 
-// restoreNativeOwnership deliberately fails closed. A malformed, insecure,
-// or unknown marker is never interpreted as an expired lease because the
-// native provider may still be alive.
+// restoreNativeOwnership fails closed for both ACP and native work. A malformed,
+// insecure, or unknown marker may still represent a live native provider and
+// is never interpreted as an expired lease.
 func (w *Worker) restoreNativeOwnership() error {
 	path := w.NativeOwnerPath()
 	info, err := os.Lstat(path)
@@ -38,53 +39,70 @@ func (w *Worker) restoreNativeOwnership() error {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("inspect native provider ownership marker: %w", err)
+		return w.blockNativeOwnership("could not be inspected")
 	}
 	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
-		return fmt.Errorf("native provider ownership marker %q is not a private 0600 regular file; refusing ACP work until it is recovered explicitly", path)
+		return w.blockNativeOwnership("is not a private 0600 regular file")
 	}
 	body, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("read native provider ownership marker: %w", err)
+		return w.blockNativeOwnership("could not be read")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	var marker nativeOwnerMarker
 	if err := decoder.Decode(&marker); err != nil {
-		return fmt.Errorf("decode native provider ownership marker %q: %w; refusing ACP work until it is recovered explicitly", path, err)
+		return w.blockNativeOwnership("is malformed")
 	}
 	if err := requireJSONEOF(decoder); err != nil {
-		return fmt.Errorf("decode native provider ownership marker %q: %w; refusing ACP work until it is recovered explicitly", path, err)
+		return w.blockNativeOwnership("is malformed")
 	}
 	if marker.Version != nativeMarkerVersion || marker.SessionID != w.config.Session.ID {
-		return fmt.Errorf("native provider ownership marker %q does not match Session %s or a supported version; refusing ACP work until it is recovered explicitly", path, w.config.Session.ID)
+		return w.blockNativeOwnership("does not match this Session or protocol version")
 	}
 	ownerToken, err := validateNativeOwnerToken(marker.OwnerToken)
 	if err != nil {
-		return fmt.Errorf("native provider ownership marker %q has an invalid owner token; refusing ACP work until it is recovered explicitly", path)
+		return w.blockNativeOwnership("has an invalid owner token")
 	}
+	if marker.State == nativeMarkerReserved || marker.State == nativeMarkerOwned {
+		if err := validateNativeGeneration(marker.Generation); err != nil {
+			return w.blockNativeOwnership("has an invalid ownership generation")
+		}
+	}
+	if marker.State != nativeMarkerReserved && marker.State != nativeMarkerOwned && marker.State != nativeMarkerRefreshPending {
+		return w.blockNativeOwnership("has an unknown ownership phase")
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	switch marker.State {
 	case nativeMarkerReserved:
-		if err := validateNativeGeneration(marker.Generation); err != nil {
-			return fmt.Errorf("native provider reservation marker %q has an invalid generation; refusing ACP work until it is recovered explicitly", path)
-		}
 		w.nativeOwnerToken = ownerToken
 		w.nativeOwnerGeneration = marker.Generation
 		w.nativeOwnerReserved = true
+		w.nativeOwnerStale = false
 	case nativeMarkerOwned:
 		w.nativeOwnerToken = ownerToken
 		w.nativeOwnerGeneration = marker.Generation
 		w.nativeOwnerReserved = false
+		// Committed v2 markers predate the optional stale bit and already used
+		// exclusive ownership, so only an explicit WIP stale marker is exit-only.
+		w.nativeOwnerStale = marker.StaleAfterACP != nil && *marker.StaleAfterACP
 	case nativeMarkerRefreshPending:
-		w.nativeRefreshBarrier = true
-		w.refreshPending = true
-		w.refreshQueueRemaining = 0
-	default:
-		return fmt.Errorf("native provider ownership marker %q has unknown state %q; refusing ACP work until it is recovered explicitly", path, marker.State)
+		// A released native generation may have advanced the provider store.
+		// Preserve this durable phase until an exact ACP rehydration succeeds.
+		w.nativeReconcilePending = true
+		w.requireACPFreshnessLocked()
 	}
 	return nil
+}
+
+func (w *Worker) blockNativeOwnership(reason string) error {
+	w.mu.Lock()
+	w.nativeOwnershipBlocked = true
+	w.nativeOwnershipReason = reason
+	w.mu.Unlock()
+	return fmt.Errorf("native provider ownership marker %q %s; refusing ACP and native work until it is recovered explicitly", w.NativeOwnerPath(), reason)
 }
 
 func requireJSONEOF(decoder *json.Decoder) error {
@@ -121,6 +139,10 @@ func (w *Worker) persistNativeOwnership(state, ownerToken, generation string) er
 	marker := nativeOwnerMarker{
 		Version: nativeMarkerVersion, SessionID: w.config.Session.ID,
 		State: state, OwnerToken: ownerToken, Generation: generation,
+	}
+	if state == nativeMarkerReserved || state == nativeMarkerOwned {
+		stale := state == nativeMarkerOwned && w.nativeOwnerStale
+		marker.StaleAfterACP = &stale
 	}
 	body, err := json.MarshalIndent(marker, "", "  ")
 	if err != nil {
@@ -159,6 +181,98 @@ func (w *Worker) removeNativeOwnership() error {
 		return fmt.Errorf("remove native provider ownership marker: %w", err)
 	}
 	return syncDirectory(filepath.Dir(w.NativeOwnerPath()))
+}
+
+func (w *Worker) loadNativeRefreshPendingMarker() (nativeOwnerMarker, error) {
+	info, err := os.Lstat(w.NativeOwnerPath())
+	if err != nil {
+		return nativeOwnerMarker{}, fmt.Errorf("inspect ACP rehydration marker: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		return nativeOwnerMarker{}, fmt.Errorf("ACP rehydration marker is not a private 0600 regular file")
+	}
+	body, err := os.ReadFile(w.NativeOwnerPath())
+	if err != nil {
+		return nativeOwnerMarker{}, fmt.Errorf("read ACP rehydration marker: %w", err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	var marker nativeOwnerMarker
+	if err := decoder.Decode(&marker); err != nil {
+		return nativeOwnerMarker{}, fmt.Errorf("decode ACP rehydration marker: %w", err)
+	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return nativeOwnerMarker{}, fmt.Errorf("decode ACP rehydration marker: %w", err)
+	}
+	if marker.Version != nativeMarkerVersion || marker.SessionID != w.config.Session.ID {
+		return nativeOwnerMarker{}, fmt.Errorf("ACP rehydration marker does not match this Session or protocol version")
+	}
+	if _, err := validateNativeOwnerToken(marker.OwnerToken); err != nil {
+		return nativeOwnerMarker{}, fmt.Errorf("ACP rehydration marker has an invalid owner token")
+	}
+	if err := validateNativeGeneration(marker.Generation); err != nil {
+		return nativeOwnerMarker{}, fmt.Errorf("ACP rehydration marker has an invalid generation")
+	}
+	if marker.State != nativeMarkerRefreshPending {
+		return nativeOwnerMarker{}, fmt.Errorf("ACP rehydration marker unexpectedly changed to native state %q; preserving it and refusing stale dispatch", marker.State)
+	}
+	return marker, nil
+}
+
+// clearNativeRefreshPendingLocked removes only the non-owning freshness phase.
+// Callers hold w.mu, so a concurrently acquired native generation either wins
+// first and clears the in-memory phase or is serialized after this removal.
+func (w *Worker) clearNativeRefreshPendingLocked() error {
+	if !w.nativeReconcilePending {
+		return nil
+	}
+	info, err := os.Lstat(w.NativeOwnerPath())
+	if os.IsNotExist(err) {
+		w.nativeReconcilePending = false
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect ACP rehydration marker: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		return fmt.Errorf("ACP rehydration marker is not a private 0600 regular file")
+	}
+	body, err := os.ReadFile(w.NativeOwnerPath())
+	if os.IsNotExist(err) {
+		w.nativeReconcilePending = false
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read ACP rehydration marker: %w", err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	var marker nativeOwnerMarker
+	if err := decoder.Decode(&marker); err != nil {
+		return fmt.Errorf("decode ACP rehydration marker: %w", err)
+	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return fmt.Errorf("decode ACP rehydration marker: %w", err)
+	}
+	if marker.Version != nativeMarkerVersion || marker.SessionID != w.config.Session.ID {
+		return fmt.Errorf("ACP rehydration marker does not match this Session or protocol version")
+	}
+	if _, err := validateNativeOwnerToken(marker.OwnerToken); err != nil {
+		return fmt.Errorf("ACP rehydration marker has an invalid owner token")
+	}
+	if marker.Generation != "" {
+		if err := validateNativeGeneration(marker.Generation); err != nil {
+			return fmt.Errorf("ACP rehydration marker has an invalid generation")
+		}
+	}
+	if marker.State != nativeMarkerRefreshPending {
+		return fmt.Errorf("ACP rehydration marker unexpectedly changed to native state %q; preserving it and refusing stale dispatch", marker.State)
+	}
+	if err := w.removeNativeOwnership(); err != nil {
+		return err
+	}
+	w.nativeReconcilePending = false
+	return nil
 }
 
 func syncDirectory(path string) error {

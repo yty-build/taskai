@@ -44,10 +44,10 @@ Using the fake ACP/acpx fixtures:
 
 - Prove worker survival after parent CLI exit.
 - Connect multiple viewers.
-- Prove one active turn and ordered queued prompts.
+- Prove one active ACP turn and ordered ACP-to-ACP FIFO prompts.
 - Against a responsive mixed-version worker, prove Prompt, permission
-  decision, provider-native attach, and live Resume negotiate both the current
-  protocol and `exclusive-native-owner-v1`, then fail before any provider command or
+  decision, provider-native attach, and live Resume negotiate worker protocol
+  v3 plus `exclusive-native-owner-v2`, then fail before any provider command or
   replacement spawn. Verify HTTP writes return sanitized `409` responses with
   code `worker_upgrade_required`, while Cancel, Stop, reads, conversation/history,
   permission listing, and streams remain usable for migration. Cover
@@ -61,6 +61,10 @@ Using the fake ACP/acpx fixtures:
 - Verify JSONL validity, monotonic positions, replay, and its role as
   lifecycle/audit/provisional-overlay/fallback data rather than committed
   provider conversation history.
+- Verify pre-prompt exact ACP rehydration for every request at the FIFO head:
+  Refresh or fallback Resume must validate the same identity and emit
+  correlated `acp_rehydrated` before `turn_started`; failure sends no prompt.
+  Include a provider-store change made outside a gateway-managed native marker.
 - Cancel active/idle turns, stop, resume, crash, and recover.
 - Exercise malformed/partial adapter output and missing native IDs.
 - Verify socket, state, and log permissions.
@@ -96,20 +100,27 @@ For `acpctl task attach`:
 - A responsive worker outside the required protocol/capability contract fails closed before native
   acquisition or provider launch and reports exact stop/resume migration
   commands.
-- Once native ownership already exists, missing tmux, noninteractive I/O, or a
+- Once a native harness already exists, missing tmux, noninteractive I/O, or a
   missing stable harness all fail closed; a second outer viewer cannot use
-  direct execution, create a replacement provider, or release the live owner.
+  direct execution, create a replacement provider, or release the live harness.
+  An active owner or reservation must also reject ACP admission rather than
+  placing the prompt in the ACP FIFO.
 - Prove the outer handoff persists `reserved(generation)` before provider start,
   and the hidden/direct provider atomically activates that exact generation.
   A failed or delayed activation must launch no provider process.
+- While an ACP request is accepted/queued/preparing/running, prove new native reservation or
+  activation is rejected with wait-then-open guidance, not queued; it launches
+  no provider process and does not cancel ACP.
 - Reproduce an unowned tmux collision, remove the exact colliding harness,
-  recover the stale reservation, wait for reconciliation, then complete a new
-  native attach/exit and queued ACP continuation. Existing/uncertain tmux,
-  active ownership, stale generation activation/release, and legacy ownership
-  markers all fail closed. Missing tmux never clears an active owner. Race a
+  prove the stale reservation rejects ACP, recover that exact reservation, and
+  retry only after the recovery command reports release. Observe transcript
+  reconciliation asynchronously. Existing/uncertain tmux, active
+  native-harness state, stale generation activation/release, and legacy markers
+  all fail closed against both replacement native creation and ACP admission.
+  Missing tmux never clears an active native harness. Race a
   reserved-status probe against a safe concurrent release and prove CLI output
   reports `already_released` without instructing the operator to wait for a
-  nonexistent refresh event.
+  nonexistent ownership release.
 
 For `acpctl session attach --acp`:
 
@@ -155,27 +166,41 @@ For `acpctl session attach --acp`:
 - Verify reviewer Session independence and its producer JSONL, checkout, branch,
   status, and Git-diff evidence.
 - Prove the first exact provider identity becomes immutable canonical Session state while acpx/ACP/native IDs remain evidence.
-- Test exact Codex, Claude, Grok, and OpenCode local-store verification plus ambiguous/missing/check-out mismatch rejection.
+- Test exact Codex/Claude/Grok provider-JSONL and OpenCode-provider-SQLite
+  verification/readers plus ambiguous, missing, and checkout-mismatch
+  rejection.
 - Prove `session attach <id>` and Task Enter invoke the exact real provider-native resume command; `--acp` and Task `a` open the structured gateway console.
-- Prove tmux detach/reattach leaves the native process running and does not request an early refresh.
-- Prove an active ACP turn exclusively owns provider writes: native attach waits
-  or fails visibly and never cancels that turn.
-- Prove a running provider-native process exclusively owns provider writes:
-  ACP prompts remain visibly queued and no input reaches ACP/the provider.
-- Prove tmux viewer detach does not release ownership while the native process
-  continues; reattachment reaches that same process and conversation.
-- Prove actual native exit/stop requests exact ACP refresh and provider-store
-  reconciliation while retaining native ownership and keeping queued ACP
-  prompts behind the boundary. Only a successful atomic reconciliation may
-  release ownership and the next queued prompt. Require the sanitized
-  `provider_transcript_reconciled` lifecycle line after the exact provider read
-  and before the queued turn starts; a failed read must emit no success line.
-- Inject post-turn and post-native identity drift. Prove bounded exact recovery
-  completes before later work; if recovery fails, queued requests receive
-  correlated errors, no later prompt reaches the suspect bridge, the entire old
-  process group exits, and the worker stops with the write boundary unresolved.
+- Prove tmux detach/reattach leaves the native process running and does not
+  request an early provider-snapshot reload.
+- Prove an accepted/queued/preparing/active ACP request rejects creation or activation of a new
+  native generation with wait-then-open guidance. It must not queue native
+  startup, launch a provider process, or cancel ACP.
+- Prove a running or detached provider-native owner rejects ACP before journal
+  or queue mutation with exit-and-retry guidance. It must return no accepted
+  request ID, send no bridge Prompt, and leave the native process untouched.
+- Prove tmux viewer detach leaves both the native process and exclusive owner
+  active; reattachment reaches that same process and conversation. Only normal
+  provider exit with exact generation/token release permits a cross-surface
+  retry.
+- After native exit, prove a retried ACP prompt performs exact
+  Refresh/fallback Resume and identity validation before `turn_started`, then
+  reaches the bridge. A subsequent fresh native generation must use
+  `BuildResume` on the same canonical ID and observe the committed ACP turn.
+- Prove actual native exit/stop requests exact provider-store reload and
+  reconciliation in the background. Require the sanitized
+  `provider_transcript_reconciled` lifecycle line after the exact provider read,
+  but prove a delayed or failed presentation read does not delay ACP after
+  ownership release and exact rehydration; a failed read emits no success line
+  and keeps the last validated projection.
+- Inject post-native snapshot drift and prove it warns without discarding the
+  current projection. Separately inject ACP transport identity drift and prove
+  affected requests receive correlated errors, the suspect bridge process
+  group exits, and the worker stops for exact resume.
 - Start tmux with stale `AGENT_HOME`/`PATH`, then prove native attach passes the invoking state root/environment and rejects an unowned name collision.
-- Run the serialized ACP → native → ACP nonce smoke against all four authenticated providers.
+- Run the same-conversation ACP → native → rejected ACP while native owns →
+  normal native exit → retried ACP → fresh native nonce smoke against all four
+  authenticated providers. A separate negative case proves new native start
+  during ACP is rejected without queueing or cancellation.
 
 ## T07 — API and web
 
@@ -226,16 +251,23 @@ For every provider:
 For Codex, Claude, Grok, and OpenCode, additionally verify the canonical ID in
 the provider's exact local store and prove this sequence:
 
-1. During an active ACP turn, native attach waits/fails without cancellation.
-2. After ACP settles and reconciles, the real native harness remembers an
-   ACP-only nonce.
-3. While native owns the conversation, an ACP prompt stays visibly queued and
-   does not dispatch, including after tmux viewer detach.
-4. Add a native-only nonce, exit the provider process, and wait for exact ACP
-   refresh plus atomic provider-store reconciliation.
-5. Only then may the queued ACP prompt run; it must remember the native-only
-   nonce and the structured projection must contain one committed copy of each
-   turn.
+1. During an active ACP turn, attempt to start a new native generation. It must
+   fail immediately with wait-then-open guidance, start no provider process,
+   and leave ACP running.
+2. After ACP settles, prove a fresh real native harness remembers the ACP-only
+   nonce; add a native-only nonce, then detach while leaving it idle.
+3. Submit an ACP prompt. It must fail immediately with exit-and-retry guidance,
+   return no accepted request ID or journal record, and send nothing through ACP
+   while the detached native process still owns the Session.
+4. Reattach to that exact native harness and exit the provider normally without
+   another prompt. Observe exact `native_released` and asynchronous provider
+   snapshot reconciliation; viewer detach alone must never produce release.
+5. Retry the ACP prompt. Prove exact Refresh/fallback Resume loads the native
+   advance, emits `acp_rehydrated` before `turn_started`, and remembers the
+   native-only nonce. Then attach again and prove a fresh generation/exact
+   provider resume sees the ACP turn. The structured projection eventually
+   contains one committed copy of each turn even if display reconciliation
+   finishes after ACP dispatch.
 
 Gemini is ACP-only in V1 until an exact provider-store verifier is implemented.
 

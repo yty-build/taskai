@@ -17,7 +17,7 @@ func TestTranscriptProjectsTurnsAndCoalescesRealShapedACP(t *testing.T) {
 	requestID := "REQ-1"
 	lines := []sessionlog.Line{
 		projectionLine(1, requestID, "prompt_submitted", map[string]any{"display_message": "First paragraph.\n\nSecond paragraph."}),
-		projectionLine(2, requestID, "prompt_queued", map[string]any{"state": "ready"}),
+		projectionLine(2, requestID, "prompt_ready", map[string]any{"state": "ready"}),
 		projectionLine(3, requestID, "turn_started", map[string]any{"request_id": requestID}),
 		projectionACPLine(4, requestID, "initialize", map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
 		projectionACPLine(5, requestID, "usage_update", sessionUpdate(map[string]any{"sessionUpdate": "usage_update", "used": 15})),
@@ -123,6 +123,19 @@ func TestTranscriptRetainsRecentAssistantAndReasoningTails(t *testing.T) {
 	}
 	if thought == nil || !strings.HasSuffix(thought.text, "REASONING-TAIL") || !thought.truncated {
 		t.Fatalf("reasoning tail was not retained: %#v", thought)
+	}
+}
+
+func TestTranscriptPresentsReadyPromptAsAcceptedNotQueued(t *testing.T) {
+	projection := newTranscript()
+	projection.apply(projectionLine(1, "REQ-READY", "prompt_submitted", map[string]any{"display_message": "Continue while native is open"}))
+	projection.apply(projectionLine(2, "REQ-READY", "prompt_ready", map[string]any{"state": "ready"}))
+	request := projection.requests[0]
+	if request.state != turnReady {
+		t.Fatalf("ready prompt state = %q", request.state)
+	}
+	if got := renderTurnState(request.state); !strings.Contains(got, "Message accepted") || strings.Contains(strings.ToLower(got), "queued") {
+		t.Fatalf("ready prompt rendering = %q", got)
 	}
 }
 

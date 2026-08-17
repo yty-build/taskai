@@ -111,7 +111,8 @@ Conversation projection:
 ```
 
 `source: "provider-store"` means the committed base came from the exact
-canonical provider conversation after identity and checkout verification.
+canonical provider conversation after identity and checkout verification:
+provider JSONL for Codex, Claude, and Grok, or provider SQLite for OpenCode.
 `source: "gateway-log"` is an explicit fallback and includes a safe `warning`;
 it never claims that gateway JSONL is the provider's committed transcript.
 `committed: false` identifies a provisional ACP turn that has not yet matched a
@@ -182,7 +183,7 @@ The three `conversation_*` fields expose only safe continuity state. Database/ru
 | `GET` | `/api/v1/tasks/{id}/stream` | Aggregate Task SSE |
 | `GET` | `/api/v1/sessions/{id}` | Session DTO |
 | `GET` | `/api/v1/sessions/{id}/conversation` | Bounded committed provider snapshot + gateway overlay and cursor |
-| `POST` | `/api/v1/sessions/{id}/prompt` | Queue prompt; return request ID |
+| `POST` | `/api/v1/sessions/{id}/prompt` | Submit ACP prompt; return request ID and lifecycle state |
 | `GET` | `/api/v1/sessions/{id}/permissions` | Current actionable permission list |
 | `POST` | `/api/v1/sessions/{id}/permissions/decision` | Select an exact offered option |
 | `POST` | `/api/v1/sessions/{id}/cancel` | Request active-turn cancellation |
@@ -226,9 +227,16 @@ curl -sS http://127.0.0.1:8080/api/v1/sessions/S-…/prompt \
 ```
 
 Successful submission is `202 Accepted` with a new `request_id` and `state`. If
-another ACP turn is active, or the provider-native process owns the Session's
-writer gate, the worker queues this request; the API does not inject it into the
-active owner or send it to the provider early.
+another ACP turn is active, the worker keeps this request in its ACP-to-ACP FIFO
+because the public runtime supports one active turn per Session; the API does
+not inject it into that active turn. If an exclusive provider-native owner or
+pre-launch reservation exists, submission fails with `409` before a request is
+journaled or queued; the client must exit the provider normally, wait for exact
+release, and retry. At the head of the ACP FIFO, every accepted request first
+refreshes the idle adapter on the exact persisted ACP Session, falling back to
+exact Resume, even when no managed native marker is present. Successful
+continuity emits correlated `acp_rehydrated` before `turn_started`; failure
+sends no prompt.
 
 Permission decision:
 
@@ -261,13 +269,14 @@ Cancel and stop require an empty request body. Resume accepts an empty body or:
 ```
 
 Prompt, permission decision, and Resume against an already-live worker first
-negotiate the current worker protocol and `exclusive-native-owner-v1`
-capability. A responsive older worker returns `409` with error code
+negotiate worker protocol v3 and `exclusive-native-owner-v2`. The capability
+proves generation-scoped duplicate-native protection and cross-surface writer
+exclusion. A responsive incompatible worker returns `409` with error code
 `worker_upgrade_required`; the requested provider write is not sent and Resume
 does not spawn a replacement worker. Read endpoints, conversation/history and
 SSE, permission listing, Cancel, and Stop remain available for safe migration.
-Exit any provider CLI in `agent-<session-id>` first, then run the exact
-`acpctl session stop <session-id>` and `acpctl session resume <session-id>`
+Run the exact `acpctl session stop <session-id>` and
+`acpctl session resume <session-id>`
 commands carried in the sanitized error.
 
 Review:
@@ -349,7 +358,7 @@ Common statuses:
 | --- | --- |
 | `400` | malformed JSON/body/cursor |
 | `404` | Task or Session not found |
-| `409` | worker upgrade required, checkout, active-producer, permission race, or lifecycle conflict |
+| `409` | worker upgrade required, checkout, active-producer, permission race, native/ACP writer ownership, or lifecycle conflict |
 | `422` | valid JSON with invalid domain/profile/repository input |
 | `502` | worker operation failed; internal socket detail is suppressed |
 | `500` | internal storage/server failure with sanitized message |
@@ -361,13 +370,17 @@ Common statuses:
 - Deduplicate activities by `(session_id, position)`.
 - Hydrate structured conversation from `/conversation`, then follow the Session
   stream after its returned `gateway_cursor`. Treat the provider-store snapshot
-  as committed and unmatched ACP deltas as provisional.
+  as committed and unmatched gateway-JSONL/ACP deltas as provisional. Clients
+  do not open provider files or perform ACP Resume themselves.
 - Publish a refreshed bounded conversation projection atomically while
   preserving local scroll/focus/draft/selection/disclosure state. Never clear
   the visible transcript while fetching it.
 - Display `source`, `warning`, delayed-refresh/fallback state, and `committed` honestly;
   never promote gateway fallback to canonical provider history.
 - Route Task-scoped input only after a user/client selects a Session.
+- Treat a native-owner/reservation `409` as a rejected ACP submission, not a
+  queued request; show exit-and-retry guidance and do not synthesize an
+  optimistic turn.
 - A disconnected prompt client must reconnect using its cursor to receive completed correlated output.
 - Do not infer permission from noninteractive use; set `approve_all` explicitly.
 - Never invent a permission option ID; display only the exact current `options`, distinguish persistent `*_always` choices, and handle `409` as another viewer winning the race.

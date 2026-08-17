@@ -236,6 +236,8 @@ func (m Model) sessionAttention(current session.Session) string {
 			return "Turn failed · open the structured view for details"
 		case turnComplete:
 			return "Response complete · conversation remains resumable"
+		case turnIncomplete:
+			return "Provider turn is incomplete · open the conversation for available history"
 		case turnCancelled:
 			return "Turn cancelled · Session remains available"
 		}
@@ -705,6 +707,8 @@ func renderPermission(card *permissionCard, width int) []string {
 
 func renderTurnState(state turnState) string {
 	switch state {
+	case turnReady:
+		return "  ◌ Message accepted"
 	case turnQueued:
 		return "  ◌ Message queued"
 	case turnLive:
@@ -717,6 +721,8 @@ func renderTurnState(state turnState) string {
 		return "  ! Turn failed"
 	case turnComplete:
 		return "  ✓ Turn complete"
+	case turnIncomplete:
+		return "  ◇ Provider turn incomplete · no final response was recorded"
 	default:
 		return ""
 	}

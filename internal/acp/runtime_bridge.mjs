@@ -94,12 +94,19 @@ function emit(message) {
 }
 
 function failure(commandId, error, requestId = "") {
+  const boundedCode = (value) => {
+    if (typeof value !== "string") return undefined;
+    const trimmed = value.trim();
+    return trimmed && Buffer.byteLength(trimmed, "utf8") <= 128 ? trimmed : undefined;
+  };
   emit({
     type: "error",
     commandId,
     requestId,
     message: error instanceof Error ? error.message : String(error),
-    code: typeof error?.code === "string" ? error.code : undefined,
+    code: boundedCode(error?.code),
+    detailCode: boundedCode(error?.detailCode),
+    retryable: error?.retryable === true,
   });
 }
 

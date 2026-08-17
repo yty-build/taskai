@@ -125,6 +125,42 @@ type conversationCoverage struct {
 	pendingSpace bool
 }
 
+// conversationNormalizedText mirrors conversationCoverage's streaming
+// whitespace rules, but exists only for one bounded merge. It lets us compare
+// a provider/store prefix with a slightly newer ACP stream without retaining a
+// second long-lived copy of every completed prompt and answer.
+type conversationNormalizedText struct {
+	value        strings.Builder
+	set          bool
+	pendingSpace bool
+}
+
+func (n *conversationNormalizedText) append(value string) {
+	fields := strings.Fields(value)
+	if len(fields) == 0 {
+		if n.set && strings.TrimSpace(value) == "" && value != "" {
+			n.pendingSpace = true
+		}
+		return
+	}
+	if n.set && len(strings.TrimLeftFunc(value, unicode.IsSpace)) < len(value) {
+		n.pendingSpace = true
+	}
+	for _, field := range fields {
+		if n.set && n.pendingSpace {
+			n.value.WriteByte(' ')
+		}
+		n.value.WriteString(field)
+		n.set = true
+		n.pendingSpace = true
+	}
+	n.pendingSpace = len(strings.TrimRightFunc(value, unicode.IsSpace)) < len(value)
+}
+
+func (n *conversationNormalizedText) String() string {
+	return n.value.String()
+}
+
 // Conversation returns the best complete conversation projection available at
 // one captured gateway cursor. Provider history is preferred only after exact
 // canonical-ID and checkout verification. Every fallback is assembled here as
@@ -372,6 +408,10 @@ func mergeConversationTurnsWithGatewayState(provider native.TranscriptSnapshot, 
 	providerTurns := groupProviderTurns(provider.Records)
 	matchedProvider := make(map[int]*conversationTurn)
 	matchedGateway := make(map[*conversationTurn]bool)
+	gatewayIndex := make(map[*conversationTurn]int, len(gateway))
+	for index, turn := range gateway {
+		gatewayIndex[turn] = index
+	}
 	providerCursor := 0
 	for _, candidate := range gateway {
 		if !candidate.committable {
@@ -384,12 +424,9 @@ func mergeConversationTurnsWithGatewayState(provider native.TranscriptSnapshot, 
 			providerCursor = providerIndex + 1
 		}
 	}
+	matchIncompleteProviderTurns(providerTurns, gateway, matchedProvider, matchedGateway, gatewayIndex, gatewayTruncated)
 
 	result := make([]ConversationTurn, 0, len(providerTurns)+len(gateway))
-	gatewayIndex := make(map[*conversationTurn]int, len(gateway))
-	for index, turn := range gateway {
-		gatewayIndex[turn] = index
-	}
 	nextGateway := 0
 	appendUnmatchedGatewayBefore := func(limit int) {
 		for nextGateway < limit {
@@ -408,23 +445,165 @@ func mergeConversationTurnsWithGatewayState(provider native.TranscriptSnapshot, 
 		if gatewayTurn := matchedProvider[index]; gatewayTurn != nil {
 			appendUnmatchedGatewayBefore(gatewayIndex[gatewayTurn])
 			nextGateway = gatewayIndex[gatewayTurn] + 1
+			if !turn.complete {
+				// An incomplete provider group is an ordering anchor, not a
+				// provider commit. The gateway owns the visible failed/active ACP
+				// lifecycle, and it must appear exactly once at this provider
+				// position.
+				result = append(result, ConversationTurn{
+					Key: gatewayTurn.id, Committed: false, Surface: ConversationSurfaceACP,
+					Activities: append([]ConversationActivity(nil), gatewayTurn.activities...),
+				})
+				continue
+			}
 			activities := append([]ConversationActivity(nil), gatewayTurn.activities...)
 			if len(activities) == 0 {
-				activities = providerTurnActivities(turn, true)
+				activities = providerTurnActivities(turn)
 			} else {
 				activities = matchedCommittedActivities(turn, gatewayTurn)
 			}
 			result = append(result, ConversationTurn{Key: turn.key, Committed: true, Surface: ConversationSurfaceACP, Activities: activities})
 			continue
 		}
-		surface := inferUnmatchedProviderSurface(index, matchedProvider, gatewayIndex, gatewayTruncated)
+		surface := ConversationSurfaceUnknown
+		if turn.complete {
+			surface = inferUnmatchedProviderSurface(index, matchedProvider, gatewayIndex, gatewayTruncated)
+		}
 		result = append(result, ConversationTurn{
 			Key: turn.key, Committed: turn.complete, Surface: surface,
-			Activities: providerTurnActivities(turn, turn.complete),
+			Activities: providerTurnActivities(turn),
 		})
 	}
 	appendUnmatchedGatewayBefore(len(gateway))
 	return result
+}
+
+// matchIncompleteProviderTurns uses user-started, non-final provider groups as
+// order anchors for failed or still-active ACP turns. Complete provider turns
+// are matched first, so each partial match is constrained to the gateway range
+// between its nearest already-verified provider neighbours. Matching remains
+// deliberately conservative: exact normalized prompts are mandatory, times
+// and any partial assistant text must be compatible, and more than one
+// candidate is treated as ambiguity rather than guessed away.
+func matchIncompleteProviderTurns(
+	provider []*providerConversationTurn,
+	gateway []*conversationTurn,
+	matchedProvider map[int]*conversationTurn,
+	matchedGateway map[*conversationTurn]bool,
+	gatewayIndex map[*conversationTurn]int,
+	gatewayTruncated bool,
+) {
+	providerAssistantText := make(map[*providerConversationTurn]string)
+	gatewayAssistantText := make(map[*conversationTurn]string)
+	for providerIndex, providerTurn := range provider {
+		if providerTurn.complete || matchedProvider[providerIndex] != nil {
+			continue
+		}
+		lower, upper := 0, len(gateway)
+		lowerBounded, upperBounded := false, false
+		for matchedIndex, gatewayTurn := range matchedProvider {
+			index := gatewayIndex[gatewayTurn]
+			if matchedIndex < providerIndex && (!lowerBounded || index+1 > lower) {
+				lower, lowerBounded = index+1, true
+			}
+			if matchedIndex > providerIndex && (!upperBounded || index < upper) {
+				upper, upperBounded = index, true
+			}
+		}
+		if lower > upper || (gatewayTruncated && (!lowerBounded || !upperBounded)) {
+			continue
+		}
+		// An evicted gateway payload inside the match window makes uniqueness
+		// unknowable. Keep both records visible rather than suppressing either.
+		unknownCandidate := false
+		var compatible []*conversationTurn
+		for index := lower; index < upper; index++ {
+			candidate := gateway[index]
+			if matchedGateway[candidate] || candidate.committable {
+				continue
+			}
+			if len(candidate.activities) == 0 {
+				unknownCandidate = true
+				break
+			}
+			if incompleteProviderGatewayCompatible(providerTurn, candidate, providerAssistantText, gatewayAssistantText) {
+				compatible = append(compatible, candidate)
+				if len(compatible) > 1 {
+					break
+				}
+			}
+		}
+		if unknownCandidate || len(compatible) != 1 {
+			continue
+		}
+		matchedProvider[providerIndex] = compatible[0]
+		matchedGateway[compatible[0]] = true
+	}
+}
+
+func incompleteProviderGatewayCompatible(
+	provider *providerConversationTurn,
+	gateway *conversationTurn,
+	providerAssistantText map[*providerConversationTurn]string,
+	gatewayAssistantText map[*conversationTurn]string,
+) bool {
+	if provider == nil || gateway == nil || !provider.userMatchable || !gateway.userMatchable ||
+		!provider.user.set || !gateway.user.set || !partialConversationTimesCompatible(provider, gateway) {
+		return false
+	}
+	if !provider.user.equal(gateway.user) && !(provider.wrappedUser && provider.displayUser.equal(gateway.user)) {
+		return false
+	}
+	if (provider.assistant.set && !provider.answerMatchable) || (gateway.assistant.set && !gateway.answerMatchable) {
+		return false
+	}
+	if !provider.assistant.set || !gateway.assistant.set {
+		return true
+	}
+	if provider.assistant.equal(gateway.assistant) {
+		return true
+	}
+	providerText, cached := providerAssistantText[provider]
+	if !cached {
+		providerText = normalizedProviderAssistant(provider)
+		providerAssistantText[provider] = providerText
+	}
+	gatewayText, cached := gatewayAssistantText[gateway]
+	if !cached {
+		gatewayText = normalizedGatewayAssistant(gateway)
+		gatewayAssistantText[gateway] = gatewayText
+	}
+	if providerText == "" || gatewayText == "" {
+		return provider.assistant.equal(gateway.assistant)
+	}
+	return strings.HasPrefix(providerText, gatewayText) || strings.HasPrefix(gatewayText, providerText)
+}
+
+func partialConversationTimesCompatible(provider *providerConversationTurn, gateway *conversationTurn) bool {
+	if !provider.firstAt.IsZero() && !gateway.firstAt.IsZero() {
+		return conversationTimestampsWithinWindow(provider.firstAt, gateway.firstAt)
+	}
+	return conversationTimesCompatible(provider, gateway)
+}
+
+func normalizedProviderAssistant(turn *providerConversationTurn) string {
+	var normalized conversationNormalizedText
+	for _, record := range turn.records {
+		if record.Kind == native.TranscriptAssistant {
+			normalized.append(record.Text)
+		}
+	}
+	return normalized.String()
+}
+
+func normalizedGatewayAssistant(turn *conversationTurn) string {
+	var normalized conversationNormalizedText
+	for _, activity := range turn.activities {
+		if activity.Display != nil && activity.Display.Type == "assistant_chunk" {
+			normalized.append(activity.Display.Text)
+		}
+	}
+	return normalized.String()
 }
 
 func inferUnmatchedProviderSurface(index int, matched map[int]*conversationTurn, gatewayIndex map[*conversationTurn]int, gatewayTruncated bool) ConversationSurface {
@@ -444,9 +623,9 @@ func inferUnmatchedProviderSurface(index int, matched map[int]*conversationTurn,
 		return ConversationSurfaceUnknown
 	}
 	// A complete unmatched provider turn is positively attributable to the
-	// native surface only when it is bracketed by two matched ACP turns with no
-	// gateway turn between them. Leading, trailing, repeated, or ambiguous
-	// unmatched records remain an honest generic provider turn.
+	// native surface only when it is bracketed by two matched or safely anchored
+	// ACP turns with no gateway turn between them. Leading, trailing, repeated,
+	// or ambiguous unmatched records remain an honest generic provider turn.
 	if gatewayIndex[matched[nextProvider]] == gatewayIndex[matched[previousProvider]]+1 {
 		return ConversationSurfaceNative
 	}
@@ -490,22 +669,10 @@ func groupProviderTurns(records []native.TranscriptRecord) []*providerConversati
 			}
 		}
 	}
-	// Provider stores write user/reasoning records before a final response
-	// exists, and interrupted native turns can leave such groups in the middle
-	// of history. They are not durable completed conversation turns. ACP
-	// failures remain visible through the gateway overlay; native-only failures
-	// remain available in the native harness rather than being misrepresented
-	// here as successful provider turns.
-	complete := result[:0]
-	for _, turn := range result {
-		if turn.complete {
-			complete = append(complete, turn)
-		}
-	}
-	for index := len(complete); index < len(result); index++ {
-		result[index] = nil
-	}
-	return complete
+	// Keep every user-started group. Incomplete groups are valuable order
+	// anchors even though they are never provider commits. A snapshot that
+	// begins with assistant-only truncation was already omitted above.
+	return result
 }
 
 func selectProviderConversationTurn(provider []*providerConversationTurn, start int, gateway *conversationTurn) int {
@@ -555,6 +722,10 @@ func conversationTimesCompatible(provider *providerConversationTurn, gateway *co
 	if gatewayTime.IsZero() {
 		gatewayTime = gateway.firstAt
 	}
+	return conversationTimestampsWithinWindow(providerTime, gatewayTime)
+}
+
+func conversationTimestampsWithinWindow(providerTime, gatewayTime time.Time) bool {
 	if providerTime.IsZero() || gatewayTime.IsZero() {
 		return true
 	}
@@ -565,11 +736,9 @@ func conversationTimesCompatible(provider *providerConversationTurn, gateway *co
 	return difference <= conversationMatchWindow
 }
 
-func providerTurnActivities(turn *providerConversationTurn, complete bool) []ConversationActivity {
+func providerTurnActivities(turn *providerConversationTurn) []ConversationActivity {
 	capacity := len(turn.records)
-	if complete {
-		capacity++
-	}
+	capacity++
 	activities := make([]ConversationActivity, 0, capacity)
 	for _, record := range turn.records {
 		display := providerRecordDisplay(record)
@@ -580,9 +749,13 @@ func providerTurnActivities(turn *providerConversationTurn, complete bool) []Con
 			RequestID: turn.key, Kind: "provider_transcript", Timestamp: record.Timestamp, Display: display,
 		})
 	}
-	if complete {
+	if turn.complete {
 		activities = append(activities, ConversationActivity{
 			RequestID: turn.key, Kind: "provider_turn_completed", Display: &presentation.Activity{Type: "turn_state", State: "complete", StopReason: "end_turn"},
+		})
+	} else {
+		activities = append(activities, ConversationActivity{
+			RequestID: turn.key, Kind: "provider_turn_incomplete", Display: &presentation.Activity{Type: "turn_state", State: "incomplete", StopReason: "provider_history_incomplete"},
 		})
 	}
 	return activities

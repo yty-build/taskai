@@ -253,6 +253,8 @@ func taskPreviewStateGlyph(text string) string {
 		return "!"
 	case "Turn cancelled":
 		return "×"
+	case "Provider turn incomplete":
+		return "◇"
 	case "Message queued", "Cancellation requested":
 		return "○"
 	default:
@@ -319,6 +321,8 @@ func taskPreviewPlanSummary(entries []planEntry) string {
 
 func taskPreviewStateText(state turnState) string {
 	switch state {
+	case turnReady:
+		return "Message accepted"
 	case turnQueued:
 		return "Message queued"
 	case turnLive:
@@ -331,6 +335,8 @@ func taskPreviewStateText(state turnState) string {
 		return "Turn failed"
 	case turnComplete:
 		return "Turn complete"
+	case turnIncomplete:
+		return "Provider turn incomplete"
 	default:
 		return ""
 	}

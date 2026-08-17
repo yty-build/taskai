@@ -3,6 +3,7 @@ package acp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -77,7 +78,7 @@ func (c *RuntimeClient) Resume(ctx context.Context, spec StartSpec) (SessionInfo
 	info, err := c.ensure(ctx, spec)
 	if err != nil {
 		c.discardBridge()
-		return SessionInfo{}, err
+		return SessionInfo{}, providerFacingTurnError(err)
 	}
 	if info.ACPSessionID == "" {
 		c.discardBridge()
@@ -91,9 +92,8 @@ func (c *RuntimeClient) Resume(ctx context.Context, spec StartSpec) (SessionInfo
 	return info, nil
 }
 
-// Refresh closes the idle ACP provider process and resumes the exact same ACP
-// conversation. It is used after a provider-native harness exits so a later
-// ACP turn observes the provider's latest persisted transcript.
+// Refresh closes an idle ACP provider process and resumes the exact same ACP
+// conversation for an explicit transport refresh or identity-recovery action.
 func (c *RuntimeClient) Refresh(ctx context.Context, spec StartSpec) (SessionInfo, error) {
 	if strings.TrimSpace(spec.ResumeACPSessionID) == "" {
 		return SessionInfo{}, fmt.Errorf("ACP Session ID is required to refresh")
@@ -115,7 +115,7 @@ func (c *RuntimeClient) Refresh(ctx context.Context, spec StartSpec) (SessionInf
 	}, &payload)
 	if err != nil {
 		c.discardBridge()
-		return SessionInfo{}, err
+		return SessionInfo{}, providerFacingTurnError(err)
 	}
 	info, err := bridgeSessionInfo(target, payload)
 	if err != nil {
@@ -128,6 +128,37 @@ func (c *RuntimeClient) Refresh(ctx context.Context, spec StartSpec) (SessionInf
 	}
 	c.bindIdentity(spec, info)
 	return info, nil
+}
+
+// providerFacingTurnError classifies only explicit provider-facing
+// contention/rejection codes while opening or refreshing an exact provider
+// conversation. Generic bridge, framing, permission, and identity failures
+// remain protocol errors so the worker retains its recovery/quarantine path.
+func providerFacingTurnError(err error) error {
+	var remote *bridgeRemoteCommandError
+	if !errors.As(err, &remote) || (!providerActivationFailureCode(remote.code) && !providerActivationFailureCode(remote.detailCode)) {
+		return err
+	}
+	return &ProviderTurnError{
+		Code: remote.code, DetailCode: remote.detailCode, Message: remote.message, Retryable: remote.retryable,
+	}
+}
+
+func providerActivationFailureCode(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 128 {
+		return false
+	}
+	value = strings.NewReplacer("-", "_", " ", "_").Replace(strings.ToLower(value))
+	switch value {
+	case "busy", "provider_busy", "conversation_busy", "turn_busy",
+		"conflict", "provider_conflict", "conversation_conflict", "concurrent_turn",
+		"rate_limited", "rate_limit", "too_many_requests", "throttled",
+		"rejected", "provider_rejected", "refused", "denied", "provider_error":
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *RuntimeClient) ensure(ctx context.Context, spec StartSpec) (SessionInfo, error) {
@@ -164,6 +195,9 @@ func runtimeAgentConfiguration(profile agents.Profile) (string, bool) {
 }
 
 func (c *RuntimeClient) Prompt(ctx context.Context, spec PromptSpec, emit func(Event) error) (PromptReceipt, error) {
+	if err := ctx.Err(); err != nil {
+		return PromptReceipt{RequestID: spec.RequestID}, err
+	}
 	target, err := c.readyTarget(spec.Target)
 	if err != nil {
 		return PromptReceipt{}, err
@@ -230,7 +264,7 @@ func (c *RuntimeClient) Prompt(ctx context.Context, spec PromptSpec, emit func(E
 			case "turn_result":
 				return runtimeTurnResult(receipt, message.Result)
 			case "error":
-				return receipt, bridgeRemoteError(message)
+				return receipt, providerFacingTurnError(bridgeRemoteError(message))
 			}
 		}
 	}
@@ -506,8 +540,10 @@ func runtimeTurnResult(receipt PromptReceipt, encoded json.RawMessage) (PromptRe
 		Status     string `json:"status"`
 		StopReason string `json:"stopReason"`
 		Error      struct {
-			Message string `json:"message"`
-			Code    string `json:"code"`
+			Message    string `json:"message"`
+			Code       string `json:"code"`
+			DetailCode string `json:"detailCode"`
+			Retryable  bool   `json:"retryable"`
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(encoded, &result); err != nil {
@@ -521,11 +557,10 @@ func runtimeTurnResult(receipt PromptReceipt, encoded json.RawMessage) (PromptRe
 		receipt.StopReason = "cancelled"
 		return receipt, nil
 	case "failed":
-		message := result.Error.Message
-		if result.Error.Code != "" {
-			message = result.Error.Code + ": " + message
+		return receipt, &ProviderTurnError{
+			Code: result.Error.Code, DetailCode: result.Error.DetailCode,
+			Message: firstNonEmptyString(result.Error.Message, "provider turn failed"), Retryable: result.Error.Retryable,
 		}
-		return receipt, &ProtocolError{Operation: "runtime turn", Message: firstNonEmptyString(message, "provider turn failed")}
 	default:
 		return receipt, &ProtocolError{Operation: "runtime turn result", Message: fmt.Sprintf("unknown status %q", result.Status)}
 	}

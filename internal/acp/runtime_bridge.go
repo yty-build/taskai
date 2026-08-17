@@ -55,11 +55,24 @@ type bridgeMessage struct {
 	Reason       string          `json:"reason"`
 	Message      string          `json:"message"`
 	Code         string          `json:"code"`
+	DetailCode   string          `json:"detailCode"`
+	Retryable    bool            `json:"retryable"`
 	Data         json.RawMessage `json:"data"`
 	Event        json.RawMessage `json:"event"`
 	Request      json.RawMessage `json:"request"`
 	Result       json.RawMessage `json:"result"`
 }
+
+type bridgeRemoteCommandError struct {
+	protocol   *ProtocolError
+	code       string
+	detailCode string
+	retryable  bool
+	message    string
+}
+
+func (e *bridgeRemoteCommandError) Error() string { return e.protocol.Error() }
+func (e *bridgeRemoteCommandError) Unwrap() error { return e.protocol }
 
 type bridgeCommand struct {
 	Type            string            `json:"type"`
@@ -487,10 +500,15 @@ func (b *runtimeBridge) terminateProcess() error {
 }
 
 func bridgeRemoteError(message bridgeMessage) error {
+	protocolMessage := message.Message
 	if message.Code != "" {
-		return &ProtocolError{Operation: "runtime bridge", Message: message.Code + ": " + message.Message}
+		protocolMessage = message.Code + ": " + message.Message
 	}
-	return &ProtocolError{Operation: "runtime bridge", Message: message.Message}
+	return &bridgeRemoteCommandError{
+		protocol: &ProtocolError{Operation: "runtime bridge", Message: protocolMessage},
+		code:     strings.TrimSpace(message.Code), detailCode: strings.TrimSpace(message.DetailCode),
+		retryable: message.Retryable, message: message.Message,
+	}
 }
 
 func bridgeSessionInfo(target Target, payload bridgeSession) (SessionInfo, error) {

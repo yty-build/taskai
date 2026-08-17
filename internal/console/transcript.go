@@ -61,10 +61,12 @@ type transcriptRequest struct {
 type turnState string
 
 const (
+	turnReady      turnState = "ready"
 	turnQueued     turnState = "queued"
 	turnLive       turnState = "live"
 	turnCancelling turnState = "cancelling"
 	turnComplete   turnState = "complete"
+	turnIncomplete turnState = "incomplete"
 	turnCancelled  turnState = "cancelled"
 	turnFailed     turnState = "error"
 )
@@ -155,8 +157,9 @@ func (t *transcript) apply(line sessionlog.Line) bool {
 		if message != "" && request != nil {
 			request.setUserMessage(message, false)
 		}
+	case "prompt_ready":
 		if request != nil && request.state == "" {
-			request.state = turnQueued
+			request.state = turnReady
 		}
 	case "prompt_queued":
 		if request != nil && request.state == "" {

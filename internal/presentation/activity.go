@@ -29,14 +29,17 @@ const (
 // It deliberately omits ACP envelopes, worker fields, provider identifiers,
 // environment values, and unbounded raw input.
 type Activity struct {
-	Type       string      `json:"type"`
-	MessageID  string      `json:"message_id,omitempty"`
-	Text       string      `json:"text,omitempty"`
-	State      string      `json:"state,omitempty"`
-	StopReason string      `json:"stop_reason,omitempty"`
-	Tool       *Tool       `json:"tool,omitempty"`
-	Plan       []PlanEntry `json:"plan,omitempty"`
-	Truncated  bool        `json:"truncated,omitempty"`
+	Type        string      `json:"type"`
+	MessageID   string      `json:"message_id,omitempty"`
+	Text        string      `json:"text,omitempty"`
+	State       string      `json:"state,omitempty"`
+	StopReason  string      `json:"stop_reason,omitempty"`
+	ErrorSource string      `json:"error_source,omitempty"`
+	ErrorCode   string      `json:"error_code,omitempty"`
+	Retryable   *bool       `json:"retryable,omitempty"`
+	Tool        *Tool       `json:"tool,omitempty"`
+	Plan        []PlanEntry `json:"plan,omitempty"`
+	Truncated   bool        `json:"truncated,omitempty"`
 }
 
 type Tool struct {
@@ -71,6 +74,8 @@ func Project(line sessionlog.Line) *Activity {
 		return &Activity{Type: "user_message", Text: text, Truncated: clipped}
 	case "prompt_queued":
 		return &Activity{Type: "turn_state", State: "queued"}
+	case "prompt_ready":
+		return &Activity{Type: "turn_state", State: "ready"}
 	case "turn_started":
 		return &Activity{Type: "turn_state", State: "working"}
 	case "cancel_requested":
@@ -87,6 +92,21 @@ func Project(line sessionlog.Line) *Activity {
 		// diagnostic detail. Keep that in the private log and expose only a
 		// stable, actionable message at the browser boundary.
 		text := "The provider turn failed. Check the native provider CLI or local server logs for details."
+		if line.Type == "turn_error" {
+			var failure struct {
+				Source    string `json:"source"`
+				Code      string `json:"code"`
+				Retryable bool   `json:"retryable"`
+			}
+			if json.Unmarshal(line.Data, &failure) == nil && failure.Source == "provider" {
+				code := safeProviderFailureCode(failure.Code)
+				retryable := failure.Retryable
+				return &Activity{
+					Type: "error_upsert", Text: safeProviderFailureText(code, retryable), State: "error",
+					ErrorSource: "provider", ErrorCode: code, Retryable: &retryable,
+				}
+			}
+		}
 		if line.Type == "worker_error" {
 			text = "The Session worker encountered an error. Check local server logs for details."
 		}
@@ -101,6 +121,36 @@ func Project(line sessionlog.Line) *Activity {
 		return projectACP(line.Data)
 	default:
 		return nil
+	}
+}
+
+func safeProviderFailureCode(code string) string {
+	switch code {
+	case "busy", "conflict", "rate_limited", "rejected", "provider_error":
+		return code
+	default:
+		return "provider_error"
+	}
+}
+
+func safeProviderFailureText(code string, retryable bool) string {
+	switch code {
+	case "busy":
+		return "The provider is busy with this conversation. Wait for the current provider turn to settle, then try again."
+	case "conflict":
+		return "The provider reported a conversation conflict. Wait for the other provider turn to settle, then try again."
+	case "rate_limited":
+		return "The provider rate-limited this turn. Try again shortly."
+	case "rejected":
+		if retryable {
+			return "The provider rejected this turn. Try again after its current condition clears."
+		}
+		return "The provider rejected this turn."
+	default:
+		if retryable {
+			return "The provider could not complete this turn. Try again."
+		}
+		return "The provider could not complete this turn."
 	}
 }
 

@@ -82,8 +82,8 @@ type LaunchResult struct {
 }
 
 // PermissionSnapshot is disposable transport state for viewers. It keeps the
-// actionable permissions and the live worker's provider-write readiness in one
-// read so a stale worker is never presented as accepting a decision.
+// actionable permissions and the live worker's protocol/decision readiness in
+// one read so a stale worker is never presented as accepting a decision.
 type PermissionSnapshot struct {
 	Permissions    []worker.PendingPermission
 	DecisionsReady bool
@@ -127,7 +127,7 @@ type WorkerUpgradeRequiredError struct {
 
 func (e *WorkerUpgradeRequiredError) Error() string {
 	return fmt.Sprintf(
-		"Session %s worker upgrade required; %s. Exit any provider CLI in tmux Session %s first. Then run `acpctl session stop %s` and `acpctl session resume %s`. Worker protocol %d does not satisfy the required protocol %d and capability %s contract",
+		"Session %s worker upgrade required; %s. Return to any existing provider terminal and exit the provider CLI without sending another prompt; if it is tmux-hosted, run `tmux attach-session -t =%s` to reach it. Then run `acpctl session stop %s` and `acpctl session resume %s`. Worker protocol %d does not satisfy the required protocol %d and capability %s contract",
 		e.SessionID, e.Operation, native.TmuxSessionName(e.SessionID), e.SessionID, e.SessionID, e.ProtocolVersion, worker.ProtocolVersion, worker.CapabilityExclusiveNativeOwner,
 	)
 }
@@ -632,9 +632,10 @@ func (s *SessionService) Stop(ctx context.Context, id string) error {
 }
 
 // AttachNative opens the real provider harness for the Session's exact
-// canonical provider conversation. The worker grants one exclusive provider
-// writer before the provider starts; attachment itself remains a disposable
-// viewer and never owns a tmux-hosted provider lifecycle.
+// canonical provider conversation. The worker reserves one exclusive native
+// harness so neither a second provider-native process nor an ACP prompt can
+// write concurrently. Attachment itself remains a disposable viewer and never
+// owns a tmux-hosted provider lifecycle.
 func (s *SessionService) AttachNative(ctx context.Context, id string, options NativeAttachOptions) error {
 	explicitOwnerProcess := strings.TrimSpace(options.OwnerToken) != ""
 	current, err := s.repository.GetSession(ctx, id)
@@ -655,7 +656,7 @@ func (s *SessionService) AttachNative(ctx context.Context, id string, options Na
 		return fmt.Errorf("Session %s has no canonical provider conversation ID; native attachment is unavailable and no replacement conversation was started", id)
 	}
 	if current.WorkerSocket == "" {
-		return fmt.Errorf("Session %s has no live worker to coordinate exclusive provider access; resume the Session before native attachment", id)
+		return fmt.Errorf("Session %s has no live worker to coordinate native harness ownership; resume the Session before native attachment", id)
 	}
 	if s.registry == nil {
 		return fmt.Errorf("agent registry is required for provider-native attachment")
@@ -720,7 +721,16 @@ func (s *SessionService) AttachNative(ctx context.Context, id string, options Na
 		NativeGeneration: options.ReservationGeneration,
 	})
 	if err != nil {
-		return fmt.Errorf("Session %s native attachment could not acquire exclusive provider access: %w", id, err)
+		action := "reserve"
+		if ownerRole == worker.NativeOwnerRoleProvider {
+			action = "activate"
+			if options.ReservationGeneration != "" {
+				if cleanupErr := s.releaseRejectedNativeActivationReservation(current, ownerToken, options.ReservationGeneration); cleanupErr != nil {
+					return fmt.Errorf("Session %s native attachment could not activate its native harness: %w; exact reservation cleanup was not safe: %v", id, err, cleanupErr)
+				}
+			}
+		}
+		return fmt.Errorf("Session %s native attachment could not %s its native harness: %w", id, action, err)
 	}
 	if acquired.Type != "native_acquired" {
 		return fmt.Errorf("Session %s native attachment received unexpected worker response %q", id, acquired.Type)
@@ -801,7 +811,7 @@ func (s *SessionService) AttachNative(ctx context.Context, id string, options Na
 			return releaseErr
 		}
 		if releaseErr != nil {
-			return fmt.Errorf("native harness for Session %s: %v; additionally failed to release exclusive provider access: %w", id, runErr, releaseErr)
+			return fmt.Errorf("native harness for Session %s: %v; additionally failed to release native harness ownership: %w", id, runErr, releaseErr)
 		}
 	}
 	if runErr != nil {
@@ -831,6 +841,25 @@ func (s *SessionService) RecoverNativeReservation(ctx context.Context, id string
 	reservation, err := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{
 		Type: "native_reservation_status", OwnerToken: ownerToken,
 	})
+	if err != nil && strings.Contains(err.Error(), "owner token") &&
+		(strings.Contains(err.Error(), "does not match") || strings.Contains(err.Error(), "mismatch")) {
+		// Committed protocol-v2 reservations used exclusive ownership but a
+		// versioned token. Inspect that exact legacy token only for orphaned
+		// reservation recovery; active legacy ownership remains fail-closed and
+		// releasable solely by its exact lifecycle owner.
+		legacyOwnerToken, tokenErr := native.LegacyExclusiveOwnerTokenV2(s.home.Root, current.ID)
+		if tokenErr != nil {
+			return NativeReservationRecoveryResult{}, tokenErr
+		}
+		legacyReservation, legacyErr := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{
+			Type: "native_reservation_status", OwnerToken: legacyOwnerToken,
+		})
+		if legacyErr == nil {
+			ownerToken = legacyOwnerToken
+			reservation = legacyReservation
+			err = nil
+		}
+	}
 	if err != nil {
 		return NativeReservationRecoveryResult{}, fmt.Errorf("Session %s native reservation recovery refused: %w", id, err)
 	}
@@ -843,7 +872,7 @@ func (s *SessionService) RecoverNativeReservation(ctx context.Context, id string
 			return NativeReservationRecoveryResult{}, fmt.Errorf("Session %s native reservation has no generation; recovery is unsafe and remains blocked", id)
 		}
 	case "active":
-		return NativeReservationRecoveryResult{}, fmt.Errorf("Session %s has active provider-native ownership. Missing tmux Session %s does not prove provider exit; recovery is refused and ACP remains blocked", id, native.TmuxSessionName(id))
+		return NativeReservationRecoveryResult{}, fmt.Errorf("Session %s has active provider-native ownership. Missing tmux Session %s does not prove provider exit; native recovery is refused to avoid starting a second provider process", id, native.TmuxSessionName(id))
 	case "released":
 		return NativeReservationRecoveryResult{}, fmt.Errorf("Session %s has no orphaned native reservation to recover", id)
 	default:
@@ -913,10 +942,25 @@ func (s *SessionService) releaseNativeOwnership(current session.Session, ownerTo
 	if message.Type != "native_released" {
 		return fmt.Errorf("unexpected worker response %q while releasing native provider ownership", message.Type)
 	}
-	if message.State == "refresh_scheduled" {
-		fmt.Fprintln(notices, "Agent Task Console: native process exited; exact ACP refresh scheduled before queued prompts.")
+	if activity {
+		fmt.Fprintln(notices, "Agent Task Console: native process exited; provider transcript reload requested. ACP prompts remain available.")
 	}
 	return nil
+}
+
+func (s *SessionService) releaseRejectedNativeActivationReservation(current session.Session, ownerToken, generation string) error {
+	probeContext, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	status, err := s.runtime.Send(probeContext, current.WorkerSocket, worker.Command{
+		Type: "native_reservation_status", OwnerToken: ownerToken,
+	})
+	if err != nil {
+		return fmt.Errorf("verify rejected native activation reservation: %w", err)
+	}
+	if status.Type != "native_reservation_status" || status.State != "reserved" || status.NativeGeneration != generation {
+		return fmt.Errorf("the exact native reservation is no longer proven reserved; ownership was preserved")
+	}
+	return s.releaseNativeOwnership(current, ownerToken, generation, false, io.Discard)
 }
 
 func (s *SessionService) History(ctx context.Context, id string, cursor uint64) ([]sessionlog.Line, error) {

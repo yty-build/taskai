@@ -522,6 +522,35 @@ func TestRuntimeRefreshResumesExactACPIdentity(t *testing.T) {
 	}
 }
 
+func TestRuntimeResumeAndRefreshClassifyProviderActivationConflict(t *testing.T) {
+	refreshClient, refreshTarget, _ := runtimeFixture(t, "activation-conflict-on-refresh")
+	started, err := refreshClient.Start(context.Background(), StartSpec{Target: refreshTarget})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = refreshClient.Refresh(context.Background(), StartSpec{
+		Target: refreshTarget, ResumeACPSessionID: started.ACPSessionID,
+	})
+	assertProviderActivationConflict(t, err)
+
+	resumeClient, resumeTarget, _ := runtimeFixture(t, "activation-conflict")
+	_, err = resumeClient.Resume(context.Background(), StartSpec{
+		Target: resumeTarget, ResumeACPSessionID: "acp-existing",
+	})
+	assertProviderActivationConflict(t, err)
+}
+
+func assertProviderActivationConflict(t *testing.T, err error) {
+	t.Helper()
+	var providerErr *ProviderTurnError
+	if !errors.As(err, &providerErr) || providerErr.Code != "turn_failed" || providerErr.DetailCode != "conversation_conflict" || !providerErr.Retryable {
+		t.Fatalf("provider activation conflict = %T %v", err, err)
+	}
+	if strings.Contains(err.Error(), "bridge_frame_too_large") {
+		t.Fatalf("provider activation conflict was conflated with bridge integrity: %v", err)
+	}
+}
+
 func TestRuntimeResumeAndRefreshRejectCanonicalProviderIdentityDrift(t *testing.T) {
 	client, target, _ := runtimeFixture(t, "identity-drift-on-refresh")
 	target.Profile.Environment["FAKE_ACPX_NATIVE_ID"] = "native-canonical"
@@ -608,6 +637,50 @@ func TestRuntimeRefreshTimeoutDiscardsBridgeAndAllowsExactResume(t *testing.T) {
 		Target: target, ResumeACPSessionID: started.ACPSessionID, ExpectedProviderConversationID: "native-reconnected",
 	}); err != nil {
 		t.Fatalf("exact Resume() after timed-out refresh = %v", err)
+	}
+}
+
+func TestRuntimeTurnFailureIsCorrelatedButBridgeErrorIsProtocolFailure(t *testing.T) {
+	receipt := PromptReceipt{RequestID: "REQ-provider-failed", LastSeq: 7}
+	returned, err := runtimeTurnResult(receipt, json.RawMessage(`{"status":"failed","error":{"code":"turn_failed","detailCode":"provider_busy","message":"conversation is busy","retryable":true}}`))
+	var providerErr *ProviderTurnError
+	if !errors.As(err, &providerErr) || providerErr.Code != "turn_failed" || providerErr.DetailCode != "provider_busy" || !providerErr.Retryable || returned != receipt {
+		t.Fatalf("failed turn result = %#v, %T %v", returned, err, err)
+	}
+
+	err = bridgeRemoteError(bridgeMessage{Type: "error", Code: "bridge_frame_too_large", Message: "invalid frame"})
+	var protocolErr *ProtocolError
+	if !errors.As(err, &protocolErr) {
+		t.Fatalf("bridge error = %T %v, want ProtocolError", err, err)
+	}
+}
+
+func TestRuntimePromptClassifiesOnlyAllowlistedProviderBridgeErrors(t *testing.T) {
+	providerClient, providerTarget, _ := runtimeFixture(t, "prompt-provider-conflict")
+	if _, err := providerClient.Start(context.Background(), StartSpec{Target: providerTarget}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := providerClient.Prompt(context.Background(), PromptSpec{
+		Target: providerTarget, RequestID: "REQ-provider-bridge", Message: "continue",
+	}, nil)
+	var providerErr *ProviderTurnError
+	if !errors.As(err, &providerErr) || providerErr.Code != "turn_failed" || providerErr.DetailCode != "provider_busy" || !providerErr.Retryable {
+		t.Fatalf("provider prompt bridge error = %T %v", err, err)
+	}
+
+	bridgeClient, bridgeTarget, _ := runtimeFixture(t, "prompt-bridge-frame-error")
+	if _, err := bridgeClient.Start(context.Background(), StartSpec{Target: bridgeTarget}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = bridgeClient.Prompt(context.Background(), PromptSpec{
+		Target: bridgeTarget, RequestID: "REQ-bridge-integrity", Message: "continue",
+	}, nil)
+	var protocolErr *ProtocolError
+	if !errors.As(err, &protocolErr) {
+		t.Fatalf("bridge integrity prompt error = %T %v, want ProtocolError", err, err)
+	}
+	if errors.As(err, &providerErr) {
+		t.Fatalf("bridge integrity prompt error was classified as provider failure: %v", err)
 	}
 }
 

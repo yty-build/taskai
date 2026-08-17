@@ -95,6 +95,8 @@ func applyConversationActivity(request *transcriptRequest, activity appservice.C
 	case "turn_state":
 		request.stop = display.StopReason
 		switch display.State {
+		case "ready":
+			request.state = turnReady
 		case "queued":
 			request.state = turnQueued
 		case "working":
@@ -105,6 +107,8 @@ func applyConversationActivity(request *transcriptRequest, activity appservice.C
 			request.state = turnCancelled
 		case "complete":
 			request.state = turnComplete
+		case "incomplete":
+			request.state = turnIncomplete
 		case "error":
 			request.state = turnFailed
 		}

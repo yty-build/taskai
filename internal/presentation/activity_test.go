@@ -25,6 +25,15 @@ func TestProjectBuildsSemanticConversationActivity(t *testing.T) {
 			},
 		},
 		{
+			name: "ready prompt is not queued",
+			line: sessionlog.Line{Seq: 2, RequestID: "REQ", Type: "prompt_ready", Data: json.RawMessage(`{"state":"ready"}`)},
+			check: func(t *testing.T, got *Activity) {
+				if got == nil || got.Type != "turn_state" || got.State != "ready" {
+					t.Fatalf("projection = %#v", got)
+				}
+			},
+		},
+		{
 			name: "legacy prompt fallback",
 			line: acpLine(t, "session_prompt", `{"jsonrpc":"2.0","params":{"prompt":[{"type":"text","text":"Task T-1: Fix login\nDescription: Repair auth\nSession: S-secret\nRole: reviewer\nRepository: /private/repo\n\nSession-specific instructions:\nCheck the tests."}]}}`),
 			check: func(t *testing.T, got *Activity) {
@@ -175,6 +184,21 @@ func TestProjectRedactsProviderAndWorkerErrors(t *testing.T) {
 		if summary := Summary(line, display); strings.Contains(summary, secret) || strings.Contains(summary, "top-secret") {
 			t.Fatalf("unsafe error summary = %q", summary)
 		}
+	}
+}
+
+func TestProjectSurfacesOnlyAllowlistedProviderFailureProvenance(t *testing.T) {
+	line := sessionlog.Line{Type: "turn_error", Data: json.RawMessage(`{"source":"provider","code":"busy","retryable":true,"message":"SECRET provider detail /Users/private"}`)}
+	display := Project(line)
+	if display == nil || display.Type != "error_upsert" || display.ErrorSource != "provider" || display.ErrorCode != "busy" || display.Retryable == nil || !*display.Retryable {
+		t.Fatalf("provider failure projection = %#v", display)
+	}
+	if !strings.Contains(display.Text, "provider is busy") || strings.Contains(display.Text, "SECRET") || strings.Contains(display.Text, "/Users/private") {
+		t.Fatalf("unsafe or unhelpful provider failure text = %q", display.Text)
+	}
+	unknown := Project(sessionlog.Line{Type: "turn_error", Data: json.RawMessage(`{"source":"provider","code":"SECRET_INTERNAL_CODE","retryable":false,"message":"SECRET"}`)})
+	if unknown == nil || unknown.ErrorCode != "provider_error" || strings.Contains(Summary(line, unknown), "SECRET") {
+		t.Fatalf("unknown provider failure was not bucketed safely: %#v", unknown)
 	}
 }
 

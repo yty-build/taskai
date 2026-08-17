@@ -36,7 +36,7 @@ type tmuxCommandFunc func(context.Context, string, []string, string, io.Reader, 
 
 // MayContinueRunner reports that Run can return when the viewer detaches while
 // the provider process remains alive. In that case the process owner, not the
-// viewer, is responsible for requesting the eventual ACP refresh.
+// viewer, is responsible for reporting exit and requesting transcript reload.
 type MayContinueRunner interface {
 	ProcessMayContinue() bool
 }
@@ -200,7 +200,7 @@ func (r *TmuxRunner) Run(ctx context.Context, invocation Invocation, input io.Re
 	}
 	if exists {
 		// Until the owner tag is verified, an existing process may still be our
-		// provider. Conservatively prevent an ACP refresh on every collision or
+		// provider. Preserve the native lifecycle owner on every collision or
 		// inspection failure.
 		r.mayContinue = true
 	}
@@ -208,7 +208,7 @@ func (r *TmuxRunner) Run(ctx context.Context, invocation Invocation, input io.Re
 		if r.preexistingState == PreexistingOwnershipReserved {
 			return fmt.Errorf("pre-launch native reservation exists, but tmux Session %q is missing; refusing to create a second provider-native process. Run acpctl session recover-native %s to verify exact harness absence and schedule reconciliation before retrying attachment", name, r.ConsoleSessionID)
 		}
-		return fmt.Errorf("active provider-native ownership exists, but tmux Session %q is missing; refusing to create a second provider-native process. Missing tmux does not prove provider exit, so automated recovery is refused and ACP remains blocked", name)
+		return fmt.Errorf("active provider-native ownership exists, but tmux Session %q is missing; refusing to create a second provider-native process. Missing tmux does not prove provider exit, so automated native recovery is refused", name)
 	}
 	if !exists {
 		shellCommand := shellJoin(
@@ -253,7 +253,7 @@ func (r *TmuxRunner) Run(ctx context.Context, invocation Invocation, input io.Re
 	}
 	if !owned {
 		// A failed owner check cannot prove that the existing provider is gone.
-		// Retain exclusive worker ownership so ACP can never write concurrently.
+		// Retain ownership so another provider-native process cannot be started.
 		r.mayContinue = true
 		return fmt.Errorf("tmux Session %q has a different native owner protocol, state root, or generation; refusing to attach. Do not kill it based on this mismatch alone because it may be a legitimate newer harness. Return to the console, inspect Session status, and retry attachment. Run acpctl session recover-native %s only after the worker reports a pre-launch reservation and the exact harness is independently known absent", name, r.ConsoleSessionID)
 	}
@@ -294,15 +294,29 @@ func (r *TmuxRunner) runDirect(ctx context.Context, invocation Invocation, input
 // contains no filesystem path or provider credential. A protocol bump rejects
 // older live harnesses; within one protocol it makes acquisition idempotent.
 func OwnerToken(stateRoot, consoleSessionID string) (string, error) {
+	return ownerTokenForVersion(nativeOwnerProtocolVersion, stateRoot, consoleSessionID)
+}
+
+// LegacyExclusiveOwnerTokenV2 derives the prior exclusive-handoff token only
+// for bounded reservation recovery. It must not be used to launch or reuse a
+// provider process under the current protocol.
+func LegacyExclusiveOwnerTokenV2(stateRoot, consoleSessionID string) (string, error) {
+	return ownerTokenForVersion("v2", stateRoot, consoleSessionID)
+}
+
+func ownerTokenForVersion(version, stateRoot, consoleSessionID string) (string, error) {
 	if strings.TrimSpace(stateRoot) == "" {
 		return "", fmt.Errorf("Agent Task Console state root is required for native tmux attachment")
+	}
+	if !consoleSessionIDPattern.MatchString(consoleSessionID) {
+		return "", fmt.Errorf("invalid Task Console Session ID %q for native owner token", consoleSessionID)
 	}
 	root, err := filepath.Abs(stateRoot)
 	if err != nil {
 		return "", fmt.Errorf("resolve Agent Task Console state root: %w", err)
 	}
 	sum := sha256.Sum256([]byte(filepath.Clean(root)))
-	return fmt.Sprintf("%s:%x:%s", nativeOwnerProtocolVersion, sum, consoleSessionID), nil
+	return fmt.Sprintf("%s:%x:%s", version, sum, consoleSessionID), nil
 }
 
 func tmuxOwnerIdentity(stateRoot, consoleSessionID string) (string, error) {
@@ -351,6 +365,17 @@ func interactiveTerminal(input io.Reader, output io.Writer) bool {
 
 func TmuxSessionName(consoleSessionID string) string {
 	return "agent-" + consoleSessionID
+}
+
+// TmuxAttachCommand returns a shell-safe, exact-target command that an
+// operator can use only to reach an existing native harness and exit its
+// provider process. Session IDs are restricted before interpolation, so the
+// command contains no quoting ambiguity or provider/authentication data.
+func TmuxAttachCommand(consoleSessionID string) (string, error) {
+	if !consoleSessionIDPattern.MatchString(consoleSessionID) {
+		return "", fmt.Errorf("invalid Task Console Session ID %q for native tmux attachment", consoleSessionID)
+	}
+	return "tmux attach-session -t =" + TmuxSessionName(consoleSessionID), nil
 }
 
 func (v TmuxReservationRecoveryVerifier) VerifyReservationAbsent(ctx context.Context, consoleSessionID string) error {

@@ -29,14 +29,15 @@ import (
 )
 
 type apiRuntime struct {
-	mu         sync.Mutex
-	repository *store.Store
-	home       config.Home
-	nextPID    int
-	sockets    map[string]string
-	commands   []worker.Command
-	pending    map[string][]worker.PendingPermission
-	stale      bool
+	mu          sync.Mutex
+	repository  *store.Store
+	home        config.Home
+	nextPID     int
+	sockets     map[string]string
+	commands    []worker.Command
+	pending     map[string][]worker.PendingPermission
+	stale       bool
+	nativeOwned bool
 }
 
 func (r *apiRuntime) Spawn(ctx context.Context, sessionID string) (worker.SpawnResult, error) {
@@ -58,6 +59,7 @@ func (r *apiRuntime) Send(ctx context.Context, socket string, command worker.Com
 	sessionID, ok := r.sockets[socket]
 	r.commands = append(r.commands, command)
 	stale := r.stale
+	nativeOwned := r.nativeOwned
 	r.mu.Unlock()
 	if !ok {
 		return worker.Message{}, fmt.Errorf("fake worker unavailable")
@@ -90,6 +92,9 @@ func (r *apiRuntime) Send(ctx context.Context, socket string, command worker.Com
 		delete(r.pending, sessionID)
 		r.mu.Unlock()
 		return worker.Message{Type: "permission_decided"}, nil
+	}
+	if command.Type == "prompt" && nativeOwned {
+		return worker.Message{}, fmt.Errorf("Session %s native harness is running; ACP prompt was not accepted. Exit or close that native provider launch, then retry", sessionID)
 	}
 	return worker.Message{Type: "accepted", State: "ready", RequestID: command.RequestID}, nil
 }
@@ -484,6 +489,42 @@ func TestStaleWorkerProviderWritesReturnConflictWithoutSendingProviderCommand(t 
 	assertWorkerCommands(t, fixture.runtime, "ping", "prompt")
 }
 
+func TestNativeOwnedSessionRejectsPromptAsActionableConflict(t *testing.T) {
+	fixture := newAPIFixture(t)
+	taskResponse := performJSON(t, fixture.handler, http.MethodPost, "/api/v1/tasks", map[string]any{"title": "Exclusive native prompt"})
+	assertStatus(t, taskResponse, http.StatusCreated)
+	var createdTask struct {
+		Task TaskDTO `json:"task"`
+	}
+	decodeResponse(t, taskResponse, &createdTask)
+	sessionResponse := performJSON(t, fixture.handler, http.MethodPost, "/api/v1/tasks/"+createdTask.Task.ID+"/sessions", map[string]any{
+		"agent": "codex", "role": "implementer", "repo_path": fixture.repo, "prompt": "Initial request",
+	})
+	assertStatus(t, sessionResponse, http.StatusCreated)
+	var started struct {
+		Session SessionDTO `json:"session"`
+	}
+	decodeResponse(t, sessionResponse, &started)
+
+	fixture.runtime.mu.Lock()
+	fixture.runtime.nativeOwned = true
+	fixture.runtime.commands = nil
+	fixture.runtime.mu.Unlock()
+	response := performJSON(t, fixture.handler, http.MethodPost, "/api/v1/sessions/"+started.Session.ID+"/prompt", map[string]string{"message": "must not be queued"})
+	assertStatus(t, response, http.StatusConflict)
+	var payload struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	decodeResponse(t, response, &payload)
+	if payload.Error.Code != "session_conflict" || !strings.Contains(payload.Error.Message, "native harness is running") || !strings.Contains(payload.Error.Message, "prompt was not accepted") {
+		t.Fatalf("native-owned prompt response = %#v", payload.Error)
+	}
+	assertWorkerCommands(t, fixture.runtime, "ping", "prompt")
+}
+
 func assertWorkerUpgradeResponse(t *testing.T, response *httptest.ResponseRecorder, sessionID, operation, forbiddenPath string) {
 	t.Helper()
 	var payload struct {
@@ -825,6 +866,24 @@ func TestActivityDTOCarriesBoundedSemanticDisplayWithoutACPEnvelope(t *testing.T
 		if strings.Contains(string(encoded), forbidden) {
 			t.Fatalf("activity DTO leaked %q: %s", forbidden, encoded)
 		}
+	}
+}
+
+func TestActivityDTOCarriesSanitizedProviderFailureProvenance(t *testing.T) {
+	line := sessionlog.Line{
+		Seq: 9, RequestID: "REQ-provider-busy", Type: "turn_error",
+		Data: json.RawMessage(`{"source":"provider","code":"busy","retryable":true,"message":"SECRET provider detail"}`),
+	}
+	dto := makeActivityDTO("S-one", line, "")
+	if dto.Display == nil || dto.Display.ErrorSource != "provider" || dto.Display.ErrorCode != "busy" || dto.Display.Retryable == nil || !*dto.Display.Retryable {
+		t.Fatalf("provider failure DTO = %#v", dto)
+	}
+	encoded, err := json.Marshal(dto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "SECRET") || !strings.Contains(string(encoded), `"error_code":"busy"`) || !strings.Contains(string(encoded), `"retryable":true`) {
+		t.Fatalf("provider failure DTO provenance/redaction = %s", encoded)
 	}
 }
 

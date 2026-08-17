@@ -440,11 +440,14 @@ func runSession(ctx context.Context, args []string, stdout, stderr io.Writer, se
 }
 
 func writeNativeRecoveryResult(stdout io.Writer, sessionID string, recovered appservice.NativeReservationRecoveryResult) {
-	if recovered.State == "refresh_scheduled" {
-		fmt.Fprintf(stdout, "Recovered orphaned native reservation for %s; exact refresh and reconciliation are scheduled. Wait for native_refreshed, then run acpctl session attach %s.\n", sessionID, sessionID)
-		return
+	switch recovered.State {
+	case "released":
+		fmt.Fprintf(stdout, "Recovered orphaned native reservation for %s; provider transcript reload was requested and ACP prompts remain available. Retry acpctl session attach %s when ready.\n", sessionID, sessionID)
+	case "refresh_scheduled":
+		fmt.Fprintf(stdout, "Recovered legacy native reservation state for %s; reconciliation is in progress and ACP prompts remain available. Retry acpctl session attach %s when ready.\n", sessionID, sessionID)
+	default:
+		fmt.Fprintf(stdout, "Native reservation for %s was already released. Inspect Session status, then retry acpctl session attach %s when ready.\n", sessionID, sessionID)
 	}
-	fmt.Fprintf(stdout, "Native reservation for %s was already released; no recovery refresh was scheduled. Inspect Session status, then retry acpctl session attach %s when it is ready.\n", sessionID, sessionID)
 }
 
 func runSessionStart(ctx context.Context, args []string, stdout io.Writer, service *appservice.SessionService) error {

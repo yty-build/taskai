@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/yty-build/acp-gateway/internal/worker"
 )
 
 func TestSessionLifecycleThroughBuiltCLIAndDetachedWorker(t *testing.T) {
@@ -83,6 +85,11 @@ func TestSessionLifecycleThroughBuiltCLIAndDetachedWorker(t *testing.T) {
 			t.Errorf("Session detail does not contain %q:\n%s", expected, detail)
 		}
 	}
+	workerClient := worker.NewSocketClient(filepath.Join(root, "workers", sessionID+".sock"))
+	waitForCLI(t, 4*time.Second, func() bool {
+		status, statusErr := workerClient.Send(context.Background(), worker.Command{Type: "status"})
+		return statusErr == nil && status.ActiveRequestID == "" && status.Queued == 0 && status.Status == "waiting"
+	})
 
 	conversationPath := filepath.Join(codexHome, "sessions", "2026", "08", "15", "rollout-native-reconnected.jsonl")
 	if err := os.MkdirAll(filepath.Dir(conversationPath), 0o700); err != nil {
@@ -93,7 +100,7 @@ func TestSessionLifecycleThroughBuiltCLIAndDetachedWorker(t *testing.T) {
 		t.Fatal(err)
 	}
 	code, output, stderr = runBinary(root, binary, "session", "attach", sessionID)
-	if code != 0 || !strings.Contains(output, "fake native attached") || !strings.Contains(stderr, "ACP refresh scheduled") {
+	if code != 0 || !strings.Contains(output, "fake native attached") || !strings.Contains(stderr, "provider transcript reload requested") {
 		t.Fatalf("native attach: code=%d output=%q stderr=%q", code, output, stderr)
 	}
 	nativeInvocation, err := os.ReadFile(nativeRecord)
@@ -106,8 +113,8 @@ func TestSessionLifecycleThroughBuiltCLIAndDetachedWorker(t *testing.T) {
 		}
 	}
 	code, output, stderr = runBinary(root, binary, "session", "logs", sessionID)
-	if code != 0 || stderr != "" || !strings.Contains(output, "native refresh") {
-		t.Fatalf("native refresh history: code=%d output=%q stderr=%q", code, output, stderr)
+	if code != 0 || stderr != "" || !strings.Contains(output, "provider_transcript_reconciled") {
+		t.Fatalf("provider transcript history: code=%d output=%q stderr=%q", code, output, stderr)
 	}
 
 	argsLog, err := os.ReadFile(filepath.Join(root, "acpx-args.log"))
@@ -200,9 +207,12 @@ func TestSessionLifecycleThroughBuiltCLIAndDetachedWorker(t *testing.T) {
 	}
 	reviewerID := fields[2]
 	sessionsToStop = append(sessionsToStop, reviewerID)
+	reviewerWorker := worker.NewSocketClient(filepath.Join(root, "workers", reviewerID+".sock"))
 	waitForCLI(t, 4*time.Second, func() bool {
 		code, detail, _ = runBinary(root, binary, "session", reviewerID)
-		return code == 0 && strings.Contains(detail, "Role: reviewer") && strings.Contains(detail, "Status: waiting")
+		status, statusErr := reviewerWorker.Send(context.Background(), worker.Command{Type: "status"})
+		return code == 0 && strings.Contains(detail, "Role: reviewer") && strings.Contains(detail, "Status: waiting") &&
+			statusErr == nil && status.ActiveRequestID == "" && status.Queued == 0
 	})
 	if !strings.Contains(detail, "Task: "+taskID) || !strings.Contains(detail, "Repo: "+canonicalRepo) {
 		t.Fatalf("reviewer detail = %q", detail)

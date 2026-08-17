@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -529,7 +530,62 @@ func TestConversationProviderGroupingDropsLeadingPartialTurn(t *testing.T) {
 	}
 }
 
-func TestConversationProviderGroupingDropsTrailingPartialDuringLiveACP(t *testing.T) {
+func TestConversationOpenCodeMultipartUserMessageDoesNotFabricateIncompleteTurn(t *testing.T) {
+	const conversationID = "opencode-multipart-conversation"
+	service, _, current := nativeServiceHarness(t, "opencode", conversationID)
+	if current.ProviderConversationID != conversationID {
+		t.Fatalf("canonical OpenCode conversation = %q, want %q", current.ProviderConversationID, conversationID)
+	}
+	databasePath := filepath.Join(t.TempDir(), "opencode.db")
+	t.Setenv("OPENCODE_DB", databasePath)
+	database, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL)`,
+		`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL)`,
+		`CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL)`,
+		`INSERT INTO session (id, directory) VALUES ('opencode-multipart-conversation', '` + strings.ReplaceAll(current.RepoPath, "'", "''") + `')`,
+		`INSERT INTO message VALUES ('user-message', 'opencode-multipart-conversation', 1000, '{"role":"user"}')`,
+		`INSERT INTO message VALUES ('assistant-message', 'opencode-multipart-conversation', 2000, '{"role":"assistant","time":{"completed":2100},"finish":"stop"}')`,
+		`INSERT INTO part VALUES ('user-text-1', 'user-message', 'opencode-multipart-conversation', 1001, '{"type":"text","text":"first fragment"}')`,
+		`INSERT INTO part VALUES ('user-reasoning', 'user-message', 'opencode-multipart-conversation', 1002, '{"type":"reasoning","text":"must not render"}')`,
+		`INSERT INTO part VALUES ('user-text-2', 'user-message', 'opencode-multipart-conversation', 1003, '{"type":"text","text":"second fragment"}')`,
+		`INSERT INTO part VALUES ('assistant-text', 'assistant-message', 'opencode-multipart-conversation', 2001, '{"type":"text","text":"complete answer"}')`,
+	} {
+		if _, err := database.Exec(statement); err != nil {
+			database.Close()
+			t.Fatalf("OpenCode conversation fixture: %v", err)
+		}
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, err := service.Conversation(context.Background(), current.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Source != ConversationSourceProvider || len(snapshot.Provider.Records) != 2 || len(snapshot.Turns) != 1 {
+		t.Fatalf("OpenCode multipart conversation = %#v", snapshot)
+	}
+	turn := snapshot.Turns[0]
+	if !turn.Committed || !hasConversationDisplay(turn.Activities, "user_message", "first fragment\nsecond fragment") ||
+		!hasConversationDisplay(turn.Activities, "assistant_chunk", "complete answer") ||
+		hasConversationActivityKind(turn.Activities, "provider_turn_incomplete") {
+		t.Fatalf("OpenCode multipart provider message fabricated a partial turn: %#v", turn)
+	}
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "must not render") {
+		t.Fatalf("OpenCode user reasoning part crossed the conversation boundary: %s", encoded)
+	}
+}
+
+func TestConversationProviderGroupingAnchorsTrailingPartialWithoutDuplicatingLiveACP(t *testing.T) {
 	provider := native.TranscriptSnapshot{Records: []native.TranscriptRecord{
 		{Key: "complete-user", Kind: native.TranscriptUser, Text: "Earlier prompt"},
 		{Key: "complete-answer", Kind: native.TranscriptAssistant, Text: "Earlier answer"},
@@ -546,16 +602,19 @@ func TestConversationProviderGroupingDropsTrailingPartialDuringLiveACP(t *testin
 	active.user.append("Active prompt")
 
 	grouped := groupProviderTurns(provider.Records)
-	if len(grouped) != 1 || grouped[0].key != "complete-user" {
-		t.Fatalf("trailing partial provider turn was treated as complete: %#v", grouped)
+	if len(grouped) != 2 || grouped[0].key != "complete-user" || grouped[1].key != "active-user" || grouped[1].complete {
+		t.Fatalf("trailing partial provider turn was not retained as an incomplete anchor: %#v", grouped)
 	}
 	merged := mergeConversationTurns(provider, []*conversationTurn{active})
 	if len(merged) != 2 || !merged[0].Committed || merged[1].Committed || merged[1].Key != active.id {
 		t.Fatalf("trailing provider partial duplicated the live ACP turn: %#v", merged)
 	}
+	if merged[1].Surface != ConversationSurfaceACP || hasConversationActivityKind(merged[1].Activities, "provider_turn_incomplete") {
+		t.Fatalf("matched live ACP turn was replaced by an inferred provider failure: %#v", merged[1])
+	}
 }
 
-func TestConversationProviderGroupingDropsInterruptedMiddlePartial(t *testing.T) {
+func TestConversationProviderGroupingUsesInterruptedMiddlePartialAsOrderAnchor(t *testing.T) {
 	provider := native.TranscriptSnapshot{Records: []native.TranscriptRecord{
 		{Key: "user-1", Kind: native.TranscriptUser, Text: "First prompt"},
 		{Key: "answer-1", Kind: native.TranscriptAssistant, Text: "First durable answer"},
@@ -572,12 +631,157 @@ func TestConversationProviderGroupingDropsInterruptedMiddlePartial(t *testing.T)
 	third := conversationGatewayFixture("REQ-3", 3, "Third prompt", "Third durable answer", true)
 
 	grouped := groupProviderTurns(provider.Records)
-	if len(grouped) != 2 || grouped[0].key != "user-1" || grouped[1].key != "user-3" {
-		t.Fatalf("interrupted provider partial remained in committed history: %#v", grouped)
+	if len(grouped) != 3 || grouped[0].key != "user-1" || grouped[1].key != "failed-user" || grouped[1].complete || grouped[2].key != "user-3" {
+		t.Fatalf("interrupted provider partial was not retained as an order anchor: %#v", grouped)
 	}
 	merged := mergeConversationTurns(provider, []*conversationTurn{first, failed, third})
 	if len(merged) != 3 || !merged[0].Committed || merged[1].Committed || !merged[2].Committed || merged[1].Key != failed.id {
 		t.Fatalf("interrupted provider partial duplicated or reordered the gateway failure: %#v", merged)
+	}
+}
+
+func TestConversationMergeOrdersMatchedACPFailureBeforeNativeAndLaterACP(t *testing.T) {
+	provider := native.TranscriptSnapshot{Records: []native.TranscriptRecord{
+		{Key: "provider-A-user", Kind: native.TranscriptUser, Text: "Prompt A"},
+		{Key: "provider-A-answer", Kind: native.TranscriptAssistant, Text: "A durable answer"},
+		{Key: "provider-B-user", Kind: native.TranscriptUser, Text: "Prompt B"},
+		{Key: "provider-B-reasoning", Kind: native.TranscriptReasoning, Text: "B partial reasoning"},
+		{Key: "provider-B-answer", Kind: native.TranscriptAssistant, Phase: "commentary", Text: "B partial"},
+		{Key: "provider-C-user", Kind: native.TranscriptUser, Text: "Native prompt C"},
+		{Key: "provider-C-answer", Kind: native.TranscriptAssistant, Text: "C durable native answer"},
+		{Key: "provider-D-user", Kind: native.TranscriptUser, Text: "Prompt D"},
+		{Key: "provider-D-answer", Kind: native.TranscriptAssistant, Text: "D durable answer"},
+	}}
+	a := conversationGatewayFixture("REQ-A", 1, "Prompt A", "A durable answer", true)
+	b := conversationGatewayFixture("REQ-B", 2, "Prompt B", "B partial output visible over ACP", false)
+	b.activities = append(b.activities, ConversationActivity{
+		RequestID: b.id, Kind: "turn_error", Display: &presentation.Activity{Type: "error_upsert", State: "error", Text: "Provider turn failed"},
+	})
+	d := conversationGatewayFixture("REQ-D", 3, "Prompt D", "D durable answer", true)
+
+	merged := mergeConversationTurns(provider, []*conversationTurn{a, b, d})
+	if len(merged) != 4 {
+		t.Fatalf("A/B/C/D merge length = %d, want 4: %#v", len(merged), merged)
+	}
+	wantKeys := []string{"provider-A-user", b.id, "provider-C-user", "provider-D-user"}
+	wantSurfaces := []ConversationSurface{ConversationSurfaceACP, ConversationSurfaceACP, ConversationSurfaceNative, ConversationSurfaceACP}
+	for index := range wantKeys {
+		if merged[index].Key != wantKeys[index] || merged[index].Surface != wantSurfaces[index] {
+			t.Fatalf("A/B/C/D turn %d = key %q surface %q, want %q/%q: %#v", index, merged[index].Key, merged[index].Surface, wantKeys[index], wantSurfaces[index], merged)
+		}
+	}
+	if merged[1].Committed || !hasConversationDisplay(merged[1].Activities, "error_upsert", "Provider turn failed") ||
+		hasConversationActivityKind(merged[1].Activities, "provider_turn_incomplete") {
+		t.Fatalf("failed ACP turn was not emitted exactly once from gateway history: %#v", merged[1])
+	}
+	if !merged[0].Committed || !merged[2].Committed || !merged[3].Committed {
+		t.Fatalf("A/C/D provider commits were lost: %#v", merged)
+	}
+}
+
+func TestConversationMergeRendersUnmatchedProviderPartialsAsIncompleteUnknownTurns(t *testing.T) {
+	provider := native.TranscriptSnapshot{Records: []native.TranscriptRecord{
+		{Key: "leading-orphan", Kind: native.TranscriptAssistant, Text: "must be omitted"},
+		{Key: "complete-user", Kind: native.TranscriptUser, Text: "Complete prompt"},
+		{Key: "complete-answer", Kind: native.TranscriptAssistant, Text: "Complete answer"},
+		{Key: "middle-user", Kind: native.TranscriptUser, Text: "Interrupted middle prompt"},
+		{Key: "middle-reasoning", Kind: native.TranscriptReasoning, Text: "Partial middle reasoning"},
+		{Key: "later-user", Kind: native.TranscriptUser, Text: "Later complete prompt"},
+		{Key: "later-answer", Kind: native.TranscriptAssistant, Text: "Later complete answer"},
+		{Key: "trailing-user", Kind: native.TranscriptUser, Text: "Trailing incomplete prompt"},
+		{Key: "trailing-answer", Kind: native.TranscriptAssistant, Phase: "commentary", Text: "Trailing partial output"},
+	}}
+
+	merged := mergeConversationTurns(provider, nil)
+	if len(merged) != 4 {
+		t.Fatalf("unmatched provider turns = %d, want 4: %#v", len(merged), merged)
+	}
+	for _, index := range []int{1, 3} {
+		turn := merged[index]
+		if turn.Committed || turn.Surface != ConversationSurfaceUnknown ||
+			!hasConversationTurnState(turn.Activities, "incomplete", "provider_history_incomplete") ||
+			hasConversationTurnState(turn.Activities, "complete", "") {
+			t.Fatalf("provider partial %d was presented as final or attributed to a surface: %#v", index, turn)
+		}
+	}
+	for _, turn := range merged {
+		if hasConversationDisplay(turn.Activities, "assistant_chunk", "must be omitted") {
+			t.Fatalf("leading assistant-only truncation became a fabricated turn: %#v", merged)
+		}
+	}
+}
+
+func TestConversationMergeRefusesAmbiguousOrOpenBoundedPartialMatches(t *testing.T) {
+	provider := native.TranscriptSnapshot{Records: []native.TranscriptRecord{
+		{Key: "A-user", Kind: native.TranscriptUser, Text: "A"},
+		{Key: "A-answer", Kind: native.TranscriptAssistant, Text: "A durable answer"},
+		{Key: "partial-user", Kind: native.TranscriptUser, Text: "Repeat partial"},
+		{Key: "C-user", Kind: native.TranscriptUser, Text: "Native C"},
+		{Key: "C-answer", Kind: native.TranscriptAssistant, Text: "C durable answer"},
+		{Key: "D-user", Kind: native.TranscriptUser, Text: "D"},
+		{Key: "D-answer", Kind: native.TranscriptAssistant, Text: "D durable answer"},
+	}}
+	a := conversationGatewayFixture("REQ-A", 1, "A", "A durable answer", true)
+	b1 := conversationGatewayFixture("REQ-B1", 2, "Repeat partial", "", false)
+	b2 := conversationGatewayFixture("REQ-B2", 3, "Repeat partial", "", false)
+	d := conversationGatewayFixture("REQ-D", 4, "D", "D durable answer", true)
+
+	ambiguous := mergeConversationTurns(provider, []*conversationTurn{a, b1, b2, d})
+	if len(ambiguous) != 6 || countConversationTurnKey(ambiguous, b1.id) != 1 || countConversationTurnKey(ambiguous, b2.id) != 1 ||
+		countConversationTurnKey(ambiguous, "partial-user") != 1 {
+		t.Fatalf("ambiguous repeated partial was guessed or suppressed: %#v", ambiguous)
+	}
+	for _, turn := range ambiguous {
+		if turn.Key == "C-user" && turn.Surface != ConversationSurfaceUnknown {
+			t.Fatalf("ambiguous gateway gap falsely attributed provider C to native: %#v", ambiguous)
+		}
+	}
+
+	trailingProvider := native.TranscriptSnapshot{Records: []native.TranscriptRecord{
+		{Key: "A-user", Kind: native.TranscriptUser, Text: "A"},
+		{Key: "A-answer", Kind: native.TranscriptAssistant, Text: "A durable answer"},
+		{Key: "partial-user", Kind: native.TranscriptUser, Text: "Trailing active"},
+	}}
+	active := conversationGatewayFixture("REQ-active", 2, "Trailing active", "", false)
+	bounded := mergeConversationTurnsWithGatewayState(trailingProvider, []*conversationTurn{a, active}, true)
+	if len(bounded) != 3 || countConversationTurnKey(bounded, "partial-user") != 1 || countConversationTurnKey(bounded, active.id) != 1 {
+		t.Fatalf("open-ended bounded history falsely deduplicated a partial match: %#v", bounded)
+	}
+}
+
+func TestIncompleteProviderGatewayMatchRequiresExactSafeCompatibleEvidence(t *testing.T) {
+	started := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	providerFixture := func(user, answer string, truncated bool) *providerConversationTurn {
+		records := []native.TranscriptRecord{{Key: "partial-user", Kind: native.TranscriptUser, Text: user, Timestamp: started, Truncated: truncated}}
+		if answer != "" {
+			records = append(records, native.TranscriptRecord{Key: "partial-answer", Kind: native.TranscriptAssistant, Phase: "commentary", Text: answer, Timestamp: started.Add(time.Second)})
+		}
+		return groupProviderTurns(records)[0]
+	}
+	gatewayFixture := func(user, answer string, timestamp time.Time) *conversationTurn {
+		turn := conversationGatewayFixture("REQ-partial", 1, user, answer, false)
+		turn.firstAt = timestamp
+		turn.answerAt = timestamp.Add(2 * time.Second)
+		return turn
+	}
+	compatible := func(provider *providerConversationTurn, gateway *conversationTurn) bool {
+		return incompleteProviderGatewayCompatible(provider, gateway, map[*providerConversationTurn]string{}, map[*conversationTurn]string{})
+	}
+
+	if !compatible(providerFixture("Exact prompt", "partial", false), gatewayFixture("Exact   prompt", "partial response", started)) {
+		t.Fatal("normalized exact prompt with a compatible assistant prefix did not match")
+	}
+	if compatible(providerFixture("Exact prompt", "partial", false), gatewayFixture("Different prompt", "partial response", started)) {
+		t.Fatal("different prompt matched an incomplete provider group")
+	}
+	if compatible(providerFixture("Exact prompt", "partial", true), gatewayFixture("Exact prompt", "partial response", started)) {
+		t.Fatal("truncated provider prompt matched an incomplete gateway turn")
+	}
+	if compatible(providerFixture("Exact prompt", "partial", false), gatewayFixture("Exact prompt", "different output", started)) {
+		t.Fatal("incompatible partial assistant output matched")
+	}
+	if compatible(providerFixture("Exact prompt", "partial", false), gatewayFixture("Exact prompt", "partial response", started.Add(conversationMatchWindow+time.Second))) {
+		t.Fatal("timestamp-incompatible repeated occurrence matched")
 	}
 }
 
@@ -748,6 +952,37 @@ func containsConversationDisplayType(activities []ConversationActivity, displayT
 		}
 	}
 	return false
+}
+
+func hasConversationActivityKind(activities []ConversationActivity, kind string) bool {
+	for _, activity := range activities {
+		if activity.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func hasConversationTurnState(activities []ConversationActivity, state, stopReason string) bool {
+	for _, activity := range activities {
+		if activity.Display == nil || activity.Display.Type != "turn_state" || activity.Display.State != state {
+			continue
+		}
+		if stopReason == "" || activity.Display.StopReason == stopReason {
+			return true
+		}
+	}
+	return false
+}
+
+func countConversationTurnKey(turns []ConversationTurn, key string) int {
+	count := 0
+	for _, turn := range turns {
+		if turn.Key == key {
+			count++
+		}
+	}
+	return count
 }
 
 func conversationDisplayIndex(activities []ConversationActivity, displayType, text string) int {

@@ -727,6 +727,90 @@ func TestSessionConsoleLoadsProviderHistoryAndKeepsLiveACPEventsAcrossReconcile(
 	}
 }
 
+func TestSessionConsolePreservesIncompleteProviderTurnState(t *testing.T) {
+	snapshot := appservice.ConversationSnapshot{Turns: []appservice.ConversationTurn{{
+		Key: "provider-partial", Committed: false,
+		Activities: []appservice.ConversationActivity{
+			{Kind: "provider_transcript", Display: &presentation.Activity{Type: "user_message", Text: "Interrupted native prompt"}},
+			{Kind: "provider_transcript", Display: &presentation.Activity{Type: "assistant_chunk", Text: "Partial provider output"}},
+			{Kind: "provider_turn_incomplete", Display: &presentation.Activity{Type: "turn_state", State: "incomplete", StopReason: "provider_history_incomplete"}},
+		},
+	}}}
+	projection := transcriptFromConversation(snapshot)
+	request := projection.byID["provider-partial"]
+	if request == nil || request.committed || request.state != turnIncomplete {
+		t.Fatalf("incomplete provider request = %#v", request)
+	}
+	if got := renderTurnState(request.state); !strings.Contains(got, "Provider turn incomplete") {
+		t.Fatalf("incomplete state rendering = %q", got)
+	}
+}
+
+func TestProviderTranscriptReconcileLifecycleRefreshesWithoutReplacingLiveTranscript(t *testing.T) {
+	base := newConsoleBackend()
+	snapshot := appservice.ConversationSnapshot{
+		Source: appservice.ConversationSourceProvider, GatewayCursor: 40,
+		Turns: []appservice.ConversationTurn{{
+			Key: "provider-turn", Committed: true,
+			Activities: []appservice.ConversationActivity{
+				{Display: &presentation.Activity{Type: "user_message", Text: "Keep this committed prompt"}},
+				{Display: &presentation.Activity{Type: "assistant_chunk", Text: "Keep this committed answer"}},
+			},
+		}},
+	}
+	backend := &conversationFakeBackend{fakeBackend: base, snapshot: snapshot}
+	model, cancel, err := newSessionModel(context.Background(), backend, "S-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+
+	warning := projectionLine(41, "", "provider_transcript_reconcile_warning", map[string]any{"message": "provider store still flushing"})
+	updated, _ := model.Update(activityMsg{sessionID: "S-1", line: warning})
+	model = updated.(Model)
+	if !strings.Contains(model.notice, "reload is delayed") || !strings.Contains(model.View(), "Keep this committed answer") {
+		t.Fatalf("reconcile warning replaced transcript or hid notice: notice=%q\n%s", model.notice, model.View())
+	}
+	if shouldReconcileConversation(warning) {
+		t.Fatal("reconcile warning should preserve the current transcript instead of loading a replacement")
+	}
+
+	reconciled := projectionLine(42, "", "provider_transcript_reconciled", map[string]any{"source": "provider-store", "state": "reconciled"})
+	updated, command := model.Update(activityMsg{sessionID: "S-1", line: reconciled})
+	model = updated.(Model)
+	if command == nil || !shouldReconcileConversation(reconciled) {
+		t.Fatalf("provider transcript reconciliation did not schedule a joined snapshot: command=%v", command)
+	}
+	if !strings.Contains(model.View(), "Keep this committed answer") {
+		t.Fatalf("reconciliation signal replaced transcript before snapshot join:\n%s", model.View())
+	}
+	updated, _ = model.Update(conversationMsg{sessionID: "S-1", snapshot: snapshot})
+	model = updated.(Model)
+	if model.notice != "" {
+		t.Fatalf("successful provider snapshot left stale reconcile warning: %q", model.notice)
+	}
+
+	model.composer.focused = true
+	model.composer.insert([]rune("keep this draft")...)
+	model.scroll = 4
+	model.addActivity("S-1", projectionLine(43, "REQ-REHYDRATE", "prompt_submitted", map[string]any{"display_message": "Provisional ACP prompt"}), true)
+	model.addActivity("S-1", projectionACPLine(44, "REQ-REHYDRATE", "agent_message_chunk", sessionUpdate(messageUpdate("agent_message_chunk", "Provisional ACP answer", "rehydrate-live"))), true)
+	rehydrated := projectionLine(45, "REQ-REHYDRATE", "acp_rehydrated", map[string]any{"state": "refreshed"})
+	updated, command = model.Update(activityMsg{sessionID: "S-1", line: rehydrated})
+	model = updated.(Model)
+	if command == nil || !shouldReconcileConversation(rehydrated) {
+		t.Fatalf("ACP rehydration did not schedule a joined provider snapshot: command=%v", command)
+	}
+	if model.composer.text() != "keep this draft" || !model.composer.focused || model.scroll != 4 || !strings.Contains(model.View(), "Provisional ACP answer") {
+		t.Fatalf("ACP rehydration signal changed disposable viewer state: draft=%q focused=%t scroll=%d\n%s", model.composer.text(), model.composer.focused, model.scroll, model.View())
+	}
+	updated, _ = model.Update(conversationMsg{sessionID: "S-1", snapshot: snapshot})
+	model = updated.(Model)
+	if model.composer.text() != "keep this draft" || !model.composer.focused || model.scroll != 4 || !strings.Contains(model.View(), "Provisional ACP answer") {
+		t.Fatalf("ACP rehydration snapshot dropped draft, scroll, or provisional ACP output: draft=%q focused=%t scroll=%d\n%s", model.composer.text(), model.composer.focused, model.scroll, model.View())
+	}
+}
+
 func TestSessionConsoleAdoptsGatewayFallbackSnapshotBeforeRawHistory(t *testing.T) {
 	base := newConsoleBackend()
 	base.histories["S-1"] = []sessionlog.Line{
@@ -913,11 +997,12 @@ func TestConversationCommitRetryContinuesUntilProviderSnapshotCommits(t *testing
 		name      string
 		identity  string
 		turnState string
+		wantRetry bool
 	}{
 		{name: "missing canonical identity", turnState: "complete"},
-		{name: "live turn", identity: "provider-conversation", turnState: "working"},
-		{name: "failed turn", identity: "provider-conversation", turnState: "error"},
-		{name: "cancelled turn", identity: "provider-conversation", turnState: "cancelled"},
+		{name: "live turn", identity: "provider-conversation", turnState: "working", wantRetry: true},
+		{name: "failed turn", identity: "provider-conversation", turnState: "error", wantRetry: true},
+		{name: "cancelled turn", identity: "provider-conversation", turnState: "cancelled", wantRetry: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			candidate := baseModel(context.Background(), backend)
@@ -932,10 +1017,41 @@ func TestConversationCommitRetryContinuesUntilProviderSnapshotCommits(t *testing
 			}
 			updated, retry := candidate.Update(conversationMsg{sessionID: "S-OTHER", snapshot: snapshot})
 			candidate = updated.(Model)
-			if retry != nil || candidate.conversationCommitPending["S-OTHER"] {
-				t.Fatalf("ineligible fallback scheduled promotion: pending=%v command=%v", candidate.conversationCommitPending["S-OTHER"], retry)
+			if gotRetry := retry != nil && candidate.conversationCommitPending["S-OTHER"]; gotRetry != test.wantRetry {
+				t.Fatalf("fallback authority retry = %v, want %v: pending=%v command=%v", gotRetry, test.wantRetry, candidate.conversationCommitPending["S-OTHER"], retry)
 			}
 		})
+	}
+}
+
+func TestConversationAuthorityRetryRecoversIdleEmptyGatewayFallback(t *testing.T) {
+	backend := newConsoleBackend()
+	model := baseModel(context.Background(), backend)
+	defer model.manager.cancel()
+	model.current = session.Session{ID: "S-IDLE", ProviderConversationID: "provider-conversation"}
+
+	fallback := appservice.ConversationSnapshot{Source: appservice.ConversationSourceGateway}
+	updated, retry := model.Update(conversationMsg{sessionID: "S-IDLE", snapshot: fallback})
+	model = updated.(Model)
+	if retry == nil || !model.conversationCommitPending["S-IDLE"] {
+		t.Fatalf("idle gateway fallback did not schedule provider-authority retry: pending=%v command=%v", model.conversationCommitPending["S-IDLE"], retry)
+	}
+
+	provider := appservice.ConversationSnapshot{Source: appservice.ConversationSourceProvider, Turns: []appservice.ConversationTurn{{
+		Key: "provider-native", Committed: true,
+		Activities: []appservice.ConversationActivity{
+			{Kind: "provider_transcript", Display: &presentation.Activity{Type: "user_message", Text: "Native history"}},
+			{Kind: "provider_transcript", Display: &presentation.Activity{Type: "assistant_chunk", Text: "Loaded later"}},
+			{Kind: "provider_turn_completed", Display: &presentation.Activity{Type: "turn_state", State: "complete"}},
+		},
+	}}}
+	updated, retry = model.Update(conversationMsg{sessionID: "S-IDLE", snapshot: provider})
+	model = updated.(Model)
+	if retry != nil || model.conversationCommitPending["S-IDLE"] || model.snapshotSources["S-IDLE"] != appservice.ConversationSourceProvider {
+		t.Fatalf("provider authority did not clear retry state: pending=%v source=%q command=%v", model.conversationCommitPending["S-IDLE"], model.snapshotSources["S-IDLE"], retry)
+	}
+	if request := model.projections["S-IDLE"].byID["provider-native"]; request == nil || request.state != turnComplete {
+		t.Fatalf("late provider history was not adopted: %#v", request)
 	}
 }
 
@@ -989,6 +1105,19 @@ func TestEscapeLeavesComposerWithoutCancellingAndExplicitCancelPreservesDraft(t 
 	}
 	if !strings.Contains(model.notice, "does not pause") {
 		t.Fatalf("cancellation notice = %q", model.notice)
+	}
+}
+
+func TestAcceptedOrQueuedPromptRemainsCancellableDuringPreparation(t *testing.T) {
+	for _, state := range []turnState{turnReady, turnQueued} {
+		t.Run(string(state), func(t *testing.T) {
+			current := session.Session{Status: session.StatusWaiting}
+			projection := newTranscript()
+			projection.request("REQ-preparing").state = state
+			if !sessionIsActive(current, projection) {
+				t.Fatalf("%s ACP head was not exposed as cancellable", state)
+			}
+		})
 	}
 }
 

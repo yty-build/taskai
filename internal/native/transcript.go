@@ -731,6 +731,58 @@ func grokUserText(encoded json.RawMessage) string {
 	return strings.Join(text, "\n")
 }
 
+type openCodeUserMessage struct {
+	messageID string
+	created   int64
+	text      []byte
+	truncated bool
+}
+
+func (m *openCodeUserMessage) appendText(value string, sourceTruncated bool) {
+	if sourceTruncated {
+		m.truncated = true
+	}
+	value = sanitizeTranscriptText(value)
+	if value == "" {
+		return
+	}
+	if len(m.text) >= maxProviderTranscriptTextBytes {
+		m.truncated = true
+		return
+	}
+	if len(m.text) > 0 {
+		m.text = append(m.text, '\n')
+	}
+	remaining := maxProviderTranscriptTextBytes - len(m.text)
+	if len(value) > remaining {
+		m.text = append(m.text, value[:remaining]...)
+		m.truncated = true
+		return
+	}
+	m.text = append(m.text, value...)
+}
+
+func (m *openCodeUserMessage) addTo(builder *transcriptBuilder) {
+	if m == nil {
+		return
+	}
+	providerIdentity := strings.TrimSpace(m.messageID)
+	fallback := "opencode-user:" + providerIdentity
+	keySource := providerIdentity
+	if keySource == "" {
+		keySource = fallback
+	}
+	expectedKey := opaqueTranscriptKey(builder.provider, builder.conversationID, string(TranscriptUser), keySource)
+	builder.add(TranscriptUser, providerIdentity, fallback, time.UnixMilli(m.created), "", string(m.text))
+	if !m.truncated {
+		return
+	}
+	builder.truncated = true
+	if len(builder.records) > builder.start && builder.records[len(builder.records)-1].Key == expectedKey {
+		builder.records[len(builder.records)-1].Truncated = true
+	}
+}
+
 func readOpenCodeTranscript(ctx context.Context, verification Verification, expectedDirectory string, builder *transcriptBuilder) error {
 	path, err := canonicalStorePath(verification.StorePath)
 	if err != nil {
@@ -760,6 +812,7 @@ func readOpenCodeTranscript(ctx context.Context, verification Verification, expe
 	rows, err := transaction.QueryContext(ctx, `
 		WITH recent AS (
 			SELECT p.id, p.message_id, p.time_created, p.data,
+			       m.time_created AS message_time_created,
 			       json_extract(m.data, '$.role') AS role,
 			       json_extract(p.data, '$.type') AS part_type,
 			       json_extract(m.data, '$.time.completed') AS message_completed,
@@ -768,40 +821,61 @@ func readOpenCodeTranscript(ctx context.Context, verification Verification, expe
 			WHERE p.session_id = ?
 			  AND json_extract(m.data, '$.role') IN ('user', 'assistant')
 			  AND json_extract(p.data, '$.type') IN ('text', 'reasoning')
-			ORDER BY p.time_created DESC, p.id DESC
+			  AND (json_extract(m.data, '$.role') = 'assistant'
+			       OR json_extract(p.data, '$.type') = 'text')
+			ORDER BY m.time_created DESC, m.id DESC, p.time_created DESC, p.id DESC
 			LIMIT ?
 		)
-		SELECT id, message_id, time_created, role, part_type, message_completed, message_finish,
+		SELECT id, message_id, time_created, message_time_created,
+		       role, part_type, message_completed, message_finish,
 		       CAST(substr(CAST(json_extract(data, '$.text') AS BLOB), 1, ?) AS TEXT),
 		       length(CAST(json_extract(data, '$.text') AS BLOB))
 		FROM recent
-		ORDER BY time_created, id`, verification.ConversationID, maxProviderTranscriptRecords+1, maxProviderTranscriptTextBytes+1)
+		ORDER BY message_time_created, message_id, time_created, id`, verification.ConversationID, maxProviderTranscriptRecords+1, maxProviderTranscriptTextBytes+1)
 	if err != nil {
 		return providerStoreError("OpenCode", path, err)
 	}
 	defer rows.Close()
 	rowCount := 0
+	var userMessage *openCodeUserMessage
+	flushUserMessage := func() {
+		userMessage.addTo(builder)
+		userMessage = nil
+	}
 	for rows.Next() {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		var partID, messageID, role, partType string
-		var created int64
+		var created, messageCreated int64
 		var completed sql.NullInt64
 		var finish sql.NullString
 		var text sql.NullString
 		var textBytes sql.NullInt64
-		if err := rows.Scan(&partID, &messageID, &created, &role, &partType, &completed, &finish, &text, &textBytes); err != nil {
+		if err := rows.Scan(&partID, &messageID, &created, &messageCreated, &role, &partType, &completed, &finish, &text, &textBytes); err != nil {
 			return providerStoreError("OpenCode", path, err)
 		}
 		rowCount++
 		if rowCount > maxProviderTranscriptRecords {
 			builder.truncated = true
 		}
-		kind := TranscriptAssistant
 		if role == "user" {
-			kind = TranscriptUser
-		} else if partType == "reasoning" {
+			if partType != "text" {
+				continue
+			}
+			if userMessage == nil || userMessage.messageID != messageID {
+				flushUserMessage()
+				userMessage = &openCodeUserMessage{messageID: messageID, created: messageCreated}
+				if userMessage.created == 0 {
+					userMessage.created = created
+				}
+			}
+			userMessage.appendText(text.String, textBytes.Valid && textBytes.Int64 > maxProviderTranscriptTextBytes)
+			continue
+		}
+		flushUserMessage()
+		kind := TranscriptAssistant
+		if partType == "reasoning" {
 			kind = TranscriptReasoning
 		}
 		phase := ""
@@ -819,6 +893,7 @@ func readOpenCodeTranscript(ctx context.Context, verification Verification, expe
 			}
 		}
 	}
+	flushUserMessage()
 	if err := rows.Err(); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()

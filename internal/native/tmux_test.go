@@ -116,6 +116,18 @@ func TestTmuxRunnerCreatesAttachesAndReattachesOnePrivateHarness(t *testing.T) {
 	}
 }
 
+func TestTmuxAttachCommandIsExactAndShellSafe(t *testing.T) {
+	command, err := TmuxAttachCommand("S-EXACT_123")
+	if err != nil || command != "tmux attach-session -t =agent-S-EXACT_123" {
+		t.Fatalf("TmuxAttachCommand() = %q, %v", command, err)
+	}
+	for _, unsafe := range []string{"S bad", "S;touch-pwned", "../S", "S$(id)"} {
+		if command, err := TmuxAttachCommand(unsafe); err == nil || command != "" {
+			t.Fatalf("TmuxAttachCommand(%q) = %q, %v", unsafe, command, err)
+		}
+	}
+}
+
 func TestTmuxRunnerConcurrentCreateRaceAttachesWinner(t *testing.T) {
 	t.Setenv("TMUX", "")
 	hasCalls := 0
@@ -283,6 +295,35 @@ func TestTmuxRunnerFallsBackToDirectProviderWithoutTmux(t *testing.T) {
 	body, err := os.ReadFile(record)
 	if err != nil || !strings.Contains(string(body), "marker=tmux unavailable") {
 		t.Fatalf("direct fallback record = %q, %v", body, err)
+	}
+}
+
+func TestTmuxRunnerDirectFallbackActivationFailureNeverStartsProvider(t *testing.T) {
+	fixture, err := filepath.Abs(filepath.Join("testdata", "fake-native"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMUX", "")
+	record := filepath.Join(t.TempDir(), "must-not-exist")
+	runner := &TmuxRunner{
+		Executable: "acpctl", ConsoleSessionID: "S-FALLBACK-BLOCKED", StateRoot: t.TempDir(), ReservationGeneration: testNativeGeneration,
+		lookupPath:    func(string) (string, error) { return "", os.ErrNotExist },
+		isInteractive: func(io.Reader, io.Writer) bool { return true },
+	}
+	runner.SetReservationActivator(func(context.Context) error {
+		return errors.New("wait for the current ACP turn to settle, then open Native CLI again")
+	})
+	err = runner.Run(context.Background(), Invocation{
+		Command: fixture, WorkingDirectory: t.TempDir(), Environment: map[string]string{"FAKE_NATIVE_RECORD": record},
+	}, strings.NewReader(""), io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "wait for the current ACP turn to settle") {
+		t.Fatalf("activation error = %v", err)
+	}
+	if _, statErr := os.Stat(record); !os.IsNotExist(statErr) {
+		t.Fatalf("provider ran after rejected activation: %v", statErr)
+	}
+	if runner.ProcessMayContinue() || runner.NativeActivityOccurred() {
+		t.Fatalf("rejected activation continuing=%t activity=%t", runner.ProcessMayContinue(), runner.NativeActivityOccurred())
 	}
 }
 

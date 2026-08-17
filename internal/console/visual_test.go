@@ -299,6 +299,12 @@ func TestStructuredACPShowsCompletedTurnState(t *testing.T) {
 	}
 }
 
+func TestStructuredACPShowsIncompleteProviderTurnState(t *testing.T) {
+	if got := renderTurnState(turnIncomplete); got != "  ◇ Provider turn incomplete · no final response was recorded" {
+		t.Fatalf("incomplete provider turn status = %q", got)
+	}
+}
+
 func TestStructuredACPTaskReturnRemainsVisibleAtMinimumWidth(t *testing.T) {
 	model := visualSessionModel(t)
 	model.direct = false

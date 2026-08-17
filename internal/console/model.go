@@ -152,6 +152,8 @@ type conversationRetryMsg struct {
 	attempt   int
 }
 
+const providerTranscriptReloadDelayedNotice = "Provider transcript reload is delayed; live ACP output remains current."
+
 func newTaskModel(parent context.Context, backend Backend, taskID string) (Model, context.CancelFunc, error) {
 	ctx, cancel := context.WithCancel(parent)
 	detail, err := backend.Task(ctx, taskID)
@@ -221,6 +223,8 @@ func (m *Model) loadStored(current session.Session) error {
 			if snapshotWarning != "" {
 				m.notice = snapshotWarning
 			}
+		} else if strings.TrimSpace(current.ProviderConversationID) != "" {
+			m.conversationCommitPending[current.ID] = true
 		}
 	}
 	lines, err := m.backend.History(m.ctx, current.ID, historyCursor)
@@ -293,6 +297,9 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 	case activityMsg:
 		m.addActivity(message.sessionID, message.line, true)
 		wait := m.manager.wait()
+		if message.line.Type == "provider_transcript_reconcile_warning" {
+			m.notice = providerTranscriptReloadDelayedNotice
+		}
 		if shouldReconcileConversation(message.line) {
 			if _, ok := m.backend.(conversationBackend); ok {
 				if message.line.Type == "turn_completed" {
@@ -307,7 +314,8 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 	case conversationMsg:
 		if message.err != nil {
 			m.notice = "Provider history refresh delayed; live ACP output remains current."
-			if m.conversationCommitPending[message.sessionID] && m.canRetryConversationPromotion(message.sessionID) {
+			if m.canRetryConversationPromotion(message.sessionID) {
+				m.conversationCommitPending[message.sessionID] = true
 				return m, m.scheduleConversationCommitRetry(message.sessionID)
 			}
 			delete(m.conversationCommitPending, message.sessionID)
@@ -317,6 +325,10 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 		if !isConversationSnapshot(message.snapshot) {
 			if notice := conversationSnapshotNotice(message.snapshot); notice != "" {
 				m.notice = notice
+			}
+			if m.canRetryConversationPromotion(message.sessionID) {
+				m.conversationCommitPending[message.sessionID] = true
+				return m, m.scheduleConversationCommitRetry(message.sessionID)
 			}
 			return m, nil
 		}
@@ -335,6 +347,8 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 		}
 		if notice := conversationSnapshotNotice(message.snapshot); notice != "" {
 			m.notice = notice
+		} else if message.snapshot.Source == appservice.ConversationSourceProvider && m.notice == providerTranscriptReloadDelayedNotice {
+			m.notice = ""
 		}
 		if !m.adoptConversationSnapshot(message.sessionID, message.snapshot) {
 			if m.conversationCommitPending[message.sessionID] && m.canRetryConversationPromotion(message.sessionID) {
@@ -889,7 +903,7 @@ func sessionIsActive(current session.Session, projection *transcript) bool {
 		return false
 	}
 	state := projection.latestState()
-	return state == turnLive || state == turnCancelling
+	return state == turnReady || state == turnQueued || state == turnLive || state == turnCancelling
 }
 
 func (m *Model) toggleToolDetail() {
@@ -1103,7 +1117,8 @@ func conversationSnapshotNeedsCommit(snapshot appservice.ConversationSnapshot) b
 }
 
 func conversationSnapshotNeedsPromotion(current session.Session, snapshot appservice.ConversationSnapshot) bool {
-	return strings.TrimSpace(current.ProviderConversationID) != "" && conversationSnapshotNeedsCommit(snapshot)
+	return strings.TrimSpace(current.ProviderConversationID) != "" &&
+		(snapshot.Source != appservice.ConversationSourceProvider || conversationSnapshotNeedsCommit(snapshot))
 }
 
 func conversationCommitRetryDelay(attempt int) time.Duration {
@@ -1136,7 +1151,7 @@ func (m *Model) ensureConversationCommitState() {
 
 func shouldReconcileConversation(line sessionlog.Line) bool {
 	switch line.Type {
-	case "turn_completed", "turn_error", "native_refreshed", "native_refresh_recovered":
+	case "turn_completed", "turn_error", "native_refreshed", "native_refresh_recovered", "provider_transcript_reconciled", "acp_rehydrated":
 		return true
 	default:
 		return false

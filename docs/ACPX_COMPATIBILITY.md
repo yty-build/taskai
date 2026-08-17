@@ -61,11 +61,23 @@ provider transcript adapters remain isolated in `internal/native`: Codex uses
 profile maps to `grok --resume <id>`, and OpenCode reuses the same pinned npm
 CLI without its `acp` subcommand and adds `--session <id>`. Unknown profiles,
 missing identities, ambiguous records, and checkout mismatches fail closed.
+Committed-history readers use the exact provider stores: Codex, Claude, and
+Grok JSONL, and OpenCode SQLite. Gateway Session JSONL is not an input to these
+provider resume commands.
 
-The worker enforces one per-Session provider writer: native attach waits/fails
-while an ACP turn owns it, and ACP prompts remain queued while the native
-process owns it. A tmux viewer detach does not release a running process's
-ownership. Native exit/stop refreshes exact ACP identity and atomically
-reconciles the provider snapshot while retaining native ownership; only then
-does ownership release and queued ACP input dispatch. See
+Provider-write callers first negotiate worker protocol v3 plus
+`exclusive-native-owner-v2`; older responsive workers fail closed before
+sending input or spawning a provider. The public runtime supports one active
+ACP turn per Session, so the worker keeps an ACP-to-ACP FIFO. A provider-native
+owner or pre-launch reservation is not part of that FIFO: an ACP submission is
+rejected before admission and must be retried after the provider exits and
+exact ownership releases. Conversely,
+starting or activating a native generation while ACP is accepted, queued,
+preparing, or active is rejected rather than queued and never cancels ACP.
+Before every accepted ACP dispatch at the FIFO head, the worker Refreshes the
+exact persisted ACP Session, with exact-Resume fallback and identity validation;
+success emits correlated `acp_rehydrated` before `turn_started`. Native
+exit/stop starts exact provider-snapshot reconciliation, and a fresh native
+generation later uses `BuildResume` on the same canonical ID. Viewer detach
+changes neither provider-process lifetime nor exclusive ownership. See
 [CODEX_NATIVE_SMOKE.md](CODEX_NATIVE_SMOKE.md).

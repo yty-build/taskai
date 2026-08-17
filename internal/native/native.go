@@ -26,8 +26,8 @@ type Runner interface {
 }
 
 // ExecRunner launches the provider directly and records whether the process
-// actually started. Callers use that distinction to avoid refreshing ACP after
-// a command lookup, working-directory, or pre-start context failure.
+// actually started. Callers use that distinction to request provider transcript
+// reconciliation only after an invocation reached the provider.
 type ExecRunner struct {
 	activityOccurred      bool
 	preexistingOwner      bool

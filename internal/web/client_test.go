@@ -42,7 +42,9 @@ const liveHistorySummary = conversationHistorySummary({turns:[{committed:false,b
 testAssert(liveHistorySummary.short === "1 live turn · 2 steps" && liveHistorySummary.detail.includes("can be saved after successful completion"), "unfinished provider history was not explained clearly");
 const stoppedHistorySummary = conversationHistorySummary({turns:[{committed:false,state:"cancelled",blocks:[]},{committed:false,state:"error",blocks:[]},{committed:false,state:"failed",blocks:[]}],snapshotTruncated:false,historyClipped:false});
 testAssert(stoppedHistorySummary.short === "3 unsaved" && stoppedHistorySummary.active === 0 && stoppedHistorySummary.stopped === 3, "terminal unsaved history was misclassified as live");
-testAssert(stoppedHistorySummary.detail.includes("remain unsaved gateway history") && !stoppedHistorySummary.detail.includes("can be saved"), "terminal unsaved history promised an impossible provider save");
+testAssert(stoppedHistorySummary.detail.includes("remain unsaved history") && !stoppedHistorySummary.detail.includes("can be saved"), "terminal unsaved history promised an impossible provider save");
+const incompleteHistorySummary = conversationHistorySummary({turns:[{committed:false,state:"incomplete",blocks:[]}],snapshotTruncated:false,historyClipped:false});
+testAssert(incompleteHistorySummary.active === 0 && incompleteHistorySummary.stopped === 1, "incomplete provider history was misrepresented as a live invocation");
 const liveWithoutReasoning = {surface:"acp",state:"working",reasoningSeen:false,permissionIDs:new Set(),tools:new Map(),lifecycle:[{state:"queued"},{state:"working"}],firstTimestamp:1000,lastTimestamp:2300,committed:false};
 const liveOverview = turnOverviewElement(liveWithoutReasoning);
 testAssert(liveOverview.textContent.includes("ACP turn") && liveOverview.textContent.includes("Working") && liveOverview.textContent.includes("No tools") && liveOverview.textContent.includes("Reasoning not provided"), "live invocation overview was incomplete");
@@ -56,6 +58,16 @@ testAssert(approvalOverview.children[0].children[1].className.includes("status-a
 const failedOverview = turnOverviewElement({surface:"unknown",state:"error",reasoningSeen:false,permissionIDs:new Set(),tools:new Map(),lifecycle:[{state:"working"},{state:"error"}],firstTimestamp:0,lastTimestamp:0,committed:false});
 testAssert(failedOverview.textContent.includes("Provider turn") && failedOverview.textContent.includes("Failed") && failedOverview.textContent.includes("Working → Failed"), "failed provider invocation was misrepresented");
 testAssert(!failedOverview.textContent.includes("REQ-") && !failedOverview.textContent.includes("provider_transcript"), "invocation overview exposed internal identifiers");
+resetTranscript();
+applyActivity(activity(1, "turn_error", {type:"error_upsert",state:"error",text:"The provider is busy with this conversation.",error_source:"provider",error_code:"busy",retryable:true}, null, "PROVIDER-BUSY"));
+const providerBusyTurn = transcriptState.byRequest.get("PROVIDER-BUSY");
+const providerBusyCard = renderBlockElement(providerBusyTurn.error, "codex");
+testAssert(providerBusyTurn.error.errorCode === "busy" && providerBusyTurn.error.retryable && providerBusyCard.textContent.includes("Provider busy") && providerBusyCard.textContent.includes("Retryable"), "provider busy provenance was not visible in the Web conversation");
+resetTranscript();
+applyActivity(activity(0, "provider_transcript", {type:"user_message",text:"Interrupted native prompt"}, null, "PROVIDER-PARTIAL"));
+applyActivity(activity(0, "provider_turn_incomplete", {type:"turn_state",state:"incomplete",stop_reason:"provider_history_incomplete"}, null, "PROVIDER-PARTIAL"));
+const providerPartialTurn = transcriptState.byRequest.get("PROVIDER-PARTIAL");
+testAssert(providerPartialTurn.state === "incomplete" && turnStatusLabel(providerPartialTurn) === "Incomplete" && turnLifecycleLabel(providerPartialTurn) === "Incomplete", "provider partial history synthesized a complete or live turn");
 const stableOverviewTurn = {surface:"acp",state:"working",reasoningSeen:false,permissionIDs:new Set(),tools:new Map(),lifecycle:[{state:"working"}],firstTimestamp:0,lastTimestamp:0,committed:false,overviewElement:null};
 const stableOverview = turnOverviewElement(stableOverviewTurn);
 stableOverviewTurn.state = "complete";
@@ -82,6 +94,22 @@ testAssert(
   upgradeFetchError?.status === 409 && upgradeFetchError?.code === "worker_upgrade_required" && upgradeFetchError?.message === "Recover the worker",
   "browser API client discarded the typed worker-upgrade conflict"
 );
+fetch = async () => ({
+  ok:false, status:409,
+  async text(){ return JSON.stringify({error:{code:"session_conflict",message:"Native harness is running; ACP prompt was not accepted. Exit it, then retry."}}); },
+});
+resetTranscript();
+let nativeConflict;
+try {
+  await apiRequest("/native-owned-prompt", "POST", {message:"must not be queued"});
+} catch (error) {
+  nativeConflict = error;
+}
+testAssert(
+  nativeConflict?.status === 409 && nativeConflict?.code === "session_conflict" && nativeConflict?.message.includes("prompt was not accepted"),
+  "browser API client hid the actionable native-ownership conflict"
+);
+testAssert(transcriptState.turns.length === 0, "rejected native-open prompt created an optimistic conversation turn");
 
 resetTranscript();
 applyActivity(activity(0, "acp", {type:"legacy_user_message", text:"Legacy injected prompt"}));
@@ -281,6 +309,23 @@ applyActivity(activity(1, "turn_started", {type:"turn_state", state:"working"}, 
 testAssert(orderedTurns()[0].id === "old", "late history replay was ordered after an optimistic prompt");
 
 resetTranscript();
+applyActivity(activity(1, "prompt_submitted", {type:"user_message",text:"send while native is open"}, null, "READY-NATIVE"));
+applyActivity(activity(2, "prompt_ready", {type:"turn_state",state:"ready"}, null, "READY-NATIVE"));
+const readyNativeTurn = transcriptState.byRequest.get("READY-NATIVE");
+testAssert(readyNativeTurn?.state === "ready" && turnStatusLabel(readyNativeTurn) === "Accepted", "ready ACP request was presented as queued");
+testAssert(turnLifecycleLabel(readyNativeTurn) === "Accepted" && !turnLifecycleLabel(readyNativeTurn).includes("Queued"), "ready ACP lifecycle invented queueing");
+resetTranscript();
+const optimisticReadyTurn = turnFor({request_id:"OPTIMISTIC-READY", position:Number.POSITIVE_INFINITY});
+setRuntimeStatus("waiting");
+testAssert(applyOptimisticPromptReceipt(optimisticReadyTurn, "ready"), "optimistic ready state was not applied");
+testAssert(optimisticReadyTurn.state === "ready" && turnStatusLabel(optimisticReadyTurn) === "Accepted" && turnLifecycleLabel(optimisticReadyTurn) === "Accepted", "API ready receipt invented provider work before turn_started");
+testAssert(currentSessionRuntimeStatus === "waiting", "API ready receipt fabricated a Working Session before turn_started");
+testAssert(sessionActionVisible("cancel", ["starting", "working"], "waiting"), "Accepted prompt preparation did not expose Stop response while runtime status was still waiting");
+testAssert(!sessionActionVisible("stop", ["stopped"], "waiting"), "Accepted prompt preparation exposed an unrelated Session action");
+optimisticReadyTurn.state = "cancelled";
+testAssert(!sessionActionVisible("cancel", ["starting", "working"], "waiting"), "terminal local prompt kept the preparation Stop response visible");
+
+resetTranscript();
 transcriptState.lastPosition = 99;
 attachActivityStream("/api/v1/sessions/S/stream");
 testAssert(createdEventSources[0] === "/api/v1/sessions/S/stream?seed=99", "stream reopen did not use a one-time cursor seed");
@@ -434,10 +479,13 @@ conversationSnapshotSignature = "";
 conversationReconcileInFlight = false;
 conversationReconcilePending = false;
 conversationReconcileBuffer = [];
+providerAuthorityRetryTimer = 0;
+scheduledTimeouts.length = 0;
 apiRequest = async () => gatewaySnapshot;
 testAssert(await reconcileConversation("S", {initial:true}), "initial gateway fallback snapshot was not adopted");
 testAssert(transcriptState.source === "gateway-log" && transcriptState.lastPosition === 17, "initial gateway fallback lost its source or captured cursor");
 testAssert(transcriptState.byRequest.get("GATEWAY-REQ")?.blocks.some((block) => block.type === "assistant" && block.text === "Gateway answer"), "initial gateway fallback lost its bounded semantic turn");
+testAssert(scheduledTimeouts.includes(10000) && providerAuthorityRetryTimer !== 0, "idle-capable gateway fallback did not schedule an independent provider-authority retry");
 const gatewayStreamCount = createdEventSources.length;
 attachActivityStream("/api/v1/sessions/S/stream");
 testAssert(createdEventSources[gatewayStreamCount] === "/api/v1/sessions/S/stream?seed=17", "initial gateway fallback did not seed SSE after its captured cursor");
@@ -445,7 +493,8 @@ testAssert(createdEventSources[gatewayStreamCount] === "/api/v1/sessions/S/strea
 let resolveConversationRequest;
 apiRequest = () => new Promise((resolve) => { resolveConversationRequest = resolve; });
 resetTranscript();
-transcriptState.shouldStick = true;
+transcriptState.shouldStick = false;
+draftTextarea.value = "keep this draft";
 conversationSnapshotSignature = "";
 conversationReconcileInFlight = false;
 conversationReconcilePending = false;
@@ -454,27 +503,77 @@ scheduledTimeouts.length = 0;
 const inFlightReconcile = reconcileConversation("S");
 conversationReconcileBuffer.push(
   activity(40, "acp", {type:"assistant_chunk",text:"stale"}, null, "STALE"),
-  activity(41, "turn_started", {type:"turn_state",state:"working"}, null, "LIVE-RACE")
+  activity(41, "turn_started", {type:"turn_state",state:"working"}, null, "LIVE-RACE"),
+  activity(42, "acp", {type:"assistant_chunk",message_id:"live-rehydrate",text:"Provisional ACP output"}, null, "LIVE-RACE")
 );
 const coalescedReconcile = reconcileConversation("S");
 resolveConversationRequest(committedSnapshot);
 await Promise.all([inFlightReconcile, coalescedReconcile]);
 testAssert(transcriptState.turns.length === 4 && transcriptState.byRequest.has("LIVE-RACE"), "SSE event crossing provider reload was lost");
+testAssert(transcriptState.byRequest.get("LIVE-RACE")?.blocks.some((block) => block.type === "assistant" && block.text === "Provisional ACP output"), "provider reload dropped provisional ACP output");
 testAssert(!transcriptState.byRequest.has("STALE"), "provider reload replayed an event at the captured gateway cursor");
+testAssert(!transcriptState.shouldStick && draftTextarea.value === "keep this draft", "provider reload changed scroll intent or the composer draft");
 testAssert(scheduledTimeouts.includes(120), "overlapping provider reload was not coalesced after the active fetch");
+
+let resolveOverflowRequest;
+apiRequest = () => new Promise((resolve) => { resolveOverflowRequest = resolve; });
+resetTranscript();
+transcriptState.shouldStick = false;
+draftTextarea.value = "keep overflow draft";
+conversationSnapshotSignature = "";
+conversationReconcileInFlight = false;
+conversationReconcilePending = false;
+conversationReconcileBuffer = [];
+conversationReconcileBufferBytes = 0;
+conversationReconcileOverflow = false;
+scheduledTimeouts.length = 0;
+const overflowReconcile = reconcileConversation("S");
+for (let index = 0; index <= LIMITS.reconcileEvents; index += 1) {
+  const live = activity(1000 + index, "acp", {type:"assistant_chunk",message_id:"overflow-stream",text:"x"}, null, "OVERFLOW-LIVE");
+  bufferConversationActivity(live);
+  applyActivity(live);
+}
+resolveOverflowRequest(committedSnapshot);
+await overflowReconcile;
+testAssert(conversationReconcileBuffer.length === 0 && conversationReconcileBufferBytes === 0, "overflowed reconciliation buffer was retained");
+testAssert(transcriptState.byRequest.has("OVERFLOW-LIVE") && !transcriptState.byRequest.has("REQ-1"), "overflow adopted a snapshot that omitted live cursor positions");
+testAssert(transcriptState.sourceWarning.includes("live activity was busy") && scheduledTimeouts.includes(120), "overflow did not preserve live state and schedule a clean retry");
+testAssert(!transcriptState.shouldStick && draftTextarea.value === "keep overflow draft", "overflow retry changed scroll intent or composer draft");
 
 conversationSnapshotSignature = snapshotSignature(committedSnapshot);
 transcriptState.sourceWarning = "Provider history refresh is delayed; live ACP output remains current.";
 apiRequest = async () => committedSnapshot;
 await reconcileConversation("S");
 testAssert(transcriptState.sourceWarning === "", "successful unchanged provider snapshot left a stale refresh warning");
+const turnsBeforeReconcileWarning = transcriptState.turns;
+providerAuthorityRetryTimer = 0;
+scheduledTimeouts.length = 0;
+testAssert(noteProviderTranscriptReconcileWarning("provider_transcript_reconcile_warning", "S"), "provider transcript warning was not recognized");
+testAssert(transcriptState.turns === turnsBeforeReconcileWarning && transcriptState.sourceWarning.includes("delayed"), "provider transcript warning replaced conversation state or was not disclosed");
+testAssert(scheduledTimeouts.includes(10000), "provider transcript reconciliation fallback did not schedule an independent authority retry");
+testAssert(shouldReconcileConversationKind("provider_transcript_reconciled"), "provider transcript reconciliation does not trigger a committed history reload");
+testAssert(shouldReconcileConversationKind("acp_rehydrated"), "ACP rehydration does not trigger a committed provider history reload");
+testAssert(!shouldReconcileConversationKind("provider_transcript_reconcile_warning"), "provider transcript warning incorrectly replaced the current transcript");
 
 const turnsBeforeFallbackRefresh = transcriptState.turns;
 const cursorBeforeFallbackRefresh = transcriptState.lastPosition;
+providerAuthorityRetryTimer = 0;
+scheduledTimeouts.length = 0;
 apiRequest = async () => ({...gatewaySnapshot, gateway_cursor:999, turns:[{key:"STALE-FALLBACK",committed:false,activities:[activity(998,"acp",{type:"assistant_chunk",text:"must not replace current view"},null,"STALE-FALLBACK")]}]});
 await reconcileConversation("S");
 testAssert(transcriptState.turns === turnsBeforeFallbackRefresh && transcriptState.lastPosition === cursorBeforeFallbackRefresh, "later provider-store fallback replaced the current provider/live view");
 testAssert(transcriptState.source === "provider-store" && !transcriptState.byRequest.has("STALE-FALLBACK"), "later fallback downgraded provider authority or injected stale history");
+testAssert(scheduledTimeouts.includes(10000) && providerAuthorityRetryTimer !== 0, "later native/provider fallback did not keep polling for restored provider authority");
+
+resetTranscript();
+conversationSnapshotSignature = "";
+conversationReconcileInFlight = false;
+conversationReconcilePending = false;
+providerAuthorityRetryTimer = 0;
+scheduledTimeouts.length = 0;
+apiRequest = async () => { throw new Error("provider authority temporarily unavailable"); };
+await reconcileConversation("S", {initial:true});
+testAssert(transcriptState.turns.length === 0 && scheduledTimeouts.includes(10000), "empty idle provider-authority failure had no background recovery path");
 
 resetTranscript();
 applyActivity(activity(1, "turn_started", {type:"turn_state",state:"working"}, null, "RETRY"));
@@ -503,6 +602,7 @@ const fs = require("node:fs");
 const vm = require("node:vm");
 const createdEventSources = [];
 const scheduledTimeouts = [];
+const draftTextarea = {value:""};
 class FakeElement {
   constructor(tagName) {
     this.tagName = String(tagName || "").toUpperCase();
@@ -533,7 +633,7 @@ class FakeEventSource {
   close() {}
 }
 const sandbox = {
-  TextEncoder, console, EventSource: FakeEventSource, createdEventSources, scheduledTimeouts,
+  TextEncoder, console, EventSource: FakeEventSource, createdEventSources, scheduledTimeouts, draftTextarea,
   fetch: async () => ({
     ok:false, status:409,
     async text(){ return JSON.stringify({error:{code:"worker_upgrade_required",message:"Recover the worker"}}); },

@@ -1,11 +1,13 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,21 +28,35 @@ import (
 )
 
 type fakeACP struct {
-	mu             sync.Mutex
-	active         map[string]chan struct{}
-	cancelled      map[string]bool
-	started        chan string
-	concurrent     int
-	maxConcurrent  int
-	startCount     int
-	resumeCount    int
-	resumeErr      error
-	resumeNativeID string
-	inspectACP     string
-	inspectNative  string
-	promptErr      error
-	refreshCount   int
-	refreshWait    bool
+	mu               sync.Mutex
+	active           map[string]chan struct{}
+	cancelled        map[string]bool
+	cancelCount      int
+	cancelGate       <-chan struct{}
+	cancelInFlight   int
+	trackClose       bool
+	closed           bool
+	closeWhileCancel bool
+	started          chan string
+	concurrent       int
+	maxConcurrent    int
+	startCount       int
+	resumeCount      int
+	resumeErr        error
+	resumeHook       func()
+	resumeNativeID   string
+	inspectACP       string
+	inspectNative    string
+	promptErr        error
+	promptReturnGate <-chan struct{}
+	promptReturning  chan string
+	refreshCount     int
+	refreshWait      bool
+	refreshErr       error
+	refreshNativeID  string
+	refreshGate      <-chan struct{}
+	refreshStarted   chan int
+	calls            []string
 }
 
 func newFakeACP() *fakeACP {
@@ -50,18 +66,25 @@ func newFakeACP() *fakeACP {
 func (f *fakeACP) Start(context.Context, acp.StartSpec) (acp.SessionInfo, error) {
 	f.mu.Lock()
 	f.startCount++
+	f.calls = append(f.calls, "start")
 	f.mu.Unlock()
 	return acp.SessionInfo{ACPXRecordID: "acpx-start", ACPSessionID: "acp-start", NativeSessionID: "native-start"}, nil
 }
 
 func (f *fakeACP) Resume(_ context.Context, spec acp.StartSpec) (acp.SessionInfo, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.resumeCount++
-	if f.resumeErr != nil {
-		return acp.SessionInfo{}, f.resumeErr
-	}
+	f.calls = append(f.calls, "resume")
+	resumeErr := f.resumeErr
+	resumeHook := f.resumeHook
 	nativeID := f.resumeNativeID
+	f.mu.Unlock()
+	if resumeHook != nil {
+		resumeHook()
+	}
+	if resumeErr != nil {
+		return acp.SessionInfo{}, resumeErr
+	}
 	if nativeID == "" {
 		nativeID = "native-start"
 	}
@@ -71,9 +94,24 @@ func (f *fakeACP) Resume(_ context.Context, spec acp.StartSpec) (acp.SessionInfo
 func (f *fakeACP) Refresh(ctx context.Context, spec acp.StartSpec) (acp.SessionInfo, error) {
 	f.mu.Lock()
 	f.refreshCount++
+	f.calls = append(f.calls, "refresh")
 	refreshWait := f.refreshWait
-	refreshErr := f.resumeErr
+	refreshErr := f.refreshErr
+	refreshGate := f.refreshGate
+	refreshStarted := f.refreshStarted
+	refreshCount := f.refreshCount
+	nativeID := f.refreshNativeID
 	f.mu.Unlock()
+	if refreshStarted != nil {
+		refreshStarted <- refreshCount
+	}
+	if refreshGate != nil {
+		select {
+		case <-refreshGate:
+		case <-ctx.Done():
+			return acp.SessionInfo{}, ctx.Err()
+		}
+	}
 	if refreshWait {
 		<-ctx.Done()
 		return acp.SessionInfo{}, ctx.Err()
@@ -81,13 +119,17 @@ func (f *fakeACP) Refresh(ctx context.Context, spec acp.StartSpec) (acp.SessionI
 	if refreshErr != nil {
 		return acp.SessionInfo{}, refreshErr
 	}
-	return acp.SessionInfo{ACPXRecordID: "acpx-refreshed", ACPSessionID: spec.ResumeACPSessionID, NativeSessionID: "native-start"}, nil
+	if nativeID == "" {
+		nativeID = "native-start"
+	}
+	return acp.SessionInfo{ACPXRecordID: "acpx-refreshed", ACPSessionID: spec.ResumeACPSessionID, NativeSessionID: nativeID}, nil
 }
 
 func (f *fakeACP) Prompt(ctx context.Context, spec acp.PromptSpec, emit func(acp.Event) error) (acp.PromptReceipt, error) {
 	release := make(chan struct{})
 	f.mu.Lock()
 	f.active[spec.RequestID] = release
+	f.calls = append(f.calls, "prompt:"+spec.RequestID)
 	f.concurrent++
 	if f.concurrent > f.maxConcurrent {
 		f.maxConcurrent = f.concurrent
@@ -106,7 +148,20 @@ func (f *fakeACP) Prompt(ctx context.Context, spec acp.PromptSpec, emit func(acp
 	f.mu.Lock()
 	cancelled := f.cancelled[spec.RequestID]
 	promptErr := f.promptErr
+	promptReturnGate := f.promptReturnGate
+	promptReturning := f.promptReturning
 	f.mu.Unlock()
+	if promptReturning != nil {
+		promptReturning <- spec.RequestID
+	}
+	if promptReturnGate != nil {
+		select {
+		case <-promptReturnGate:
+		case <-ctx.Done():
+			f.finish(spec.RequestID)
+			return acp.PromptReceipt{RequestID: spec.RequestID, LastSeq: 1}, ctx.Err()
+		}
+	}
 	f.finish(spec.RequestID)
 	if promptErr != nil {
 		return acp.PromptReceipt{RequestID: spec.RequestID, LastSeq: 1}, promptErr
@@ -127,13 +182,33 @@ func (f *fakeACP) finish(requestID string) {
 
 func (f *fakeACP) Cancel(context.Context, acp.Target) error {
 	f.mu.Lock()
+	f.cancelInFlight++
+	gate := f.cancelGate
+	f.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.cancelInFlight--
+	f.cancelCount++
 	for requestID, release := range f.active {
 		if !f.cancelled[requestID] {
 			f.cancelled[requestID] = true
 			close(release)
 		}
 	}
+	return nil
+}
+
+func (f *fakeACP) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.trackClose {
+		return nil
+	}
+	f.closed = true
+	f.closeWhileCancel = f.cancelInFlight > 0
 	return nil
 }
 
@@ -241,6 +316,10 @@ func (f *permissionACP) Start(context.Context, acp.StartSpec) (acp.SessionInfo, 
 
 func (f *permissionACP) Resume(context.Context, acp.StartSpec) (acp.SessionInfo, error) {
 	return f.Start(context.Background(), acp.StartSpec{})
+}
+
+func (f *permissionACP) Refresh(context.Context, acp.StartSpec) (acp.SessionInfo, error) {
+	return acp.SessionInfo{ACPXRecordID: "acpx-permission-refreshed", ACPSessionID: "acp-permission", NativeSessionID: "native-permission"}, nil
 }
 
 func (f *permissionACP) Prompt(ctx context.Context, spec acp.PromptSpec, emit func(acp.Event) error) (acp.PromptReceipt, error) {
@@ -457,8 +536,8 @@ func TestWorkerSerializesPromptsBroadcastsAndReplays(t *testing.T) {
 	if err != nil || status.ActiveRequestID != "req-1" || status.Queued != 1 || status.Status != "working" {
 		t.Fatalf("status = %#v, %v", status, err)
 	}
-	if _, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: "owner-active", NativeOwnerRole: NativeOwnerRoleDirect}); err == nil || !strings.Contains(err.Error(), "ACP request req-1 is active") {
-		t.Fatalf("native acquire during ACP turn error = %v", err)
+	if nativeOwner, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: "owner-active", NativeOwnerRole: NativeOwnerRoleDirect}); err == nil || !strings.Contains(err.Error(), "wait for the current ACP turn to settle") {
+		t.Fatalf("native acquire during accepted ACP work = %#v, %v", nativeOwner, err)
 	}
 	if _, err := harness.client.Send(context.Background(), Command{Type: "cancel", RequestID: "req-1"}); err != nil {
 		t.Fatal(err)
@@ -480,6 +559,13 @@ func TestWorkerSerializesPromptsBroadcastsAndReplays(t *testing.T) {
 	})
 	if got := harness.acp.maximumConcurrency(); got != 1 {
 		t.Fatalf("maximum ACP concurrency = %d, want 1", got)
+	}
+	harness.acp.mu.Lock()
+	providerCalls := append([]string(nil), harness.acp.calls...)
+	harness.acp.mu.Unlock()
+	wantProviderCalls := []string{"start", "refresh", "prompt:req-1", "refresh", "prompt:req-2"}
+	if !reflect.DeepEqual(providerCalls, wantProviderCalls) {
+		t.Fatalf("ACP-only FIFO did not rehydrate every prompt: calls=%v want=%v", providerCalls, wantProviderCalls)
 	}
 
 	var replay []Message
@@ -512,6 +598,308 @@ func TestWorkerSerializesPromptsBroadcastsAndReplays(t *testing.T) {
 			}
 			return false
 		})
+	}
+}
+
+func TestCancelInterruptsPredispatchRehydrationAndNextQueuedPromptProceeds(t *testing.T) {
+	harness := startWorkerHarness(t)
+	refreshGate := make(chan struct{})
+	refreshStarted := make(chan int, 3)
+	harness.acp.mu.Lock()
+	harness.acp.refreshGate = refreshGate
+	harness.acp.refreshStarted = refreshStarted
+	harness.acp.mu.Unlock()
+	accepted, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-cancel-rehydration", Message: "do not dispatch"})
+	if err != nil || accepted.State != "ready" {
+		t.Fatalf("prompt receipt = %#v, %v", accepted, err)
+	}
+	select {
+	case <-refreshStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pre-dispatch refresh did not start")
+	}
+	queued, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-cancelled-rehydration", Message: "continue next"})
+	if err != nil || queued.State != "queued" {
+		t.Fatalf("queued prompt = %#v, %v", queued, err)
+	}
+	if _, err := harness.client.Send(context.Background(), Command{Type: "cancel", RequestID: "req-cancel-rehydration"}); err != nil {
+		t.Fatal(err)
+	}
+	close(refreshGate)
+	waitStarted(t, harness.acp.started, "req-after-cancelled-rehydration")
+	harness.acp.Complete("req-after-cancelled-rehydration")
+	waitFor(t, 2*time.Second, func() bool {
+		status, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
+		return statusErr == nil && status.ActiveRequestID == "" && status.Status == string(session.StatusWaiting)
+	})
+	harness.acp.mu.Lock()
+	cancelCount, refreshCount := harness.acp.cancelCount, harness.acp.refreshCount
+	harness.acp.mu.Unlock()
+	if cancelCount != 0 || refreshCount != 2 {
+		t.Fatalf("pre-dispatch cancel runtime calls: cancel=%d refresh=%d, want 0/2", cancelCount, refreshCount)
+	}
+	lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cancelled, startedCancelled bool
+	var cancelRequestedAt, cancelledAt uint64
+	for _, line := range lines {
+		if line.RequestID != "req-cancel-rehydration" {
+			continue
+		}
+		startedCancelled = startedCancelled || line.Type == "turn_started"
+		if line.Type == "cancel_requested" {
+			cancelRequestedAt = line.Seq
+		}
+		if line.Type == "turn_completed" {
+			var receipt acp.PromptReceipt
+			cancelled = json.Unmarshal(line.Data, &receipt) == nil && receipt.StopReason == "cancelled"
+			cancelledAt = line.Seq
+		}
+	}
+	if !cancelled || startedCancelled || cancelRequestedAt == 0 || cancelRequestedAt >= cancelledAt {
+		t.Fatalf("pre-dispatch cancellation history cancelled=%t turnStarted=%t requested/completed=%d/%d: %#v", cancelled, startedCancelled, cancelRequestedAt, cancelledAt, lines)
+	}
+}
+
+func TestCancelTerminalizesAcceptedFIFOHeadBeforeDispatch(t *testing.T) {
+	harness := startWorkerHarness(t)
+	const requestID = "req-ready-cancel"
+	harness.runtime.mu.Lock()
+	harness.runtime.queue = append(harness.runtime.queue, queuedPrompt{RequestID: requestID, Message: "never dispatch", DisplayMessage: "never dispatch"})
+	harness.runtime.seenRequestIDs[requestID] = struct{}{}
+	harness.runtime.mu.Unlock()
+
+	if err := harness.runtime.cancel(context.Background(), requestID); err != nil {
+		t.Fatal(err)
+	}
+	harness.runtime.mu.Lock()
+	queued := len(harness.runtime.queue)
+	_, seen := harness.runtime.seenRequestIDs[requestID]
+	harness.runtime.mu.Unlock()
+	if queued != 0 || seen {
+		t.Fatalf("cancelled accepted head remained runnable: queued=%d seen=%t", queued, seen)
+	}
+	select {
+	case started := <-harness.acp.started:
+		t.Fatalf("cancelled accepted head reached provider: %s", started)
+	default:
+	}
+	lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requestedAt, completedAt uint64
+	for _, line := range lines {
+		if line.RequestID != requestID {
+			continue
+		}
+		if line.Type == "cancel_requested" {
+			requestedAt = line.Seq
+		}
+		if line.Type == "turn_completed" {
+			completedAt = line.Seq
+			var receipt acp.PromptReceipt
+			if json.Unmarshal(line.Data, &receipt) != nil || receipt.StopReason != "cancelled" {
+				t.Fatalf("accepted-head terminal = %s", line.Data)
+			}
+		}
+	}
+	if requestedAt != 0 || completedAt == 0 {
+		t.Fatalf("never-started cancellation should be one terminal record, requested/completed=%d/%d: %#v", requestedAt, completedAt, lines)
+	}
+}
+
+func TestCancelClaimsTerminalBeforeProviderCompletionCanPublish(t *testing.T) {
+	harness := startWorkerHarness(t)
+	returnGate := make(chan struct{})
+	returning := make(chan string, 1)
+	harness.acp.mu.Lock()
+	harness.acp.promptReturnGate = returnGate
+	harness.acp.promptReturning = returning
+	harness.acp.mu.Unlock()
+
+	if _, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-terminal-race", Message: "race completion"}); err != nil {
+		t.Fatal(err)
+	}
+	waitStarted(t, harness.acp.started, "req-terminal-race")
+	harness.acp.Complete("req-terminal-race")
+	select {
+	case requestID := <-returning:
+		if requestID != "req-terminal-race" {
+			t.Fatalf("provider returning request = %q", requestID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("provider did not reach its completion boundary")
+	}
+	if _, err := harness.client.Send(context.Background(), Command{Type: "cancel", RequestID: "req-terminal-race"}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		status, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
+		return statusErr == nil && status.ActiveRequestID == ""
+	})
+	lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requestedAt, terminalAt uint64
+	terminalCount := 0
+	for _, line := range lines {
+		if line.RequestID != "req-terminal-race" {
+			continue
+		}
+		if line.Type == "cancel_requested" {
+			requestedAt = line.Seq
+		}
+		if line.Type == "turn_completed" || line.Type == "turn_error" {
+			terminalCount++
+			terminalAt = line.Seq
+			if line.Type != "turn_completed" || !bytes.Contains(line.Data, []byte(`"stopReason":"cancelled"`)) {
+				t.Fatalf("completion raced past cancellation claim: %#v", line)
+			}
+		}
+	}
+	if terminalCount != 1 || requestedAt == 0 || terminalAt <= requestedAt {
+		t.Fatalf("terminal claim history terminals=%d requested/completed=%d/%d: %#v", terminalCount, requestedAt, terminalAt, lines)
+	}
+}
+
+func TestEnqueueJournalFailureLeavesNoRunnablePrompt(t *testing.T) {
+	harness := startWorkerHarness(t)
+	if err := harness.runtime.log.Close(); err != nil {
+		t.Fatal(err)
+	}
+	state, err := harness.runtime.enqueue("req-journal-failure", "must not run", "must not run")
+	if err == nil || state != "" {
+		t.Fatalf("enqueue with closed journal = state %q, error %v", state, err)
+	}
+	harness.runtime.mu.Lock()
+	queued := len(harness.runtime.queue)
+	_, seen := harness.runtime.seenRequestIDs["req-journal-failure"]
+	harness.runtime.mu.Unlock()
+	if queued != 0 || seen {
+		t.Fatalf("journal-rejected prompt remained runnable: queued=%d seen=%t", queued, seen)
+	}
+	harness.runtime.signalWake()
+	select {
+	case requestID := <-harness.acp.started:
+		t.Fatalf("journal-rejected prompt reached provider: %s", requestID)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestWorkerShutdownJoinsAcceptLoopAndClosesBlockedConnections(t *testing.T) {
+	harness := startWorkerHarness(t)
+	connection, err := net.Dial("unix", harness.runtime.SocketPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if _, err := connection.Write([]byte(`{"type":"status"`)); err != nil {
+		t.Fatal(err)
+	}
+	// A successful second request proves the accept loop moved past the first
+	// connection and its handler is blocked in Scanner waiting for a newline.
+	if _, err := harness.client.Send(context.Background(), Command{Type: "status"}); err != nil {
+		t.Fatal(err)
+	}
+
+	harness.cancel()
+	waitFor(t, 3*time.Second, func() bool {
+		current, loadErr := harness.repository.GetSession(context.Background(), harness.runtime.config.Session.ID)
+		return loadErr == nil && current.WorkerPID == 0 && current.WorkerSocket == ""
+	})
+}
+
+func TestWorkerShutdownJoinsCancelHandlerBeforeClosingACP(t *testing.T) {
+	harness := startWorkerHarness(t)
+	cancelGate := make(chan struct{})
+	harness.acp.mu.Lock()
+	harness.acp.trackClose = true
+	harness.acp.cancelGate = cancelGate
+	harness.acp.mu.Unlock()
+	if _, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "REQ-stop-cancel-race", Message: "continue"}); err != nil {
+		t.Fatal(err)
+	}
+	waitStarted(t, harness.acp.started, "REQ-stop-cancel-race")
+	cancelDone := make(chan error, 1)
+	go func() {
+		_, err := harness.client.Send(context.Background(), Command{Type: "cancel", RequestID: "REQ-stop-cancel-race"})
+		cancelDone <- err
+	}()
+	waitFor(t, time.Second, func() bool {
+		harness.acp.mu.Lock()
+		defer harness.acp.mu.Unlock()
+		return harness.acp.cancelInFlight == 1
+	})
+	stopDone := make(chan error, 1)
+	go func() {
+		_, err := harness.client.Send(context.Background(), Command{Type: "stop"})
+		stopDone <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	harness.acp.mu.Lock()
+	closedEarly := harness.acp.closed
+	harness.acp.mu.Unlock()
+	if closedEarly {
+		t.Fatal("ACP closed while cancel handler was still using it")
+	}
+	close(cancelGate)
+	if err := <-cancelDone; err != nil && !strings.Contains(err.Error(), "EOF") {
+		t.Fatal(err)
+	}
+	if err := <-stopDone; err != nil && !strings.Contains(err.Error(), "EOF") {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, func() bool {
+		harness.acp.mu.Lock()
+		defer harness.acp.mu.Unlock()
+		return harness.acp.closed
+	})
+	harness.acp.mu.Lock()
+	closeWhileCancel := harness.acp.closeWhileCancel
+	harness.acp.mu.Unlock()
+	if closeWhileCancel {
+		t.Fatal("ACP Close overlapped an in-flight cancel handler")
+	}
+}
+
+func TestQueuedCancellationJournalFailureStopsBeforePromptCanRun(t *testing.T) {
+	runtime, fake := disconnectedIdentityWorker(t, "acp-canonical", "native-canonical")
+	history, err := sessionlog.Open(runtime.LogPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.log = history
+	runtime.hub = newHub(history.LastSequence())
+	runtime.queue = []queuedPrompt{{RequestID: "REQ-cancel-journal", Message: "must not run"}}
+	runtime.seenRequestIDs["REQ-cancel-journal"] = struct{}{}
+	stopContext, stop := context.WithCancel(context.Background())
+	runtime.stop = stop
+	if err := history.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.cancel(context.Background(), "REQ-cancel-journal"); err == nil || !strings.Contains(err.Error(), "Session log is closed") {
+		t.Fatalf("queued cancel journal error = %v", err)
+	}
+	runtime.mu.Lock()
+	queued, transportError := len(runtime.queue), runtime.transportError
+	runtime.mu.Unlock()
+	if queued != 0 || !strings.Contains(transportError, "persist cancellation") {
+		t.Fatalf("failed cancellation queue=%d transportError=%q", queued, transportError)
+	}
+	select {
+	case <-stopContext.Done():
+	default:
+		t.Fatal("journal-uncertain cancellation did not stop the worker")
+	}
+	runtime.signalWake()
+	select {
+	case requestID := <-fake.started:
+		t.Fatalf("journal-uncertain cancelled prompt reached provider: %s", requestID)
+	case <-time.After(50 * time.Millisecond):
 	}
 }
 
@@ -673,8 +1061,8 @@ func TestCancelAndStopAbandonPendingPermission(t *testing.T) {
 			t.Fatal("stop did not release pending prompt")
 		}
 		waitFor(t, 2*time.Second, func() bool {
-			_, statErr := os.Stat(harness.runtime.SocketPath())
-			return os.IsNotExist(statErr)
+			current, loadErr := harness.runtime.config.Repository.GetSession(context.Background(), harness.runtime.config.Session.ID)
+			return loadErr == nil && current.WorkerPID == 0 && current.Status == session.StatusStopped
 		})
 		lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
 		if err != nil {
@@ -723,46 +1111,7 @@ func containsString(values []string, wanted string) bool {
 	return false
 }
 
-func TestNativeRefreshDefersUntilActiveAndQueuedPromptsFinish(t *testing.T) {
-	harness := startWorkerHarness(t)
-	first, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-active", Message: "active"})
-	if err != nil || first.State != "ready" {
-		t.Fatalf("active prompt = %#v, %v", first, err)
-	}
-	waitStarted(t, harness.acp.started, "req-active")
-	accepted, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-queued", Message: "queued"})
-	if err != nil || accepted.State != "queued" {
-		t.Fatalf("prompt = %#v, %v", accepted, err)
-	}
-	refresh, err := harness.client.Send(context.Background(), Command{Type: "refresh"})
-	if err != nil || refresh.Type != "refresh_scheduled" || refresh.State != "deferred" {
-		t.Fatalf("refresh = %#v, %v", refresh, err)
-	}
-	harness.acp.mu.Lock()
-	if harness.acp.refreshCount != 0 {
-		harness.acp.mu.Unlock()
-		t.Fatal("refresh ran while an ACP turn was active")
-	}
-	harness.acp.mu.Unlock()
-	harness.acp.Complete("req-active")
-	waitStarted(t, harness.acp.started, "req-queued")
-	status, err := harness.client.Send(context.Background(), Command{Type: "status"})
-	if err != nil || !status.RefreshPending || status.ActiveRequestID != "req-queued" {
-		t.Fatalf("status while refresh deferred = %#v, %v", status, err)
-	}
-	harness.acp.Complete("req-queued")
-	waitFor(t, 2*time.Second, func() bool {
-		harness.acp.mu.Lock()
-		defer harness.acp.mu.Unlock()
-		return harness.acp.refreshCount == 1
-	})
-	waitFor(t, 2*time.Second, func() bool {
-		latest, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
-		return statusErr == nil && !latest.RefreshPending && !latest.Refreshing && latest.Queued == 0 && latest.ActiveRequestID == ""
-	})
-}
-
-func TestNativeOwnershipQueuesACPThroughExactRefreshBarrier(t *testing.T) {
+func TestNativeOwnershipRejectsACPThenReleaseRehydratesBeforePrompt(t *testing.T) {
 	harness := startWorkerHarness(t)
 	const ownerToken = "owner-native-barrier"
 	reconcileRelease := make(chan struct{})
@@ -783,75 +1132,78 @@ func TestNativeOwnershipQueuesACPThroughExactRefreshBarrier(t *testing.T) {
 	if err != nil || marker.Mode().Perm() != 0o600 {
 		t.Fatalf("native ownership marker = %#v, %v", marker, err)
 	}
-	accepted, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-native", Message: "continue"})
-	if err != nil || accepted.State != "queued" {
-		t.Fatalf("prompt while native owns = %#v, %v", accepted, err)
+	if _, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-during-native", Message: "continue"}); err == nil || !strings.Contains(err.Error(), "native harness is running") || !strings.Contains(err.Error(), "prompt was not accepted") {
+		t.Fatalf("prompt while native owns error = %v", err)
+	}
+	if duplicate, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleDirect}); err != nil || duplicate.State != "already_acquired" {
+		t.Fatalf("exclusive native reuse = %#v, %v", duplicate, err)
 	}
 	status, err := harness.client.Send(context.Background(), Command{Type: "status"})
-	if err != nil || !status.NativeOwned || status.ProviderWriter != "native" || status.Queued != 1 || status.ActiveRequestID != "" {
+	if err != nil || !status.NativeOwned || status.Queued != 0 || status.ActiveRequestID != "" {
 		t.Fatalf("native-owned status = %#v, %v", status, err)
 	}
 	if _, err := harness.client.Send(context.Background(), Command{Type: "stop"}); err == nil || !strings.Contains(err.Error(), "exit the native provider") {
 		t.Fatalf("stop while native owns error = %v", err)
 	}
-	select {
-	case requestID := <-harness.acp.started:
-		t.Fatalf("ACP prompt %s started while native owned the provider", requestID)
-	case <-time.After(100 * time.Millisecond):
-	}
-	harness.acp.mu.Lock()
-	harness.acp.refreshWait = true
-	harness.acp.mu.Unlock()
 	released, err := harness.client.Send(context.Background(), Command{Type: "native_release", OwnerToken: ownerToken, NativeGeneration: acquired.NativeGeneration, NativeActivity: true})
-	if err != nil || released.State != "refresh_scheduled" {
+	if err != nil || released.State != "released" {
 		t.Fatalf("native release = %#v, %v", released, err)
 	}
-	waitFor(t, time.Second, func() bool {
-		status, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
-		return statusErr == nil && !status.NativeOwned && status.Refreshing && status.ProviderWriter == "refresh"
-	})
-	if _, err := os.Stat(harness.runtime.NativeOwnerPath()); err != nil {
-		t.Fatalf("refresh barrier marker disappeared before exact refresh completed: %v", err)
+	releaseMarker, err := os.ReadFile(harness.runtime.NativeOwnerPath())
+	if err != nil || !bytes.Contains(releaseMarker, []byte(`"state": "refresh_pending"`)) {
+		t.Fatalf("native release freshness marker = %q, %v", releaseMarker, err)
 	}
-	if _, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleDirect}); err == nil || !strings.Contains(err.Error(), "identity refresh is active") {
-		t.Fatalf("native acquire during refresh error = %v", err)
-	}
-	select {
-	case requestID := <-harness.acp.started:
-		t.Fatalf("ACP prompt %s beat the exact identity refresh", requestID)
-	case <-time.After(100 * time.Millisecond):
+	accepted, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-native", Message: "continue again"})
+	if err != nil || accepted.State != "ready" {
+		t.Fatalf("post-release ACP prompt = %#v, %v", accepted, err)
 	}
 	select {
 	case <-harness.reconcile.started:
 	case <-time.After(2 * time.Second):
-		t.Fatal("provider transcript reconciliation did not start after exact ACP recovery")
+		t.Fatal("provider transcript reconciliation did not start after native release")
 	}
-	if _, err := os.Stat(harness.runtime.NativeOwnerPath()); err != nil {
-		t.Fatalf("refresh barrier marker disappeared during provider transcript reconciliation: %v", err)
-	}
-	select {
-	case requestID := <-harness.acp.started:
-		t.Fatalf("ACP prompt %s beat provider transcript reconciliation", requestID)
-	case <-time.After(100 * time.Millisecond):
+	waitStarted(t, harness.acp.started, "req-after-native")
+	if _, err := os.Stat(harness.runtime.NativeOwnerPath()); !os.IsNotExist(err) {
+		t.Fatalf("native release freshness marker remains after exact ACP rehydration: %v", err)
 	}
 	close(reconcileRelease)
-	waitStarted(t, harness.acp.started, "req-after-native")
+	waitFor(t, 2*time.Second, func() bool {
+		lines, readErr := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
+		if readErr != nil {
+			return false
+		}
+		for _, line := range lines {
+			if line.Type == "provider_transcript_reconciled" {
+				return true
+			}
+		}
+		return false
+	})
 	harness.acp.mu.Lock()
 	refreshCount, resumeCount := harness.acp.refreshCount, harness.acp.resumeCount
 	harness.acp.mu.Unlock()
-	if refreshCount != 1 || resumeCount != 1 {
-		t.Fatalf("exact refresh/recovery count = %d/%d, want 1/1", refreshCount, resumeCount)
+	if refreshCount != 1 || resumeCount != 0 {
+		t.Fatalf("exact ACP rehydration after native release: refresh=%d resume=%d, want 1/0", refreshCount, resumeCount)
 	}
-	if _, err := os.Stat(harness.runtime.NativeOwnerPath()); !os.IsNotExist(err) {
-		t.Fatalf("native refresh barrier marker remains after exact transcript reconciliation: %v", err)
+	wantCalls := []string{"start", "refresh", "prompt:req-after-native"}
+	harness.acp.mu.Lock()
+	calls := append([]string(nil), harness.acp.calls...)
+	harness.acp.mu.Unlock()
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("provider activation order = %v, want %v", calls, wantCalls)
 	}
 	lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var reconciledAt, dispatchedAt uint64
+	var readyRecorded, falselyQueued bool
 	for _, line := range lines {
 		switch {
+		case line.RequestID == "req-after-native" && line.Type == "prompt_ready":
+			readyRecorded = true
+		case line.RequestID == "req-after-native" && line.Type == "prompt_queued":
+			falselyQueued = true
 		case line.Type == "provider_transcript_reconciled":
 			reconciledAt = line.Seq
 			var payload map[string]string
@@ -862,7 +1214,15 @@ func TestNativeOwnershipQueuesACPThroughExactRefreshBarrier(t *testing.T) {
 			dispatchedAt = line.Seq
 		}
 	}
-	if reconciledAt == 0 || dispatchedAt == 0 || reconciledAt >= dispatchedAt {
+	for _, line := range lines {
+		if line.RequestID == "req-during-native" {
+			t.Fatalf("rejected native-open prompt mutated log: %#v", line)
+		}
+	}
+	if !readyRecorded || falselyQueued {
+		t.Fatalf("ready ACP request provenance ready=%t falselyQueued=%t", readyRecorded, falselyQueued)
+	}
+	if reconciledAt == 0 || dispatchedAt == 0 || dispatchedAt >= reconciledAt {
 		t.Fatalf("provider transcript reconcile/dispatch ordering = %d/%d", reconciledAt, dispatchedAt)
 	}
 	harness.reconcile.mu.Lock()
@@ -871,6 +1231,346 @@ func TestNativeOwnershipQueuesACPThroughExactRefreshBarrier(t *testing.T) {
 	}
 	harness.reconcile.mu.Unlock()
 	harness.acp.Complete("req-after-native")
+}
+
+func TestReleasedNativeGenerationRehydratesBeforeEveryACPPrompt(t *testing.T) {
+	harness := startWorkerHarness(t)
+	const ownerToken = "owner-alternating-surfaces"
+	acquired, err := harness.client.Send(context.Background(), Command{
+		Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleDirect,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.client.Send(context.Background(), Command{
+		Type: "native_release", OwnerToken: ownerToken, NativeGeneration: acquired.NativeGeneration, NativeActivity: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, requestID := range []string{"req-after-native-one", "req-after-native-two"} {
+		accepted, promptErr := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: requestID, Message: "continue exact conversation"})
+		if promptErr != nil || accepted.State != "ready" {
+			t.Fatalf("%s accepted = %#v, %v", requestID, accepted, promptErr)
+		}
+		waitStarted(t, harness.acp.started, requestID)
+		harness.acp.Complete(requestID)
+		waitFor(t, 2*time.Second, func() bool {
+			status, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
+			return statusErr == nil && status.ActiveRequestID == "" && status.Status == string(session.StatusWaiting)
+		})
+	}
+
+	harness.acp.mu.Lock()
+	calls := append([]string(nil), harness.acp.calls...)
+	harness.acp.mu.Unlock()
+	want := []string{"start", "refresh", "prompt:req-after-native-one", "refresh", "prompt:req-after-native-two"}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("alternating provider calls = %v, want %v", calls, want)
+	}
+}
+
+func TestNativeActivationDuringACPRehydrationIsRejectedBeforeProviderStart(t *testing.T) {
+	harness := startWorkerHarness(t)
+	acquired, err := harness.client.Send(context.Background(), Command{
+		Type: "native_acquire", OwnerToken: "owner-release-during-refresh", NativeOwnerRole: NativeOwnerRoleDirect,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.client.Send(context.Background(), Command{
+		Type: "native_release", OwnerToken: "owner-release-during-refresh", NativeGeneration: acquired.NativeGeneration, NativeActivity: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	refreshGate := make(chan struct{})
+	refreshStarted := make(chan int, 4)
+	harness.acp.mu.Lock()
+	harness.acp.refreshGate = refreshGate
+	harness.acp.refreshStarted = refreshStarted
+	harness.acp.mu.Unlock()
+	accepted, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-release-during-refresh", Message: "continue exactly"})
+	if err != nil || accepted.State != "ready" {
+		t.Fatalf("prompt receipt = %#v, %v", accepted, err)
+	}
+	select {
+	case attempt := <-refreshStarted:
+		if attempt != 1 {
+			t.Fatalf("first refresh attempt = %d", attempt)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first ACP refresh did not start")
+	}
+	if _, err := harness.client.Send(context.Background(), Command{
+		Type: "native_acquire", OwnerToken: "new-owner-during-refresh", NativeOwnerRole: NativeOwnerRoleDirect,
+	}); err == nil || !strings.Contains(err.Error(), "wait for the current ACP turn to settle") {
+		t.Fatalf("native activation during ACP rehydration error = %v", err)
+	}
+	close(refreshGate)
+	waitStarted(t, harness.acp.started, "req-release-during-refresh")
+	if _, err := os.Stat(harness.runtime.NativeOwnerPath()); !os.IsNotExist(err) {
+		t.Fatalf("release freshness marker remains before provider prompt: %v", err)
+	}
+	harness.acp.mu.Lock()
+	calls := append([]string(nil), harness.acp.calls...)
+	harness.acp.mu.Unlock()
+	want := []string{"start", "refresh", "prompt:req-release-during-refresh"}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("release/refresh provider order = %v, want %v", calls, want)
+	}
+	harness.acp.Complete("req-release-during-refresh")
+}
+
+func TestNativeActivationBetweenRehydrationAndDispatchIsRejected(t *testing.T) {
+	harness := startWorkerHarness(t)
+	harness.runtime.mu.Lock()
+	harness.runtime.active = &queuedPrompt{RequestID: "req-release-before-dispatch"}
+	harness.runtime.mu.Unlock()
+	epoch, err := harness.runtime.rehydrateACPForPrompt(context.Background(), "req-release-before-dispatch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.client.Send(context.Background(), Command{
+		Type: "native_acquire", OwnerToken: "owner-between-rehydrate-dispatch", NativeOwnerRole: NativeOwnerRoleDirect,
+	}); err == nil || !strings.Contains(err.Error(), "wait for the current ACP turn to settle") {
+		t.Fatalf("native activation between rehydration and dispatch error = %v", err)
+	}
+	if err := harness.runtime.publishACPDispatch("req-release-before-dispatch", epoch); err != nil {
+		t.Fatalf("exclusive ACP dispatch boundary = %v", err)
+	}
+	lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range lines {
+		if line.Type == "native_acquired" {
+			t.Fatal("rejected native activation published ownership")
+		}
+	}
+	harness.acp.mu.Lock()
+	refreshCount := harness.acp.refreshCount
+	harness.acp.mu.Unlock()
+	if refreshCount != 1 {
+		t.Fatalf("refreshes at exclusive dispatch boundary = %d, want 1", refreshCount)
+	}
+	if _, err := os.Stat(harness.runtime.NativeOwnerPath()); !os.IsNotExist(err) {
+		t.Fatalf("rejected native activation created ownership marker: %v", err)
+	}
+}
+
+func TestCancelBetweenRehydrationAndDispatchPreventsTurnStart(t *testing.T) {
+	harness := startWorkerHarness(t)
+	promptContext, cancelPrompt := context.WithCancel(context.Background())
+	harness.runtime.mu.Lock()
+	harness.runtime.active = &queuedPrompt{RequestID: "req-cancel-before-dispatch"}
+	harness.runtime.activeCancel = cancelPrompt
+	harness.runtime.seenRequestIDs["req-cancel-before-dispatch"] = struct{}{}
+	harness.runtime.mu.Unlock()
+	epoch, err := harness.runtime.rehydrateACPForPrompt(promptContext, "req-cancel-before-dispatch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := harness.runtime.cancel(context.Background(), "req-cancel-before-dispatch"); err != nil {
+		t.Fatal(err)
+	}
+	if err := harness.runtime.publishACPDispatch("req-cancel-before-dispatch", epoch); !errors.Is(err, context.Canceled) {
+		t.Fatalf("dispatch after cancellation = %v", err)
+	}
+	cancelled, claimed := harness.runtime.claimPromptTerminal("req-cancel-before-dispatch", true)
+	if !claimed || !cancelled {
+		t.Fatalf("cancelled terminal claim = cancelled %t claimed %t", cancelled, claimed)
+	}
+	harness.runtime.finishClaimedCancelledPrompt("req-cancel-before-dispatch")
+
+	lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requestedAt, completedAt uint64
+	for _, line := range lines {
+		if line.RequestID != "req-cancel-before-dispatch" {
+			continue
+		}
+		if line.Type == "turn_started" {
+			t.Fatal("cancelled freshness boundary emitted turn_started")
+		}
+		if line.Type == "cancel_requested" {
+			requestedAt = line.Seq
+		}
+		if line.Type == "turn_completed" {
+			completedAt = line.Seq
+		}
+	}
+	if requestedAt == 0 || completedAt <= requestedAt {
+		t.Fatalf("boundary cancellation order = %d/%d: %#v", requestedAt, completedAt, lines)
+	}
+	select {
+	case requestID := <-harness.acp.started:
+		t.Fatalf("cancelled boundary reached provider Prompt: %s", requestID)
+	default:
+	}
+}
+
+func TestNewNativeActivationRejectsAcceptedACPWorkWithoutQueuingOrCancellingIt(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		setup func(*Worker)
+	}{
+		{name: "active", setup: func(runtime *Worker) { runtime.active = &queuedPrompt{RequestID: "req-active"} }},
+		{name: "queued", setup: func(runtime *Worker) { runtime.queue = []queuedPrompt{{RequestID: "req-queued"}} }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runtime, _ := disconnectedIdentityWorker(t, "acp-canonical", "native-canonical")
+			if err := os.MkdirAll(runtime.config.WorkersDirectory, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			runtime.mu.Lock()
+			test.setup(runtime)
+			runtime.mu.Unlock()
+			_, _, err := runtime.acquireNative("new-native-owner", NativeOwnerRoleDirect, "")
+			if err == nil || !strings.Contains(err.Error(), "wait for the current ACP turn to settle") || !strings.Contains(err.Error(), "open Native CLI again") {
+				t.Fatalf("native activation error = %v", err)
+			}
+			if _, markerErr := os.Stat(runtime.NativeOwnerPath()); !os.IsNotExist(markerErr) {
+				t.Fatalf("rejected native activation created ownership marker: %v", markerErr)
+			}
+		})
+	}
+}
+
+func TestNativeReservationRejectsACPBeforeProviderActivation(t *testing.T) {
+	harness := startWorkerHarness(t)
+	reserved, err := harness.client.Send(context.Background(), Command{
+		Type: "native_acquire", OwnerToken: "owner-provider-activation", NativeOwnerRole: NativeOwnerRoleReservation,
+	})
+	if err != nil || reserved.State != "reserved" {
+		t.Fatalf("native reservation = %#v, %v", reserved, err)
+	}
+	if _, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-before-native-activation", Message: "continue"}); err == nil || !strings.Contains(err.Error(), "active launch reservation") {
+		t.Fatalf("ACP prompt during native reservation error = %v", err)
+	}
+	status, err := harness.client.Send(context.Background(), Command{
+		Type: "native_reservation_status", OwnerToken: "owner-provider-activation",
+	})
+	if err != nil || status.State != "reserved" || status.NativeGeneration != reserved.NativeGeneration {
+		t.Fatalf("reservation after rejected activation = %#v, %v", status, err)
+	}
+	activated, err := harness.client.Send(context.Background(), Command{
+		Type: "native_acquire", OwnerToken: "owner-provider-activation", NativeOwnerRole: NativeOwnerRoleProvider, NativeGeneration: reserved.NativeGeneration,
+	})
+	if err != nil || activated.State != "activated" {
+		t.Fatalf("provider activation retry = %#v, %v", activated, err)
+	}
+	if _, err := harness.client.Send(context.Background(), Command{
+		Type: "native_release", OwnerToken: "owner-provider-activation", NativeGeneration: reserved.NativeGeneration,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestACPRehydrationIntegrityFailureQuarantinesBeforeQueuedPrompt(t *testing.T) {
+	harness := startWorkerHarness(t)
+	refreshGate := make(chan struct{})
+	refreshStarted := make(chan int, 1)
+	harness.acp.mu.Lock()
+	harness.acp.refreshErr = &acp.ProtocolError{Operation: "refresh", Message: "SECRET refresh transport failure"}
+	harness.acp.resumeErr = &acp.ProtocolError{Operation: "resume", Message: "SECRET resume transport failure"}
+	harness.acp.refreshGate = refreshGate
+	harness.acp.refreshStarted = refreshStarted
+	harness.acp.mu.Unlock()
+
+	failed, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-rehydrate-fails", Message: "do not dispatch stale"})
+	if err != nil || failed.State != "ready" {
+		t.Fatalf("failed rehydration receipt = %#v, %v", failed, err)
+	}
+	select {
+	case <-refreshStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pre-prompt refresh did not start")
+	}
+	queued, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-rehydrate-failure", Message: "must not dispatch"})
+	if err != nil || queued.State != "queued" {
+		t.Fatalf("queued behind rehydration = %#v, %v", queued, err)
+	}
+	close(refreshGate)
+	waitFor(t, 3*time.Second, func() bool {
+		current, getErr := harness.repository.GetSession(context.Background(), "S-worker")
+		return getErr == nil && current.WorkerPID == 0 && current.Status == session.StatusStopped
+	})
+	select {
+	case requestID := <-harness.acp.started:
+		t.Fatalf("prompt reached provider without exact rehydration: %s", requestID)
+	default:
+	}
+	lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal := map[string]bool{}
+	for _, line := range lines {
+		if line.Type != "turn_error" {
+			continue
+		}
+		if bytes.Contains(line.Data, []byte("SECRET")) || len(line.Data) > 512 {
+			t.Fatalf("public continuity failure leaked or was unbounded: %s", line.Data)
+		}
+		terminal[line.RequestID] = true
+	}
+	if !terminal["req-rehydrate-fails"] || !terminal["req-after-rehydrate-failure"] {
+		t.Fatalf("continuity quarantine terminal history = %#v", lines)
+	}
+}
+
+func TestACPRehydrationProviderConflictKeepsSafeTurnProvenance(t *testing.T) {
+	harness := startWorkerHarness(t)
+	harness.acp.mu.Lock()
+	harness.acp.refreshErr = &acp.ProviderTurnError{
+		Code: "turn_failed", DetailCode: "conversation_conflict", Message: "SECRET refresh provider detail", Retryable: true,
+	}
+	harness.acp.resumeErr = &acp.ProviderTurnError{
+		Code: "turn_failed", DetailCode: "conversation_conflict", Message: "SECRET resume provider detail", Retryable: true,
+	}
+	harness.acp.mu.Unlock()
+
+	accepted, err := harness.client.Send(context.Background(), Command{
+		Type: "prompt", RequestID: "req-rehydrate-conflict", Message: "do not dispatch through a provider conflict",
+	})
+	if err != nil || accepted.State != "ready" {
+		t.Fatalf("provider-conflict receipt = %#v, %v", accepted, err)
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		lines, readErr := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
+		if readErr != nil {
+			return false
+		}
+		for _, line := range lines {
+			if line.Type != "turn_error" || line.RequestID != "req-rehydrate-conflict" {
+				continue
+			}
+			var failure struct {
+				Source    string `json:"source"`
+				Code      string `json:"code"`
+				Retryable bool   `json:"retryable"`
+				Message   string `json:"message"`
+			}
+			return json.Unmarshal(line.Data, &failure) == nil && failure.Source == "provider" && failure.Code == "conflict" &&
+				failure.Retryable && strings.Contains(failure.Message, "conversation conflict") && !bytes.Contains(line.Data, []byte("SECRET"))
+		}
+		return false
+	})
+	select {
+	case requestID := <-harness.acp.started:
+		t.Fatalf("provider-conflicted rehydration dispatched Prompt: %s", requestID)
+	default:
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		current, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
+		return statusErr == nil && current.Status == string(session.StatusWaiting) && current.ActiveRequestID == ""
+	})
+	status, err := harness.client.Send(context.Background(), Command{Type: "status"})
+	if err != nil || status.Status != string(session.StatusWaiting) || status.ActiveRequestID != "" {
+		t.Fatalf("status after provider-conflicted rehydration = %#v, %v", status, err)
+	}
 }
 
 func TestGenerationScopedReservationRecoveryThenNativeExitContinuesACP(t *testing.T) {
@@ -893,18 +1593,14 @@ func TestGenerationScopedReservationRecoveryThenNativeExitContinuesACP(t *testin
 	recovered, err := harness.client.Send(context.Background(), Command{
 		Type: "native_recover_reservation", OwnerToken: ownerToken, NativeGeneration: reserved.NativeGeneration,
 	})
-	if err != nil || recovered.State != "refresh_scheduled" {
+	if err != nil || recovered.State != "released" {
 		t.Fatalf("reservation recovery = %#v, %v", recovered, err)
 	}
 	if _, err := harness.client.Send(context.Background(), Command{
 		Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleProvider, NativeGeneration: reserved.NativeGeneration,
-	}); err == nil || (!strings.Contains(err.Error(), "reservation is no longer active") && !strings.Contains(err.Error(), "identity refresh")) {
+	}); err == nil || !strings.Contains(err.Error(), "reservation is no longer active") {
 		t.Fatalf("delayed recovered-generation activation error = %v", err)
 	}
-	waitFor(t, 3*time.Second, func() bool {
-		current, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
-		return statusErr == nil && !current.NativeOwned && !current.RefreshPending && !current.Refreshing
-	})
 
 	second, err := harness.client.Send(context.Background(), Command{
 		Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleReservation,
@@ -931,14 +1627,17 @@ func TestGenerationScopedReservationRecoveryThenNativeExitContinuesACP(t *testin
 	}); err == nil || !strings.Contains(err.Error(), "active provider-native ownership") {
 		t.Fatalf("active owner recovery error = %v", err)
 	}
-	queued, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-reservation-recovery", Message: "continue"})
-	if err != nil || queued.State != "queued" {
-		t.Fatalf("prompt during active native owner = %#v, %v", queued, err)
+	if _, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-during-active-reservation-owner", Message: "do not cross surfaces"}); err == nil || !strings.Contains(err.Error(), "native harness is running") {
+		t.Fatalf("prompt during active native owner error = %v", err)
 	}
 	if _, err := harness.client.Send(context.Background(), Command{
 		Type: "native_release", OwnerToken: ownerToken, NativeGeneration: second.NativeGeneration, NativeActivity: true,
 	}); err != nil {
 		t.Fatal(err)
+	}
+	accepted, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-reservation-recovery", Message: "continue"})
+	if err != nil || accepted.State != "ready" {
+		t.Fatalf("prompt after native release = %#v, %v", accepted, err)
 	}
 	waitStarted(t, harness.acp.started, "req-after-reservation-recovery")
 	harness.acp.Complete("req-after-reservation-recovery")
@@ -1014,12 +1713,65 @@ func TestNativeActivationPublishFailureRestoresRecoverableReservationWithoutProv
 	}
 	runtime.log = reopened
 	recovered, err := runtime.recoverNativeReservation(ownerToken, generation)
-	if err != nil || recovered != "refresh_scheduled" {
+	if err != nil || recovered != "released" {
 		t.Fatalf("rolled-back reservation recovery = %q, %v", recovered, err)
 	}
 }
 
-func TestProviderTranscriptReconcileFailureKeepsDurableBarrierRetryable(t *testing.T) {
+func TestNativeAcquirePublishFailureRestoresRefreshPendingAcrossRestart(t *testing.T) {
+	runtime, _ := disconnectedIdentityWorker(t, "acp-canonical", "native-canonical")
+	if err := os.MkdirAll(runtime.config.WorkersDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const (
+		priorOwner      = "released-native-owner"
+		priorGeneration = "0123456789abcdef0123456789abcdef"
+	)
+	if err := runtime.persistNativeOwnership(nativeMarkerRefreshPending, priorOwner, priorGeneration); err != nil {
+		t.Fatal(err)
+	}
+	runtime.nativeReconcilePending = true
+	history, err := sessionlog.Open(runtime.LogPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.log = history
+	runtime.hub = newHub(history.LastSequence())
+	if err := history.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if state, generation, err := runtime.acquireNative("new-native-owner", NativeOwnerRoleDirect, ""); err == nil || state != "" || generation != "" {
+		t.Fatalf("native acquire with failed journal = %q/%q, %v", state, generation, err)
+	}
+	body, err := os.ReadFile(runtime.NativeOwnerPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var marker nativeOwnerMarker
+	if err := json.Unmarshal(body, &marker); err != nil {
+		t.Fatal(err)
+	}
+	if marker.State != nativeMarkerRefreshPending || marker.OwnerToken != priorOwner || marker.Generation != priorGeneration {
+		t.Fatalf("restored refresh marker = %#v", marker)
+	}
+
+	restarted, err := New(runtime.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.restoreNativeOwnership(); err != nil {
+		t.Fatal(err)
+	}
+	restarted.mu.Lock()
+	owner, pending := restarted.nativeOwnerToken, restarted.nativeReconcilePending
+	restarted.mu.Unlock()
+	if owner != "" || !pending {
+		t.Fatalf("restart restored owner=%q pending=%t, want no provider authorization and durable freshness", owner, pending)
+	}
+}
+
+func TestProviderTranscriptReconcileFailureDoesNotBlockACP(t *testing.T) {
 	harness := startWorkerHarness(t)
 	const ownerToken = "owner-reconcile-retry"
 	harness.reconcile.mu.Lock()
@@ -1029,82 +1781,62 @@ func TestProviderTranscriptReconcileFailureKeepsDurableBarrierRetryable(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if queued, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-blocked-by-reconcile", Message: "must wait"}); err != nil || queued.State != "queued" {
-		t.Fatalf("queued prompt = %#v, %v", queued, err)
+	released, err := harness.client.Send(context.Background(), Command{Type: "native_release", OwnerToken: ownerToken, NativeGeneration: acquired.NativeGeneration, NativeActivity: true})
+	if err != nil || released.State != "released" {
+		t.Fatalf("native release = %#v, %v", released, err)
 	}
-	if _, err := harness.client.Send(context.Background(), Command{Type: "native_release", OwnerToken: ownerToken, NativeGeneration: acquired.NativeGeneration, NativeActivity: true}); err != nil {
-		t.Fatal(err)
+	accepted, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-during-reconcile-failure", Message: "continue"})
+	if err != nil || accepted.State != "ready" {
+		t.Fatalf("ACP prompt after native release = %#v, %v", accepted, err)
 	}
-	waitFor(t, 3*time.Second, func() bool {
-		current, err := harness.repository.GetSession(context.Background(), harness.runtime.config.Session.ID)
-		return err == nil && current.WorkerPID == 0
+	waitStarted(t, harness.acp.started, "req-during-reconcile-failure")
+	harness.acp.Complete("req-during-reconcile-failure")
+	waitFor(t, 2*time.Second, func() bool {
+		lines, readErr := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
+		if readErr != nil {
+			return false
+		}
+		for _, line := range lines {
+			if line.Type == "provider_transcript_reconcile_warning" {
+				return true
+			}
+		}
+		return false
 	})
-	select {
-	case requestID := <-harness.acp.started:
-		t.Fatalf("ACP prompt %s dispatched after provider transcript reconciliation failed", requestID)
-	case <-time.After(150 * time.Millisecond):
+	if _, err := os.Stat(harness.runtime.NativeOwnerPath()); !os.IsNotExist(err) {
+		t.Fatalf("native owner marker remains after reconcile warning: %v", err)
 	}
-	marker, err := os.ReadFile(harness.runtime.NativeOwnerPath())
-	if err != nil || !strings.Contains(string(marker), `"state": "refresh_pending"`) {
-		t.Fatalf("durable refresh barrier after reconcile failure = %q, %v", marker, err)
+	status, err := harness.client.Send(context.Background(), Command{Type: "status"})
+	if err != nil || status.Status == string(session.StatusStopped) {
+		t.Fatalf("worker status after reconcile warning = %#v, %v", status, err)
 	}
-	failedLines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
+}
+
+func TestWorkerShutdownCancelsBlockedProviderTranscriptReconcile(t *testing.T) {
+	harness := startWorkerHarness(t)
+	harness.reconcile.mu.Lock()
+	harness.reconcile.wait = make(chan struct{})
+	harness.reconcile.mu.Unlock()
+	acquired, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: "owner-blocked-reconcile", NativeOwnerRole: NativeOwnerRoleDirect})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, line := range failedLines {
-		if line.Type == "provider_transcript_reconciled" {
-			t.Fatalf("failed provider transcript read emitted successful reconciliation: %#v", line)
-		}
+	if _, err := harness.client.Send(context.Background(), Command{
+		Type: "native_release", OwnerToken: "owner-blocked-reconcile", NativeGeneration: acquired.NativeGeneration, NativeActivity: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-harness.reconcile.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("provider transcript reconciliation did not start")
 	}
 
-	current, err := harness.repository.GetSession(context.Background(), harness.runtime.config.Session.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	retryReconciler := newFakeTranscriptReconciler()
-	retryConfig := harness.runtime.config
-	retryConfig.Session = current
-	retryConfig.ReconcileProviderTranscript = retryReconciler.Reconcile
-	restarted, err := New(retryConfig)
-	if err != nil {
-		t.Fatal(err)
-	}
-	restartContext, stopRestart := context.WithCancel(context.Background())
-	restartDone := make(chan error, 1)
-	go func() { restartDone <- restarted.Run(restartContext) }()
-	t.Cleanup(func() {
-		stopRestart()
-		select {
-		case err := <-restartDone:
-			if err != nil {
-				t.Errorf("retry Worker.Run() error = %v", err)
-			}
-		case <-time.After(3 * time.Second):
-			t.Error("retry worker did not stop")
-		}
-	})
-	restartedClient := NewSocketClient(restarted.SocketPath())
+	harness.cancel()
 	waitFor(t, 3*time.Second, func() bool {
-		probe, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer cancel()
-		return restartedClient.Ping(probe) == nil
+		current, loadErr := harness.repository.GetSession(context.Background(), harness.runtime.config.Session.ID)
+		return loadErr == nil && current.WorkerPID == 0 && current.WorkerSocket == ""
 	})
-	waitFor(t, 3*time.Second, func() bool {
-		_, markerErr := os.Stat(restarted.NativeOwnerPath())
-		status, statusErr := restartedClient.Send(context.Background(), Command{Type: "status"})
-		return os.IsNotExist(markerErr) && statusErr == nil && !status.RefreshPending && !status.Refreshing
-	})
-	retryReconciler.mu.Lock()
-	if retryReconciler.calls != 1 {
-		t.Fatalf("provider transcript reconcile retries = %d, want 1", retryReconciler.calls)
-	}
-	retryReconciler.mu.Unlock()
-	if accepted, err := restartedClient.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-reconcile-retry", Message: "continue"}); err != nil || accepted.State != "ready" {
-		t.Fatalf("prompt after retry = %#v, %v", accepted, err)
-	}
-	waitStarted(t, harness.acp.started, "req-after-reconcile-retry")
-	harness.acp.Complete("req-after-reconcile-retry")
 }
 
 func TestNativeOwnershipSurvivesWorkerRestartUntilOwnerRelease(t *testing.T) {
@@ -1113,6 +1845,9 @@ func TestNativeOwnershipSurvivesWorkerRestartUntilOwnerRelease(t *testing.T) {
 	acquired, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleDirect})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if _, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-before-worker-restart", Message: "continue before restart"}); err == nil || !strings.Contains(err.Error(), "native harness is running") {
+		t.Fatalf("pre-restart native-open prompt error = %v", err)
 	}
 	harness.cancel()
 	waitFor(t, 3*time.Second, func() bool {
@@ -1159,38 +1894,183 @@ func TestNativeOwnershipSurvivesWorkerRestartUntilOwnerRelease(t *testing.T) {
 		return restartedClient.Ping(pingContext) == nil
 	})
 	status, err := restartedClient.Send(context.Background(), Command{Type: "status"})
-	if err != nil || !status.NativeOwned || status.ProviderWriter != "native" {
+	if err != nil || !status.NativeOwned || status.ActiveRequestID != "" {
 		t.Fatalf("status after worker restart = %#v, %v", status, err)
 	}
 	harness.acp.mu.Lock()
 	resumeCountWhileNative := harness.acp.resumeCount
 	harness.acp.mu.Unlock()
 	if resumeCountWhileNative != 0 {
-		t.Fatalf("worker restart resumed ACP %d time(s) while native still owned the provider", resumeCountWhileNative)
+		t.Fatalf("worker restart ACP resumes = %d, want 0 while native remains open", resumeCountWhileNative)
 	}
-	accepted, err := restartedClient.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-worker-restart", Message: "continue"})
-	if err != nil || accepted.State != "queued" {
-		t.Fatalf("restart prompt = %#v, %v", accepted, err)
+	if _, err := restartedClient.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-worker-restart", Message: "continue"}); err == nil || !strings.Contains(err.Error(), "native harness is running") {
+		t.Fatalf("restart native-open prompt error = %v", err)
 	}
-	select {
-	case requestID := <-harness.acp.started:
-		t.Fatalf("ACP prompt %s started after worker restart while native still owned", requestID)
-	case <-time.After(150 * time.Millisecond):
+	if reused, err := restartedClient.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleDirect}); err != nil || reused.State != "already_acquired" {
+		t.Fatalf("restart-safe exclusive native reuse = %#v, %v", reused, err)
 	}
 	if _, err := restartedClient.Send(context.Background(), Command{Type: "native_release", OwnerToken: ownerToken, NativeGeneration: acquired.NativeGeneration, NativeActivity: true}); err != nil {
 		t.Fatal(err)
 	}
-	waitStarted(t, harness.acp.started, "req-after-worker-restart")
+	releaseMarker, err := os.ReadFile(restarted.NativeOwnerPath())
+	if err != nil || !bytes.Contains(releaseMarker, []byte(`"state": "refresh_pending"`)) {
+		t.Fatalf("restart-safe release freshness marker = %q, %v", releaseMarker, err)
+	}
+	afterRelease, err := restartedClient.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-native-release", Message: "continue after release"})
+	if err != nil || afterRelease.State != "ready" {
+		t.Fatalf("post-release prompt = %#v, %v", afterRelease, err)
+	}
+	waitStarted(t, harness.acp.started, "req-after-native-release")
+	if _, err := os.Stat(restarted.NativeOwnerPath()); !os.IsNotExist(err) {
+		t.Fatalf("native release freshness marker remains after exact ACP rehydration: %v", err)
+	}
+	harness.acp.Complete("req-after-native-release")
 	harness.acp.mu.Lock()
 	refreshCount, resumeCountAfterRelease := harness.acp.refreshCount, harness.acp.resumeCount
 	harness.acp.mu.Unlock()
-	if refreshCount != 0 || resumeCountAfterRelease != 1 {
-		t.Fatalf("provider calls after restart release: refresh=%d resume=%d, want 0/1", refreshCount, resumeCountAfterRelease)
+	if refreshCount != 1 || resumeCountAfterRelease != 0 {
+		t.Fatalf("provider calls after restart release: refresh=%d resume=%d, want 1/0", refreshCount, resumeCountAfterRelease)
 	}
 	if _, err := os.Stat(restarted.NativeOwnerPath()); !os.IsNotExist(err) {
 		t.Fatalf("native owner marker remains after restart refresh: %v", err)
 	}
-	harness.acp.Complete("req-after-worker-restart")
+}
+
+func TestV3RestoresLegacyRefreshPendingUntilExactPromptRehydration(t *testing.T) {
+	runtime, fake := disconnectedIdentityWorker(t, "acp-canonical", "native-canonical")
+	fake.mu.Lock()
+	fake.resumeNativeID = "native-canonical"
+	fake.refreshNativeID = "native-canonical"
+	fake.inspectACP = "acp-canonical"
+	fake.inspectNative = "native-canonical"
+	fake.mu.Unlock()
+	if err := os.MkdirAll(runtime.config.WorkersDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.persistNativeOwnership(nativeMarkerRefreshPending, "legacy-v2-owner", "0123456789abcdef0123456789abcdef"); err != nil {
+		t.Fatal(err)
+	}
+	reconcile := newFakeTranscriptReconciler()
+	reconcileRelease := make(chan struct{})
+	reconcile.wait = reconcileRelease
+	runtime.config.ReconcileProviderTranscript = reconcile.Reconcile
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runtime.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("Worker.Run() error = %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Error("worker did not stop")
+		}
+	}()
+	client := NewSocketClient(runtime.SocketPath())
+	waitFor(t, 3*time.Second, func() bool { return client.Ping(context.Background()) == nil })
+	if marker, err := os.ReadFile(runtime.NativeOwnerPath()); err != nil || !bytes.Contains(marker, []byte(`"state": "refresh_pending"`)) {
+		t.Fatalf("legacy refresh_pending marker was not preserved before prompt: %q, %v", marker, err)
+	}
+	accepted, err := client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-legacy-refresh", Message: "continue immediately"})
+	if err != nil || accepted.State != "ready" {
+		t.Fatalf("prompt during legacy transcript reload = %#v, %v", accepted, err)
+	}
+	waitStarted(t, fake.started, "req-legacy-refresh")
+	if _, err := os.Stat(runtime.NativeOwnerPath()); !os.IsNotExist(err) {
+		t.Fatalf("legacy refresh_pending marker remains after exact rehydration: %v", err)
+	}
+	select {
+	case <-reconcile.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("legacy transcript reconciliation did not start after exact rehydration")
+	}
+	fake.Complete("req-legacy-refresh")
+	close(reconcileRelease)
+	waitFor(t, 2*time.Second, func() bool {
+		lines, readErr := sessionlog.ReadFile(runtime.LogPath(), 0)
+		if readErr != nil {
+			return false
+		}
+		for _, line := range lines {
+			if line.Type == "provider_transcript_reconciled" {
+				return true
+			}
+		}
+		return false
+	})
+	status, err := client.Send(context.Background(), Command{Type: "status"})
+	if err != nil || status.Status == string(session.StatusStopped) {
+		t.Fatalf("worker after legacy reconciliation = %#v, %v", status, err)
+	}
+	fake.mu.Lock()
+	resumeCount := fake.resumeCount
+	fake.mu.Unlock()
+	if resumeCount != 1 {
+		t.Fatalf("legacy marker ACP resume count = %d, want 1", resumeCount)
+	}
+}
+
+func TestStartupRefreshMarkerReplacementBlocksBothSurfaces(t *testing.T) {
+	runtime, fake := disconnectedIdentityWorker(t, "acp-canonical", "native-canonical")
+	if err := os.MkdirAll(runtime.config.WorkersDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const generation = "0123456789abcdef0123456789abcdef"
+	if err := runtime.persistNativeOwnership(nativeMarkerRefreshPending, "release-owner", generation); err != nil {
+		t.Fatal(err)
+	}
+	hookErr := make(chan error, 1)
+	fake.mu.Lock()
+	fake.resumeNativeID = "native-canonical"
+	fake.refreshNativeID = "native-canonical"
+	fake.inspectACP = "acp-canonical"
+	fake.inspectNative = "native-canonical"
+	fake.resumeHook = func() {
+		hookErr <- runtime.persistNativeOwnership(nativeMarkerOwned, "unexpected-owner", generation)
+	}
+	fake.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runtime.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("Worker.Run() error = %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Error("worker did not stop")
+		}
+	}()
+	client := NewSocketClient(runtime.SocketPath())
+	waitFor(t, 3*time.Second, func() bool { return client.Ping(context.Background()) == nil })
+	if err := <-hookErr; err != nil {
+		t.Fatal(err)
+	}
+	preserved, err := os.ReadFile(runtime.NativeOwnerPath())
+	if err != nil || !bytes.Contains(preserved, []byte(`"state": "owned"`)) {
+		t.Fatalf("replacement marker = %q, %v", preserved, err)
+	}
+	if _, err := client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: "new-owner", NativeOwnerRole: NativeOwnerRoleDirect}); err == nil || !strings.Contains(err.Error(), "unexpectedly changed") {
+		t.Fatalf("native acquire with replaced marker error = %v", err)
+	}
+	if _, err := client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-marker-replacement", Message: "must not run"}); err == nil || !strings.Contains(err.Error(), "prompt was not accepted") {
+		t.Fatalf("ACP prompt with replaced marker error = %v", err)
+	}
+	afterPrompt, err := os.ReadFile(runtime.NativeOwnerPath())
+	if err != nil || !bytes.Equal(afterPrompt, preserved) {
+		t.Fatalf("blocked surfaces changed preserved replacement marker: before=%q after=%q err=%v", preserved, afterPrompt, err)
+	}
+	assertNoRequestLog(t, runtime.LogPath(), "req-after-marker-replacement")
+	fake.mu.Lock()
+	refreshCount := fake.refreshCount
+	fake.mu.Unlock()
+	if refreshCount != 0 {
+		t.Fatalf("ACP refresh calls after fail-closed marker replacement = %d, want 0", refreshCount)
+	}
 }
 
 func TestWorkerRestorePreservesReservationPhaseAndLegacyOwnedIsActive(t *testing.T) {
@@ -1201,7 +2081,7 @@ func TestWorkerRestorePreservesReservationPhaseAndLegacyOwnedIsActive(t *testing
 		reserved   bool
 	}{
 		{name: "generation reservation", marker: nativeMarkerReserved, generation: "0123456789abcdef0123456789abcdef", reserved: true},
-		{name: "legacy owned marker", marker: nativeMarkerOwned},
+		{name: "owned marker", marker: nativeMarkerOwned, generation: "abcdef0123456789abcdef0123456789"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			runtime, _ := disconnectedIdentityWorker(t, "acp-canonical", "native-canonical")
@@ -1234,101 +2114,168 @@ func TestWorkerRestorePreservesReservationPhaseAndLegacyOwnedIsActive(t *testing
 	}
 }
 
-func TestInvalidNativeOwnershipMarkerFailsClosed(t *testing.T) {
-	runtime, fake := disconnectedIdentityWorker(t, "acp-canonical", "native-canonical")
-	if err := os.MkdirAll(runtime.config.WorkersDirectory, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(runtime.NativeOwnerPath(), []byte("not-json\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	err := runtime.Run(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "refusing ACP work until it is recovered explicitly") {
-		t.Fatalf("invalid native marker error = %v", err)
-	}
-	fake.mu.Lock()
-	startCount, resumeCount := fake.startCount, fake.resumeCount
-	fake.mu.Unlock()
-	if startCount != 0 || resumeCount != 0 {
-		t.Fatalf("ACP transport opened despite invalid native marker: start=%d resume=%d", startCount, resumeCount)
-	}
-}
-
-func TestScheduledRefreshKeepsItsQueueBoundaryAheadOfNewPrompts(t *testing.T) {
-	worker := &Worker{wake: make(chan struct{}, 1)}
-	if state := worker.scheduleRefresh(); state != "scheduled" {
-		t.Fatalf("idle refresh state = %q", state)
-	}
-	worker.mu.Lock()
-	worker.queue = append(worker.queue, queuedPrompt{RequestID: "new-after-refresh"})
-	worker.mu.Unlock()
-	if prompt, _, ok := worker.nextPrompt(context.Background()); ok {
-		t.Fatalf("new prompt %q beat the scheduled refresh", prompt.RequestID)
-	}
-
-	worker = &Worker{
-		wake:  make(chan struct{}, 1),
-		queue: []queuedPrompt{{RequestID: "already-queued"}},
-	}
-	if state := worker.scheduleRefresh(); state != "deferred" {
-		t.Fatalf("queued refresh state = %q", state)
-	}
-	worker.mu.Lock()
-	worker.queue = append(worker.queue, queuedPrompt{RequestID: "new-after-barrier"})
-	worker.mu.Unlock()
-	prompt, _, ok := worker.nextPrompt(context.Background())
-	if !ok || prompt.RequestID != "already-queued" {
-		t.Fatalf("pre-existing queued prompt = %#v, %t", prompt, ok)
-	}
-	worker.mu.Lock()
-	worker.activeCancel()
-	worker.active, worker.activeCancel = nil, nil
-	worker.mu.Unlock()
-	if prompt, _, ok := worker.nextPrompt(context.Background()); ok {
-		t.Fatalf("post-barrier prompt %q ran before refresh", prompt.RequestID)
+func TestOwnedNativeMarkerMigrationDistinguishesExclusiveAndExplicitStale(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		staleField string
+		wantStale  bool
+	}{
+		{name: "committed v2 marker without stale bit is reusable"},
+		{name: "explicit WIP stale marker is exit only", staleField: `,"stale_after_acp":true`, wantStale: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runtime, _ := disconnectedIdentityWorker(t, "acp-canonical", "native-canonical")
+			if err := os.MkdirAll(runtime.config.WorkersDirectory, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			const (
+				owner      = "legacy-owner"
+				generation = "0123456789abcdef0123456789abcdef"
+			)
+			body := fmt.Sprintf(`{"version":1,"session_id":"S-identity","state":"owned","owner_token":"legacy-owner","generation":"%s"%s}`, generation, test.staleField)
+			if err := os.WriteFile(runtime.NativeOwnerPath(), []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := runtime.restoreNativeOwnership(); err != nil {
+				t.Fatal(err)
+			}
+			state, restoredGeneration, err := runtime.acquireNative(owner, NativeOwnerRoleDirect, "")
+			if test.wantStale {
+				if err == nil || !strings.Contains(err.Error(), "exit without sending another prompt") {
+					t.Fatalf("explicit stale reuse = %q/%q, %v", state, restoredGeneration, err)
+				}
+			} else if err != nil || state != "already_acquired" || restoredGeneration != generation {
+				t.Fatalf("exclusive v2 reuse = %q/%q, %v", state, restoredGeneration, err)
+			}
+			history, err := sessionlog.Open(runtime.LogPath())
+			if err != nil {
+				t.Fatal(err)
+			}
+			runtime.log = history
+			runtime.hub = newHub(history.LastSequence())
+			t.Cleanup(func() { _ = history.Close() })
+			released, err := runtime.releaseNative(owner, generation, false)
+			if err != nil || released != "released" {
+				t.Fatalf("exact marker release = %q, %v", released, err)
+			}
+			if _, err := os.Stat(runtime.NativeOwnerPath()); !os.IsNotExist(err) {
+				t.Fatalf("marker remains after exact release: %v", err)
+			}
+		})
 	}
 }
 
-func TestStalledNativeRefreshTimesOutRecoversAndReleasesQueuedPrompt(t *testing.T) {
+func TestInvalidNativeOwnershipMarkerFailsClosedBeforeACPConnect(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{name: "malformed", body: "not-json\n"},
+		{name: "unknown phase", body: `{"version":1,"session_id":"S-identity","state":"future","owner_token":"owner"}`},
+		{name: "owned without generation", body: `{"version":1,"session_id":"S-identity","state":"owned","owner_token":"owner"}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runtime, fake := disconnectedIdentityWorker(t, "acp-canonical", "native-canonical")
+			if err := os.MkdirAll(runtime.config.WorkersDirectory, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(runtime.NativeOwnerPath(), []byte(test.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err := runtime.Run(context.Background())
+			if err == nil || !strings.Contains(err.Error(), "refusing ACP and native work") {
+				t.Fatalf("Worker.Run() invalid marker error = %v", err)
+			}
+			preserved, err := os.ReadFile(runtime.NativeOwnerPath())
+			if err != nil || string(preserved) != test.body {
+				t.Fatalf("invalid native marker was changed: %q, %v", preserved, err)
+			}
+			fake.mu.Lock()
+			startCount, resumeCount, refreshCount := fake.startCount, fake.resumeCount, fake.refreshCount
+			fake.mu.Unlock()
+			if startCount != 0 || resumeCount != 0 || refreshCount != 0 {
+				t.Fatalf("ACP calls with invalid native marker: start=%d resume=%d refresh=%d, want 0/0/0", startCount, resumeCount, refreshCount)
+			}
+		})
+	}
+}
+
+func TestACPRehydrationCleanupPreservesUntrustedMarker(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{name: "malformed", body: "not-json\n"},
+		{name: "wrong Session", body: `{"version":1,"session_id":"S-other","state":"refresh_pending","owner_token":"owner","generation":"0123456789abcdef0123456789abcdef"}`},
+		{name: "future version", body: `{"version":99,"session_id":"S-identity","state":"refresh_pending","owner_token":"owner","generation":"0123456789abcdef0123456789abcdef"}`},
+		{name: "unexpected owned", body: `{"version":1,"session_id":"S-identity","state":"owned","owner_token":"owner","generation":"0123456789abcdef0123456789abcdef","stale_after_acp":false}`},
+		{name: "unexpected reserved", body: `{"version":1,"session_id":"S-identity","state":"reserved","owner_token":"owner","generation":"0123456789abcdef0123456789abcdef","stale_after_acp":false}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runtime, _ := disconnectedIdentityWorker(t, "acp-canonical", "native-canonical")
+			if err := os.MkdirAll(runtime.config.WorkersDirectory, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(runtime.NativeOwnerPath(), []byte(test.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			runtime.mu.Lock()
+			runtime.nativeReconcilePending = true
+			err := runtime.clearNativeRefreshPendingLocked()
+			stillPending := runtime.nativeReconcilePending
+			runtime.mu.Unlock()
+			if err == nil || !stillPending {
+				t.Fatalf("cleanup error=%v pending=%t", err, stillPending)
+			}
+			preserved, readErr := os.ReadFile(runtime.NativeOwnerPath())
+			if readErr != nil || string(preserved) != test.body {
+				t.Fatalf("untrusted marker changed: %q, %v", preserved, readErr)
+			}
+		})
+	}
+}
+
+func TestRuntimeRefreshMarkerReplacementBlocksBothSurfaces(t *testing.T) {
 	harness := startWorkerHarness(t)
-	harness.acp.mu.Lock()
-	harness.acp.refreshWait = true
-	harness.acp.mu.Unlock()
-	refresh, err := harness.client.Send(context.Background(), Command{Type: "refresh"})
-	if err != nil || refresh.Type != "refresh_scheduled" {
-		t.Fatalf("refresh = %#v, %v", refresh, err)
+	const generation = "0123456789abcdef0123456789abcdef"
+	harness.runtime.mu.Lock()
+	if err := harness.runtime.persistNativeOwnership(nativeMarkerOwned, "unexpected-runtime-owner", generation); err != nil {
+		harness.runtime.mu.Unlock()
+		t.Fatal(err)
 	}
-	waitFor(t, 2*time.Second, func() bool {
-		status, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
-		return statusErr == nil && status.Refreshing
-	})
-	accepted, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-stalled-refresh", Message: "continue"})
-	if err != nil || accepted.State != "queued" {
-		t.Fatalf("prompt during refresh = %#v, %v", accepted, err)
+	harness.runtime.nativeReconcilePending = true
+	harness.runtime.requireACPFreshnessLocked()
+	harness.runtime.mu.Unlock()
+	preserved, err := os.ReadFile(harness.runtime.NativeOwnerPath())
+	if err != nil {
+		t.Fatal(err)
 	}
-	waitStarted(t, harness.acp.started, "req-after-stalled-refresh")
-	harness.acp.mu.Lock()
-	resumeCount := harness.acp.resumeCount
-	harness.acp.mu.Unlock()
-	if resumeCount != 1 {
-		t.Fatalf("exact recovery Resume calls = %d, want 1", resumeCount)
+	if err := harness.runtime.prepareACPDispatch(context.Background(), "req-replaced-at-runtime"); err == nil || !strings.Contains(err.Error(), "unexpectedly changed") {
+		t.Fatalf("runtime replacement preparation error = %v", err)
 	}
-	harness.acp.Complete("req-after-stalled-refresh")
-	waitFor(t, 2*time.Second, func() bool {
-		status, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
-		return statusErr == nil && !status.Refreshing && status.Queued == 0 && status.ActiveRequestID == ""
-	})
+	if _, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: "new-runtime-owner", NativeOwnerRole: NativeOwnerRoleDirect}); err == nil || !strings.Contains(err.Error(), "both ACP and native work are unavailable") {
+		t.Fatalf("native acquire after runtime replacement error = %v", err)
+	}
+	afterFailure, err := os.ReadFile(harness.runtime.NativeOwnerPath())
+	if err != nil || !bytes.Equal(afterFailure, preserved) {
+		t.Fatalf("runtime replacement marker changed: before=%q after=%q err=%v", preserved, afterFailure, err)
+	}
 	lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var warned, recovered bool
 	for _, line := range lines {
-		warned = warned || line.Type == "native_refresh_warning"
-		recovered = recovered || line.Type == "native_refresh_recovered"
+		if line.Type == "turn_started" && line.RequestID == "req-replaced-at-runtime" {
+			t.Fatal("runtime marker replacement reached ACP dispatch")
+		}
 	}
-	if !warned || !recovered {
-		t.Fatalf("refresh history warned=%t recovered=%t: %#v", warned, recovered, lines)
+	if _, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-runtime-replacement", Message: "must not run"}); err == nil || !strings.Contains(err.Error(), "prompt was not accepted") {
+		t.Fatalf("ACP retry with blocked native marker error = %v", err)
+	}
+	assertNoRequestLog(t, harness.runtime.LogPath(), "req-after-runtime-replacement")
+	afterPrompt, err := os.ReadFile(harness.runtime.NativeOwnerPath())
+	if err != nil || !bytes.Equal(afterPrompt, preserved) {
+		t.Fatalf("blocked surfaces changed marker: before=%q after=%q err=%v", preserved, afterPrompt, err)
 	}
 }
 
@@ -1370,10 +2317,64 @@ func TestPostTurnIdentityDriftQuarantinesTransportBeforeQueuedPrompt(t *testing.
 	}
 }
 
+func TestProviderTurnFailureKeepsWorkerAndACPQueueUsable(t *testing.T) {
+	harness := startWorkerHarness(t)
+	harness.acp.mu.Lock()
+	harness.acp.promptErr = &acp.ProviderTurnError{Code: "turn_failed", DetailCode: "provider_busy", Message: "SECRET provider detail", Retryable: true}
+	harness.acp.mu.Unlock()
+	if _, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-provider-busy", Message: "first"}); err != nil {
+		t.Fatal(err)
+	}
+	waitStarted(t, harness.acp.started, "req-provider-busy")
+	queued, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-provider-busy", Message: "second"})
+	if err != nil || queued.State != "queued" {
+		t.Fatalf("queued prompt = %#v, %v", queued, err)
+	}
+	harness.acp.Complete("req-provider-busy")
+	waitStarted(t, harness.acp.started, "req-after-provider-busy")
+	harness.acp.mu.Lock()
+	harness.acp.promptErr = nil
+	harness.acp.mu.Unlock()
+	harness.acp.Complete("req-after-provider-busy")
+	waitFor(t, 2*time.Second, func() bool {
+		status, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
+		return statusErr == nil && status.Status == string(session.StatusWaiting) && status.ActiveRequestID == "" && status.Queued == 0
+	})
+	harness.acp.mu.Lock()
+	resumeCount, refreshCount := harness.acp.resumeCount, harness.acp.refreshCount
+	harness.acp.mu.Unlock()
+	if resumeCount != 0 || refreshCount != 2 {
+		t.Fatalf("provider turn rejection recovery/rehydration: resume=%d refresh=%d, want 0/2", resumeCount, refreshCount)
+	}
+	lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var failed, completed, safeProvenance bool
+	for _, line := range lines {
+		if line.Type == "turn_error" && line.RequestID == "req-provider-busy" {
+			failed = true
+			var failure struct {
+				Source    string `json:"source"`
+				Code      string `json:"code"`
+				Retryable bool   `json:"retryable"`
+				Message   string `json:"message"`
+			}
+			if json.Unmarshal(line.Data, &failure) == nil {
+				safeProvenance = failure.Source == "provider" && failure.Code == "busy" && failure.Retryable && strings.Contains(failure.Message, "provider is busy") && !bytes.Contains(line.Data, []byte("SECRET"))
+			}
+		}
+		completed = completed || (line.Type == "turn_completed" && line.RequestID == "req-after-provider-busy")
+	}
+	if !failed || !completed || !safeProvenance {
+		t.Fatalf("provider failure FIFO history failed=%t completed=%t safe=%t: %#v", failed, completed, safeProvenance, lines)
+	}
+}
+
 func TestPromptFailureRecoversOrQuarantinesBeforeQueuedPrompt(t *testing.T) {
 	harness := startWorkerHarness(t)
 	harness.acp.mu.Lock()
-	harness.acp.promptErr = errors.New("bridge disconnected")
+	harness.acp.promptErr = &acp.ProtocolError{Operation: "runtime bridge", Message: "bridge disconnected"}
 	harness.acp.resumeNativeID = "native-replacement"
 	harness.acp.mu.Unlock()
 	if _, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-bridge-failure", Message: "first"}); err != nil {
@@ -1433,7 +2434,11 @@ func TestResumeRejectsProviderIdentityDrift(t *testing.T) {
 
 func disconnectedIdentityWorker(t *testing.T, acpSessionID, canonicalID string) (*Worker, *fakeACP) {
 	t.Helper()
-	root := t.TempDir()
+	root, err := os.MkdirTemp("/tmp", "atc-identity-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	repository, err := store.Open(context.Background(), filepath.Join(root, "agent.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -1651,6 +2656,19 @@ func waitStarted(t *testing.T, started <-chan string, want string) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("request %s did not start", want)
+	}
+}
+
+func assertNoRequestLog(t *testing.T, path, requestID string) {
+	t.Helper()
+	lines, err := sessionlog.ReadFile(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range lines {
+		if line.RequestID == requestID {
+			t.Fatalf("rejected request %s was journaled as %s", requestID, line.Type)
+		}
 	}
 }
 

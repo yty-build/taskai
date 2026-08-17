@@ -32,62 +32,115 @@ Use this only in a disposable Git repository with authenticated Codex and acpx 0
    Confirm that the initial nonce response appears as committed provider
    history, with any not-yet-committed ACP activity identified as provisional.
    Then press `q`. Detaching this viewer must not stop the worker, cancel work,
-   or alter provider-write ownership.
+   or stop the provider process.
 
-5. Start a deliberately slow harmless ACP turn. While it is active, try to open
-   the real Codex harness. Native attach must wait or fail visibly; it must not
-   cancel the ACP turn or open another conversation. After the ACP turn settles
-   and provider-store reconciliation succeeds, open the real Codex harness for
-   that exact conversation:
+5. Make the ACP turn deterministically wait at a write permission. In a second
+   terminal, follow the raw Session journal:
+
+   ```bash
+   bin/acpctl session logs <session-id> --follow --raw
+   ```
+
+   In a third terminal, submit this prompt:
+
+   ```bash
+   bin/acpctl session prompt <session-id> \
+     "Use your write tool to create .agent-native-overlap-smoke containing overlap-check. Do not choose a permission for me."
+   ```
+
+   Wait until the raw follower shows `permission_requested` for that request.
+   Do not approve it. While that correlated ACP turn is still active, attempt
+   to open a new real Codex harness:
 
    ```bash
    bin/acpctl session attach <session-id>
    ```
 
-   The command must verify the canonical ID in Codex's local Session store and run `codex resume <canonical-id>` in the persisted checkout. Ask Codex: `What nonce did I ask you to remember? Reply only with it.` The answer must be `ACP-NATIVE-42`.
-
-6. While Codex is still running, submit an ACP prompt from another terminal:
+   The gateway must reject this new generation immediately with
+   wait-then-open guidance. The attempt is not queued, launches no Codex
+   process, and does not cancel the ACP turn. Cancel it explicitly and wait for
+   its terminal `cancelled` record:
 
    ```bash
-   bin/acpctl session prompt <session-id> "Reply only after native ownership is released: QUEUED-AFTER-NATIVE"
+   bin/acpctl session cancel <session-id>
    ```
 
-   It must remain visibly queued and must not reach the provider. If tmux is
-   installed, press `Ctrl-B d`. Codex and its native writer ownership must keep
-   running. The ACP prompt must still be queued. Re-run
-   `bin/acpctl session attach <session-id>` and confirm that it reconnects to
-   the same native screen instead of starting another process.
+   Then run the same attach command again. This time it must verify
+   the canonical ID in Codex's local Session store and run
+   `codex resume <canonical-id>` in the persisted checkout. Ask Codex:
+   `What nonce did I ask you to remember? Reply only with it.` The answer must
+   be `ACP-NATIVE-42`.
 
-7. Add a second harmless native-only nonce, `NATIVE-ACP-73`, then exit Codex normally. Detaching tmux is not an exit; close the Codex process itself for this step.
+6. Add a harmless native-only nonce, `NATIVE-ACP-73`, and wait for Codex to
+   finish that turn. If tmux is installed, press `Ctrl-B d`: this detaches the
+   viewer but deliberately leaves the now-idle provider process and its
+   exclusive native ownership running.
 
-8. Inspect raw Session activity:
+7. While that Codex process is still open but idle, submit an ACP prompt from
+   another terminal:
+
+   ```bash
+   bin/acpctl session prompt <session-id> \
+     "What native-only nonce did I just ask you to remember? Include it, then reply with marker ACP-AFTER-NATIVE-51. Do not use tools."
+   ```
+
+   The gateway must reject the submission immediately with exit-and-retry
+   guidance. It must not return an accepted request ID, append prompt lifecycle
+   records, enter the ACP FIFO, or send anything through the bridge. This proves
+   that tmux detach preserves native ownership rather than silently changing
+   write surfaces.
+
+8. Reattach to that exact native harness and exit Codex normally without
+   sending another provider prompt:
+
+   ```bash
+   bin/acpctl session attach <session-id>
+   ```
+
+   The gateway must not kill the process automatically. A second tmux detach is
+   still not an exit. After normal exit, inspect raw Session activity:
 
    ```bash
    bin/acpctl session logs <session-id> --raw
    ```
 
-   Expect `native_refresh_started`, then `provider_transcript_reconciled`, then
-   `native_refreshed` before the queued ACP request begins.
-   `provider_transcript_reconciled` proves the bounded exact provider read
-   succeeded while the durable ownership marker was still closed;
-   `native_refreshed` proves the marker was released and queued ACP is safe to
-   dispatch. A `native_refresh_warning` is actionable, and a failed provider
-   read must not emit `provider_transcript_reconciled`; queued writes must not
-   cross the unresolved ownership/reconciliation boundary.
+   Expect `native_released`, followed asynchronously by
+   `provider_transcript_reconciled` or
+   `provider_transcript_reconcile_warning`. A failed provider read must not emit
+   `provider_transcript_reconciled`; it retains the last validated structured
+   view. The read-only transcript reconciliation result is not the ACP write
+   gate: exact native release clears ownership, and the later exact ACP
+   rehydration gates dispatch.
 
-9. Reopen the structured ACP console and ask for the native-only nonce:
+9. Retry the ACP prompt from step 7. After it reaches the ACP FIFO head, the
+   gateway must refresh the idle ACP adapter on the exact persisted ACP Session,
+   falling back to exact Resume if necessary. It must validate the same
+   canonical identity, emit correlated `acp_rehydrated` before `turn_started`,
+   and only then forward the prompt. The response must include `NATIVE-ACP-73`
+   and `ACP-AFTER-NATIVE-51`. A delayed provider-transcript reconciliation may
+   finish later and must not delay this post-release ACP dispatch.
+
+10. Reopen the structured ACP console:
 
    ```bash
    bin/acpctl session attach <session-id> --acp
    ```
 
-   Confirm that the queued request ran only after reconciliation. Submit:
-   `What native-only nonce did I just ask you to remember? Reply only with it.`
-   The answer must be `NATIVE-ACP-73`, and the structured view must show one
-   committed copy of each turn without a visible reload or duplicate.
+   This load must read the committed Codex provider JSONL snapshot and join the
+   gateway Session-JSONL lifecycle/provisional overlay; it must not treat the
+   gateway journal as the committed transcript. The view must show one copy of
+   each turn without a visible reload or duplicate, retaining the prior
+   validated view if a snapshot refresh is temporarily unavailable.
 
-Native and ACP are distinct transports to one canonical provider conversation,
-but their writes are exclusive. This smoke deliberately exercises both gate
-directions: native attach cannot cross an active ACP turn, and an ACP prompt
-cannot cross a running native process. Viewer detach alone changes neither
-work nor ownership.
+11. Open a fresh native process and ask for `ACP-AFTER-NATIVE-51`. It must
+    resume the same canonical ID and see the committed ACP turn. This creates a
+    fresh native generation and uses a fresh exact `BuildResume` invocation;
+    no old process was reused or killed.
+
+Native and ACP are distinct transports to one canonical provider conversation.
+The ACP runtime permits one active ACP turn, so later ACP prompts use an
+ACP-to-ACP FIFO. A native owner or reservation never joins that queue: the
+second cross-surface activation is rejected immediately. Viewer detach changes
+neither provider-process lifetime nor exclusive native ownership. Normal
+provider exit releases ownership; every later ACP prompt still performs exact
+Refresh/fallback Resume and identity validation before dispatch.

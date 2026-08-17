@@ -18,10 +18,11 @@ Read `agent_task_console_spec.md` completely before editing. The specification i
 10. If a dependency or adapter behavior differs from the specification, investigate it, preserve the product contract behind an internal adapter, document the decision, and continue when safely possible.
 11. Treat the provider store as committed conversation history, ACP as the live
     provisional stream, and Session JSONL as lifecycle/audit/overlay/fallback.
-    No transport may silently promote JSONL into the canonical provider
+    V1 reads Codex/Claude/Grok provider JSONL and OpenCode provider SQLite. No
+    transport may silently promote gateway JSONL into the canonical provider
     transcript.
 12. Keep exactly Task and Session as persistent product entities. Provider
-    snapshots, ACP overlays, provider-write ownership, reconciliation
+    snapshots, ACP overlays, native-harness lifecycle, reconciliation
     boundaries, and projection revisions remain operational/in-memory state.
 
 ## Ordered conversation-continuity and UX work
@@ -32,10 +33,11 @@ approved source and seamless-view contract in this dependency order:
 1. **D05 — ACP live contract:** normalize request-correlated ACP activity as a
    provisional stream and keep every `acpx` assumption inside `internal/acp`.
    Do not treat ACP replay as the provider's committed transcript.
-2. **D06 — journal and write serialization:** make Session JSONL the monotonic
-   lifecycle/audit/overlay/fallback journal and add one exclusive provider-write
-   gate per Session. ACP turns and a provider-native process never write the
-   same conversation concurrently.
+2. **D06 — journal and ACP transport FIFO:** make Session JSONL the monotonic
+   lifecycle/audit/overlay/fallback journal and serialize only ACP-to-ACP turns
+   required by the public runtime. Native ownership is a separate exclusive
+   admission state: reject the second cross-surface activation instead of
+   placing it in that FIFO.
 3. **D08 — source-agnostic cockpit:** build the Go/Bubble Tea Task cockpit and
    Structured ACP console against a semantic conversation projection. Exercise
    provider-snapshot and JSONL-fallback fixtures even before live provider-store
@@ -43,7 +45,11 @@ approved source and seamless-view contract in this dependency order:
 4. **D10 — committed history and reconciliation:** add verified read-only
    provider-store adapters for Codex, Claude, Grok, and OpenCode; load the exact
    canonical conversation; join it with the gateway overlay; and reconcile
-   after ACP and native turns before the other writer continues.
+   after ACP and native turns without visible replacement. Native exit must
+   release exact ownership before a cross-surface retry is admitted.
+   Before every ACP dispatch at the head of the FIFO, Refresh the exact ACP
+   Session with exact-Resume fallback; a fresh native generation uses exact
+   provider-store verification plus `BuildResume`.
 5. **D12 — shared projection service:** make CLI, TUI, API, and web consume the
    same initial snapshot, fallback state, live cursor, and atomic replacement
    contract. Clients never open provider files or merge JSONL themselves.
@@ -51,8 +57,9 @@ approved source and seamless-view contract in this dependency order:
    and background replacements with stable keys while preserving reader and
    composer state.
 7. **D14 — cross-provider acceptance:** run the full source/fallback,
-   exclusivity, reconciliation, state-preservation, terminal-compatibility, and
-   no-flicker matrix before declaring the build complete.
+   ACP-FIFO/exclusive-surface, reconciliation, state-preservation,
+   terminal-compatibility, and no-flicker matrix before declaring the build
+   complete.
 
 ## D01 — Private Go project bootstrap
 
@@ -112,7 +119,8 @@ Commit: `feat: add declarative agent registry`
 - Keep runtime state/bridge source private, keep provider auth out of persisted options, bound bridge frames and diagnostics, and fail closed on malformed permission options.
 - Build a deterministic fake-`acpx/runtime` fixture for success, cancellation,
   exact resume, permissions, duplicate option kinds, reconnection, live chunks
-  that precede provider commit, and settled-turn refresh signals. Retain
+  that precede provider commit, post-turn identity inspection, and display
+  reconciliation signals. Retain
   CLI-adapter fixtures for the legacy compatibility unit tests.
 - Run a focused live compatibility spike before locking the subprocess/queue behavior.
 
@@ -125,24 +133,27 @@ Commit: `feat: add the acpx execution adapter`
 - Enforce one worker per active Session.
 - Implement the NDJSON Unix socket protocol from the spec with user-only permissions.
 - Support multiple simultaneous subscribers.
-- Permit one active ACP turn and a serialized prompt queue.
+- Permit one active ACP turn and a serialized ACP-to-ACP prompt queue.
 - Broadcast request-correlated activity to all viewers.
 - Append monotonically positioned JSONL lifecycle/audit history and retain the
   complete ACP material needed for provisional overlay, missed-stream recovery,
   and explicit provider-history fallback.
 - Handle signals, stale PID/socket state, duplicate workers, and crash recovery.
-- Keep work independent of disposable viewers, but serialize provider writers.
-  Add one per-Session operational write gate: an ACP turn owns it while sending;
-  native attach waits/fails without cancelling that turn; a running native
-  process owns it until process exit/stop; ACP prompts submitted meanwhile are
-  visibly queued and never reach the provider concurrently.
-- Persist enough ownership metadata for crash recovery without introducing a
-  new product entity or table. A tmux viewer detach must not falsely release a
-  still-running native owner.
-- Test FIFO acquisition, wait/fail behavior, prompt queueing behind native,
-  native reattach, stale pre-launch reservation recovery, fail-closed
-  active-owner crash preservation, and proof that two surfaces never dispatch
-  provider input concurrently. Missing tmux must never clear active ownership.
+- Keep work independent of disposable viewers. Serialize ACP-to-ACP prompts as
+  required by the one-active-turn runtime. Reject ACP admission while a native
+  owner or pre-launch reservation exists; cross-surface work never joins the
+  ACP FIFO.
+- Persist enough native-harness lifecycle metadata to prevent a second native
+  process without introducing a new product entity or table. A tmux viewer
+  detach must not falsely permit replacement native creation, and that marker
+  must also exclude ACP admission until exact native release.
+- Reject creation/activation of a new native generation while an ACP request is
+  accepted, queued, preparing, or running. The rejection is not a queue, starts
+  no provider process, and never cancels ACP.
+- Test ACP FIFO order, native reattach, stale pre-launch reservation recovery,
+  fail-closed duplicate-native crash preservation, exclusive surface
+  admission, and exact release/rehydration ordering. Missing tmux must never
+  clear an active native harness.
 
 Commit: `feat: add durable session workers`
 
@@ -203,8 +214,9 @@ Commit: `feat: add session lifecycle controls`
   under the reader. Coalesce chunk redraws without delaying meaningful state.
 - Render messages, tools, commands, results, diffs, permissions, errors, and provider-exposed reasoning in event order; identify the completed response without claiming a protocol-level final-answer channel, and provide a raw toggle.
 - Number exact provider-offered permission choices, distinguish persistent decisions, and keep a permission actionable across detach/reattach.
-- A prompt submitted while an ACP turn or native process owns the provider-write
-  gate is visibly queued and must not dispatch concurrently.
+- A prompt submitted while another ACP turn is active is visibly queued in the
+  ACP-to-ACP FIFO. Native ownership never creates that queue: reject the ACP
+  submission before admission with exit-and-retry guidance.
 - `Esc` requests cancellation of the current turn only in the specified
   non-composer focus; it is not true suspension. Composer/overlay Escape keeps
   its contextual dismiss/back behavior.
@@ -234,7 +246,8 @@ Commit: `feat: add isolated git worktrees`
 - Implement read-only provider-store adapters and deterministic fixtures for
   Codex, Claude, Grok, and OpenCode. Verify the exact canonical ID and
   repo/worktree before reading or launching; treat each format as
-  provider-specific and project only allowlisted user-visible history.
+  provider-specific (Codex/Claude/Grok JSONL, OpenCode SQLite) and project only
+  allowlisted user-visible history.
 - Define the shared conversation reducer: normalized provider snapshot is the
   committed base; gateway-only lifecycle/permission/audit state and ACP
   activity not yet represented in that snapshot form a keyed overlay. Never
@@ -253,18 +266,26 @@ Commit: `feat: add isolated git worktrees`
   provider-store adapter; never guess a store path or reuse another provider's
   parser.
 - Launch the documented provider resume command in the correct repo/worktree, preferably in a tmux-backed native harness so a terminal detach does not end the provider process.
-- Acquire the exclusive per-Session provider-write gate before native launch.
-  Wait in serialization order or fail visibly while ACP owns it; never cancel
-  the turn. Hold ownership for the native process lifetime, including viewer
-  detach/reattach, and through post-exit exact refresh plus reconciliation.
-  Keep later ACP prompts visibly queued without dispatch; release native
-  ownership only after the reconciled handoff is safe.
+- Negotiate worker protocol v3 plus `exclusive-native-owner-v2`, then reserve
+  one stable native harness to prevent duplicate native processes and exclude
+  ACP admission. New native creation/activation while ACP is accepted, queued,
+  preparing, or running is rejected with wait-then-open guidance, not queued,
+  and never cancels the ACP request.
+- Before every ACP prompt after it reaches the FIFO head, perform exact ACP
+  Refresh with exact-Resume fallback and identity validation. Emit correlated
+  `acp_rehydrated` before `turn_started`; on failure send no prompt.
 - After every settled ACP turn and after native process exit/stop, load a fresh
   provider snapshot in the background, merge still-uncommitted/gateway-only
   overlay records, validate the complete candidate, and atomically publish it.
-  Same-transport ACP work may continue while a display refresh retries, but an
-  ACP-to-native or native-to-ACP ownership handoff must not cross an
-  unreconciled provider-write boundary.
+  Native exit releases exact ownership and schedules that reconciliation. A
+  cross-surface retry may then proceed through exact ACP rehydration; a transient
+  presentation refresh failure keeps the last validated view and never permits
+  another native writer.
+- Preserve exclusive ownership when a native viewer detaches. An ACP prompt
+  must be rejected before admission until the operator exits the provider
+  normally and exact release completes. After release, ACP uses exact
+  Refresh/fallback Resume; a later native generation uses fresh `BuildResume`
+  on the updated canonical conversation. Do not auto-kill the provider.
 - Never remove a live ACP item until its equivalent provider item exists in the
   candidate snapshot. On malformed/partial/wrong-conversation/wrong-checkout
   input, leave an already-open viewer's current projection plus live overlay in
@@ -273,8 +294,9 @@ Commit: `feat: add isolated git worktrees`
 - Test exact provider argv and store verification; provider snapshot + overlay
   deduplication; turn/tool/reasoning ordering; first-turn-before-commit;
   malformed/partial stores; fallback disclosures; native detach/reattach,
-  recoverable pre-launch collision reservations, and fail-closed active-owner
-  loss; ACP → native → ACP continuity; and atomic no-blank/no-duplicate
+  recoverable pre-launch collision reservations, and fail-closed
+  duplicate-native protection; ACP → native → rejected ACP → normal native
+  release → retried ACP → fresh native continuity; and atomic no-blank/no-duplicate
   replacement for Codex, Claude, Grok, and OpenCode.
 
 Commit: `feat: make native harness the default session attachment`
@@ -342,9 +364,10 @@ Commit: `feat: add the local task console web UI`
 ## D14 — Hardening and documentation
 
 - Complete README, installation, agent profiles, architecture, API, security, permissions, troubleshooting, and public-service boundary documentation.
-- Document the three conversation sources, exclusive provider-write ownership,
-  fallback disclosures, and the difference between native committed history,
-  live provisional ACP, and raw gateway JSONL.
+- Document the three conversation sources, ACP-to-ACP FIFO, exact surface
+  activation, exclusive cross-surface conflicts, fallback disclosures,
+  generation-scoped native ownership/release, and the difference between
+  provider committed history, live provisional ACP, and raw gateway JSONL.
 - Use `acpctl` as the only executable/usage name; never install or overwrite a global `agent` command.
 - Add deterministic end-to-end acceptance automation and map it to the spec checklist.
 - Run the mandatory projection/UX matrix below with fixtures first and fresh
@@ -376,10 +399,13 @@ Run these in milestone order and repeat the cross-surface cases during D14:
    and subscription; assert captured-cursor replay yields neither gap nor
    duplicate. Assert source/fallback labels for pre-commit, provider unavailable,
    delayed refresh, and an empty new Session.
-4. **Writer exclusivity tests:** active ACP makes native wait/fail without
-   cancellation; native process makes ACP prompts visibly queue; tmux viewer
-   detach retains native ownership; process exit/stop reconciles before queued
-   ACP dispatch; crash recovery cannot create two writers.
+4. **ACP FIFO and surface-activation tests:** active ACP serializes only later
+   ACP prompts; native owner/reservation rejects ACP before admission; pre-prompt
+   exact rehydration precedes dispatch after release; new native start during
+   accepted/queued/preparing/active ACP is rejected without queueing or
+   cancellation; normal native exit preserves ownership until exact release;
+   fresh `BuildResume` restores the same conversation; crash recovery cannot
+   create two native harnesses.
 5. **Atomic reconciliation tests:** show live ACP chunks, commit the equivalent
    provider turn, refresh in the background, and assert one continuous visible
    turn with no intermediate empty frame, duplicate block, lost final response,
@@ -398,8 +424,11 @@ Run these in milestone order and repeat the cross-surface cases during D14:
    escape hatch, viewer detach, and no worker/turn loss.
 9. **Fresh live continuity:** for each authenticated Codex, Claude, Grok, and
    OpenCode Session, prove ACP prompt/stream → provider-store commit → seamless
-   refresh → native continuation → native exit/reconcile → queued ACP
-   continuation, always on the exact canonical conversation.
+   structured reload → fresh native continuation → native-store advance →
+   immediate ACP rejection while native remains open → normal native exit and
+   exact release with asynchronous transcript reconciliation → retried ACP
+   rehydration/dispatch → fresh native `BuildResume` with latest context, always
+   on the exact canonical conversation.
 
 ## Post-V1 terminal refinements
 

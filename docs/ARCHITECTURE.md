@@ -84,13 +84,16 @@ The worker:
 - owns one long-lived, private Node child using the public `acpx/runtime` API;
 - creates or resumes the same ACP Session;
 - allows at most one active ACP turn;
-- serializes later prompts in a visible queue;
-- participates in the per-Session provider-writer gate, so an ACP turn and the
-  provider-native process can never send input concurrently;
+- serializes later ACP prompts in a visible transport-local FIFO;
+- rejects ACP admission while an exclusive native owner or pre-launch
+  reservation exists; cross-surface work never enters the ACP FIFO;
 - gives every prompt a request ID;
 - appends every visible transition/output with a monotonic position;
 - broadcasts the same correlated lines to multiple subscribers;
-- supports prompt, status/ping, exact permission decision, cancel, stop, subscribe, and idle ACP refresh commands;
+- supports prompt, status/ping, exact permission decision, cancel, stop, and subscribe commands;
+- before every prompt dispatch at the head of the ACP FIFO, refreshes the idle
+  adapter on the exact ACP Session and falls back to exact Resume without
+  changing canonical identity;
 - clears worker ownership on orderly stop.
 
 Pending permissions are runtime state plus append-only Session journal records,
@@ -102,15 +105,15 @@ The runtime bridge uses a bounded NDJSON control pipe on child fd 3. Child stdin
 
 The spawning CLI is not the worker's parent lifecycle owner. Terminal and web connections may exit without affecting it. Every normal CLI invocation reconciles stale persisted PID/socket state and removes stale runtime files.
 
-Every provider-writing operation against a live worker first negotiates the
-current worker protocol and `exclusive-native-owner-v1` capability. This gate
-covers prompts, permission decisions, provider-native attachment, and Resume
-when a worker socket is already live. A responsive older worker receives no
-provider command and returns a typed upgrade conflict instead of being assumed
-safe. Cancel, Stop, status/read, conversation/history, and stream operations
-remain available so the user can inspect and migrate safely: exit any provider
-CLI in `agent-<session-id>`, stop that Session, then resume it with the current
-binary.
+Operations against a live worker first negotiate worker protocol v3 and
+`exclusive-native-owner-v2`. That capability proves generation-scoped
+duplicate-native-process protection and cross-surface writer exclusion. The
+compatibility check covers prompts, permission decisions, provider-native
+attachment, and Resume when a worker socket is already live. A responsive
+incompatible worker receives no provider command and returns a typed upgrade
+conflict. Cancel, Stop, status/read, conversation/history, and stream operations
+remain available so the user can inspect and migrate safely by stopping and
+resuming that Session with the current binary.
 
 ## Conversation sources, projection, and reconnect
 
@@ -118,12 +121,13 @@ One canonical provider conversation has three distinct data paths:
 
 | Source | Role |
 | --- | --- |
-| Verified provider-owned store | Committed, authoritative user-visible conversation history |
+| Verified provider-owned store (Codex/Claude/Grok JSONL; OpenCode SQLite) | Committed, authoritative user-visible conversation history |
 | Live ACP | Provisional reasoning, output, tools, permissions, and turn state while work is happening |
 | Session JSONL | Gateway lifecycle/audit record, missed-stream recovery, provisional overlay, and explicit fallback |
 
 The provider store may itself be JSONL, SQLite, or another provider format; it
-is accessed only through verified provider adapters in `internal/native`.
+is accessed only through verified provider adapters in `internal/native`. V1
+reads Codex, Claude, and Grok provider JSONL plus OpenCode provider SQLite.
 Gateway JSONL is not promoted into a canonical transcript merely because a
 provider snapshot is temporarily unavailable.
 
@@ -190,7 +194,9 @@ provider-native by default; `--acp` selects the structured gateway console.
   activity, then subscribes. Enter opens the selected native provider harness
   and `a` opens its reconciled structured ACP view.
 - Structured ACP attachment loads the shared provider-snapshot-plus-overlay
-  projection, then follows ACP from the captured gateway cursor.
+  projection, then follows ACP from the captured gateway cursor. Every prompt
+  additionally performs exact ACP rehydration after reaching the FIFO head and
+  before dispatch.
 - Multiple viewers may subscribe safely.
 - A Task prompt is never broadcast; the user must select its target Session.
 - In Task/structured ACP views, `q`, `Ctrl-C`, browser close, network loss, or `acpctl serve` exit detaches only the viewer. Native keys belong to the provider; tmux uses `Ctrl-B d` to detach while leaving it running.
@@ -207,13 +213,11 @@ Before native attachment, `internal/native` verifies that exact canonical ID aga
 ```text
 canonical provider ID ── exact local-store verification ── native CLI resume
           │                                                │
-          └────────── per-Session exclusive writer gate ───┘
+          └────────── ACP bridge ───────────────────────────┘
+                    same conversation; exclusive writers
                                                            │ process exits/stops
                                                            ▼
-                                      refresh + provider-store reconciliation
-                                                           │
-                                                           ▼
-                                              release queued ACP write
+                    owner release + provider-store reconciliation
 ```
 
 When tmux is available, the native CLI runs in a stable per-Session tmux session; detaching the viewer leaves it running. The gateway tags that tmux session with a hash of the canonical state root plus Session identity, explicitly passes the selected `AGENT_HOME` and current `PATH` to defeat stale tmux-server environment, and refuses an unowned name collision. From a gateway console already inside tmux, attachment switches that client to the same stable harness; `Ctrl-B L` returns to the previous console client view. Direct execution is allowed only outside tmux when the terminal is non-interactive or the tmux binary is unavailable; a nested tmux handoff always fails closed rather than launching a second provider.
@@ -231,30 +235,43 @@ generation immediately before provider start and present it again on release.
 A delayed process from an older generation cannot activate or release a newer
 lifecycle. A collision that never activated remains `reserved` and can be
 recovered explicitly only after exact `=agent-<session-id>` tmux absence is
-verified. Recovery that revokes the reservation schedules exact refresh and
-provider-store reconciliation because the colliding harness may have changed
+verified. Recovery that revokes the reservation releases that exact generation,
+schedules the same provider-store reconciliation as normal native exit, and
+retains the freshness marker that forces exact ACP rehydration before the next
+dispatch. This is required because the colliding harness may have changed
 provider history. If a concurrent safe release wins first, recovery reports
-`already_released` and does not invent a refresh event to wait for. Once
-`active`, tmux disappearance does not prove that the provider
-tree exited, so ownership stays fail-closed. Legacy ownership markers are also
-treated as active.
+`already_released`. Once
+`active`, tmux disappearance does not prove that the provider tree exited, so
+the native-harness lifecycle stays fail-closed against creating a replacement
+native process or admitting ACP work. Legacy ownership markers are
+conservatively treated as exclusive native-harness markers.
 
-Viewer connections are non-exclusive, but provider writes are exclusive per
-Session. If an ACP turn owns the writer gate, native attach waits or fails
-visibly without cancelling that turn. While a provider-native process owns the
-gate, ACP prompts remain visibly queued and do not reach the provider. A tmux
-viewer detach is not process exit and does not release native ownership.
+Before every ACP prompt, after it reaches the head of the ACP FIFO, the worker
+closes and refreshes its idle ACP adapter on the exact persisted ACP Session
+ID. If that fails, it performs exact Resume. This also covers provider-store
+changes made outside a gateway-managed native harness.
+Both paths revalidate ACP, native, and provider identity; successful continuity
+emits correlated `acp_rehydrated` (`refreshed` or `resumed`) before
+`turn_started`. A failed rehydration sends no prompt through an uncertain
+adapter.
 
-Native process exit/stop requests an exact ACP refresh plus provider-store
-reconciliation while native ownership and the boundary remain closed to queued
-writes. Ownership releases only after that reconciliation succeeds. Refresh,
-prompt-transport failure, and post-turn identity inspection reload persisted
-verification state and are time-bounded. An uncertain bridge and its provider
-process group are terminated and awaited before exact ACP resume is attempted.
-Queued work crosses the boundary only after identity recovery and atomic
-reconciliation succeed; otherwise requests receive correlated errors and the
-worker stops for explicit resume. Recovery never substitutes a different
-conversation identity.
+Viewer connections are non-exclusive, but native and ACP provider writes are
+exclusive. While a native owner or reservation exists, ACP admission returns an
+actionable conflict before journal or queue mutation. While ACP is accepted,
+queued, preparing, or active, native creation or activation is rejected without
+cancelling ACP. Only ACP-to-ACP prompts use the transport FIFO.
+
+Native process exit/stop establishes a durable release barrier and starts exact
+provider-store reload and presentation reconciliation. Only after the exact
+owner has released may a retried ACP request be admitted; that request still
+must complete pre-prompt exact ACP rehydration before dispatch. Presentation
+reconciliation may finish independently after release and never weakens writer
+exclusion. Pre-prompt ACP rehydration,
+prompt-transport failure recovery, and post-turn identity inspection reload
+persisted verification state and are time-bounded. An uncertain ACP bridge and its provider process
+group may still be terminated and awaited before exact ACP resume; affected
+requests receive correlated transport errors. Recovery never substitutes a
+different conversation identity.
 
 ## Review
 
@@ -291,14 +308,24 @@ Browser hardening includes loopback Host enforcement, cross-origin mutation reje
   journal/overlay.
 - **Prompt client disconnects:** worker continues and records the request-correlated response for cursor replay.
 - **Native verification fails:** no native process starts; the ACP worker is unchanged.
+- **New native generation requested while ACP is accepted, queued, preparing, or active:** reject
+  the native start with wait-then-open guidance; do not queue it, start a
+  provider process, or cancel ACP.
 - **Provider snapshot is temporarily unreadable:** an already-open viewer keeps
   its current in-memory presentation and discloses the delayed refresh; an
   initial load uses the bounded gateway-history fallback. Never swap in a
   partial candidate.
-- **Post-native refresh, reconciliation, or post-turn identity recovery fails:**
-  warnings and correlated queued-request errors are recorded, the suspect
-  process tree is terminated, and the worker stops for explicit exact resume;
-  queued writes do not cross the unresolved ownership boundary.
+- **Post-native provider reload or reconciliation fails:** after exact native
+  release, the current validated view is retained and a delayed-history warning
+  is recorded. A retried ACP request still performs exact Refresh/fallback
+  Resume before dispatch; snapshot presentation failure never permits a second
+  native writer.
+- **Pre-prompt ACP rehydration fails:** the correlated request receives an
+  error and no prompt is sent through the uncertain adapter. If native ownership
+  still exists, the request is rejected before admission rather than queued.
+- **ACP transport identity recovery fails:** affected requests receive
+  correlated errors, the suspect ACP process tree is terminated, and the
+  worker stops for explicit exact resume.
 - **SQLite contention:** busy timeout and per-repository locking protect local concurrency.
 - **Existing checkout collision:** fail before a second writer unless explicitly overridden.
 

@@ -180,9 +180,10 @@ acpctl session resume <id>
 - `stop` asks the worker to stop and waits for persisted ownership to clear.
 - `resume` starts a new detached worker that resumes the persisted ACP Session ID
   for the same canonical provider conversation.
-- a worker accepts one turn at a time and queues later prompts.
-- the per-Session provider-writer gate prevents ACP and the provider-native
-  process from sending input concurrently.
+- a worker accepts one ACP turn at a time and keeps later ACP prompts in its
+  transport-local FIFO.
+- an open or detached provider-native process retains exclusive ownership;
+  ACP submissions are rejected before admission and never enter that FIFO.
 - multiple subscribers receive the same lines.
 - a worker stop/crash does not delete JSONL.
 
@@ -212,20 +213,21 @@ Session's exact provider-native CLI. When the console itself is inside tmux,
 native attachment switches to the one stable `agent-<session-id>` tmux
 Session: use `Ctrl-B L` to return to the console or `Ctrl-B d` to detach the
 client while the provider keeps running. `acpctl session attach <id>`
-reconnects to it. Detaching either view never stops the worker, cancels an ACP
-turn, or releases provider-write ownership held by a still-running native
-process. Do not use `stop` merely to close a UI.
+reconnects to it while that generation remains current. Detaching either view
+never stops the worker, cancels an ACP turn, or stops the still-running native
+process. A detached native process retains exclusive ownership until normal
+provider exit; do not use `stop` merely to close a UI.
 
 Prompt, permission decision, provider-native attachment, and Resume against a
-live worker all negotiate the current worker protocol and
-`exclusive-native-owner-v1` capability before sending provider input or
-spawning anything. If a worker does not satisfy that complete contract, those
-operations fail closed; HTTP provider-write calls return `409` with code
+live worker all negotiate worker protocol v3 and
+`exclusive-native-owner-v2` before sending provider input or spawning anything.
+That capability proves generation-scoped duplicate-native protection and
+cross-surface writer exclusion. If a worker does not satisfy that contract,
+those operations fail closed; HTTP provider-write calls return `409` with code
 `worker_upgrade_required`, and no prompt, permission decision, native process,
 or replacement worker is sent or started. Cancel, Stop, status/read,
 conversation/history, permission-list, and stream operations remain available
-for inspection and safe migration. First exit any provider CLI in tmux Session
-`agent-<session-id>`. Then run, in order:
+for inspection and safe migration. Then run, in order:
 
 ```bash
 acpctl session stop <session-id>
@@ -271,7 +273,7 @@ server-side projection. They do not read provider files or merge JSONL locally.
 
 | Source | Operational meaning |
 | --- | --- |
-| Provider-owned store | Committed user-visible history for the exact verified canonical conversation |
+| Provider-owned store | Committed user-visible history: verified provider JSONL for Codex/Claude/Grok and verified provider SQLite for OpenCode |
 | ACP | Live provisional chunks, reasoning, tools, approvals, and turn state |
 | Gateway Session JSONL | Lifecycle/audit evidence, missed-stream recovery, provisional overlay, and fallback |
 
@@ -289,6 +291,14 @@ bounded gateway-history fallback. If a transient refresh fails, an already-open
 viewer keeps its current in-memory presentation and marks the refresh as
 delayed. A new Session with no conversation activity shows an explicit empty
 state rather than a partial or invented conversation.
+
+Viewing and prompting have separate activation boundaries. Opening Web or the
+structured terminal only loads the provider snapshot plus gateway JSONL
+overlay. Before every ACP prompt after it reaches the FIFO head, the worker
+refreshes its idle adapter on the exact persisted ACP Session; if refresh fails
+it performs exact Resume. A successful
+continuity step records correlated `acp_rehydrated` (`refreshed` or `resumed`)
+before `turn_started`. A failed rehydration sends no provider prompt.
 
 ## Provider-native mode
 
@@ -315,18 +325,34 @@ With tmux installed, the command creates or reconnects to a stable `agent-<sessi
 Ctrl-B d
 ```
 
-Native and ACP are two transports to the same provider conversation. Multiple
-read-only viewers may coexist, but writes are exclusive per Session:
+Native and ACP are two transports to the same canonical provider conversation.
+Multiple viewers may coexist, but provider writes are exclusive per Session:
 
-- an active ACP turn owns the provider-writer gate; native attach waits or
-  fails visibly without pausing or cancelling that turn;
-- a running provider-native process owns the gate; ACP prompts remain visibly
-  queued and no ACP input reaches the provider;
-- detaching a tmux viewer leaves the provider process and native ownership
-  intact;
-- native process exit/stop begins exact refresh and provider-store
-  reconciliation while native ownership remains held; ownership releases and
-  queued ACP dispatch resumes only after that boundary is complete.
+- later ACP prompts still wait behind an active ACP turn because the public ACP
+  runtime supports one active turn per Session;
+- while a native owner or pre-launch reservation exists, ACP submission is
+  rejected before journal or queue mutation with exit-and-retry guidance;
+- while ACP is accepted, queued, preparing, or running, native creation or
+  activation is rejected immediately with wait-then-open guidance;
+- neither rejection pauses, cancels, or takes over the active surface;
+- detaching a tmux viewer leaves the provider process and its native ownership
+  intact.
+
+Starting or activating a new native generation while an ACP request is
+accepted, queued, preparing, or running is rejected immediately, not queued.
+No native provider process starts and the ACP request is not cancelled. Wait
+for the correlated ACP request to settle, then retry `session attach` so the
+new process resumes a current provider snapshot.
+
+ACP submission while native owns the Session fails immediately with
+exit-and-retry guidance. Return to the original provider terminal—or attach to
+its verified `agent-<session-id>` tmux harness—then exit the provider normally.
+Viewer detach is not release, and the gateway never auto-kills the provider.
+After exact owner release, provider-store reconciliation begins. Retry ACP only
+after release; at the FIFO head it performs exact Refresh/fallback Resume and
+identity validation before `turn_started`. A later native launch verifies the
+provider store and runs a fresh `BuildResume` invocation on the same canonical
+ID.
 
 If an owner-tag mismatch prevents attachment, do not kill the tmux Session from
 that error alone: it may be a legitimate newer generation observed by a stale
@@ -339,38 +365,42 @@ only that reservation:
 ```bash
 acpctl session recover-native <session-id>
 acpctl session logs <session-id> --raw
-# if recovery reports a scheduled refresh, wait for native_refreshed; then:
 acpctl session attach <session-id>
 ```
 
 Recovery refuses while the exact tmux harness exists, tmux inspection is
 unavailable or uncertain, or the worker says the generation became active. A
-successful recovery that revokes the reservation schedules exact refresh and
-provider-store reconciliation before another attachment. If a concurrent safe
-release already won, the command explicitly says no recovery refresh was
-scheduled; do not wait for a nonexistent `native_refreshed` event. Missing tmux
-is never evidence that an active provider process exited: active ownership,
-including a legacy ownership marker, remains blocked until the real provider
-owner completes its normal release. There is intentionally no force flag.
+successful recovery revokes the exact reservation and starts provider-store
+reconciliation. Do not retry another surface until the recovery command reports
+release; a later ACP request still performs exact Refresh/fallback Resume before
+dispatch. If a concurrent safe release already won, the command explicitly
+reports that state. Missing tmux is never evidence that an active provider
+process exited: an active or legacy native-harness marker remains blocked
+against replacement native creation and ACP admission until the real provider
+process completes its normal release. There is intentionally no force flag.
 
 The tmux Session receives the invoking `AGENT_HOME` and `PATH`, rather than
-inheriting stale values from an older tmux server. Refresh and reconciliation
-are time-bounded. On an uncertain result the complete bridge/provider process
-group is terminated and awaited before bounded exact resume recovery. If
-recovery fails, queued prompts receive correlated `turn_error` records and the
-worker stops instead of using an uncertain conversation. Warnings use
-`native_refresh_warning` or `native_refresh_recovery_warning`; the writer gate
-remains closed to new provider input until the outcome is safe.
+inheriting stale values from an older tmux server. Reload and reconciliation
+are time-bounded. Snapshot failure keeps the current validated presentation and
+emits `provider_transcript_reconcile_warning`. After native ownership has
+released, presentation reconciliation does not replace the independent exact
+ACP rehydration gate. An uncertain ACP transport fails its affected requests
+with correlated `turn_error` records and stops for exact resume rather than
+substituting a conversation.
 
 ```bash
 acpctl session logs <id> --raw
 ```
 
-Look for `native_refresh_started`, then `native_refreshed` (or
-`native_refresh_recovered`), or an actionable warning. The success event is
-published only after exact provider transcript reconciliation completes and
-native ownership is safe to release. Continue through `--acp` if native
-verification is unavailable; never substitute another identifier.
+On provider exit, look for `native_released`, followed asynchronously by
+`provider_transcript_reconciled` or
+`provider_transcript_reconcile_warning`. Reservation recovery similarly emits
+`native_reservation_recovered` before its asynchronous reconciliation result.
+The release record is the ownership boundary; the reconciliation result is the
+display-history result. Pre-prompt ACP continuity is represented separately by
+correlated `acp_rehydrated`, followed by `turn_started`. Continue through
+`--acp` if native verification is unavailable; never substitute another
+identifier.
 
 ## Review operations
 
@@ -466,11 +496,11 @@ To remove disposable state, first verify the exact `AGENT_HOME`, stop its Sessio
 
 **Stop timeout:** inspect Session detail and process state. A later normal CLI command will reconcile a dead PID/socket; do not delete a live socket blindly.
 
-**Prompt says queued:** another ACP turn may own execution, or the
-provider-native process may own the Session's writer gate. V1 exposes the
-request's queued state but does not yet distinguish the current writer in
-Session detail. Follow the request ID; queued input does not reach the provider
-early.
+**Prompt says queued:** another ACP turn occupies the public runtime's
+one-active-turn slot, or the provider/runtime itself returned a queued state.
+Native ownership is never represented as a queued ACP request: it returns an
+immediate conflict before admission. Follow an accepted request ID and do not
+resend it while its recorded state is unresolved.
 
 **Cancel says no active turn:** the Session is idle; send the next prompt normally.
 
@@ -490,12 +520,24 @@ early.
 
 **Provider-store verification fails:** the gateway found no exact canonical-ID/check-out match and intentionally did not launch native mode. Diagnose the provider's local state or continue with `--acp`.
 
+**Native start rejected while ACP is accepted/queued/preparing/running:** let
+the correlated ACP request settle, then retry `session attach`. The native
+request was not queued, no provider process started, and ACP was not cancelled.
+
+**ACP prompt is rejected while native is open or detached:** return to the
+original provider terminal, or its verified `agent-<session-id>` tmux harness,
+and exit the provider normally. The rejected prompt was neither journaled nor
+queued. After exact release, retry; the prompt performs exact ACP rehydration
+before dispatch.
+
 **tmux owner mismatch/name collision:** an existing `agent-<session-id>` tmux Session has a different protocol, state-root, or generation tag. The gateway refuses to attach. Return to the console, inspect Session status, and retry; do not kill it from the mismatch alone because it may be a legitimate newer harness. Close or rename only a separately verified unrelated collision. Run `recover-native` only when the worker reports a pre-launch reservation and the exact harness is known absent.
 
-**Refresh/recovery warning after native exit:** inspect raw logs and the
-conversation source state. The writer gate remains closed to queued provider
-input until exact recovery and reconciliation succeed. If they fail, the
-worker drains queued work with correlated errors and stops; run
+**Reconciliation/recovery warning after native exit:** inspect raw logs and the
+conversation source state. The current validated transcript remains visible
+after the background reconciliation warning, and a later page/Session reload
+retries the provider-store read. Confirm that native ownership released before
+retrying ACP; the exact Refresh/fallback Resume boundary remains mandatory. If
+the ACP transport itself reports identity failure, run
 `acpctl session resume <id>` to establish the exact persisted identity before
 sending another prompt.
 

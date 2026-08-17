@@ -67,13 +67,13 @@ func TestHiddenNativeRequiresReservationGeneration(t *testing.T) {
 func TestNativeRecoveryOutputDoesNotInventRefreshAfterConcurrentRelease(t *testing.T) {
 	var output bytes.Buffer
 	writeNativeRecoveryResult(&output, "S-EXACT", appservice.NativeReservationRecoveryResult{State: "already_released"})
-	if !strings.Contains(output.String(), "already released") || !strings.Contains(output.String(), "no recovery refresh was scheduled") || strings.Contains(output.String(), "Wait for native_refreshed") {
+	if !strings.Contains(output.String(), "already released") || strings.Contains(output.String(), "Wait for native_refreshed") {
 		t.Fatalf("already-released recovery output = %q", output.String())
 	}
 	output.Reset()
-	writeNativeRecoveryResult(&output, "S-EXACT", appservice.NativeReservationRecoveryResult{State: "refresh_scheduled"})
-	if !strings.Contains(output.String(), "Wait for native_refreshed") {
-		t.Fatalf("scheduled recovery output = %q", output.String())
+	writeNativeRecoveryResult(&output, "S-EXACT", appservice.NativeReservationRecoveryResult{State: "released"})
+	if !strings.Contains(output.String(), "ACP prompts remain available") || strings.Contains(output.String(), "Wait for native_refreshed") {
+		t.Fatalf("released recovery output = %q", output.String())
 	}
 }
 
