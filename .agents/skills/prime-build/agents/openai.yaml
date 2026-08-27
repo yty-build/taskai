@@ -1,0 +1,7 @@
+interface:
+  display_name: "Prime TaskAI Build"
+  short_description: "Coordinate the approved TaskAI build"
+  default_prompt: "Use $prime-build to coordinate the approved TaskAI build."
+
+policy:
+  allow_implicit_invocation: false
