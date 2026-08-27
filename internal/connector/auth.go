@@ -9,9 +9,10 @@ import (
 type AuthState string
 
 const (
-	AuthConnected    AuthState = "connected"
-	AuthDisconnected AuthState = "disconnected"
-	AuthNeedsRepair  AuthState = "needs_repair"
+	AuthConnected        AuthState = "connected"
+	AuthDisconnected     AuthState = "disconnected"
+	AuthNeedsRepair      AuthState = "needs_repair"
+	AuthMissingConnector AuthState = "missing_connector"
 )
 
 type AuthPort interface {
