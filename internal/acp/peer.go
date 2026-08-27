@@ -19,6 +19,7 @@ const (
 	MethodSessionCancel = "session/cancel"
 	MethodSessionUpdate = "session/update"
 	MethodCancelRequest = "$/cancelRequest"
+	MaxInboundRequests  = 64
 )
 
 // Handler is the complete public inbound JSON-RPC surface. Implementations may
@@ -188,6 +189,17 @@ func (p *Peer) Wait() error {
 	return p.Err()
 }
 
+// Done closes when the endpoint has terminated. It lets transport owners
+// release and reap the process behind a Peer without starting a second waiter.
+func (p *Peer) Done() <-chan struct{} {
+	if p == nil {
+		done := make(chan struct{})
+		close(done)
+		return done
+	}
+	return p.done
+}
+
 // Close ends this endpoint and unblocks its transport.
 func (p *Peer) Close() error {
 	p.fail(ErrTransportClosed)
@@ -231,7 +243,10 @@ func (p *Peer) readLoop(ctx context.Context) {
 				}
 			}
 		case KindRequest:
-			p.startInbound(ctx, message)
+			if err := p.startInbound(ctx, message); err != nil {
+				p.fail(err)
+				return
+			}
 		default:
 			p.fail(ErrMalformedFrame)
 			return
@@ -239,10 +254,23 @@ func (p *Peer) readLoop(ctx context.Context) {
 	}
 }
 
-func (p *Peer) startInbound(parent context.Context, message Message) {
-	key, _ := correlationKey(message.ID)
+func (p *Peer) startInbound(parent context.Context, message Message) error {
+	key, err := correlationKey(message.ID)
+	if err != nil {
+		return ErrMalformedFrame
+	}
 	ctx, cancel := context.WithCancel(parent)
 	p.mu.Lock()
+	if p.terminal != nil {
+		p.mu.Unlock()
+		cancel()
+		return ErrTransportClosed
+	}
+	if _, duplicate := p.inbound[key]; duplicate || len(p.inbound) >= MaxInboundRequests {
+		p.mu.Unlock()
+		cancel()
+		return ErrMalformedFrame
+	}
 	p.inbound[key] = cancel
 	p.mu.Unlock()
 
@@ -273,6 +301,7 @@ func (p *Peer) startInbound(parent context.Context, message Message) {
 			p.fail(err)
 		}
 	}()
+	return nil
 }
 
 func (p *Peer) cancelInbound(params json.RawMessage) {

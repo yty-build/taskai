@@ -111,6 +111,7 @@ type childState struct {
 
 type turnState struct {
 	child     *childState
+	port      ChildPort
 	token     string
 	turnID    string
 	requestID string
@@ -148,8 +149,13 @@ type Delegator struct {
 	answerChanged chan struct{}
 	closed        bool
 	fatal         error
+	closing       chan struct{}
 	done          chan struct{}
 	doneOnce      sync.Once
+
+	// beforeTurnClaim is a content-free deterministic concurrency test seam.
+	// It is nil in production.
+	beforeTurnClaim func()
 }
 
 func NewDelegator(ctx context.Context, parentSessionID string, registry *Registry, events ChildEventSink, ids IDSource) (*Delegator, error) {
@@ -170,6 +176,7 @@ func NewDelegator(ctx context.Context, parentSessionID string, registry *Registr
 		children:      make(map[string]*childState),
 		turns:         make(map[string]*turnState),
 		answerChanged: make(chan struct{}),
+		closing:       make(chan struct{}),
 		done:          make(chan struct{}),
 	}, nil
 }
@@ -233,6 +240,9 @@ func (d *Delegator) start(ctx context.Context, input delegateInput) (capabilityR
 	if input.Mode == ModeFollow {
 		turn.queue = newFrameQueue()
 	}
+	if d.beforeTurnClaim != nil {
+		d.beforeTurnClaim()
+	}
 
 	d.mu.Lock()
 	if d.closed {
@@ -246,7 +256,7 @@ func (d *Delegator) start(ctx context.Context, input delegateInput) (capabilityR
 		}
 		return capabilityResult{}, ErrTransport
 	}
-	if child.closed || child.active != nil || child.replaying || child.resuming {
+	if child.closed || child.port == nil || child.active != nil || child.replaying || child.resuming {
 		if created {
 			delete(d.children, child.id)
 			child.closed = true
@@ -268,6 +278,11 @@ func (d *Delegator) start(ctx context.Context, input delegateInput) (capabilityR
 		}
 		return capabilityResult{}, ErrCapacity
 	}
+	// Snapshot the exact port under the same lock that claims child.active.
+	// Idle-death detection may retire and Resume child.port between
+	// resolveChild and this point; a turn must either own the replacement port
+	// or lose the active reservation, never observe an unsynchronized pointer.
+	turn.port = child.port
 	child.active = turn
 	child.mode = input.Mode
 	d.turns[token] = turn
@@ -328,28 +343,32 @@ func (d *Delegator) resolveChild(provider, childID string) (*childState, bool, e
 		return nil, false, ErrInvalidOperation
 	}
 	if childID != "" {
+		var stale ChildPort
 		d.mu.Lock()
 		child, ok := d.children[childID]
 		if !ok || child.closed {
 			d.mu.Unlock()
 			return nil, false, ErrOwnership
 		}
-		if child.port != nil {
-			if child.replaying || child.resuming {
-				d.mu.Unlock()
-				return nil, false, ErrChildBusy
-			}
-			d.mu.Unlock()
-			return child, false, nil
-		}
 		if child.active != nil || child.replaying || child.resuming {
 			d.mu.Unlock()
 			return nil, false, ErrChildBusy
+		}
+		if child.port != nil && !childPortUnavailable(child.port) {
+			d.mu.Unlock()
+			return child, false, nil
+		}
+		if child.port != nil {
+			stale = child.port
+			child.port = nil
 		}
 		provider = child.provider
 		reference := replay.OpaqueRefFromBytes(child.reference.Bytes())
 		child.resuming = true
 		d.mu.Unlock()
+		if stale != nil {
+			_ = stale.Close()
+		}
 
 		profile, err := d.registry.Profile(provider)
 		if err != nil || !profile.Capabilities.Resume || profile.ChildResume == nil {
@@ -432,6 +451,28 @@ func (d *Delegator) resolveChild(provider, childID string) (*childState, bool, e
 	return child, true, nil
 }
 
+type availableChildPort interface {
+	Available() bool
+}
+
+type doneChildPort interface {
+	Done() <-chan struct{}
+}
+
+func childPortUnavailable(port ChildPort) bool {
+	if available, ok := port.(availableChildPort); ok && !available.Available() {
+		return true
+	}
+	if done, ok := port.(doneChildPort); ok {
+		select {
+		case <-done.Done():
+			return true
+		default:
+		}
+	}
+	return false
+}
+
 func (d *Delegator) clearResumeReservation(child *childState) {
 	d.mu.Lock()
 	if child != nil {
@@ -452,8 +493,15 @@ func (d *Delegator) runTurn(turn *turnState, prompt string) {
 	defer d.wg.Done()
 	collector := answerCollector{}
 	var collectErr error
+	followFits := d.followBatchFits(OperationFollowNext, turn.child.id, turn.token)
 	onFrame := func(frame json.RawMessage) error {
 		if turn.mode == ModeFollow {
+			// A frame that cannot fit by itself with its required continuation
+			// could otherwise sit at the queue head forever. Reject it before
+			// enqueue so the turn can publish one bounded terminal failure.
+			if !followFits(frameBatch{Frames: []json.RawMessage{frame}, More: true}) {
+				return ErrCapacity
+			}
 			return turn.queue.push(d.ctx, frame)
 		}
 		if collectErr == nil {
@@ -461,7 +509,10 @@ func (d *Delegator) runTurn(turn *turnState, prompt string) {
 		}
 		return nil
 	}
-	native, err := turn.child.port.Prompt(d.ctx, prompt, onFrame)
+	native, err := turn.port.Prompt(d.ctx, prompt, onFrame)
+	if err != nil {
+		d.retireTurnPort(turn)
+	}
 	terminal := classifyTerminal(native, err, nil)
 	if turn.mode == ModeAnswer {
 		if collectErr != nil {
@@ -478,8 +529,31 @@ func (d *Delegator) runTurn(turn *turnState, prompt string) {
 		if _, marshalErr := probe.marshal(); marshalErr != nil {
 			terminal = Terminal{Success: false, StopReason: "malformed_completion"}
 		}
+	} else if !followFits(frameBatch{Terminal: &terminal, More: false}) {
+		// Native completion details are optional on failure. Collapse an
+		// unreturnable provider completion to a finite correlated terminal.
+		terminal = Terminal{Success: false, StopReason: "malformed_completion"}
 	}
 	d.finishTurn(turn, terminal)
+}
+
+// retireTurnPort removes only the transport owned by this exact active turn.
+// The opaque native reference remains on childState so a later model
+// invocation takes the explicit ChildResume path; there is no hidden retry.
+func (d *Delegator) retireTurnPort(turn *turnState) {
+	if turn == nil || turn.child == nil {
+		return
+	}
+	d.mu.Lock()
+	var port ChildPort
+	if turn.child.active == turn && turn.child.port != nil {
+		port = turn.child.port
+		turn.child.port = nil
+	}
+	d.mu.Unlock()
+	if port != nil {
+		_ = port.Close()
+	}
 }
 
 func (d *Delegator) finishTurn(turn *turnState, terminal Terminal) {
@@ -634,7 +708,8 @@ func (d *Delegator) cancelTurn(ctx context.Context, childID, token string) (capa
 	if err != nil {
 		return capabilityResult{}, err
 	}
-	if err := turn.child.port.Cancel(ctx); err != nil {
+	if err := turn.port.Cancel(ctx); err != nil {
+		d.retireTurnPort(turn)
 		return capabilityResult{}, &BoundaryError{Stage: "turn cancellation", Err: ErrTransport}
 	}
 	result := capabilityResult{
@@ -762,8 +837,8 @@ func (d *Delegator) RestoreOwnedChild(childID, provider string, reference replay
 	return nil
 }
 
-// Done closes on either explicit shutdown or a runtime-fatal boundary. Err is
-// non-nil only for the latter and is always content-free.
+// Done closes after explicit or runtime-fatal shutdown has closed every owned
+// child port. Err is non-nil only for the latter and is always content-free.
 func (d *Delegator) Done() <-chan struct{} { return d.done }
 
 func (d *Delegator) Err() error {
@@ -791,12 +866,17 @@ func (d *Delegator) shutdown(cause error) {
 		d.fatal = cause
 	}
 	if d.closed {
+		done := d.done
 		d.mu.Unlock()
 		d.cancel()
-		d.doneOnce.Do(func() { close(d.done) })
+		// The first shutdown caller owns child cleanup. Every concurrent caller
+		// joins that exact cleanup instead of treating the closing state as a
+		// completed state.
+		<-done
 		return
 	}
 	d.closed = true
+	close(d.closing)
 	children := make([]ChildPort, 0, len(d.children))
 	for _, child := range d.children {
 		child.closed = true
@@ -821,13 +901,13 @@ func (d *Delegator) shutdown(cause error) {
 	d.notifyAnswersLocked()
 	d.mu.Unlock()
 	d.cancel()
-	d.doneOnce.Do(func() { close(d.done) })
 	for _, queue := range queues {
 		queue.fail(ErrTransport)
 	}
 	for _, child := range children {
 		_ = child.Close()
 	}
+	d.doneOnce.Do(func() { close(d.done) })
 }
 
 func (d *Delegator) Close() error {
@@ -973,6 +1053,10 @@ func (c *answerCollector) add(raw json.RawMessage) error {
 		return nil
 	}
 	if len(params.Update.Content) == 0 || !json.Valid(params.Update.Content) {
+		return ErrMalformedCompletion
+	}
+	if params.Update.MessageID == nil || *params.Update.MessageID == "" ||
+		len(*params.Update.MessageID) > MaxCorrelationIDBytes {
 		return ErrMalformedCompletion
 	}
 	if params.Update.MessageID != nil {

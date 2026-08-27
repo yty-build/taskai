@@ -39,15 +39,17 @@ func (c *CodexAppServerClient) ConnectManager(reference replay.OpaqueRef) (Manag
 		return c.connection, nil
 	}
 	c.connection = &codexManagerConnection{
-		client:    c,
-		reference: replay.OpaqueRefFromBytes(reference.Bytes()),
+		client:        c,
+		reference:     replay.OpaqueRefFromBytes(reference.Bytes()),
+		publicSession: managerPublicSessionID(reference),
 	}
 	return c.connection, nil
 }
 
 type codexManagerConnection struct {
-	client    *CodexAppServerClient
-	reference replay.OpaqueRef
+	client        *CodexAppServerClient
+	reference     replay.OpaqueRef
+	publicSession string
 
 	mu     sync.Mutex
 	active *CodexTurnHandle
@@ -58,6 +60,13 @@ func (c *codexManagerConnection) NativeReference() replay.OpaqueRef {
 		return replay.OpaqueRef{}
 	}
 	return replay.OpaqueRefFromBytes(c.reference.Bytes())
+}
+
+func (c *codexManagerConnection) PublicSessionID() string {
+	if c == nil || !boundedCorrelation(c.publicSession) {
+		return ""
+	}
+	return c.publicSession
 }
 
 func (c *codexManagerConnection) Prompt(
@@ -119,17 +128,6 @@ func (c *codexManagerConnection) Interrupt(ctx context.Context) error {
 		return ErrStaleTurn
 	}
 	return active.Interrupt(ctx)
-}
-
-func (c *codexManagerConnection) ReadNativeSession(ctx context.Context) (json.RawMessage, error) {
-	if c == nil || c.client == nil {
-		return nil, ErrProviderUnsupported
-	}
-	threadID, err := replay.ResolveCodexReference(c.reference)
-	if err != nil {
-		return nil, ErrProviderUnsupported
-	}
-	return c.client.ThreadRead(ctx, threadID)
 }
 
 func (c *codexManagerConnection) Done() <-chan struct{} {

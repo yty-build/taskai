@@ -341,13 +341,6 @@ func TestDynamicToolRejectsUntrustedShapeAndCorrelationsBeforeDelegation(t *test
 			},
 		},
 		{
-			name: "oversized arguments", id: json.RawMessage(`3`),
-			params: map[string]any{
-				"arguments": json.RawMessage(`{"opaque":"` + strings.Repeat("x", acp.MaxFrameBytes) + `"}`),
-				"callId":    "call-oversized", "threadId": "thread-validate", "tool": DelegateToolName, "turnId": "turn-validate",
-			},
-		},
-		{
 			name: "wrong tool", id: json.RawMessage(`4`),
 			params: map[string]any{
 				"arguments": json.RawMessage(`{"operation":"next_answer"}`), "callId": "call-wrong-tool",
@@ -417,6 +410,63 @@ func TestDynamicToolRejectsUntrustedShapeAndCorrelationsBeforeDelegation(t *test
 	assertDynamicFailure(t, sendDynamicRequest(t, server, json.RawMessage(`12`), stale), "")
 	if handler.calls.Load() != 1 {
 		t.Fatal("stale request reached Delegator")
+	}
+}
+
+func TestAppServerLiveTransportRejectsOversizedFrameBeforeDispatch(t *testing.T) {
+	var notifications atomic.Int64
+	raw := []byte(`{"method":"item/agentMessage/delta","params":{"threadId":"thread-live","turnId":"turn-live","delta":"` +
+		strings.Repeat("x", MaxAppServerLiveFrameBytes) + `"}}`)
+	if len(raw) <= MaxAppServerLiveFrameBytes || len(raw) >= MaxAppServerHistoryBytes || !json.Valid(raw) {
+		t.Fatalf("invalid oversized live fixture: bytes=%d", len(raw))
+	}
+	input := append(append([]byte(nil), raw...), '\n')
+	peer := newAppServerPeer(bytes.NewReader(input), ioDiscardWriter{}, nil, func(context.Context, appServerMessage) error {
+		notifications.Add(1)
+		return nil
+	})
+	peer.start(context.Background())
+	select {
+	case <-peer.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("oversized live frame did not close transport")
+	}
+	if notifications.Load() != 0 || !errors.Is(peer.errValue(), ErrTransport) {
+		t.Fatalf("oversized live dispatches=%d error=%v", notifications.Load(), peer.errValue())
+	}
+}
+
+func TestAppServerExplicitThreadReadAcceptsBoundedHistoryResponseAboveLiveLimit(t *testing.T) {
+	client, server := openTestAppServer(t, &countDynamicHandler{})
+	done := make(chan struct {
+		raw json.RawMessage
+		err error
+	}, 1)
+	go func() {
+		raw, err := client.ThreadRead(context.Background(), "thread-large-history")
+		done <- struct {
+			raw json.RawMessage
+			err error
+		}{raw: raw, err: err}
+	}()
+	request := server.read(t)
+	if request.Method != appMethodThreadRead {
+		t.Fatalf("method = %q, want thread/read", request.Method)
+	}
+	thread := json.RawMessage(`{"id":"thread-large-history","turns":[],"opaque":"` +
+		strings.Repeat("h", MaxAppServerLiveFrameBytes) + `"}`)
+	result := append(append([]byte(`{"thread":`), thread...), '}')
+	wire := append([]byte(`{"id":`), request.ID...)
+	wire = append(wire, []byte(`,"result":`)...)
+	wire = append(wire, result...)
+	wire = append(wire, '}')
+	if len(wire) <= MaxAppServerLiveFrameBytes || len(wire) >= MaxAppServerHistoryBytes || !json.Valid(wire) {
+		t.Fatalf("invalid bounded history fixture: bytes=%d", len(wire))
+	}
+	server.sendRaw(t, wire)
+	read := <-done
+	if read.err != nil || !bytes.Equal(read.raw, thread) {
+		t.Fatalf("ThreadRead bytes=%d error=%v", len(read.raw), read.err)
 	}
 }
 
@@ -585,26 +635,6 @@ func TestCodexManagerReturnsLiveACPConnectionWithExactReadInterruptAndDeath(t *t
 	}
 	if !sawPublic {
 		t.Fatal("live public manager content was not streamed")
-	}
-
-	readDone := make(chan struct {
-		raw json.RawMessage
-		err error
-	}, 1)
-	go func() {
-		raw, err := connection.ReadNativeSession(context.Background())
-		readDone <- struct {
-			raw json.RawMessage
-			err error
-		}{raw, err}
-	}()
-	readRequest := server.read(t)
-	if readRequest.Method != appMethodThreadRead || !bytes.Equal(readRequest.Params, json.RawMessage(`{"threadId":"thread-live-port","includeTurns":true}`)) {
-		t.Fatalf("exact native read = %s %s", readRequest.Method, readRequest.Params)
-	}
-	server.respond(t, readRequest, json.RawMessage(`{"thread":{"id":"thread-live-port","turns":[]}}`))
-	if read := <-readDone; read.err != nil || !bytes.Equal(read.raw, json.RawMessage(`{"id":"thread-live-port","turns":[]}`)) {
-		t.Fatalf("native read=%s error=%v", read.raw, read.err)
 	}
 
 	interruptDone := make(chan struct {

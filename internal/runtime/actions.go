@@ -154,7 +154,8 @@ func (supervisor *Supervisor) addManager(
 
 	reference := append([]byte(nil), instance.NativeReference()...)
 	if len(reference) == 0 || len(reference) > session.MaxProviderReferenceBytes ||
-		session.ValidateProviderReference(reference) != nil {
+		session.ValidateProviderReference(reference) != nil ||
+		!validManagerPublicSessionID(instance.PublicSessionID()) {
 		_ = supervisor.stopHandle(instance)
 		_ = supervisor.interruptTree(id)
 		return id, ErrTransport
@@ -309,7 +310,8 @@ func (supervisor *Supervisor) resume(ctx context.Context, clientID string, manag
 		}
 		return supervisor.managerError(resumeErr)
 	}
-	if !bytes.Equal(instance.NativeReference(), metadata.ProviderReference) {
+	if !bytes.Equal(instance.NativeReference(), metadata.ProviderReference) ||
+		!validManagerPublicSessionID(instance.PublicSessionID()) {
 		_ = supervisor.stopHandle(instance)
 		_ = supervisor.interruptTree(managerID)
 		return ErrTransport
@@ -412,7 +414,7 @@ func (supervisor *Supervisor) send(ctx context.Context, clientID string, manager
 			if id != managerID {
 				return ErrInvalidRequest
 			}
-			frame, decodeErr := decodePublicFrame(raw)
+			frame, decodeErr := decodePublicFrame(raw, entry.publicSessionID)
 			if decodeErr != nil {
 				return decodeErr
 			}

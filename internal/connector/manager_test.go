@@ -738,7 +738,10 @@ func (a *recordingAppServer) ConnectManager(reference replay.OpaqueRef) (connect
 	if err != nil || !bytes.Equal(reference.Bytes(), want.Bytes()) {
 		return nil, connector.ErrOwnership
 	}
-	connection := &recordingManagerConnection{reference: replay.OpaqueRefFromBytes(reference.Bytes()), done: make(chan struct{})}
+	connection := &recordingManagerConnection{
+		reference: replay.OpaqueRefFromBytes(reference.Bytes()), publicSessionID: "manager_public_fixture",
+		done: make(chan struct{}),
+	}
 	a.mu.Lock()
 	a.connections = append(a.connections, connection)
 	a.mu.Unlock()
@@ -789,14 +792,17 @@ func (f *recordingAppFactory) snapshotHandlers() []connector.DynamicToolHandler 
 }
 
 type recordingManagerConnection struct {
-	reference replay.OpaqueRef
-	done      chan struct{}
-	closeOnce sync.Once
+	reference       replay.OpaqueRef
+	publicSessionID string
+	done            chan struct{}
+	closeOnce       sync.Once
 }
 
 func (c *recordingManagerConnection) NativeReference() replay.OpaqueRef {
 	return replay.OpaqueRefFromBytes(c.reference.Bytes())
 }
+
+func (c *recordingManagerConnection) PublicSessionID() string { return c.publicSessionID }
 
 func (*recordingManagerConnection) Prompt(context.Context, string, func(json.RawMessage) error) (json.RawMessage, error) {
 	return nil, errors.New("unused manager prompt")
@@ -804,10 +810,6 @@ func (*recordingManagerConnection) Prompt(context.Context, string, func(json.Raw
 
 func (*recordingManagerConnection) Interrupt(context.Context) error {
 	return errors.New("unused manager interrupt")
-}
-
-func (*recordingManagerConnection) ReadNativeSession(context.Context) (json.RawMessage, error) {
-	return nil, errors.New("unused manager history")
 }
 
 func (c *recordingManagerConnection) Done() <-chan struct{} { return c.done }

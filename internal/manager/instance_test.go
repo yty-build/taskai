@@ -121,9 +121,6 @@ func TestSendPreservesPromptAndOrderedPublicFramesExactly(t *testing.T) {
 	if completion[0] != '{' || gotFrames[0][0] != '{' {
 		t.Fatal("caller-visible data aliases connector-owned buffers")
 	}
-	if got := connection.snapshot(); got.nativeReads != 0 {
-		t.Fatalf("Send read provider history %d times", got.nativeReads)
-	}
 }
 
 func TestSendSlowSinkBackpressuresProviderInPlace(t *testing.T) {
@@ -627,6 +624,55 @@ func TestStopFailureIsBoundedAndStillClosesExactlyOnce(t *testing.T) {
 	}
 }
 
+func TestStopDeadlineHardClosesInterruptThatIgnoresContext(t *testing.T) {
+	gate := make(chan struct{})
+	connection := newFakeConnection("manager-ref")
+	connection.interruptGate = gate
+	connection.interruptIgnoresContext = true
+	connection.closeInterruptGate = gate
+	_, instance, _ := startTestManager(t, context.Background(), "manager-one", connection)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := instance.Stop(ctx)
+	if !errors.Is(err, ErrStopFailed) {
+		t.Fatalf("deadline Stop = %v, want stop_failed", err)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatal("deadline Stop remained blocked behind provider Interrupt")
+	}
+	if got := connection.snapshot(); got.interrupts != 1 || got.closes != 1 {
+		t.Fatalf("forced Stop calls = Interrupt %d Close %d, want 1/1", got.interrupts, got.closes)
+	}
+	if terminal, ok := instance.Terminal(); !ok || terminal != (Terminal{Kind: TerminalFailed, Code: CodeStopFailed}) {
+		t.Fatalf("forced Stop terminal = %#v, %v", terminal, ok)
+	}
+}
+
+func TestStopDeadlineDoesNotWaitForInterruptAfterHardClose(t *testing.T) {
+	gate := make(chan struct{})
+	connection := newFakeConnection("manager-ref")
+	connection.interruptGate = gate
+	connection.interruptIgnoresContext = true
+	_, instance, _ := startTestManager(t, context.Background(), "manager-one", connection)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := instance.Stop(ctx)
+	close(gate)
+	if !errors.Is(err, ErrStopFailed) {
+		t.Fatalf("deadline Stop = %v, want stop_failed", err)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatal("deadline Stop waited for Interrupt after hard Close returned")
+	}
+	if got := connection.snapshot(); got.interrupts != 1 || got.closes != 1 {
+		t.Fatalf("forced Stop calls = Interrupt %d Close %d, want 1/1", got.interrupts, got.closes)
+	}
+}
+
 func TestCrashDuringStopPublishesOneRaceSafeTerminal(t *testing.T) {
 	interruptEntered := make(chan struct{}, 1)
 	interruptGate := make(chan struct{})
@@ -743,10 +789,10 @@ func TestInstanceSurfaceContainsNoContentQueueHistoryOrViewerState(t *testing.T)
 		gotFields[index] = instanceType.Field(index).Name
 	}
 	wantFields := []string{
-		"id", "providerID", "reference", "connection", "lifetime", "cancel", "release",
+		"id", "providerID", "reference", "publicSessionID", "connection", "lifetime", "cancel", "release",
 		"stateMu", "busy", "unavailable", "stopping",
 		"done", "terminalOnce", "terminalMu", "terminal",
-		"stopOnce", "stopMu", "stopErr",
+		"stopOnce", "stopMu", "stopErr", "closeOnce", "closeErr",
 	}
 	if !reflect.DeepEqual(gotFields, wantFields) {
 		t.Fatalf("Instance fields changed:\n got %v\nwant %v", gotFields, wantFields)
@@ -769,7 +815,7 @@ func TestInstanceSurfaceContainsNoContentQueueHistoryOrViewerState(t *testing.T)
 		methods[index] = pointerType.Method(index).Name
 	}
 	sort.Strings(methods)
-	wantMethods := []string{"Available", "Close", "Done", "ID", "NativeReference", "ProviderID", "Send", "Stop", "Terminal"}
+	wantMethods := []string{"Available", "Close", "Done", "ForceClose", "ID", "NativeReference", "ProviderID", "PublicSessionID", "Send", "Stop", "Terminal"}
 	if !reflect.DeepEqual(methods, wantMethods) {
 		t.Fatalf("Instance public methods = %v, want narrow %v", methods, wantMethods)
 	}

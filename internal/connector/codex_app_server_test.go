@@ -56,6 +56,10 @@ func TestCodexAppServerPinnedInitializeStartResumeAndRestoredToolHandler(t *test
 	if started.err != nil {
 		t.Fatal(started.err)
 	}
+	wantPublicSession := managerPublicSessionID(started.session.NativeReference)
+	if got := started.session.Connection.PublicSessionID(); got != wantPublicSession || !boundedCorrelation(got) {
+		t.Fatalf("public Manager Session identity = %q, want bounded %q", got, wantPublicSession)
+	}
 
 	resumeDone := make(chan struct {
 		session NativeManagerSession
@@ -89,6 +93,9 @@ func TestCodexAppServerPinnedInitializeStartResumeAndRestoredToolHandler(t *test
 	}
 	if resumed.session.Connection == nil || resumed.session.Connection != started.session.Connection {
 		t.Fatal("same-client exact Resume did not retain the live manager connection")
+	}
+	if got := resumed.session.Connection.PublicSessionID(); got != wantPublicSession {
+		t.Fatalf("Resume changed public Manager Session identity to %q", got)
 	}
 	promptDone := make(chan error, 1)
 	go func() {
@@ -358,6 +365,102 @@ func TestCodexAppServerFailsClosedOnVersionMismatchAndForeignToolThread(t *testi
 		t.Fatalf("tool ownership failure echoed private request content: %s", response.Raw)
 	}
 	_ = client
+}
+
+func TestCodexAppServerInitializeRequiresExactObservedVersion(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		result  json.RawMessage
+		want    string
+		wantErr bool
+	}{
+		{name: "exact public identity", result: json.RawMessage(`{"userAgent":"codex-cli/0.150.1","platformFamily":"unix"}`), want: CodexAppServerVersion},
+		{name: "missing", result: json.RawMessage(`{"platformFamily":"unix"}`), wantErr: true},
+		{name: "wrong type", result: json.RawMessage(`{"userAgent":1501}`), wantErr: true},
+		{name: "wrong provider", result: json.RawMessage(`{"userAgent":"codex/0.150.1"}`), wantErr: true},
+		{name: "mismatch", result: json.RawMessage(`{"userAgent":"codex-cli/0.151.0"}`), wantErr: true},
+		{name: "suffix", result: json.RawMessage(`{"userAgent":"codex-cli/0.150.1-dev"}`), wantErr: true},
+		{name: "duplicate", result: json.RawMessage(`{"userAgent":"codex-cli/0.151.0","userAgent":"codex-cli/0.150.1"}`), wantErr: true},
+		{name: "non object", result: json.RawMessage(`[]`), wantErr: true},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := observedCodexAppServerVersion(test.result)
+			if test.wantErr {
+				if !errors.Is(err, ErrProviderUnsupported) || got != "" {
+					t.Fatalf("observed version = %q, %v", got, err)
+				}
+				return
+			}
+			if err != nil || got != test.want {
+				t.Fatalf("observed version = %q, %v; want %q", got, err, test.want)
+			}
+		})
+	}
+}
+
+func TestCodexAppServerRejectsHandshakeMismatchBeforeInitialized(t *testing.T) {
+	t.Parallel()
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+	server := &appHarness{conn: serverConn, reader: bufio.NewReaderSize(serverConn, 64<<10)}
+	done := make(chan error, 1)
+	go func() {
+		client, err := openCodexAppServer(
+			context.Background(), clientConn, clientConn, CodexAppServerVersion, &recordingDynamicHandler{},
+		)
+		if client != nil {
+			_ = client.Close()
+		}
+		done <- err
+	}()
+	initialize := server.read(t)
+	if initialize.Method != appMethodInitialize {
+		t.Fatalf("first method = %q, want initialize", initialize.Method)
+	}
+	server.respond(t, initialize, json.RawMessage(`{"userAgent":"codex-cli/0.151.0"}`))
+	if err := <-done; !errors.Is(err, ErrProviderUnsupported) {
+		t.Fatalf("mismatched handshake error = %v", err)
+	}
+	_ = serverConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	if raw, err := readAppServerLine(server.reader); err == nil {
+		t.Fatalf("mismatched handshake sent a post-initialize frame: %s", raw)
+	}
+}
+
+func TestCodexAppServerSilentInitializeIsFinitelyBounded(t *testing.T) {
+	t.Parallel()
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+	server := &appHarness{conn: serverConn, reader: bufio.NewReaderSize(serverConn, 64<<10)}
+	done := make(chan error, 1)
+	go func() {
+		client, err := openCodexAppServerWithin(
+			context.Background(), clientConn, clientConn, CodexAppServerVersion,
+			&recordingDynamicHandler{}, 20*time.Millisecond,
+		)
+		if client != nil {
+			_ = client.Close()
+		}
+		done <- err
+	}()
+	initialize := server.read(t)
+	if initialize.Method != appMethodInitialize {
+		t.Fatalf("first method = %q, want initialize", initialize.Method)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrTransport) {
+			t.Fatalf("silent initialize error = %v, want transport", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("silent initialize exceeded its finite handshake deadline")
+	}
 }
 
 func TestDynamicToolResultBudgetIncludesEscapingAndFullRPCHeadroom(t *testing.T) {

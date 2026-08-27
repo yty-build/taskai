@@ -33,16 +33,17 @@ type recordedChild struct {
 type fakeManagerPorts struct {
 	mu sync.Mutex
 
-	startCalls   []connector.ManagerStartRequest
-	resumeCalls  []recordedResume
-	connections  []*fakeConnection
-	next         int
-	startErr     error
-	resumeErr    error
-	startRef     []byte
-	resumeRef    []byte
-	startGate    <-chan struct{}
-	startEntered chan<- struct{}
+	startCalls          []connector.ManagerStartRequest
+	resumeCalls         []recordedResume
+	connections         []*fakeConnection
+	next                int
+	startErr            error
+	resumeErr           error
+	startRef            []byte
+	resumeRef           []byte
+	startGate           <-chan struct{}
+	startEntered        chan<- struct{}
+	startIgnoresContext bool
 }
 
 func (ports *fakeManagerPorts) Start(ctx context.Context, request connector.ManagerStartRequest) (connector.NativeManagerSession, error) {
@@ -59,10 +60,14 @@ func (ports *fakeManagerPorts) Start(ctx context.Context, request connector.Mana
 		entered <- struct{}{}
 	}
 	if gate != nil {
-		select {
-		case <-gate:
-		case <-ctx.Done():
-			return connector.NativeManagerSession{}, ctx.Err()
+		if ports.startIgnoresContext {
+			<-gate
+		} else {
+			select {
+			case <-gate:
+			case <-ctx.Done():
+				return connector.NativeManagerSession{}, ctx.Err()
+			}
 		}
 	}
 	if err != nil {
@@ -145,20 +150,23 @@ func (ports *fakeManagerPorts) resumeRequest(index int) recordedResume {
 type promptFunction func(context.Context, string, func(json.RawMessage) error) (json.RawMessage, error)
 
 type fakeConnection struct {
-	reference replay.OpaqueRef
+	reference       replay.OpaqueRef
+	publicSessionID string
 
-	mu             sync.Mutex
-	prompts        []string
-	promptCalls    int
-	interrupts     int
-	closes         int
-	nativeReads    int
-	err            error
-	interruptErr   error
-	closeErr       error
-	promptFunction promptFunction
-	interruptGate  <-chan struct{}
-	interruptEnter chan<- struct{}
+	mu                      sync.Mutex
+	prompts                 []string
+	promptCalls             int
+	interrupts              int
+	closes                  int
+	err                     error
+	interruptErr            error
+	closeErr                error
+	promptFunction          promptFunction
+	interruptGate           <-chan struct{}
+	interruptEnter          chan<- struct{}
+	interruptIgnoresContext bool
+	closeInterruptGate      chan struct{}
+	closeInterruptOnce      sync.Once
 
 	done     chan struct{}
 	doneOnce sync.Once
@@ -166,14 +174,17 @@ type fakeConnection struct {
 
 func newFakeConnection(reference string) *fakeConnection {
 	return &fakeConnection{
-		reference: replay.OpaqueRefFromBytes([]byte(reference)),
-		done:      make(chan struct{}),
+		reference:       replay.OpaqueRefFromBytes([]byte(reference)),
+		publicSessionID: "manager_public_fixture",
+		done:            make(chan struct{}),
 	}
 }
 
 func (connection *fakeConnection) NativeReference() replay.OpaqueRef {
 	return replay.OpaqueRefFromBytes(connection.reference.Bytes())
 }
+
+func (connection *fakeConnection) PublicSessionID() string { return connection.publicSessionID }
 
 func (connection *fakeConnection) Prompt(
 	ctx context.Context,
@@ -205,23 +216,20 @@ func (connection *fakeConnection) Interrupt(ctx context.Context) error {
 		entered <- struct{}{}
 	}
 	if gate != nil {
-		select {
-		case <-gate:
-		case <-ctx.Done():
-			return ctx.Err()
+		if connection.interruptIgnoresContext {
+			<-gate
+		} else {
+			select {
+			case <-gate:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
 	}
 	if err != nil {
 		return err
 	}
 	return connector.ErrStaleTurn
-}
-
-func (connection *fakeConnection) ReadNativeSession(context.Context) (json.RawMessage, error) {
-	connection.mu.Lock()
-	connection.nativeReads++
-	connection.mu.Unlock()
-	return json.RawMessage(`{"private":"must-not-be-read"}`), nil
 }
 
 func (connection *fakeConnection) Done() <-chan struct{} { return connection.done }
@@ -237,6 +245,9 @@ func (connection *fakeConnection) Close() error {
 	connection.closes++
 	err := connection.closeErr
 	connection.mu.Unlock()
+	if connection.closeInterruptGate != nil {
+		connection.closeInterruptOnce.Do(func() { close(connection.closeInterruptGate) })
+	}
 	connection.doneOnce.Do(func() { close(connection.done) })
 	return err
 }
@@ -261,7 +272,6 @@ func (connection *fakeConnection) observeLifetime(ctx context.Context) {
 type connectionSnapshot struct {
 	prompts                         []string
 	promptCalls, interrupts, closes int
-	nativeReads                     int
 	err                             error
 }
 
@@ -271,7 +281,7 @@ func (connection *fakeConnection) snapshot() connectionSnapshot {
 	return connectionSnapshot{
 		prompts:     append([]string(nil), connection.prompts...),
 		promptCalls: connection.promptCalls, interrupts: connection.interrupts,
-		closes: connection.closes, nativeReads: connection.nativeReads, err: connection.err,
+		closes: connection.closes, err: connection.err,
 	}
 }
 

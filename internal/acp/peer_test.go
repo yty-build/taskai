@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestClientCorrelatesReorderedResponses(t *testing.T) {
@@ -190,5 +191,48 @@ func TestAgentRequestCancellation(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "private-canary") {
 		t.Fatalf("error exposed remote content: %v", err)
+	}
+}
+
+func TestPeerRejectsDuplicateLiveInboundRequestID(t *testing.T) {
+	t.Parallel()
+	remote, local := net.Pipe()
+	t.Cleanup(func() {
+		_ = remote.Close()
+		_ = local.Close()
+	})
+	entered := make(chan struct{})
+	var once sync.Once
+	peer := NewAgent(local, local, HandlerFuncs{Request: func(ctx context.Context, _ Message) (json.RawMessage, *ErrorObject) {
+		once.Do(func() { close(entered) })
+		<-ctx.Done()
+		return nil, &ErrorObject{Code: -32800, Message: "cancelled"}
+	}})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := peer.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	encoder := NewEncoder(remote)
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- encoder.Encode(Request(json.RawMessage(`7`), MethodSessionPrompt, json.RawMessage(`{}`)))
+	}()
+	<-entered
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.Encode(Request(json.RawMessage(`7`), MethodSessionPrompt, json.RawMessage(`{}`))); err != nil {
+		t.Fatal(err)
+	}
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- peer.Wait() }()
+	select {
+	case err := <-waitDone:
+		if !errors.Is(err, ErrMalformedFrame) {
+			t.Fatalf("duplicate inbound terminal = %v, want malformed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("duplicate inbound request did not terminate peer")
 	}
 }

@@ -3,10 +3,12 @@ package manager
 import (
 	"bytes"
 	"context"
+	"errors"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/yty-build/acp-gateway/internal/connector"
@@ -19,7 +21,8 @@ const (
 	// MaxActiveManagers bounds the Service map and its one watcher goroutine
 	// per live connector composite. Runtime may start another Manager only
 	// after an existing instance reaches its one-time terminal state.
-	MaxActiveManagers = 256
+	MaxActiveManagers     = 256
+	managerStartupTimeout = 10 * time.Second
 )
 
 // StartRequest contains only the metadata and transient project directory
@@ -45,7 +48,8 @@ type ResumeRequest struct {
 // metadata-only and never probe, authenticate, launch, Start, or Resume a
 // provider.
 type Service struct {
-	registry *connector.Registry
+	registry       *connector.Registry
+	startupTimeout time.Duration
 
 	mu     sync.RWMutex
 	active map[session.ID]*Instance // nil is an in-progress Start/Resume reservation.
@@ -55,7 +59,10 @@ func NewService(registry *connector.Registry) (*Service, error) {
 	if registry == nil {
 		return nil, ErrInvalidRequest
 	}
-	return &Service{registry: registry, active: make(map[session.ID]*Instance)}, nil
+	return &Service{
+		registry: registry, startupTimeout: managerStartupTimeout,
+		active: make(map[session.ID]*Instance),
+	}, nil
 }
 
 // ActiveIDs returns established live Manager IDs in deterministic order. It
@@ -107,15 +114,19 @@ func (service *Service) Start(ctx context.Context, request StartRequest) (*Insta
 	}
 
 	lifetime, cancel := context.WithCancel(ctx)
-	native, startErr := profile.Manager.Start(lifetime, connector.ManagerStartRequest{
-		ParentSessionID: string(manager.ID),
-		CWD:             request.ProjectCWD,
-		Registry:        service.registry,
-		Events:          request.ChildEvents,
+	native, abandoned, startErr := service.openWithin(lifetime, manager.ID, func() (connector.NativeManagerSession, error) {
+		return profile.Manager.Start(lifetime, connector.ManagerStartRequest{
+			ParentSessionID: string(manager.ID),
+			CWD:             request.ProjectCWD,
+			Registry:        service.registry,
+			Events:          request.ChildEvents,
+		})
 	})
 	if startErr != nil {
 		cancel()
-		service.releaseReservation(manager.ID)
+		if !abandoned {
+			service.releaseReservation(manager.ID)
+		}
 		return nil, sanitizeError(startErr)
 	}
 	if lifetime.Err() != nil {
@@ -160,16 +171,20 @@ func (service *Service) Resume(ctx context.Context, request ResumeRequest) (*Ins
 
 	reference := replay.OpaqueRefFromBytes(manager.ProviderReference)
 	lifetime, cancel := context.WithCancel(ctx)
-	native, resumeErr := profile.ManagerResume.Resume(lifetime, connector.ManagerResumeRequest{
-		ParentSessionID: string(manager.ID),
-		NativeReference: reference,
-		OwnedChildren:   owned,
-		Registry:        service.registry,
-		Events:          request.ChildEvents,
+	native, abandoned, resumeErr := service.openWithin(lifetime, manager.ID, func() (connector.NativeManagerSession, error) {
+		return profile.ManagerResume.Resume(lifetime, connector.ManagerResumeRequest{
+			ParentSessionID: string(manager.ID),
+			NativeReference: reference,
+			OwnedChildren:   owned,
+			Registry:        service.registry,
+			Events:          request.ChildEvents,
+		})
 	})
 	if resumeErr != nil {
 		cancel()
-		service.releaseReservation(manager.ID)
+		if !abandoned {
+			service.releaseReservation(manager.ID)
+		}
 		return nil, sanitizeError(resumeErr)
 	}
 	if lifetime.Err() != nil {
@@ -188,6 +203,54 @@ func (service *Service) Resume(ctx context.Context, request ResumeRequest) (*Ins
 	service.install(manager.ID, instance)
 	instance.watch()
 	return instance, nil
+}
+
+var errManagerStartupTimeout = errors.New("manager startup timeout")
+
+type nativeOpenResult struct {
+	native connector.NativeManagerSession
+	err    error
+}
+
+// openWithin bounds provider Start/Resume without turning the finite launch
+// deadline into the established Manager lifetime. A factory that ignores
+// cancellation remains reserved (and therefore globally capacity-bounded)
+// until it returns, at which point any late native process is closed.
+func (service *Service) openWithin(
+	lifetime context.Context,
+	id session.ID,
+	open func() (connector.NativeManagerSession, error),
+) (connector.NativeManagerSession, bool, error) {
+	if service == nil || lifetime == nil || open == nil {
+		return connector.NativeManagerSession{}, false, ErrInvalidRequest
+	}
+	timeout := service.startupTimeout
+	if timeout <= 0 {
+		timeout = managerStartupTimeout
+	}
+	result := make(chan nativeOpenResult)
+	abandon := make(chan struct{})
+	go func() {
+		native, err := open()
+		select {
+		case result <- nativeOpenResult{native: native, err: err}:
+		case <-abandon:
+			closeInvalidNative(native)
+			service.releaseReservation(id)
+		}
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case opened := <-result:
+		return opened.native, false, opened.err
+	case <-lifetime.Done():
+		close(abandon)
+		return connector.NativeManagerSession{}, true, lifetime.Err()
+	case <-timer.C:
+		close(abandon)
+		return connector.NativeManagerSession{}, true, errManagerStartupTimeout
+	}
 }
 
 func (service *Service) startProfile(providerID string) (connector.Profile, error) {
@@ -227,16 +290,23 @@ func (service *Service) adopt(
 	}
 	reference := native.NativeReference.Bytes()
 	connectionReference := native.Connection.NativeReference().Bytes()
+	publicSessionID := native.Connection.PublicSessionID()
 	if len(reference) == 0 || len(reference) > session.MaxProviderReferenceBytes ||
 		!bytes.Equal(reference, connectionReference) ||
-		(expectedReference != nil && !bytes.Equal(reference, expectedReference)) {
+		(expectedReference != nil && !bytes.Equal(reference, expectedReference)) ||
+		!validPublicSessionID(publicSessionID) {
 		return nil, ErrTransport
 	}
 	return newInstance(
 		manager.ID, manager.ProviderID, replay.OpaqueRefFromBytes(reference),
-		native.Connection, lifetime, cancel,
+		publicSessionID, native.Connection, lifetime, cancel,
 		func(instance *Instance) { service.release(manager.ID, instance) },
 	), nil
+}
+
+func validPublicSessionID(value string) bool {
+	return value != "" && len(value) <= connector.MaxCorrelationIDBytes && utf8.ValidString(value) &&
+		strings.IndexByte(value, 0) < 0
 }
 
 func (service *Service) reserve(id session.ID) error {

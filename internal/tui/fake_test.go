@@ -35,14 +35,15 @@ type fakeBackend struct {
 	snapshotErr error
 	actionErr   map[string]error
 
-	addManagerOnError  *Session
-	attachStarted      chan struct{}
-	attachRelease      chan struct{}
-	attachIgnoreCancel bool
-	attachStartOnce    sync.Once
-	detachStarted      chan struct{}
-	detachStartOnce    sync.Once
-	resumeStateOnError *SessionState
+	addManagerOnError   *Session
+	attachStarted       chan struct{}
+	attachRelease       chan struct{}
+	attachIgnoreCancel  bool
+	attachStartOnce     sync.Once
+	detachStarted       chan struct{}
+	detachStartOnce     sync.Once
+	detachWaitForCancel bool
+	resumeStateOnError  *SessionState
 }
 
 func newFake(snapshot Snapshot) *fakeBackend {
@@ -159,9 +160,12 @@ func (f *fakeBackend) Attach(ctx context.Context, task TaskID) error {
 	return err
 }
 
-func (f *fakeBackend) Detach(_ context.Context, task TaskID) error {
+func (f *fakeBackend) Detach(ctx context.Context, task TaskID) error {
 	if f.detachStarted != nil {
 		f.detachStartOnce.Do(func() { close(f.detachStarted) })
+	}
+	if f.detachWaitForCancel {
+		<-ctx.Done()
 	}
 	return f.record("detach", task, "", "", "")
 }

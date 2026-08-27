@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/yty-build/acp-gateway/internal/session"
 	"github.com/yty-build/acp-gateway/internal/settings"
@@ -39,6 +40,9 @@ const (
 	ipcRequestIDWidth       = 16
 	maxIPCActionConnections = 64
 	maxIPCClientActions     = 8
+	ipcHandshakeReadTimeout = 5 * time.Second
+	ipcActionReadTimeout    = 5 * time.Second
+	ipcWriteTimeout         = 5 * time.Second
 )
 
 type localEndpoint interface {
@@ -62,18 +66,20 @@ type IPCServer struct {
 	clients map[string]*ipcServerClient
 	conns   map[net.Conn]struct{}
 
-	connectionSlots chan struct{}
-	actionSlots     chan struct{}
-	wg              sync.WaitGroup
-	closeOnce       sync.Once
-	closeErr        error
+	connectionSlots      chan struct{}
+	actionSlots          chan struct{}
+	handshakeReadTimeout time.Duration
+	actionReadTimeout    time.Duration
+	writeTimeout         time.Duration
+	wg                   sync.WaitGroup
+	closeOnce            sync.Once
+	closeErr             error
 }
 
 type ipcServerClient struct {
 	id        string
 	port      ClientPort
 	event     net.Conn
-	actionMu  sync.Mutex
 	closeOnce sync.Once
 }
 
@@ -102,8 +108,11 @@ func NewIPCServer(stateDir string, backend ClientAcceptor) (*IPCServer, error) {
 	return &IPCServer{
 		backend: backend, endpoint: endpoint,
 		clients: make(map[string]*ipcServerClient), conns: make(map[net.Conn]struct{}),
-		connectionSlots: make(chan struct{}, MaxSubscriberCount+maxIPCActionConnections),
-		actionSlots:     make(chan struct{}, maxIPCActionConnections),
+		connectionSlots:      make(chan struct{}, MaxSubscriberCount+maxIPCActionConnections),
+		actionSlots:          make(chan struct{}, maxIPCActionConnections),
+		handshakeReadTimeout: ipcHandshakeReadTimeout,
+		actionReadTimeout:    ipcActionReadTimeout,
+		writeTimeout:         ipcWriteTimeout,
 	}, nil
 }
 
@@ -177,9 +186,15 @@ func (server *IPCServer) serveConnection(connection net.Conn) {
 	if err := verifyLocalPeer(connection); err != nil {
 		return
 	}
+	if armIPCReadDeadline(connection, server.handshakeReadTimeout) != nil {
+		return
+	}
 	var hello wireHello
 	if readWireFrame(connection, &hello) != nil || validateHello(hello) != nil {
-		_ = writeWireFrame(connection, wireHelloResponse{Protocol: ipcProtocolVersion, Error: CodeInvalidRequest})
+		_ = server.writeFrame(connection, wireHelloResponse{Protocol: ipcProtocolVersion, Error: CodeInvalidRequest})
+		return
+	}
+	if clearIPCReadDeadline(connection) != nil {
 		return
 	}
 	switch hello.Role {
@@ -190,15 +205,15 @@ func (server *IPCServer) serveConnection(connection net.Conn) {
 		case server.actionSlots <- struct{}{}:
 			defer func() { <-server.actionSlots }()
 		default:
-			_ = writeWireFrame(connection, wireHelloResponse{Protocol: ipcProtocolVersion, Error: CodeBusy})
+			_ = server.writeFrame(connection, wireHelloResponse{Protocol: ipcProtocolVersion, Error: CodeBusy})
 			return
 		}
 		client := server.lookupClient(hello.ClientID)
 		if client == nil {
-			_ = writeWireFrame(connection, wireHelloResponse{Protocol: ipcProtocolVersion, Error: CodeUnavailable})
+			_ = server.writeFrame(connection, wireHelloResponse{Protocol: ipcProtocolVersion, Error: CodeUnavailable})
 			return
 		}
-		if writeWireFrame(connection, wireHelloResponse{Protocol: ipcProtocolVersion}) != nil {
+		if server.writeFrame(connection, wireHelloResponse{Protocol: ipcProtocolVersion}) != nil {
 			return
 		}
 		server.serveActionConnection(connection, client)
@@ -209,7 +224,7 @@ func (server *IPCServer) serveEventConnection(connection net.Conn, clientID stri
 	server.mu.Lock()
 	if server.closed || server.clients[clientID] != nil {
 		server.mu.Unlock()
-		_ = writeWireFrame(connection, wireHelloResponse{Protocol: ipcProtocolVersion, Error: CodeConflict})
+		_ = server.writeFrame(connection, wireHelloResponse{Protocol: ipcProtocolVersion, Error: CodeConflict})
 		return
 	}
 	server.mu.Unlock()
@@ -218,7 +233,7 @@ func (server *IPCServer) serveEventConnection(connection net.Conn, clientID stri
 		if err == nil {
 			err = ErrTransport
 		}
-		_ = writeWireFrame(connection, wireHelloResponse{Protocol: ipcProtocolVersion, Error: codeOf(err)})
+		_ = server.writeFrame(connection, wireHelloResponse{Protocol: ipcProtocolVersion, Error: codeOf(err)})
 		return
 	}
 	client := &ipcServerClient{id: clientID, port: port, event: connection}
@@ -226,13 +241,13 @@ func (server *IPCServer) serveEventConnection(connection net.Conn, clientID stri
 	if server.closed || server.clients[clientID] != nil {
 		server.mu.Unlock()
 		client.close()
-		_ = writeWireFrame(connection, wireHelloResponse{Protocol: ipcProtocolVersion, Error: CodeConflict})
+		_ = server.writeFrame(connection, wireHelloResponse{Protocol: ipcProtocolVersion, Error: CodeConflict})
 		return
 	}
 	server.clients[clientID] = client
 	server.mu.Unlock()
 	defer server.removeClient(clientID, client)
-	if writeWireFrame(connection, wireHelloResponse{Protocol: ipcProtocolVersion}) != nil {
+	if server.writeFrame(connection, wireHelloResponse{Protocol: ipcProtocolVersion}) != nil {
 		return
 	}
 
@@ -300,7 +315,7 @@ func (server *IPCServer) serveEventConnection(connection net.Conn, clientID stri
 					response.Error = codeOf(nextErr)
 				}
 			}
-			if writeWireFrame(connection, response) != nil {
+			if server.writeFrame(connection, response) != nil {
 				clear(response.Result)
 				return
 			}
@@ -312,28 +327,74 @@ func (server *IPCServer) serveEventConnection(connection net.Conn, clientID stri
 }
 
 func (server *IPCServer) serveActionConnection(connection net.Conn, client *ipcServerClient) {
+	if armIPCReadDeadline(connection, server.actionReadTimeout) != nil {
+		return
+	}
 	var request wireRequest
-	if readWireFrame(connection, &request) != nil || validateWireRequest(request) != nil || request.Method == ipcMethodNext {
-		_ = writeWireFrame(connection, wireResponse{
+	readErr := readWireFrame(connection, &request)
+	deadlineErr := clearIPCReadDeadline(connection)
+	if readErr != nil || deadlineErr != nil || validateWireRequest(request) != nil || request.Method == ipcMethodNext {
+		clear(request.Params)
+		_ = server.writeFrame(connection, wireResponse{
 			Protocol: ipcProtocolVersion, ID: request.ID, Error: CodeInvalidRequest,
 		})
 		return
 	}
-	client.actionMu.Lock()
 	result, callErr, closeClient := server.dispatchAction(client, request.Method, request.Params)
 	clear(request.Params)
-	client.actionMu.Unlock()
 	response := wireResponse{Protocol: ipcProtocolVersion, ID: request.ID, Result: result}
 	if callErr != nil {
 		clear(result)
 		response.Result = nil
 		response.Error = codeOf(callErr)
 	}
-	_ = writeWireFrame(connection, response)
+	_ = server.writeFrame(connection, response)
 	clear(response.Result)
 	if closeClient {
 		server.removeClient(client.id, client)
 	}
+}
+
+func armIPCReadDeadline(connection net.Conn, timeout time.Duration) error {
+	if connection == nil || timeout <= 0 {
+		return ErrTransport
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return ErrTransport
+	}
+	return nil
+}
+
+func clearIPCReadDeadline(connection net.Conn) error {
+	if connection == nil {
+		return ErrTransport
+	}
+	if err := connection.SetReadDeadline(time.Time{}); err != nil {
+		return ErrTransport
+	}
+	return nil
+}
+
+func (server *IPCServer) writeFrame(connection net.Conn, value any) error {
+	if server == nil {
+		return ErrTransport
+	}
+	return writeIPCFrame(connection, server.writeTimeout, value)
+}
+
+func writeIPCFrame(connection net.Conn, timeout time.Duration, value any) error {
+	if connection == nil || timeout <= 0 {
+		return ErrTransport
+	}
+	if err := connection.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		return ErrTransport
+	}
+	writeErr := writeWireFrame(connection, value)
+	clearErr := connection.SetWriteDeadline(time.Time{})
+	if writeErr != nil || clearErr != nil {
+		return ErrTransport
+	}
+	return nil
 }
 
 func (server *IPCServer) dispatchAction(client *ipcServerClient, method string, raw json.RawMessage) (json.RawMessage, error, bool) {

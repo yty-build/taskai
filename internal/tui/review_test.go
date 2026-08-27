@@ -255,6 +255,31 @@ func TestQuitFromAttachedNestedScreensDetachesExactlyOnce(t *testing.T) {
 	}
 }
 
+func TestQuitCancelsBeforeBestEffortDetach(t *testing.T) {
+	model, fake, _ := loadedModel(t, baseSnapshot(), false)
+	runCmd(t, model, updateKey(model, "enter"))
+	fake.detachWaitForCancel = true
+
+	cmd := updateCtrlC(model)
+	if cmd == nil {
+		t.Fatal("Ctrl+C returned no quit command")
+	}
+	done := make(chan tea.Msg, 1)
+	go func() { done <- cmd() }()
+	select {
+	case message := <-done:
+		if _, ok := message.(tea.QuitMsg); !ok {
+			t.Fatalf("quit command message = %T, want Bubble Tea QuitMsg", message)
+		}
+	case <-time.After(time.Second):
+		model.Close()
+		t.Fatal("quit waited on Detach before cancelling terminal-owned work")
+	}
+	if calls := fake.callsOf("detach"); len(calls) != 1 || calls[0].task != "task-new" {
+		t.Fatalf("detach calls = %#v, want task-new exactly once", calls)
+	}
+}
+
 func TestHistoricalManagerResumeAvailabilityIsMechanical(t *testing.T) {
 	t.Run("unavailable", func(t *testing.T) {
 		snapshot := baseSnapshot()

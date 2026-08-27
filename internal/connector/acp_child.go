@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/yty-build/acp-gateway/internal/acp"
 	"github.com/yty-build/acp-gateway/internal/replay"
 )
+
+const acpHandshakeTimeout = 10 * time.Second
 
 // ProviderReferenceCodec is the connector-only bridge between a provider's
 // public native Session ID and the one opaque envelope shared by persistence,
@@ -269,14 +272,17 @@ func (f ACPFactory) Resume(ctx context.Context, nativeReference replay.OpaqueRef
 }
 
 func (f ACPFactory) open(ctx context.Context, resumeSessionID string, reference replay.OpaqueRef, resuming bool) (ChildPort, error) {
-	if f.CWD == "" || !filepath.IsAbs(f.CWD) || f.References == nil {
+	if ctx == nil || ctx.Err() != nil || f.CWD == "" || !filepath.IsAbs(f.CWD) || f.References == nil {
 		return nil, ErrProviderUnsupported
 	}
 	process, err := f.Launcher.Start(ctx, f.Command)
 	if err != nil {
 		return nil, err
 	}
-	session := &ACPSession{process: process, requestHandler: f.RequestHandler}
+	session := &ACPSession{
+		process: process, requestHandler: f.RequestHandler,
+		closeDone: make(chan struct{}),
+	}
 	handler := acp.HandlerFuncs{
 		Request:      session.handleRequest,
 		Notification: session.handleNotification,
@@ -286,9 +292,11 @@ func (f ACPFactory) open(ctx context.Context, resumeSessionID string, reference 
 		_ = session.Close()
 		return nil, &BoundaryError{Stage: "ACP start", Err: ErrTransport}
 	}
+	handshakeCtx, cancelHandshake := context.WithTimeout(ctx, acpHandshakeTimeout)
+	defer cancelHandshake()
 
 	initialize := json.RawMessage(`{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"taskai","version":"1"}}`)
-	initialized, err := session.client.Call(ctx, acp.MethodInitialize, initialize)
+	initialized, err := session.client.Call(handshakeCtx, acp.MethodInitialize, initialize)
 	if err != nil {
 		_ = session.Close()
 		return nil, &BoundaryError{Stage: "ACP initialize", Err: ErrTransport}
@@ -306,7 +314,7 @@ func (f ACPFactory) open(ctx context.Context, resumeSessionID string, reference 
 			CWD        string `json:"cwd"`
 			MCPServers []any  `json:"mcpServers"`
 		}{CWD: f.CWD, MCPServers: []any{}})
-		created, callErr := session.client.Call(ctx, acp.MethodSessionNew, params)
+		created, callErr := session.client.Call(handshakeCtx, acp.MethodSessionNew, params)
 		if callErr != nil {
 			_ = session.Close()
 			return nil, &BoundaryError{Stage: "ACP session new", Err: ErrTransport}
@@ -325,6 +333,7 @@ func (f ACPFactory) open(ctx context.Context, resumeSessionID string, reference 
 		}
 		session.sessionID = response.SessionID
 		session.reference = reference
+		session.watchTransport()
 		return session, nil
 	}
 
@@ -333,7 +342,7 @@ func (f ACPFactory) open(ctx context.Context, resumeSessionID string, reference 
 		CWD        string `json:"cwd"`
 		MCPServers []any  `json:"mcpServers"`
 	}{SessionID: resumeSessionID, CWD: f.CWD, MCPServers: []any{}})
-	if _, err := session.client.Call(ctx, acp.MethodSessionResume, params); err != nil {
+	if _, err := session.client.Call(handshakeCtx, acp.MethodSessionResume, params); err != nil {
 		_ = session.Close()
 		return nil, &BoundaryError{Stage: "ACP session resume", Err: ErrTransport}
 	}
@@ -343,6 +352,7 @@ func (f ACPFactory) open(ctx context.Context, resumeSessionID string, reference 
 	}
 	session.sessionID = resumeSessionID
 	session.reference = replay.OpaqueRefFromBytes(reference.Bytes())
+	session.watchTransport()
 	return session, nil
 }
 
@@ -358,10 +368,53 @@ type ACPSession struct {
 	mu     sync.Mutex
 	sink   func(json.RawMessage) error
 	closed bool
+
+	closeOnce sync.Once
+	closeDone chan struct{}
+	closeErr  error
 }
 
 func (s *ACPSession) NativeReference() replay.OpaqueRef {
 	return replay.OpaqueRefFromBytes(s.reference.Bytes())
+}
+
+// Available reports whether this exact public ACP transport is still usable.
+// The Delegator uses it only to decide between reusing this transport and
+// exact-resuming its already-owned native Session reference.
+func (s *ACPSession) Available() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	available := !s.closed && s.client != nil && s.process != nil && s.sessionID != ""
+	s.mu.Unlock()
+	if !available {
+		return false
+	}
+	select {
+	case <-s.client.Done():
+		return false
+	default:
+		return true
+	}
+}
+
+// Done closes only after the connector transport has closed and its owned
+// provider process has been reaped.
+func (s *ACPSession) Done() <-chan struct{} {
+	if s == nil || s.closeDone == nil {
+		done := make(chan struct{})
+		close(done)
+		return done
+	}
+	return s.closeDone
+}
+
+func (s *ACPSession) watchTransport() {
+	go func() {
+		<-s.client.Done()
+		_ = s.Close()
+	}()
 }
 
 func (s *ACPSession) Prompt(ctx context.Context, prompt string, sink func(json.RawMessage) error) (json.RawMessage, error) {
@@ -396,6 +449,7 @@ func (s *ACPSession) Prompt(ctx context.Context, prompt string, sink func(json.R
 	})
 	result, err := s.client.Call(ctx, acp.MethodSessionPrompt, params)
 	if err != nil {
+		_ = s.Close()
 		return nil, ErrTransport
 	}
 	return result, nil
@@ -418,6 +472,7 @@ func (s *ACPSession) Cancel(ctx context.Context) error {
 		SessionID string `json:"sessionId"`
 	}{SessionID: sessionID})
 	if err := s.client.Notify(acp.MethodSessionCancel, params); err != nil {
+		_ = s.Close()
 		return ErrTransport
 	}
 	return nil
@@ -459,18 +514,25 @@ func (s *ACPSession) handleRequest(ctx context.Context, message acp.Message) (js
 }
 
 func (s *ACPSession) Close() error {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
+	if s == nil {
 		return nil
 	}
-	s.closed = true
-	s.mu.Unlock()
-	if s.client != nil {
-		_ = s.client.Close()
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
+		if s.client != nil {
+			_ = s.client.Close()
+		}
+		if s.process != nil {
+			s.closeErr = s.process.Close()
+		}
+		if s.closeDone != nil {
+			close(s.closeDone)
+		}
+	})
+	if s.closeDone != nil {
+		<-s.closeDone
 	}
-	if s.process != nil {
-		_ = s.process.Close()
-	}
-	return nil
+	return s.closeErr
 }

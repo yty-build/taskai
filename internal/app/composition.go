@@ -6,8 +6,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -31,19 +33,17 @@ type systemCommand struct {
 }
 
 func (command systemCommand) View(ctx context.Context, streams IO) error {
+	projectCWD, err := currentProjectCWD()
+	if err != nil {
+		return err
+	}
 	stateDir, err := ResolveStateDir()
 	if err != nil {
 		return runtime.ErrEndpointUnsafe
 	}
-	client, err := command.acquire(ctx, stateDir)
+	client, err := command.acquireWorkspace(ctx, stateDir, projectCWD)
 	if err != nil {
 		return terminalError(err)
-	}
-
-	projectCWD, err := currentProjectCWD()
-	if err != nil {
-		_ = client.Close()
-		return err
 	}
 	providers, err := newProductionProviders(projectCWD)
 	if err != nil {
@@ -88,6 +88,9 @@ func (command systemCommand) View(ctx context.Context, streams IO) error {
 // restrictive local IPC endpoint. It performs no provider probe,
 // authentication, Start, Resume, Replay, or process launch during bootstrap.
 func (systemCommand) Work(ctx context.Context) error {
+	if ctx == nil || ctx.Err() != nil {
+		return runtime.ErrCancelled
+	}
 	stateDir, err := ResolveStateDir()
 	if err != nil {
 		return runtime.ErrEndpointUnsafe
@@ -95,6 +98,12 @@ func (systemCommand) Work(ctx context.Context) error {
 	projectCWD, err := currentProjectCWD()
 	if err != nil {
 		return err
+	}
+	if ctx.Err() != nil {
+		return runtime.ErrCancelled
+	}
+	if err := establishWorkspaceBinding(stateDir, projectCWD); err != nil {
+		return terminalError(err)
 	}
 	metadata, err := store.Open(ctx, stateDir)
 	if err != nil {
@@ -121,7 +130,12 @@ func (systemCommand) Work(ctx context.Context) error {
 		_ = metadata.Close()
 		return runtime.ErrUnsupported
 	}
-	supervisor, err := runtime.NewSupervisor(ctx, runtime.Config{
+	// The request context stops endpoint serving, but shutdown reconciliation
+	// still needs a live context to persist every owned Session as interrupted.
+	// Keep that narrow lifetime alive until Supervisor.Close has finished.
+	supervisorCtx, cancelSupervisor := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelSupervisor()
+	supervisor, err := runtime.NewSupervisor(supervisorCtx, runtime.Config{
 		Store: metadata, Registry: providers.registry, Managers: managers,
 		ProjectCWD: projectCWD, Providers: cloneProviderSpecs(providers.catalog),
 	})
@@ -209,11 +223,23 @@ func currentProjectCWD() (string, error) {
 	if err != nil {
 		return "", runtime.ErrInvalidRequest
 	}
-	value = filepath.Clean(value)
-	if !filepath.IsAbs(value) {
+	return canonicalProjectCWD(value)
+}
+
+func canonicalProjectCWD(value string) (string, error) {
+	if value == "" || !filepath.IsAbs(value) || strings.IndexByte(value, 0) >= 0 || !utf8.ValidString(value) {
 		return "", runtime.ErrInvalidRequest
 	}
-	return value, nil
+	resolved, err := filepath.EvalSymlinks(value)
+	if err != nil {
+		return "", runtime.ErrInvalidRequest
+	}
+	resolved = filepath.Clean(resolved)
+	info, err := os.Stat(resolved)
+	if err != nil || !info.IsDir() || !filepath.IsAbs(resolved) || len(resolved) > manager.MaxProjectCWDBytes {
+		return "", runtime.ErrInvalidRequest
+	}
+	return resolved, nil
 }
 
 func (command systemCommand) acquire(ctx context.Context, stateDir string) (runtime.ClientPort, error) {
@@ -264,6 +290,28 @@ func (command systemCommand) acquire(ctx context.Context, stateDir string) (runt
 		}
 		delay = min(delay*2, workerRetryMaximum)
 	}
+}
+
+// acquireWorkspace checks the immutable project binding on both sides of the
+// viewer attach. The second check closes the race where two project viewers
+// observe an absent root and different workers compete to establish it.
+func (command systemCommand) acquireWorkspace(
+	ctx context.Context,
+	stateDir string,
+	projectCWD string,
+) (runtime.ClientPort, error) {
+	if err := inspectWorkspaceBinding(stateDir, projectCWD, false); err != nil {
+		return nil, err
+	}
+	client, err := command.acquire(ctx, stateDir)
+	if err != nil {
+		return nil, err
+	}
+	if err := inspectWorkspaceBinding(stateDir, projectCWD, true); err != nil {
+		_ = client.Close()
+		return nil, err
+	}
+	return client, nil
 }
 
 func retryableDialError(err error) bool {

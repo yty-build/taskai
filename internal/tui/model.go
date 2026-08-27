@@ -1360,10 +1360,13 @@ func (m *Model) quitCmd() tea.Cmd {
 	attempt := m.startDetach()
 	runtime := m.runtime
 	return func() tea.Msg {
+		// Terminal ownership must be released even when a broken transport does
+		// not answer Detach. Cancelling the model first makes the best-effort
+		// Detach finite without stopping the worker-owned Manager tree.
+		m.Close()
 		if attempt != nil {
 			_ = attempt.run(runtime)
 		}
-		m.Close()
 		return tea.Quit()
 	}
 }

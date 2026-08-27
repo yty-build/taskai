@@ -229,6 +229,9 @@ func TestFollowTerminalMatrixInvalidatesAndResetsToAnswer(t *testing.T) {
 			if _, err := delegator.Invoke(context.Background(), json.RawMessage(stale)); !errors.Is(err, connector.ErrStaleTurn) {
 				t.Fatalf("stale follow_next error = %v", err)
 			}
+			if tc.transport {
+				return
+			}
 
 			answerStart := invokeResult(t, delegator, fmt.Sprintf(`{"operation":"start","child_session_id":%q,"prompt":"next","mode":"answer"}`, start.ChildSessionID))
 			if answerStart.Mode != connector.ModeAnswer || answerStart.NextOperation != connector.OperationNextAnswer || len(answerStart.Frames) != 0 {
@@ -242,6 +245,69 @@ func TestFollowTerminalMatrixInvalidatesAndResetsToAnswer(t *testing.T) {
 				t.Fatalf("same-child Answer manufactured content: %+v", answerTerminal.Completion)
 			}
 		})
+	}
+}
+
+func TestTransportFailureRetiresChildAndLaterExactResumes(t *testing.T) {
+	t.Parallel()
+	factory := testkit.NewScriptedFactory(
+		testkit.ChildScript{NativeReference: "native-crash", TransportError: true},
+		testkit.ChildScript{
+			NativeReference: "native-crash",
+			Frames:          []json.RawMessage{testkit.AgentMessageFrame("native-crash", "answer", "resumed")},
+		},
+	)
+	registry := connector.NewRegistry()
+	versions := connector.Versions{ACPProtocol: 1, Connector: "test-fixture"}
+	profile := connector.NewConformedProfile(
+		"fake-resumable",
+		"Fake resumable ACP",
+		versions,
+		connector.Conformance{
+			Exact:  versions,
+			Proven: connector.Capabilities{Subordinate: true, Resume: true},
+		},
+		nil,
+		factory,
+		factory,
+		nil,
+		nil,
+		connector.ReplayBinding{},
+	)
+	if err := registry.Register(profile); err != nil {
+		t.Fatal(err)
+	}
+	delegator, err := connector.NewDelegator(
+		context.Background(), "manager", registry, &testkit.EventRecorder{}, &testkit.SequenceIDs{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = delegator.Close() })
+
+	started := invokeResult(t, delegator, `{"operation":"start","provider":"fake-resumable","prompt":"opaque","mode":"answer"}`)
+	failed := invokeResult(t, delegator, `{"operation":"next_answer"}`)
+	if failed.Completion == nil || failed.Completion.Success || failed.Completion.StopReason != "transport_failure" {
+		t.Fatalf("failed completion = %+v", failed.Completion)
+	}
+	newCalls, resumeReferences := factory.CallSnapshot()
+	if newCalls != 1 || len(resumeReferences) != 0 {
+		t.Fatalf("transport failure performed hidden retry: New=%d Resume=%d", newCalls, len(resumeReferences))
+	}
+
+	resumed := invokeResult(t, delegator, fmt.Sprintf(
+		`{"operation":"start","child_session_id":%q,"prompt":"next","mode":"answer"}`,
+		started.ChildSessionID,
+	))
+	answer := invokeResult(t, delegator, `{"operation":"next_answer"}`)
+	if resumed.ChildSessionID != started.ChildSessionID || answer.Completion == nil || !answer.Completion.Success ||
+		len(answer.Completion.Answer) != 1 || contentText(t, answer.Completion.Answer[0]) != "resumed" {
+		t.Fatalf("resumed result = start %+v answer %+v", resumed, answer)
+	}
+	newCalls, resumeReferences = factory.CallSnapshot()
+	wantReference, _ := replay.NewCodexReference("native-crash")
+	if newCalls != 1 || len(resumeReferences) != 1 || !bytes.Equal(resumeReferences[0].Bytes(), wantReference.Bytes()) {
+		t.Fatalf("exact lifecycle calls: New=%d Resume=%d refs=%v", newCalls, len(resumeReferences), resumeReferences)
 	}
 }
 

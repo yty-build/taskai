@@ -45,6 +45,9 @@ func Command(ctx context.Context, spec CommandSpec) (*exec.Cmd, error) {
 	args := append([]string(nil), spec.Args...)
 	cmd := exec.CommandContext(ctx, spec.Executable, args...)
 	cmd.Dir = spec.Dir
+	if err := configureProviderProcess(cmd); err != nil {
+		return nil, ErrInvalidCommand
+	}
 	return cmd, nil
 }
 
@@ -109,13 +112,15 @@ func (p *Process) Wait() error {
 	return p.waitErr
 }
 
-// Close cancels only the exact process launched by this Process. Runtime-tree
-// supervision is owned by the runtime packet, not this connector primitive.
+// Close terminates and reaps the isolated provider process group. A provider
+// launcher may fork, so killing only the direct child would abandon work that
+// TaskAI still owns.
 func (p *Process) Close() error {
 	if p == nil {
 		return nil
 	}
 	p.cancel()
+	_ = terminateProviderProcess(p.cmd.Process)
 	_ = p.Stdin.Close()
 	_ = p.Stdout.Close()
 	_ = p.Wait()

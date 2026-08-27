@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/yty-build/acp-gateway/internal/acp"
@@ -84,10 +85,14 @@ func (supervisor *Supervisor) childEvent(ctx context.Context, boundManager sessi
 	supervisor.mu.Lock()
 	deliveries, err := supervisor.childEventLocked(managerID, childID, providerID, event)
 	supervisor.mu.Unlock()
+	var waits []viewerDeliveryWait
 	if err == nil {
-		err = supervisor.deliver(deliveries)
+		waits, err = supervisor.deliver(deliveries)
 	}
 	supervisor.deliveryMu.Unlock()
+	if err == nil {
+		err = supervisor.waitViewerDeliveries(waits)
+	}
 	return err
 }
 
@@ -263,9 +268,13 @@ func (supervisor *Supervisor) registerViewer(id string) (*viewer, error) {
 	value := &viewer{
 		id: id, generation: supervisor.generation, floor: supervisor.sequence,
 		done: make(chan struct{}), queue: make(chan Event, 1),
+		deliveries:   make(chan queuedViewerEvent, viewerDeliveryBacklog),
+		deliveryDone: make(chan struct{}), deliveryTimeout: viewerDeliveryStallTimeout,
 		attached: make(map[task.ID]struct{}),
 	}
 	supervisor.viewers[id] = value
+	supervisor.wg.Add(1)
+	go supervisor.runViewerDelivery(value)
 	return value, nil
 }
 
@@ -279,10 +288,11 @@ func (supervisor *Supervisor) unregisterViewer(id string, expected *viewer) {
 		delete(supervisor.viewers, id)
 	}
 	supervisor.mu.Unlock()
+	supervisor.deliveryMu.Unlock()
 	if expected != nil {
+		expected.waitDeliveryStop()
 		expected.clearPending()
 	}
-	supervisor.deliveryMu.Unlock()
 }
 
 func (value *viewer) clearPending() {
@@ -290,9 +300,17 @@ func (value *viewer) clearPending() {
 		select {
 		case event := <-value.queue:
 			clearEvent(&event)
+		case delivery := <-value.deliveries:
+			clearEvent(&delivery.event)
 		default:
 			return
 		}
+	}
+}
+
+func (value *viewer) waitDeliveryStop() {
+	if value != nil && value.deliveryDone != nil {
+		<-value.deliveryDone
 	}
 }
 
@@ -311,6 +329,22 @@ func validClientID(id string) bool {
 type eventDelivery struct {
 	viewer *viewer
 	event  Event
+}
+
+const (
+	viewerDeliveryBacklog      = 8
+	viewerDeliveryStallTimeout = 5 * time.Second
+)
+
+type queuedViewerEvent struct {
+	event     Event
+	delivered chan struct{}
+}
+
+type viewerDeliveryWait struct {
+	viewer    *viewer
+	delivered <-chan struct{}
+	deadline  time.Time
 }
 
 // prepareSessionLocked allocates one global sequence while state is locked.
@@ -371,19 +405,140 @@ func (supervisor *Supervisor) prepareFrameLocked(managerSession session.Session,
 	return result, nil
 }
 
-func (supervisor *Supervisor) deliver(deliveries []eventDelivery) error {
+func (supervisor *Supervisor) runViewerDelivery(value *viewer) {
+	defer supervisor.wg.Done()
+	defer close(value.deliveryDone)
+	defer value.clearPending()
+	for {
+		select {
+		case delivery := <-value.deliveries:
+			select {
+			case value.queue <- delivery.event:
+				delivery.event = Event{}
+				if delivery.delivered != nil {
+					close(delivery.delivered)
+				}
+			case <-value.done:
+				clearEvent(&delivery.event)
+				return
+			case <-supervisor.ctx.Done():
+				clearEvent(&delivery.event)
+				value.close()
+				return
+			}
+		case <-value.done:
+			return
+		case <-supervisor.ctx.Done():
+			value.close()
+			return
+		}
+	}
+}
+
+// deliver transfers transient events into ordered, bounded per-viewer
+// dispatchers. It is called while deliveryMu is held, but never waits for a
+// viewer. A full dispatcher is detached so it cannot stall unrelated work.
+func (supervisor *Supervisor) deliver(deliveries []eventDelivery) ([]viewerDeliveryWait, error) {
+	waits := make([]viewerDeliveryWait, 0, len(deliveries))
 	for index := range deliveries {
 		delivery := &deliveries[index]
 		select {
-		case delivery.viewer.queue <- cloneEvent(delivery.event):
-		case <-delivery.viewer.done:
 		case <-supervisor.ctx.Done():
 			clearDeliveries(deliveries[index:])
-			return ErrClosed
+			return nil, ErrClosed
+		case <-delivery.viewer.done:
+			clearEvent(&delivery.event)
+			continue
+		default:
 		}
-		clearEvent(&delivery.event)
+		queued := queuedViewerEvent{event: delivery.event}
+		if delivery.event.Kind == EventPublicFrame {
+			queued.delivered = make(chan struct{})
+		}
+		select {
+		case delivery.viewer.deliveries <- queued:
+			delivery.event = Event{}
+			if queued.delivered != nil {
+				timeout := delivery.viewer.deliveryTimeout
+				if timeout <= 0 {
+					timeout = viewerDeliveryStallTimeout
+				}
+				waits = append(waits, viewerDeliveryWait{
+					viewer: delivery.viewer, delivered: queued.delivered,
+					deadline: time.Now().Add(timeout),
+				})
+			}
+		case <-delivery.viewer.done:
+			clearEvent(&delivery.event)
+		default:
+			supervisor.detachViewerLocked(delivery.viewer)
+			clearEvent(&delivery.event)
+		}
+	}
+	return waits, nil
+}
+
+func (supervisor *Supervisor) waitViewerDeliveries(waits []viewerDeliveryWait) error {
+	for _, wait := range waits {
+		remaining := time.Until(wait.deadline)
+		if remaining <= 0 {
+			supervisor.detachSlowViewer(wait.viewer, wait.delivered)
+			continue
+		}
+		timer := time.NewTimer(remaining)
+		select {
+		case <-wait.delivered:
+			stopViewerDeliveryTimer(timer)
+		case <-wait.viewer.done:
+			stopViewerDeliveryTimer(timer)
+		case <-supervisor.ctx.Done():
+			stopViewerDeliveryTimer(timer)
+			return ErrClosed
+		case <-timer.C:
+			supervisor.detachSlowViewer(wait.viewer, wait.delivered)
+		}
 	}
 	return nil
+}
+
+func stopViewerDeliveryTimer(timer *time.Timer) {
+	if timer == nil || timer.Stop() {
+		return
+	}
+	select {
+	case <-timer.C:
+	default:
+	}
+}
+
+func (supervisor *Supervisor) detachSlowViewer(value *viewer, delivered <-chan struct{}) {
+	select {
+	case <-delivered:
+		return
+	default:
+	}
+	supervisor.deliveryMu.Lock()
+	defer supervisor.deliveryMu.Unlock()
+	select {
+	case <-delivered:
+		return
+	default:
+		supervisor.detachViewerLocked(value)
+	}
+}
+
+// detachViewerLocked is called with deliveryMu held. Closing done releases the
+// viewer's dispatcher and every producer waiting only on that viewer.
+func (supervisor *Supervisor) detachViewerLocked(value *viewer) {
+	if value == nil {
+		return
+	}
+	value.close()
+	supervisor.mu.Lock()
+	if current := supervisor.viewers[value.id]; current == value {
+		delete(supervisor.viewers, value.id)
+	}
+	supervisor.mu.Unlock()
 }
 
 func clearDeliveries(values []eventDelivery) {
@@ -403,7 +558,8 @@ func clearEvent(value *Event) {
 
 // commitMutation is the sole event-producing mutation boundary. Store and
 // mirror changes plus sequence allocation are atomic with Snapshot under mu;
-// ordered backpressure happens after releasing mu under deliveryMu.
+// ordered admission happens under deliveryMu; selected-frame backpressure is
+// awaited only after releasing it.
 func (supervisor *Supervisor) commitMutation(
 	mutation func() ([]eventDelivery, error),
 ) error {
@@ -411,10 +567,14 @@ func (supervisor *Supervisor) commitMutation(
 	supervisor.mu.Lock()
 	deliveries, err := mutation()
 	supervisor.mu.Unlock()
+	var waits []viewerDeliveryWait
 	if err == nil {
-		err = supervisor.deliver(deliveries)
+		waits, err = supervisor.deliver(deliveries)
 	}
 	supervisor.deliveryMu.Unlock()
+	if err == nil {
+		err = supervisor.waitViewerDeliveries(waits)
+	}
 	return err
 }
 
@@ -500,7 +660,7 @@ func (supervisor *Supervisor) publicSessionLocked(value session.Session) (Sessio
 	}, nil
 }
 
-func decodePublicFrame(raw json.RawMessage) (PublicFrame, error) {
+func decodePublicFrame(raw json.RawMessage, expectedSessionID string) (PublicFrame, error) {
 	if len(raw) == 0 || len(raw) > acp.MaxFrameBytes {
 		return PublicFrame{}, ErrCapacity
 	}
@@ -512,7 +672,8 @@ func decodePublicFrame(raw json.RawMessage) (PublicFrame, error) {
 		SessionID string          `json:"sessionId"`
 		Update    json.RawMessage `json:"update"`
 	}
-	if strictDecode(message.Params, &params) != nil || params.SessionID == "" || len(params.Update) == 0 {
+	if !validManagerPublicSessionID(expectedSessionID) || strictDecode(message.Params, &params) != nil ||
+		params.SessionID != expectedSessionID || len(params.Update) == 0 {
 		return PublicFrame{}, ErrTransport
 	}
 	var envelope struct {

@@ -52,12 +52,13 @@ type NativeManagerSession struct {
 // ManagerConnection is the provider-agnostic live Manager boundary consumed
 // by the runtime packet. Prompt frames are standard bounded ACP JSON-RPC
 // frames; provider-private transport envelopes never cross this interface.
-// Native history remains an opaque, explicit read used by the Replay adapter.
+// Provider-native history is intentionally absent; only the dedicated Replay
+// adapter may read it.
 type ManagerConnection interface {
 	NativeReference() replay.OpaqueRef
+	PublicSessionID() string
 	Prompt(context.Context, string, func(json.RawMessage) error) (json.RawMessage, error)
 	Interrupt(context.Context) error
-	ReadNativeSession(context.Context) (json.RawMessage, error)
 	Done() <-chan struct{}
 	Err() error
 	Close() error
@@ -323,6 +324,7 @@ type delegatedManagerConnection struct {
 	base     ManagerConnection
 	delegate *Delegator
 	app      CodexAppServer
+	closing  chan struct{}
 	done     chan struct{}
 
 	closeOnce sync.Once
@@ -337,7 +339,8 @@ func newDelegatedManagerConnection(
 	app CodexAppServer,
 ) ManagerConnection {
 	connection := &delegatedManagerConnection{
-		base: base, delegate: delegate, app: app, done: make(chan struct{}),
+		base: base, delegate: delegate, app: app,
+		closing: make(chan struct{}), done: make(chan struct{}),
 	}
 	go connection.watch(ctx)
 	return connection
@@ -349,13 +352,13 @@ func (c *delegatedManagerConnection) watch(ctx context.Context) {
 		c.shutdown(&BoundaryError{Stage: "manager supervisor", Err: ErrTransport})
 	case <-c.base.Done():
 		c.shutdown(&BoundaryError{Stage: "manager transport", Err: ErrTransport})
-	case <-c.delegate.Done():
+	case <-c.delegate.closing:
 		err := c.delegate.Err()
 		if err == nil {
 			err = &BoundaryError{Stage: "manager delegation", Err: ErrTransport}
 		}
 		c.shutdown(err)
-	case <-c.done:
+	case <-c.closing:
 	}
 }
 
@@ -364,6 +367,13 @@ func (c *delegatedManagerConnection) NativeReference() replay.OpaqueRef {
 		return replay.OpaqueRef{}
 	}
 	return replay.OpaqueRefFromBytes(c.base.NativeReference().Bytes())
+}
+
+func (c *delegatedManagerConnection) PublicSessionID() string {
+	if c == nil || c.base == nil {
+		return ""
+	}
+	return c.base.PublicSessionID()
 }
 
 func (c *delegatedManagerConnection) Prompt(ctx context.Context, prompt string, onFrame func(json.RawMessage) error) (json.RawMessage, error) {
@@ -378,13 +388,6 @@ func (c *delegatedManagerConnection) Interrupt(ctx context.Context) error {
 		return err
 	}
 	return c.base.Interrupt(ctx)
-}
-
-func (c *delegatedManagerConnection) ReadNativeSession(ctx context.Context) (json.RawMessage, error) {
-	if err := c.available(); err != nil {
-		return nil, err
-	}
-	return c.base.ReadNativeSession(ctx)
 }
 
 func (c *delegatedManagerConnection) Done() <-chan struct{} { return c.done }
@@ -411,7 +414,7 @@ func (c *delegatedManagerConnection) available() error {
 		return ErrTransport
 	}
 	select {
-	case <-c.done:
+	case <-c.closing:
 		if err := c.Err(); err != nil {
 			return err
 		}
@@ -428,12 +431,15 @@ func (c *delegatedManagerConnection) shutdown(cause error) {
 			c.err = cause
 			c.mu.Unlock()
 		}
-		close(c.done)
+		// Reject new work immediately, while reserving Done for the stronger
+		// cleanup-complete contract consumed by manager.Instance.
+		close(c.closing)
 		if cause != nil {
 			c.delegate.failTree(&BoundaryError{Stage: "manager runtime", Err: ErrTransport})
 		}
 		_ = c.base.Close()
 		_ = c.app.Close()
 		_ = c.delegate.Close()
+		close(c.done)
 	})
 }

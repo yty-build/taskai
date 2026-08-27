@@ -94,6 +94,183 @@ func TestIPCRoundTripUsesOnePersistentViewerAndBoundedActions(t *testing.T) {
 	}
 }
 
+func TestIPCDetachIsNotSerializedBehindLongManagerSend(t *testing.T) {
+	stateDir := shortIPCStateDir(t)
+	backend := newIPCTestBackend()
+	backend.port.sendEntered = make(chan struct{})
+	backend.port.sendRelease = make(chan struct{})
+	backend.port.detachDone = make(chan struct{})
+	server, err := NewIPCServer(stateDir, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveCtx, cancelServe := context.WithCancel(context.Background())
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx) }()
+	t.Cleanup(func() {
+		close(backend.port.sendRelease)
+		cancelServe()
+		_ = server.Close()
+		<-serveDone
+	})
+
+	client, err := Dial(context.Background(), stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	sendDone := make(chan error, 1)
+	go func() { sendDone <- client.Send(context.Background(), "manager_existing", "opaque") }()
+	awaitSignal(t, backend.port.sendEntered)
+
+	detachDone := make(chan error, 1)
+	go func() { detachDone <- client.Detach(context.Background(), "task_existing") }()
+	awaitSignal(t, backend.port.detachDone)
+	select {
+	case err := <-detachDone:
+		if err != nil {
+			t.Fatalf("Detach = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Detach waited behind an active Send")
+	}
+	select {
+	case err := <-sendDone:
+		t.Fatalf("Send completed before provider release: %v", err)
+	default:
+	}
+}
+
+func TestIPCHalfOpenHandshakeAndActionReadsExpire(t *testing.T) {
+	stateDir := shortIPCStateDir(t)
+	backend := newIPCTestBackend()
+	server, err := NewIPCServer(stateDir, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.handshakeReadTimeout = 25 * time.Millisecond
+	server.actionReadTimeout = 25 * time.Millisecond
+	serveCtx, cancelServe := context.WithCancel(context.Background())
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx) }()
+	t.Cleanup(func() {
+		cancelServe()
+		_ = server.Close()
+		<-serveDone
+	})
+
+	halfOpen, err := dialLocalEndpoint(context.Background(), stateDir)
+	if err != nil {
+		t.Fatalf("dial half-open handshake: %v", err)
+	}
+	if err := halfOpen.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var rejectedHello wireHelloResponse
+	if err := readWireFrame(halfOpen, &rejectedHello); err != nil {
+		t.Fatalf("half-open handshake was not bounded: %v", err)
+	}
+	if rejectedHello.Error != CodeInvalidRequest {
+		t.Fatalf("half-open handshake error = %q, want invalid request", rejectedHello.Error)
+	}
+	_ = halfOpen.Close()
+
+	opened, err := Dial(context.Background(), stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	client, ok := opened.(*IPCClient)
+	if !ok {
+		t.Fatalf("Dial returned %T", opened)
+	}
+	action, err := dialLocalEndpoint(context.Background(), stateDir)
+	if err != nil {
+		t.Fatalf("dial half-open action: %v", err)
+	}
+	defer action.Close()
+	if err := writeWireFrame(action, wireHello{
+		Protocol: ipcProtocolVersion, Role: ipcRoleAction, ClientID: client.id,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := action.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var acceptedHello wireHelloResponse
+	if err := readWireFrame(action, &acceptedHello); err != nil || acceptedHello.Error != "" {
+		t.Fatalf("action hello = %#v, %v", acceptedHello, err)
+	}
+	var rejectedAction wireResponse
+	if err := readWireFrame(action, &rejectedAction); err != nil {
+		t.Fatalf("half-open action was not bounded: %v", err)
+	}
+	if rejectedAction.Error != CodeInvalidRequest {
+		t.Fatalf("half-open action error = %q, want invalid request", rejectedAction.Error)
+	}
+}
+
+func TestIPCReadDeadlinesDoNotBoundCancellableEventLongPoll(t *testing.T) {
+	stateDir := shortIPCStateDir(t)
+	backend := newIPCTestBackend()
+	backend.port.nextEntered = make(chan struct{})
+	server, err := NewIPCServer(stateDir, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.handshakeReadTimeout = 20 * time.Millisecond
+	server.actionReadTimeout = 20 * time.Millisecond
+	serveCtx, cancelServe := context.WithCancel(context.Background())
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(serveCtx) }()
+	t.Cleanup(func() {
+		cancelServe()
+		_ = server.Close()
+		<-serveDone
+	})
+
+	client, err := Dial(context.Background(), stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	nextCtx, cancelNext := context.WithCancel(context.Background())
+	nextDone := make(chan error, 1)
+	go func() {
+		_, nextErr := client.Next(nextCtx, Cursor{Generation: 7, After: 11})
+		nextDone <- nextErr
+	}()
+	awaitSignal(t, backend.port.nextEntered)
+	select {
+	case err := <-nextDone:
+		t.Fatalf("event long-poll inherited a finite read deadline: %v", err)
+	case <-time.After(4 * server.handshakeReadTimeout):
+	}
+	cancelNext()
+	select {
+	case err := <-nextDone:
+		if !errors.Is(err, ErrCancelled) {
+			t.Fatalf("event long-poll cancellation = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("event long-poll did not remain cancellable")
+	}
+}
+
+func TestIPCServerWriteIsFinitelyBoundedWhenPeerStopsReading(t *testing.T) {
+	serverSide, peerSide := net.Pipe()
+	defer serverSide.Close()
+	defer peerSide.Close()
+	started := time.Now()
+	err := writeIPCFrame(serverSide, 20*time.Millisecond, wireHelloResponse{Protocol: ipcProtocolVersion})
+	if !errors.Is(err, ErrTransport) {
+		t.Fatalf("blocked IPC write = %v, want transport", err)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatal("blocked IPC write retained its connection slot past the finite deadline")
+	}
+}
+
 func TestIPCConstructorOwnsEndpointBeforeBackendOrServe(t *testing.T) {
 	stateDir := shortIPCStateDir(t)
 	backend := newIPCTestBackend()
@@ -407,6 +584,11 @@ type ipcTestPort struct {
 	events       chan Event
 	nextEntered  chan struct{}
 	nextOnce     sync.Once
+	sendEntered  chan struct{}
+	sendRelease  chan struct{}
+	sendOnce     sync.Once
+	detachDone   chan struct{}
+	detachOnce   sync.Once
 	closed       chan struct{}
 	closeOnce    sync.Once
 }
@@ -440,10 +622,26 @@ func (port *ipcTestPort) Attach(_ context.Context, id task.ID) error {
 	return nil
 }
 
-func (*ipcTestPort) Detach(context.Context, task.ID) error          { return nil }
-func (*ipcTestPort) Send(context.Context, session.ID, string) error { return nil }
-func (*ipcTestPort) Resume(context.Context, session.ID) error       { return nil }
-func (*ipcTestPort) Stop(context.Context, session.ID) error         { return nil }
+func (port *ipcTestPort) Detach(context.Context, task.ID) error {
+	if port.detachDone != nil {
+		port.detachOnce.Do(func() { close(port.detachDone) })
+	}
+	return nil
+}
+func (port *ipcTestPort) Send(ctx context.Context, _ session.ID, _ string) error {
+	if port.sendEntered == nil {
+		return nil
+	}
+	port.sendOnce.Do(func() { close(port.sendEntered) })
+	select {
+	case <-port.sendRelease:
+		return nil
+	case <-ctx.Done():
+		return ErrCancelled
+	}
+}
+func (*ipcTestPort) Resume(context.Context, session.ID) error { return nil }
+func (*ipcTestPort) Stop(context.Context, session.ID) error   { return nil }
 
 func (port *ipcTestPort) Next(ctx context.Context, _ Cursor) (Event, error) {
 	if port.nextEntered != nil {

@@ -33,8 +33,10 @@ type managerHandle interface {
 	ID() session.ID
 	ProviderID() string
 	NativeReference() []byte
+	PublicSessionID() string
 	Send(context.Context, string, manager.FrameSink) (json.RawMessage, error)
 	Stop(context.Context) error
+	ForceClose() error
 	Done() <-chan struct{}
 	Terminal() (manager.Terminal, bool)
 	Available() bool
@@ -82,10 +84,12 @@ func (handle instanceHandle) ProviderID() string { return handle.instance.Provid
 func (handle instanceHandle) NativeReference() []byte {
 	return handle.instance.NativeReference().Bytes()
 }
+func (handle instanceHandle) PublicSessionID() string { return handle.instance.PublicSessionID() }
 func (handle instanceHandle) Send(ctx context.Context, prompt string, sink manager.FrameSink) (json.RawMessage, error) {
 	return handle.instance.Send(ctx, prompt, sink)
 }
 func (handle instanceHandle) Stop(ctx context.Context) error { return handle.instance.Stop(ctx) }
+func (handle instanceHandle) ForceClose() error              { return handle.instance.ForceClose() }
 func (handle instanceHandle) Done() <-chan struct{}          { return handle.instance.Done() }
 func (handle instanceHandle) Terminal() (manager.Terminal, bool) {
 	return handle.instance.Terminal()
@@ -98,11 +102,12 @@ type providerCatalog struct {
 }
 
 type liveManager struct {
-	id     session.ID
-	taskID task.ID
-	handle managerHandle
-	fatal  chan struct{}
-	done   chan struct{}
+	id              session.ID
+	taskID          task.ID
+	publicSessionID string
+	handle          managerHandle
+	fatal           chan struct{}
+	done            chan struct{}
 
 	stopMu   sync.Mutex
 	stopping bool
@@ -119,10 +124,13 @@ type viewer struct {
 	generation uint64
 	floor      uint64
 
-	done      chan struct{}
-	closeOnce sync.Once
-	queue     chan Event
-	nextMu    sync.Mutex
+	done            chan struct{}
+	closeOnce       sync.Once
+	queue           chan Event
+	deliveries      chan queuedViewerEvent
+	deliveryDone    chan struct{}
+	deliveryTimeout time.Duration
+	nextMu          sync.Mutex
 
 	attached map[task.ID]struct{} // guarded by Supervisor.mu
 }
@@ -145,8 +153,9 @@ type Supervisor struct {
 	stopTimeout  time.Duration
 	probeTimeout time.Duration
 
-	// deliveryMu serializes sequence allocation and synchronous viewer
-	// delivery. It is always acquired before mu. Blocking sends never hold mu.
+	// deliveryMu serializes sequence allocation and ordered, non-blocking
+	// admission to each viewer dispatcher. It is always acquired before mu.
+	// Per-viewer backpressure never holds this mutex.
 	deliveryMu  sync.Mutex
 	mu          sync.Mutex
 	closed      bool
@@ -391,7 +400,8 @@ func (supervisor *Supervisor) reconcileLiveManagers() error {
 		stored, exists := supervisor.sessions[id]
 		if !exists || stored.Role != session.RoleManager || stored.ParentID != nil ||
 			stored.ProviderID != handle.ProviderID() || len(stored.ProviderReference) == 0 ||
-			!bytes.Equal(stored.ProviderReference, handle.NativeReference()) {
+			!bytes.Equal(stored.ProviderReference, handle.NativeReference()) ||
+			!validManagerPublicSessionID(handle.PublicSessionID()) {
 			return ErrPersistence
 		}
 		active[id] = handle
@@ -593,13 +603,18 @@ func (supervisor *Supervisor) applyTreeStateLocked(id session.ID, state session.
 
 func (supervisor *Supervisor) installLiveLocked(stored session.Session, handle managerHandle) *liveManager {
 	entry := &liveManager{
-		id: stored.ID, taskID: stored.TaskID, handle: handle,
+		id: stored.ID, taskID: stored.TaskID, publicSessionID: handle.PublicSessionID(), handle: handle,
 		fatal: make(chan struct{}, 1), done: make(chan struct{}), stopDone: make(chan struct{}),
 	}
 	supervisor.live[stored.ID] = entry
 	supervisor.wg.Add(1)
 	go supervisor.watchManager(entry)
 	return entry
+}
+
+func validManagerPublicSessionID(value string) bool {
+	return value != "" && len(value) <= connector.MaxCorrelationIDBytes && utf8.ValidString(value) &&
+		strings.IndexByte(value, 0) < 0
 }
 
 // Close ends the worker lifetime, interrupts remaining exact live trees, and
@@ -637,16 +652,18 @@ func (supervisor *Supervisor) Close() error {
 	for _, value := range viewers {
 		value.close()
 	}
-	// Release any producer blocked behind a viewer before clearing its sole
-	// bounded pending delivery. Supervisor lifetime remains independent.
+	// Stop admissions before waiting for each bounded viewer dispatcher to
+	// release its pending transient events. Supervisor lifetime remains
+	// independent from every viewer.
 	supervisor.deliveryMu.Lock()
 	supervisor.mu.Lock()
 	clear(supervisor.viewers)
 	supervisor.mu.Unlock()
+	supervisor.deliveryMu.Unlock()
 	for _, value := range viewers {
+		value.waitDeliveryStop()
 		value.clearPending()
 	}
-	supervisor.deliveryMu.Unlock()
 	sort.Slice(live, func(left, right int) bool { return live[left].id < live[right].id })
 	results := make([]error, len(live))
 	var stops sync.WaitGroup
@@ -757,8 +774,26 @@ func stopHandleWithin(handle managerHandle, timeout time.Duration) error {
 	}()
 	select {
 	case err := <-result:
-		return err
+		select {
+		case <-handle.Done():
+			return err
+		default:
+			forceErr := handle.ForceClose()
+			<-handle.Done()
+			if forceErr != nil {
+				return ErrTransport
+			}
+			if err != nil {
+				return err
+			}
+			return ErrTransport
+		}
 	case <-ctx.Done():
+		forceErr := handle.ForceClose()
+		<-handle.Done()
+		if forceErr != nil {
+			return ErrTransport
+		}
 		return ErrTransport
 	}
 }

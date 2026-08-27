@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/yty-build/acp-gateway/internal/acp"
 	"github.com/yty-build/acp-gateway/internal/connector"
@@ -14,9 +15,10 @@ import (
 )
 
 const (
-	MaxPromptBytes      = acp.MaxFrameBytes
-	MaxPublicFrameBytes = acp.MaxFrameBytes
-	MaxCompletionBytes  = acp.MaxFrameBytes
+	MaxPromptBytes       = acp.MaxFrameBytes
+	MaxPublicFrameBytes  = acp.MaxFrameBytes
+	MaxCompletionBytes   = acp.MaxFrameBytes
+	instanceCloseTimeout = 5 * time.Second
 )
 
 // FrameSink is a synchronous, backpressured caller port. PublicFrame must not
@@ -51,13 +53,14 @@ type Terminal struct {
 // attachment state. It retains only identity, opaque provider reference, and
 // bounded mechanical concurrency/lifecycle state.
 type Instance struct {
-	id         session.ID
-	providerID string
-	reference  replay.OpaqueRef
-	connection connector.ManagerConnection
-	lifetime   context.Context
-	cancel     context.CancelFunc
-	release    func(*Instance)
+	id              session.ID
+	providerID      string
+	reference       replay.OpaqueRef
+	publicSessionID string
+	connection      connector.ManagerConnection
+	lifetime        context.Context
+	cancel          context.CancelFunc
+	release         func(*Instance)
 
 	stateMu     sync.Mutex
 	busy        bool
@@ -69,15 +72,18 @@ type Instance struct {
 	terminalMu   sync.RWMutex
 	terminal     Terminal
 
-	stopOnce sync.Once
-	stopMu   sync.Mutex
-	stopErr  error
+	stopOnce  sync.Once
+	stopMu    sync.Mutex
+	stopErr   error
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func newInstance(
 	id session.ID,
 	providerID string,
 	reference replay.OpaqueRef,
+	publicSessionID string,
 	connection connector.ManagerConnection,
 	lifetime context.Context,
 	cancel context.CancelFunc,
@@ -85,7 +91,7 @@ func newInstance(
 ) *Instance {
 	return &Instance{
 		id: id, providerID: providerID,
-		reference: reference, connection: connection,
+		reference: reference, publicSessionID: publicSessionID, connection: connection,
 		lifetime: lifetime, cancel: cancel, release: release,
 		done: make(chan struct{}),
 	}
@@ -103,6 +109,16 @@ func (instance *Instance) ProviderID() string {
 		return ""
 	}
 	return instance.providerID
+}
+
+// PublicSessionID is the bounded connector-issued ACP identity expected on
+// every public Manager session/update frame. It is transient runtime state and
+// is never persisted.
+func (instance *Instance) PublicSessionID() string {
+	if instance == nil {
+		return ""
+	}
+	return instance.publicSessionID
 }
 
 // NativeReference returns only a defensive opaque envelope for metadata-only
@@ -199,6 +215,9 @@ func (instance *Instance) Send(
 			if terminal, ok := instance.Terminal(); ok && terminal.Code != "" {
 				return nil, SafeError{code: terminal.Code}
 			}
+			if instance.lifetime.Err() != nil {
+				return nil, ErrCancelled
+			}
 			return nil, ErrUnavailable
 		}
 		return nil, sanitizeError(err)
@@ -255,13 +274,23 @@ func (instance *Instance) stop(ctx context.Context) error {
 	instance.unavailable = true
 	instance.stateMu.Unlock()
 
-	interruptErr := instance.connection.Interrupt(ctx)
-	// Cancellation wakes the active Send even if the provider transport is
-	// concurrently failing; Close still owns exact composite teardown.
-	instance.cancel()
-	closeErr := instance.connection.Close()
+	// Attempt the provider's graceful interrupt first. If it ignores its
+	// request context, expiry independently cancels the lifetime and hard-closes
+	// the owned connector composite (whose process launcher kills its isolated
+	// process group). Stop does not wait for a non-conforming Interrupt after
+	// that deadline, so exact provider ownership can be reclaimed finitely.
+	interruptDone := make(chan error, 1)
+	go func() { interruptDone <- instance.connection.Interrupt(ctx) }()
+	var interruptErr error
+	forced := false
+	select {
+	case interruptErr = <-interruptDone:
+	case <-ctx.Done():
+		forced = true
+	}
+	closeErr := instance.hardClose()
 
-	failed := meaningfulStopError(interruptErr) || closeErr != nil
+	failed := forced || meaningfulStopError(interruptErr) || closeErr != nil
 	if failed {
 		instance.finish(Terminal{Kind: TerminalFailed, Code: CodeStopFailed})
 		return ErrStopFailed
@@ -270,13 +299,42 @@ func (instance *Instance) stop(ctx context.Context) error {
 	return nil
 }
 
+// ForceClose reclaims the exact owned connector composite without waiting for
+// a graceful Interrupt. It is the Supervisor's post-deadline ownership path
+// and returns only after connector Close has completed and Done is observable.
+func (instance *Instance) ForceClose() error {
+	if instance == nil {
+		return ErrInvalidRequest
+	}
+	instance.stateMu.Lock()
+	instance.stopping = true
+	instance.unavailable = true
+	instance.stateMu.Unlock()
+	closeErr := instance.hardClose()
+	instance.finish(Terminal{Kind: TerminalFailed, Code: CodeStopFailed})
+	if closeErr != nil {
+		return ErrStopFailed
+	}
+	return nil
+}
+
+func (instance *Instance) hardClose() error {
+	instance.cancel()
+	instance.closeOnce.Do(func() {
+		instance.closeErr = instance.connection.Close()
+	})
+	return instance.closeErr
+}
+
 // Close is the idempotent ownership fallback for callers without a request
 // context. Runtime supervisors should prefer Stop with their bounded context.
 func (instance *Instance) Close() error {
 	if instance == nil {
 		return nil
 	}
-	return instance.Stop(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), instanceCloseTimeout)
+	defer cancel()
+	return instance.Stop(ctx)
 }
 
 func meaningfulStopError(err error) bool {

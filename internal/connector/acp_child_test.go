@@ -362,6 +362,21 @@ func TestACPFactoryIsolatesMalformedOversizedAndTransportLoss(t *testing.T) {
 			if !errors.Is(err, connector.ErrTransport) {
 				t.Fatalf("Prompt() error = %v, want ErrTransport", err)
 			}
+			lifecycle, ok := child.(interface {
+				Done() <-chan struct{}
+				Available() bool
+			})
+			if !ok {
+				t.Fatal("public ACP child does not expose owned-process lifecycle")
+			}
+			select {
+			case <-lifecycle.Done():
+			case <-time.After(3 * time.Second):
+				t.Fatal("failed ACP child process was not closed and reaped")
+			}
+			if lifecycle.Available() {
+				t.Fatal("failed ACP child remained available")
+			}
 			if strings.Contains(err.Error(), "PRIVATE") {
 				t.Fatalf("traffic error leaked content: %v", err)
 			}

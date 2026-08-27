@@ -22,9 +22,17 @@ The product and binary are named `taskai`; `cmd/taskai` is the only command. The
 - `internal/tui`: the terminal interface.
 - `internal/testkit`: deterministic fakes and test-owned fixtures.
 
+The process boundary is viewer/worker, not client/server product architecture. The viewer owns Bubble Tea and any interactive provider authentication. The persistent worker owns the metadata store, Manager service, lifecycle Supervisor, and restrictive same-UID local socket; it must never inherit or retain a viewer terminal. Viewer detach or disconnect unregisters only that viewer and never stops a provider. Worker teardown stops and reconciles Manager trees before releasing the socket lock.
+
+One TaskAI state root is permanently bound to one canonical project directory by a versioned one-way digest. Validate that binding before and after viewer acquisition, and before worker bootstrap. Never place the raw project path in the binding file or permit a second project to reuse an established root.
+
 TaskAI may persist only Task and Session metadata and non-secret provider settings. Never persist prompts, answers, messages, tool traffic, events, replay items, credentials, provider transcript paths, or content-derived indexes. Store only the opaque provider Session reference needed by exact Resume and Replay.
 
 The Manager model owns delegation decisions. Present exactly one typed model-visible connector capability. Its singular operations may mechanically start one target, retrieve one native completion, continue one Follow stream, replay explicit bounded ranges, or cancel an owned turn. Do not parse manager prose or tool-output content, batch starts or answers, invent a semantic event model, or create durable invocation/queue entities.
+
+Apply the fixed TaskAI Manager prefix exactly once on a new provider Session through the conformed native instruction mechanism. Let the provider discover repository instruction files normally; never create, prepend, rewrite, or delete `CLAUDE.md`, `AGENTS.md`, or provider-equivalent files. Exact Resume accepts the stored opaque reference only. It must not accept a prefix, context, prompt, tool definition, history, cwd, or fallback Start path.
+
+Replay is an explicit connector-owned operation over the same exact provider-native Session used by Resume. Prefer the supported native history API; a direct JSON/JSONL reader must pin one conformed root and resolve one exact reference without enumeration. Never add TaskAI replay storage, seals, copied messages, or a transcript cache.
 
 Do not add web/API servers, MCP, brokers, workflows, mailboxes, provider TUI automation, terminal scraping, tmux integration, or a TaskAI transcript/session-log store.
 
@@ -43,3 +51,5 @@ make acceptance
 ```
 
 Keep fixtures synthetic and content-canary aware. Never inspect, print, copy, modify, or delete user provider Sessions, credentials, auth state, or external workspaces.
+
+End-to-end fixtures belong under `internal/testkit`, write provider-native content only beneath a test-owned provider root outside `TASKAI_STATE_DIR`, and must launch the compiled binary through a real pseudo-terminal. Production packages must not import a fixture or expose a fake-provider switch.

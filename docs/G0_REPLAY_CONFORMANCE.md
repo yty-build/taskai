@@ -1,8 +1,8 @@
 # taskai — G0 provider-native Replay conformance
 
-**Status:** Replay boundary proven; production adapters not yet implemented
+**Status:** Replay boundary proven; conformed production adapters integrated
 
-**Date:** 2026-08-26
+**Date:** 2026-08-27
 
 **Scope:** Gate G0 item 8 only
 
@@ -39,6 +39,16 @@ All probes used one exact Session reference. They emitted structural counts and 
 
 Gemini's fresh two-turn Resume probe was blocked before Session creation because this account requires `GOOGLE_CLOUD_PROJECT` or `GOOGLE_CLOUD_PROJECT_ID`. No setting was invented or mutated. That limits the live Resume evidence for this installed Gemini configuration; it does not invalidate the read-only exact-Session Replay proof. Production conformance must test each newly supported Gemini storage generation independently because newer Gemini CLI sources use JSONL while the installed version above uses a JSON ConversationRecord.
 
+## Production disposition
+
+The shipped Replay boundary now uses the exact opaque provider Session reference already stored for Resume:
+
+- Codex Replay lazily opens App Server and reads the single named thread through `thread/read`.
+- Claude Code Replay reads one exact project-scoped Session JSONL only when the configured native root, project mapping, schema, and path boundary are all safe and conformed.
+- Gemini CLI and Grok Build Replay remain unavailable. Their installed ACP surfaces do not return enough information to derive the exact native history key without enumeration or guessing.
+
+Replay adapters live behind the dedicated Replay port. The live Manager connection, runtime, metadata store, and IPC protocol expose no provider-history reader and retain no selected Replay items.
+
 ## Provider source anchors
 
 - [Codex App Server](https://developers.openai.com/codex/app-server) documents stored thread reads, resumptions, and paginated turn/item reads.
@@ -48,6 +58,6 @@ Gemini's fresh two-turn Resume probe was blocked before Session creation because
 
 ## G0 disposition
 
-Gate G0 item 8 is no longer a blocker: multiple real provider-native paths prove bounded Replay without a TaskAI content store.
+Gate G0 item 8 is no longer a blocker: multiple real provider-native paths prove bounded Replay without a TaskAI content store, and the production capability matrix now advertises only the exact paths implemented above.
 
-This does not by itself pass all of G0. The remaining connector boundary and executable revalidation are tracked in `docs/G0_CONNECTOR_CONFORMANCE.md`; cleanup or production implementation still waits for that gate to pass.
+The complete connector boundary and executable revalidation are tracked in `docs/G0_CONNECTOR_CONFORMANCE.md` and the compiled PTY acceptance suite.

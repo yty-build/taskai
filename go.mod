@@ -5,6 +5,7 @@ go 1.26.0
 require (
 	charm.land/bubbletea/v2 v2.0.9
 	charm.land/lipgloss/v2 v2.0.6
+	github.com/creack/pty v1.1.24
 	github.com/ncruces/go-sqlite3 v0.35.2
 	golang.org/x/sys v0.47.0
 )

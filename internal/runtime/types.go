@@ -173,5 +173,5 @@ type ClientPort interface {
 // public ACP conversion implemented inside runtime rather than exposing a
 // semantic provider hook.
 type FrameDecoder interface {
-	DecodePublicFrame(json.RawMessage) (PublicFrame, error)
+	DecodePublicFrame(string, json.RawMessage) (PublicFrame, error)
 }

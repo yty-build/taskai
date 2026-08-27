@@ -96,6 +96,23 @@ if rg -n '(ConversationRecord|updates\.jsonl|project-session-jsonl|conversation-
 	fail "provider-native history reader escaped internal/replay"
 fi
 
+if rg -n '\b(ReadNativeSession|NativeSessionReader)\b' \
+	internal/connector internal/manager internal/runtime internal/app \
+	--glob '*.go' --glob '!**/*_test.go' >/dev/null; then
+	fail "provider-native history leaked into the live Manager/runtime boundary"
+fi
+
+manager_connection_shape=$(awk '
+	/^type ManagerConnection interface/ { inside=1 }
+	inside { print }
+	inside && /^}/ { exit }
+' internal/connector/manager.go)
+case "$manager_connection_shape" in
+	*Replay*\(*|*History*\(*|*Read*Session*\(*)
+		fail "live ManagerConnection exposes a provider-history port"
+		;;
+esac
+
 tool_name_definitions=$(rg --no-filename '^(const|var)[[:space:]]+[A-Za-z0-9_]*ToolName[[:space:]]*=' \
 	cmd internal --glob '*.go' --glob '!**/*_test.go' | wc -l | tr -d ' ')
 if [ -f internal/connector/delegate_schema.go ]; then

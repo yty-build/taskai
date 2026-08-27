@@ -3,14 +3,17 @@ package manager
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/yty-build/acp-gateway/internal/connector"
+	"github.com/yty-build/acp-gateway/internal/replay"
 	"github.com/yty-build/acp-gateway/internal/session"
 	"github.com/yty-build/acp-gateway/internal/task"
 )
@@ -87,8 +90,9 @@ func TestStartPassesExactTransientBoundaryOnce(t *testing.T) {
 		t.Fatal("manager core unexpectedly injected a connector ID source")
 	}
 	if instance.ID() != manager.ID || instance.ProviderID() != manager.ProviderID ||
-		!bytes.Equal(instance.NativeReference().Bytes(), []byte("opaque-manager-start")) {
-		t.Fatalf("Instance identity/reference changed: id=%q provider=%q ref=%q", instance.ID(), instance.ProviderID(), instance.NativeReference().Bytes())
+		!bytes.Equal(instance.NativeReference().Bytes(), []byte("opaque-manager-start")) ||
+		instance.PublicSessionID() != connection.publicSessionID {
+		t.Fatalf("Instance identity/reference changed: id=%q provider=%q ref=%q public=%q", instance.ID(), instance.ProviderID(), instance.NativeReference().Bytes(), instance.PublicSessionID())
 	}
 	if got := service.ActiveIDs(); !reflect.DeepEqual(got, []session.ID{manager.ID}) {
 		t.Fatalf("ActiveIDs = %v, want [%s]", got, manager.ID)
@@ -110,9 +114,6 @@ func TestStartPassesExactTransientBoundaryOnce(t *testing.T) {
 	}
 	if probes, authenticates := auth.counts(); probes != 0 || authenticates != 0 {
 		t.Fatalf("manager Start probed/authenticated: Probe=%d Authenticate=%d", probes, authenticates)
-	}
-	if got := connection.snapshot(); got.nativeReads != 0 {
-		t.Fatalf("manager Start read provider history %d times", got.nativeReads)
 	}
 }
 
@@ -240,6 +241,219 @@ func TestConcurrentStartReservesOneManagerBeforeLaunch(t *testing.T) {
 	}
 }
 
+func TestStartTimeoutKeepsLateProviderOwnedUntilItCanBeClosed(t *testing.T) {
+	gate := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	connection := newFakeConnection("manager-ref")
+	ports := &fakeManagerPorts{
+		connections: []*fakeConnection{connection}, startGate: gate, startEntered: entered,
+		startIgnoresContext: true,
+	}
+	registry := newRegistry(t, fakeProfile{id: "manager", ports: ports, auth: &fakeAuth{}, manager: true})
+	service, err := NewService(registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.startupTimeout = 20 * time.Millisecond
+	request := StartRequest{
+		Manager:    managerMetadata(t, "manager-one", "manager", nil),
+		ProjectCWD: "/tmp/project", ChildEvents: noOpChildEvents(),
+	}
+	started := time.Now()
+	_, err = service.Start(context.Background(), request)
+	if !errors.Is(err, ErrTransport) {
+		t.Fatalf("silent Start = %v, want transport", err)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatal("silent Start exceeded its finite launch deadline")
+	}
+	if _, err := service.Start(context.Background(), request); !errors.Is(err, ErrAlreadyActive) {
+		t.Fatalf("late provider reservation = %v, want already_active", err)
+	}
+	close(gate)
+	waitClosed(t, connection.Done(), "late provider cleanup")
+	if got := connection.snapshot(); got.closes != 1 {
+		t.Fatalf("late provider Close calls = %d, want 1", got.closes)
+	}
+}
+
+func TestCancelledStartKeepsReservationUntilLateProviderIsClosed(t *testing.T) {
+	gate := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	connection := newFakeConnection("manager-ref")
+	ports := &fakeManagerPorts{
+		connections: []*fakeConnection{connection}, startGate: gate, startEntered: entered,
+		startIgnoresContext: true,
+	}
+	registry := newRegistry(t, fakeProfile{id: "manager", ports: ports, auth: &fakeAuth{}, manager: true})
+	service, err := NewService(registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := StartRequest{
+		Manager:    managerMetadata(t, "manager-one", "manager", nil),
+		ProjectCWD: "/tmp/project", ChildEvents: noOpChildEvents(),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, startErr := service.Start(ctx, request)
+		result <- startErr
+	}()
+	waitClosed(t, entered, "cancelled Start factory entry")
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrCancelled) {
+			t.Fatalf("cancelled Start = %v, want cancelled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled Start did not return")
+	}
+	if _, err := service.Start(context.Background(), request); !errors.Is(err, ErrAlreadyActive) {
+		t.Fatalf("abandoned reservation = %v, want already_active", err)
+	}
+	close(gate)
+	waitClosed(t, connection.Done(), "cancelled late provider cleanup")
+	deadline := time.Now().Add(time.Second)
+	for {
+		service.mu.RLock()
+		_, reserved := service.active[request.Manager.ID]
+		service.mu.RUnlock()
+		if !reserved {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("late provider cleanup did not release its reservation")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestManagerDoneAndReservationWaitForCompositeOwnedCleanup(t *testing.T) {
+	childRelease := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseChild := func() { releaseOnce.Do(func() { close(childRelease) }) }
+	defer releaseChild()
+	child := &blockingCleanupChild{
+		reference:    replay.OpaqueRefFromBytes([]byte("cleanup-child-reference")),
+		closeEntered: make(chan struct{}),
+		closeRelease: childRelease,
+	}
+	children := &blockingCleanupChildFactory{child: child}
+	app := &cleanupManagerApp{threadID: "cleanup-manager-thread"}
+	apps := &cleanupManagerAppFactory{app: app}
+	managerPort := connector.CodexManager{Apps: apps}
+
+	registry := connector.NewRegistry()
+	childVersions := connector.Versions{ACPProtocol: 1, Connector: "cleanup-child-test"}
+	if err := registry.Register(connector.NewConformedProfile(
+		"cleanup-child", "Cleanup child", childVersions,
+		connector.Conformance{Exact: childVersions, Proven: connector.Capabilities{Subordinate: true}},
+		nil, children, nil, nil, nil, connector.ReplayBinding{},
+	)); err != nil {
+		t.Fatal(err)
+	}
+	managerVersions := connector.Versions{
+		ACPProtocol: 1, ManagerRuntime: connector.CodexAppServerVersion, Connector: "cleanup-manager-test",
+	}
+	if err := registry.Register(connector.NewConformedProfile(
+		"cleanup-manager", "Cleanup manager", managerVersions,
+		connector.Conformance{Exact: managerVersions, Proven: connector.Capabilities{Manager: true}},
+		nil, nil, nil, managerPort, nil, connector.ReplayBinding{},
+	)); err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewService(registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := managerMetadata(t, "manager-cleanup", "cleanup-manager", nil)
+	request := StartRequest{Manager: metadata, ProjectCWD: t.TempDir(), ChildEvents: noOpChildEvents()}
+	instance, err := service.Start(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	handler := apps.handlerSnapshot()
+	delegator, ok := handler.(*connector.Delegator)
+	if !ok {
+		t.Fatalf("manager handler = %T, want *connector.Delegator", handler)
+	}
+	if _, err := handler.Invoke(context.Background(), json.RawMessage(
+		`{"operation":"start","provider":"cleanup-child","prompt":"opaque","mode":"answer"}`,
+	)); err != nil {
+		t.Fatalf("start child: %v", err)
+	}
+	if _, err := handler.Invoke(context.Background(), json.RawMessage(`{"operation":"next_answer"}`)); err != nil {
+		t.Fatalf("complete child turn: %v", err)
+	}
+
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- delegator.Close() }()
+	waitClosed(t, child.closeEntered, "owned child cleanup entry")
+
+	select {
+	case <-delegator.Done():
+		t.Fatal("Delegator published Done before its owned child Close completed")
+	default:
+	}
+	select {
+	case <-instance.connection.Done():
+		t.Fatal("Manager composite published Done before subordinate cleanup completed")
+	default:
+	}
+	select {
+	case <-instance.Done():
+		t.Fatal("Instance published Done before composite cleanup completed")
+	default:
+	}
+	service.mu.RLock()
+	reserved := service.active[metadata.ID]
+	service.mu.RUnlock()
+	if reserved != instance {
+		t.Fatal("Service released the exact Manager reservation during composite cleanup")
+	}
+	if _, err := service.Start(context.Background(), request); !errors.Is(err, ErrAlreadyActive) {
+		t.Fatalf("Start during composite cleanup = %v, want already_active", err)
+	}
+	if _, err := handler.Invoke(context.Background(), json.RawMessage(`{"operation":"next_answer"}`)); !errors.Is(err, connector.ErrTransport) {
+		t.Fatalf("Delegator accepted work during cleanup: %v", err)
+	}
+	select {
+	case err := <-closeResult:
+		t.Fatalf("Delegator Close returned before owned child cleanup: %v", err)
+	default:
+	}
+
+	releaseChild()
+	select {
+	case err := <-closeResult:
+		if err != nil {
+			t.Fatalf("Delegator Close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Delegator Close did not join completed child cleanup")
+	}
+	waitClosed(t, instance.connection.Done(), "Manager composite cleanup")
+	waitClosed(t, instance.Done(), "Instance cleanup terminal")
+	if terminal, ok := instance.Terminal(); !ok || terminal != (Terminal{Kind: TerminalFailed, Code: CodeTransport}) {
+		t.Fatalf("cleanup terminal = %#v, %v", terminal, ok)
+	}
+	service.mu.RLock()
+	_, stillReserved := service.active[metadata.ID]
+	service.mu.RUnlock()
+	if stillReserved {
+		t.Fatal("Service retained Manager reservation after exact cleanup completed")
+	}
+	if got := child.closeCount(); got != 1 {
+		t.Fatalf("owned child Close calls = %d, want 1", got)
+	}
+	if got := app.closeCount(); got != 1 {
+		t.Fatalf("App Server Close calls = %d, want 1", got)
+	}
+}
+
 func TestServiceBoundsActiveManagerReservations(t *testing.T) {
 	ports := &fakeManagerPorts{connections: []*fakeConnection{newFakeConnection("unused")}}
 	registry := newRegistry(t, fakeProfile{id: "manager", ports: ports, auth: &fakeAuth{}, manager: true})
@@ -301,6 +515,12 @@ func TestFailedStartReleasesReservationAndRedactsProviderError(t *testing.T) {
 }
 
 func TestStartRejectsInvalidNativeConnectionAndReleasesReservation(t *testing.T) {
+	emptyPublic := newFakeConnection("connection-ref")
+	emptyPublic.publicSessionID = ""
+	oversizedPublic := newFakeConnection("connection-ref")
+	oversizedPublic.publicSessionID = strings.Repeat("p", connector.MaxCorrelationIDBytes+1)
+	nulPublic := newFakeConnection("connection-ref")
+	nulPublic.publicSessionID = "manager\x00foreign"
 	tests := []struct {
 		name       string
 		connection *fakeConnection
@@ -312,6 +532,9 @@ func TestStartRejectsInvalidNativeConnectionAndReleasesReservation(t *testing.T)
 			name: "oversized reference", connection: newFakeConnection("connection-ref"),
 			nativeRef: bytes.Repeat([]byte{'x'}, session.MaxProviderReferenceBytes+1),
 		},
+		{name: "empty public Session identity", connection: emptyPublic},
+		{name: "oversized public Session identity", connection: oversizedPublic},
+		{name: "NUL public Session identity", connection: nulPublic},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -409,9 +632,6 @@ func TestResumePassesExactManagerAndCompleteOwnedChildrenOnce(t *testing.T) {
 	}
 	if probes, authenticates := auth.counts(); probes != 0 || authenticates != 0 {
 		t.Fatalf("Resume probed/authenticated: Probe=%d Authenticate=%d", probes, authenticates)
-	}
-	if got := connection.snapshot(); got.nativeReads != 0 {
-		t.Fatalf("Resume read provider history %d times", got.nativeReads)
 	}
 }
 
@@ -642,4 +862,139 @@ func TestStartAndResumeAPIsContainNoPrefixOrReinjectionSurface(t *testing.T) {
 			}
 		}
 	}
+}
+
+type blockingCleanupChildFactory struct {
+	mu    sync.Mutex
+	child *blockingCleanupChild
+	calls int
+}
+
+func (factory *blockingCleanupChildFactory) New(context.Context) (connector.ChildPort, error) {
+	factory.mu.Lock()
+	defer factory.mu.Unlock()
+	if factory.calls != 0 || factory.child == nil {
+		return nil, connector.ErrTransport
+	}
+	factory.calls++
+	return factory.child, nil
+}
+
+type blockingCleanupChild struct {
+	reference    replay.OpaqueRef
+	closeEntered chan struct{}
+	closeRelease <-chan struct{}
+
+	closeOnce sync.Once
+	mu        sync.Mutex
+	closes    int
+}
+
+func (child *blockingCleanupChild) NativeReference() replay.OpaqueRef {
+	return replay.OpaqueRefFromBytes(child.reference.Bytes())
+}
+
+func (*blockingCleanupChild) Prompt(
+	context.Context,
+	string,
+	func(json.RawMessage) error,
+) (json.RawMessage, error) {
+	return json.RawMessage(`{"stopReason":"end_turn"}`), nil
+}
+
+func (*blockingCleanupChild) Cancel(context.Context) error { return nil }
+
+func (child *blockingCleanupChild) Close() error {
+	child.closeOnce.Do(func() {
+		child.mu.Lock()
+		child.closes++
+		child.mu.Unlock()
+		close(child.closeEntered)
+		<-child.closeRelease
+	})
+	return nil
+}
+
+func (child *blockingCleanupChild) closeCount() int {
+	child.mu.Lock()
+	defer child.mu.Unlock()
+	return child.closes
+}
+
+type cleanupManagerAppFactory struct {
+	mu      sync.Mutex
+	app     *cleanupManagerApp
+	handler connector.DynamicToolHandler
+	calls   int
+}
+
+func (factory *cleanupManagerAppFactory) New(
+	_ context.Context,
+	handler connector.DynamicToolHandler,
+) (connector.CodexAppServer, error) {
+	factory.mu.Lock()
+	defer factory.mu.Unlock()
+	if factory.calls != 0 || factory.app == nil || handler == nil {
+		return nil, connector.ErrTransport
+	}
+	factory.calls++
+	factory.handler = handler
+	return factory.app, nil
+}
+
+func (factory *cleanupManagerAppFactory) handlerSnapshot() connector.DynamicToolHandler {
+	factory.mu.Lock()
+	defer factory.mu.Unlock()
+	return factory.handler
+}
+
+type cleanupManagerApp struct {
+	threadID string
+
+	mu         sync.Mutex
+	connection *fakeConnection
+	closes     int
+}
+
+func (*cleanupManagerApp) Version() string { return connector.CodexAppServerVersion }
+
+func (*cleanupManagerApp) DelegateHandlerRegistered() bool { return true }
+
+func (app *cleanupManagerApp) ThreadStart(
+	context.Context,
+	connector.ThreadStartParams,
+) (connector.CodexThreadSession, error) {
+	return connector.CodexThreadSession{ThreadID: app.threadID}, nil
+}
+
+func (app *cleanupManagerApp) ThreadResume(
+	context.Context,
+	connector.ThreadResumeParams,
+) (connector.CodexThreadSession, error) {
+	return connector.CodexThreadSession{}, connector.ErrProviderUnsupported
+}
+
+func (app *cleanupManagerApp) ConnectManager(reference replay.OpaqueRef) (connector.ManagerConnection, error) {
+	want, err := replay.NewCodexReference(app.threadID)
+	if err != nil || !bytes.Equal(reference.Bytes(), want.Bytes()) {
+		return nil, connector.ErrOwnership
+	}
+	connection := newFakeConnection(string(reference.Bytes()))
+	app.mu.Lock()
+	app.connection = connection
+	app.mu.Unlock()
+	return connection, nil
+}
+
+func (app *cleanupManagerApp) Close() error {
+	app.mu.Lock()
+	app.closes++
+	app.mu.Unlock()
+	return nil
+}
+
+func (app *cleanupManagerApp) closeCount() int {
+	app.mu.Lock()
+	defer app.mu.Unlock()
+	return app.closes
 }

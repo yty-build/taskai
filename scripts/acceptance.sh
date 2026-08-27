@@ -9,49 +9,15 @@ fail() {
 }
 
 [ -x "$binary" ] || fail "taskai binary is not executable"
+case $(uname -s) in
+	Darwin|Linux) ;;
+	*) fail "compiled PTY acceptance requires Darwin or Linux" ;;
+esac
 
-temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/taskai-acceptance.XXXXXX")
-trap 'find "$temporary_root" -depth -delete 2>/dev/null || true' EXIT HUP INT TERM
-state_dir="$temporary_root/state-must-remain-absent"
+binary_dir=$(CDPATH= cd -- "$(dirname "$binary")" && pwd)
+binary_path="$binary_dir/$(basename "$binary")"
 
-expected_help='Usage:
-  taskai --help
-  taskai --version
+TASKAI_ACCEPTANCE_BINARY="$binary_path" \
+	GOWORK=off go test -count=1 -tags=acceptance ./internal/testkit/ptyacceptance
 
-Options:
-  -h, --help  Show this help.
-  --version   Show the TaskAI version.'
-
-help_output=$(TASKAI_STATE_DIR="$state_dir" "$binary" --help)
-[ "$help_output" = "$expected_help" ] || fail "help output changed"
-
-version_output=$(TASKAI_STATE_DIR="$state_dir" "$binary" --version)
-[ "$version_output" = 'taskai dev' ] || fail "version output changed"
-
-stdout_file="$temporary_root/stdout"
-stderr_file="$temporary_root/stderr"
-
-set +e
-TASKAI_STATE_DIR="$state_dir" "$binary" >"$stdout_file" 2>"$stderr_file"
-status=$?
-set -e
-[ "$status" -eq 1 ] || fail "no-argument status must be 1"
-[ ! -s "$stdout_file" ] || fail "no-argument failure wrote stdout"
-[ "$(cat "$stderr_file")" = 'taskai: interactive workspace is not implemented in this baseline' ] || fail "no-argument error changed"
-
-set +e
-TASKAI_STATE_DIR="$state_dir" "$binary" --unknown >"$stdout_file" 2>"$stderr_file"
-status=$?
-set -e
-[ "$status" -eq 2 ] || fail "invalid-argument status must be 2"
-[ ! -s "$stdout_file" ] || fail "invalid argument wrote stdout"
-[ "$(cat "$stderr_file")" = 'taskai: invalid arguments; use --help' ] || fail "invalid-argument error changed"
-
-[ ! -e "$state_dir" ] || fail "M01 informational commands created TaskAI state"
-
-for built_file in bin/*; do
-	[ -e "$built_file" ] || continue
-	[ "$built_file" = "bin/taskai" ] || fail "a command other than taskai was built"
-done
-
-printf '%s\n' 'command-surface acceptance passed; interactive product E2E is not yet claimed'
+printf '%s\n' 'acceptance: compiled PTY product flow passed'

@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -122,29 +124,33 @@ func testRegistry(t *testing.T, auth connector.AuthPort) *connector.Registry {
 }
 
 type fakeHandle struct {
-	id       session.ID
-	provider string
-	ref      []byte
-	done     chan struct{}
+	id              session.ID
+	provider        string
+	ref             []byte
+	publicSessionID string
+	done            chan struct{}
 
-	mu        sync.Mutex
-	available bool
-	terminal  manager.Terminal
-	stopOnce  sync.Once
-	stopFn    func(context.Context) error
-	sendFn    func(context.Context, string, manager.FrameSink) (json.RawMessage, error)
+	mu         sync.Mutex
+	available  bool
+	terminal   manager.Terminal
+	stopOnce   sync.Once
+	stopFn     func(context.Context) error
+	forceFn    func() error
+	forceCalls int
+	sendFn     func(context.Context, string, manager.FrameSink) (json.RawMessage, error)
 }
 
 func newFakeHandle(id session.ID, reference []byte) *fakeHandle {
 	return &fakeHandle{
 		id: id, provider: string(testProvider), ref: append([]byte(nil), reference...),
-		done: make(chan struct{}), available: true,
+		publicSessionID: "native", done: make(chan struct{}), available: true,
 	}
 }
 
 func (handle *fakeHandle) ID() session.ID          { return handle.id }
 func (handle *fakeHandle) ProviderID() string      { return handle.provider }
 func (handle *fakeHandle) NativeReference() []byte { return append([]byte(nil), handle.ref...) }
+func (handle *fakeHandle) PublicSessionID() string { return handle.publicSessionID }
 func (handle *fakeHandle) Done() <-chan struct{}   { return handle.done }
 
 func (handle *fakeHandle) Available() bool {
@@ -184,6 +190,19 @@ func (handle *fakeHandle) Stop(ctx context.Context) error {
 		handle.finish(manager.Terminal{Kind: manager.TerminalStopped})
 	})
 	return result
+}
+
+func (handle *fakeHandle) ForceClose() error {
+	handle.mu.Lock()
+	handle.forceCalls++
+	forceFn := handle.forceFn
+	handle.mu.Unlock()
+	var err error
+	if forceFn != nil {
+		err = forceFn()
+	}
+	handle.finish(manager.Terminal{Kind: manager.TerminalFailed, Code: manager.CodeStopFailed})
+	return err
 }
 
 func (handle *fakeHandle) finish(terminal manager.Terminal) {
@@ -513,6 +532,35 @@ func TestAddManagerFailureUsesOneInterruptedRowAndNeverRetries(t *testing.T) {
 	}
 }
 
+func TestAddManagerRejectsUnboundedPublicSessionIdentityBeforeInstall(t *testing.T) {
+	for _, identity := range []string{"", strings.Repeat("p", connector.MaxCorrelationIDBytes+1)} {
+		identity := identity
+		t.Run(fmt.Sprintf("bytes-%d", len(identity)), func(t *testing.T) {
+			backend := newFakeBackend()
+			backend.startFn = func(request manager.StartRequest) (managerHandle, error) {
+				handle := newFakeHandle(request.Manager.ID, []byte("invalid-public-ref"))
+				handle.publicSessionID = identity
+				backend.mu.Lock()
+				backend.active[request.Manager.ID] = handle
+				backend.mu.Unlock()
+				return handle, nil
+			}
+			ids := &queuedIDs{tasks: []task.ID{"task-public"}, sessions: []session.ID{"manager-public"}}
+			harness := newRuntimeHarness(t, nil, backend, ids)
+			drainEvents(t, harness.client)
+			taskID, _ := harness.client.AddTask(context.Background(), "Task")
+			_ = harness.client.Attach(context.Background(), taskID)
+			managerID, err := harness.client.AddManager(context.Background(), taskID, testProvider, "Manager")
+			if managerID != "manager-public" || !errors.Is(err, ErrTransport) {
+				t.Fatalf("AddManager = %q, %v", managerID, err)
+			}
+			if _, live := harness.supervisor.live[managerID]; live {
+				t.Fatal("invalid public Session identity was installed live")
+			}
+		})
+	}
+}
+
 func TestResumePassesExactReferenceAndCompleteDirectChildrenWithoutStart(t *testing.T) {
 	metadata, err := store.Open(context.Background(), t.TempDir())
 	if err != nil {
@@ -813,6 +861,48 @@ func TestDetachedDuringSendDiscardsValidatedFrames(t *testing.T) {
 	after, _ := harness.client.Snapshot(context.Background())
 	if after.ThroughSequence != before.ThroughSequence {
 		t.Fatalf("discarded frame advanced sequence: before=%d after=%d", before.ThroughSequence, after.ThroughSequence)
+	}
+}
+
+func TestSendRejectsForeignManagerPublicSessionBeforePublication(t *testing.T) {
+	ids := &queuedIDs{tasks: []task.ID{"task-public-frame"}, sessions: []session.ID{"manager-public-frame"}}
+	backend := newFakeBackend()
+	backend.startFn = func(request manager.StartRequest) (managerHandle, error) {
+		handle := newFakeHandle(request.Manager.ID, []byte("public-frame-ref"))
+		handle.publicSessionID = "manager_public_owned"
+		handle.sendFn = func(ctx context.Context, _ string, sink manager.FrameSink) (json.RawMessage, error) {
+			foreign := json.RawMessage(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"manager_public_foreign","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"must-not-publish"}}}}`)
+			if err := sink.PublicFrame(ctx, request.Manager.ID, foreign); err != nil {
+				return nil, err
+			}
+			return json.RawMessage(`{"stopReason":"end_turn"}`), nil
+		}
+		backend.mu.Lock()
+		backend.active[request.Manager.ID] = handle
+		backend.mu.Unlock()
+		return handle, nil
+	}
+	harness := newRuntimeHarness(t, nil, backend, ids)
+	drainEvents(t, harness.client)
+	taskID, _ := harness.client.AddTask(context.Background(), "Task")
+	_ = harness.client.Attach(context.Background(), taskID)
+	managerID, err := harness.client.AddManager(context.Background(), taskID, testProvider, "Manager")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := harness.client.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := harness.client.Send(context.Background(), managerID, "prompt"); !errors.Is(err, ErrTransport) {
+		t.Fatalf("foreign public Session Send error = %v, want transport", err)
+	}
+	after, err := harness.client.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.ThroughSequence != before.ThroughSequence {
+		t.Fatalf("foreign frame advanced sequence: before=%d after=%d", before.ThroughSequence, after.ThroughSequence)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/yty-build/acp-gateway/internal/acp"
 	"github.com/yty-build/acp-gateway/internal/replay"
@@ -29,16 +30,22 @@ const (
 	appMethodDynamicTool   = "item/tool/call"
 	appMethodRequestDone   = "serverRequest/resolved"
 
-	// App Server thread/read can legitimately carry a bounded provider-native
-	// history snapshot larger than an ACP frame. It remains a private connector
-	// transport and is independently capped here.
-	MaxAppServerFrameBytes = 128 << 20
+	// Live App Server traffic is a small conformed public boundary. Only an
+	// exact pending thread/read response may use the independently bounded
+	// provider-native history allowance below.
+	MaxAppServerLiveFrameBytes = acp.MaxFrameBytes
+	MaxAppServerHistoryBytes   = 128 << 20
 	// Capability JSON is embedded as a JSON string inside a dynamic-tool result
 	// and then inside an RPC response. This fixed allowance covers the bounded
 	// request ID and both envelopes after exact JSON escaping.
 	DynamicToolRPCHeadroom = 1024
 	MaxManagerToolCalls    = 64
 	MaxAppServerInbound    = 64
+
+	// CodexAppServerHandshakeTimeout bounds only the public initialize
+	// exchange. The successfully initialized peer retains its caller-owned
+	// lifetime context afterward.
+	CodexAppServerHandshakeTimeout = 10 * time.Second
 )
 
 // DynamicToolHandler is implemented by the connector-owned Delegator. Its
@@ -101,30 +108,92 @@ func openCodexAppServer(
 	version string,
 	delegate DynamicToolHandler,
 ) (*CodexAppServerClient, error) {
-	if version != CodexAppServerVersion || delegate == nil || r == nil || w == nil {
+	return openCodexAppServerWithin(ctx, r, w, version, delegate, CodexAppServerHandshakeTimeout)
+}
+
+func openCodexAppServerWithin(
+	ctx context.Context,
+	r io.Reader,
+	w io.Writer,
+	version string,
+	delegate DynamicToolHandler,
+	handshakeTimeout time.Duration,
+) (*CodexAppServerClient, error) {
+	if ctx == nil || version != CodexAppServerVersion || delegate == nil || r == nil || w == nil || handshakeTimeout <= 0 {
 		return nil, ErrProviderUnsupported
 	}
 	client := &CodexAppServerClient{
-		version: version, delegate: delegate,
-		active: make(map[string]*codexTurnState),
+		delegate: delegate,
+		active:   make(map[string]*codexTurnState),
 	}
 	client.peer = newAppServerPeer(r, w, client.handleRequest, client.handleNotification)
 	client.peer.start(ctx)
 
+	handshakeCtx, cancelHandshake := context.WithTimeout(ctx, handshakeTimeout)
+	defer cancelHandshake()
 	params := json.RawMessage(`{"clientInfo":{"name":"taskai","version":"1"},"capabilities":{"experimentalApi":true}}`)
-	result, err := client.peer.call(ctx, appMethodInitialize, params)
+	result, err := client.peer.call(handshakeCtx, appMethodInitialize, params)
 	if err != nil || !validJSONObject(result) {
 		_ = client.Close()
 		return nil, &BoundaryError{Stage: "app server initialize", Err: ErrTransport}
+	}
+	observedVersion, err := observedCodexAppServerVersion(result)
+	if err != nil || observedVersion != version {
+		_ = client.Close()
+		return nil, &BoundaryError{Stage: "app server version", Err: ErrProviderUnsupported}
 	}
 	if err := client.peer.notify(appMethodInitialized, nil); err != nil {
 		_ = client.Close()
 		return nil, &BoundaryError{Stage: "app server initialized", Err: ErrTransport}
 	}
 	client.mu.Lock()
+	client.version = observedVersion
 	client.initialized = true
 	client.mu.Unlock()
 	return client, nil
+}
+
+// observedCodexAppServerVersion accepts only the public pinned user-agent
+// identity returned by Codex App Server's initialize method. The configured
+// conformance version is an expectation, never evidence about the executable
+// that was actually launched.
+func observedCodexAppServerVersion(result json.RawMessage) (string, error) {
+	if !validJSONObject(result) {
+		return "", ErrProviderUnsupported
+	}
+	decoder := json.NewDecoder(bytes.NewReader(result))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') {
+		return "", ErrProviderUnsupported
+	}
+	var userAgent string
+	found := false
+	for decoder.More() {
+		name, err := decoder.Token()
+		if err != nil {
+			return "", ErrProviderUnsupported
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return "", ErrProviderUnsupported
+		}
+		if name != "userAgent" {
+			continue
+		}
+		if found || json.Unmarshal(value, &userAgent) != nil {
+			return "", ErrProviderUnsupported
+		}
+		found = true
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim('}') || !found {
+		return "", ErrProviderUnsupported
+	}
+	const prefix = "codex-cli/"
+	if userAgent != prefix+CodexAppServerVersion {
+		return "", ErrProviderUnsupported
+	}
+	return userAgent[len(prefix):], nil
 }
 
 func (c *CodexAppServerClient) Version() string {
@@ -793,6 +862,11 @@ type appCallResult struct {
 	err     error
 }
 
+type appPendingCall struct {
+	result        chan appCallResult
+	responseLimit int
+}
+
 type appInboundRequest struct {
 	threadID string
 	cancel   context.CancelFunc
@@ -815,7 +889,7 @@ type appServerPeer struct {
 
 	writeMu sync.Mutex
 	mu      sync.Mutex
-	pending map[string]chan appCallResult
+	pending map[string]appPendingCall
 	inbound map[string]*appInboundRequest
 	started bool
 	err     error
@@ -827,7 +901,7 @@ func newAppServerPeer(r io.Reader, w io.Writer, request appRequestHandler, notif
 	return &appServerPeer{
 		reader: bufio.NewReaderSize(r, 64<<10), writer: w,
 		request: request, onNotification: notify,
-		pending: make(map[string]chan appCallResult), inbound: make(map[string]*appInboundRequest),
+		pending: make(map[string]appPendingCall), inbound: make(map[string]*appInboundRequest),
 		done: make(chan struct{}),
 	}
 }
@@ -857,16 +931,20 @@ func (p *appServerPeer) call(ctx context.Context, method string, params json.Raw
 	id := json.RawMessage(strconv.FormatUint(p.seq.Add(1), 10))
 	key, _ := appCorrelationKey(id)
 	result := make(chan appCallResult, 1)
+	responseLimit := MaxAppServerLiveFrameBytes
+	if method == appMethodThreadRead {
+		responseLimit = MaxAppServerHistoryBytes
+	}
 	p.mu.Lock()
 	if !p.started || p.err != nil {
 		p.mu.Unlock()
 		return nil, ErrTransport
 	}
-	p.pending[key] = result
+	p.pending[key] = appPendingCall{result: result, responseLimit: responseLimit}
 	p.mu.Unlock()
 
 	wire, _ := json.Marshal(appServerMessage{ID: id, Method: method, Params: params})
-	if err := p.writeLine(wire, MaxAppServerFrameBytes); err != nil {
+	if err := p.writeLine(wire, MaxAppServerLiveFrameBytes); err != nil {
 		p.removePending(key)
 		p.fail(err)
 		return nil, err
@@ -891,19 +969,24 @@ func (p *appServerPeer) notify(method string, params json.RawMessage) error {
 		return ErrTransport
 	}
 	wire, _ := json.Marshal(appServerMessage{Method: method, Params: params})
-	return p.writeLine(wire, MaxAppServerFrameBytes)
+	return p.writeLine(wire, MaxAppServerLiveFrameBytes)
 }
 
 func (p *appServerPeer) readLoop(ctx context.Context) {
 	for {
-		raw, err := readAppServerLine(p.reader)
+		raw, err := readAppServerLineWithin(p.reader, p.currentReadLimit)
 		if err != nil {
 			p.fail(err)
 			return
 		}
-		message, err := parseAppServerMessage(raw)
+		message, err := parseAppServerMessageWithin(raw, MaxAppServerHistoryBytes)
 		if err != nil {
 			p.fail(err)
+			return
+		}
+		if len(raw) > MaxAppServerLiveFrameBytes &&
+			(message.kind() != appResponse || !p.responseWithinLimit(message.ID, len(raw))) {
+			p.fail(ErrTransport)
 			return
 		}
 		switch message.kind() {
@@ -988,15 +1071,11 @@ func (p *appServerPeer) startRequest(parent context.Context, message appServerMe
 			p.fail(ErrTransport)
 			return
 		}
-		limit := MaxAppServerFrameBytes
-		if message.Method == appMethodDynamicTool {
-			limit = acp.MaxFrameBytes
-		}
 		if !p.beginInboundResponse(key, entry) {
 			p.removeInboundEntry(key, entry)
 			return
 		}
-		writeErr := p.writeLine(wire, limit)
+		writeErr := p.writeLine(wire, MaxAppServerLiveFrameBytes)
 		p.finishInboundResponse(key, entry)
 		if writeErr != nil {
 			p.fail(writeErr)
@@ -1069,7 +1148,7 @@ func (p *appServerPeer) deliver(message appServerMessage) error {
 		return err
 	}
 	p.mu.Lock()
-	result, ok := p.pending[key]
+	pending, ok := p.pending[key]
 	if ok {
 		delete(p.pending, key)
 	}
@@ -1077,8 +1156,34 @@ func (p *appServerPeer) deliver(message appServerMessage) error {
 	if !ok {
 		return ErrTransport
 	}
-	result <- appCallResult{message: message}
+	pending.result <- appCallResult{message: message}
 	return nil
+}
+
+func (p *appServerPeer) currentReadLimit() int {
+	if p == nil {
+		return MaxAppServerLiveFrameBytes
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	limit := MaxAppServerLiveFrameBytes
+	for _, pending := range p.pending {
+		if pending.responseLimit > limit {
+			limit = pending.responseLimit
+		}
+	}
+	return limit
+}
+
+func (p *appServerPeer) responseWithinLimit(id json.RawMessage, size int) bool {
+	key, err := appCorrelationKey(id)
+	if err != nil {
+		return false
+	}
+	p.mu.Lock()
+	pending, ok := p.pending[key]
+	p.mu.Unlock()
+	return ok && size <= pending.responseLimit
 }
 
 func (p *appServerPeer) removePending(key string) {
@@ -1115,15 +1220,15 @@ func (p *appServerPeer) fail(err error) {
 		p.mu.Lock()
 		p.err = err
 		pending := p.pending
-		p.pending = make(map[string]chan appCallResult)
+		p.pending = make(map[string]appPendingCall)
 		inbound := p.inbound
 		p.inbound = make(map[string]*appInboundRequest)
 		p.mu.Unlock()
 		for _, request := range inbound {
 			request.cancel()
 		}
-		for _, result := range pending {
-			result <- appCallResult{err: err}
+		for _, pending := range pending {
+			pending.result <- appCallResult{err: err}
 		}
 		close(p.done)
 	})
@@ -1150,10 +1255,19 @@ func (p *appServerPeer) close() error {
 }
 
 func readAppServerLine(reader *bufio.Reader) ([]byte, error) {
+	return readAppServerLineWithin(reader, func() int { return MaxAppServerLiveFrameBytes })
+}
+
+func readAppServerLineWithin(reader *bufio.Reader, limit func() int) ([]byte, error) {
+	if reader == nil || limit == nil {
+		return nil, ErrTransport
+	}
 	var line []byte
 	for {
 		fragment, err := reader.ReadSlice('\n')
-		if len(line)+len(fragment) > MaxAppServerFrameBytes+1 {
+		currentLimit := limit()
+		if currentLimit < MaxAppServerLiveFrameBytes || currentLimit > MaxAppServerHistoryBytes ||
+			len(line)+len(fragment) > currentLimit+1 {
 			return nil, ErrTransport
 		}
 		line = append(line, fragment...)
@@ -1174,14 +1288,21 @@ func readAppServerLine(reader *bufio.Reader) ([]byte, error) {
 	if len(line) != 0 && line[len(line)-1] == '\r' {
 		line = line[:len(line)-1]
 	}
-	if len(line) == 0 || len(line) > MaxAppServerFrameBytes {
+	currentLimit := limit()
+	if currentLimit < MaxAppServerLiveFrameBytes || currentLimit > MaxAppServerHistoryBytes ||
+		len(line) == 0 || len(line) > currentLimit {
 		return nil, ErrTransport
 	}
 	return line, nil
 }
 
 func parseAppServerMessage(raw []byte) (appServerMessage, error) {
-	if len(raw) == 0 || len(raw) > MaxAppServerFrameBytes || !validJSONObject(raw) {
+	return parseAppServerMessageWithin(raw, MaxAppServerLiveFrameBytes)
+}
+
+func parseAppServerMessageWithin(raw []byte, limit int) (appServerMessage, error) {
+	if limit < MaxAppServerLiveFrameBytes || limit > MaxAppServerHistoryBytes ||
+		len(raw) == 0 || len(raw) > limit || !validJSONObject(raw) {
 		return appServerMessage{}, ErrTransport
 	}
 	var fields map[string]json.RawMessage
