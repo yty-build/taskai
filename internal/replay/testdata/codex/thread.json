@@ -1,0 +1,30 @@
+{
+  "id": "codex-synthetic-session",
+  "turns": [
+    {
+      "id": "codex-turn-1",
+      "status": "completed",
+      "items": [
+        {"type":"userMessage","id":"codex-user-1","text":"SYNTHETIC_REPLAY_CANARY alpha"},
+        {"type":"commandExecution","id":"codex-tool-1","command":"printf synthetic","exitCode":0},
+        {"type":"agentMessage","id":"codex-agent-1","text":"synthetic complete"}
+      ]
+    },
+    {
+      "id": "codex-turn-2",
+      "status": "failed",
+      "items": [
+        {"type":"userMessage","id":"codex-user-2","text":"synthetic failure"},
+        {"type":"futureOwnedItem","id":"codex-future-1","opaque":{"native":true}},
+        {"type":"commandExecution","id":"codex-tool-2","command":"false","exitCode":1}
+      ]
+    },
+    {
+      "id": "codex-turn-3",
+      "status": "inProgress",
+      "items": [
+        {"type":"userMessage","id":"codex-user-3","text":"synthetic incomplete"}
+      ]
+    }
+  ]
+}

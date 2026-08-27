@@ -1,0 +1,7 @@
+{"type":"user","sessionId":"claude-compact-session","version":"2.1.226","uuid":"compact-user-0","parentUuid":null,"isSidechain":false,"message":{"role":"user","content":"old synthetic"}}
+{"type":"assistant","sessionId":"claude-compact-session","version":"2.1.226","uuid":"compact-agent-0","parentUuid":"compact-user-0","isSidechain":false,"message":{"role":"assistant","content":"old answer","stop_reason":"end_turn"}}
+{"type":"system","subtype":"turn_duration","sessionId":"claude-compact-session","version":"2.1.226","uuid":"compact-terminal-0","parentUuid":"compact-agent-0","isSidechain":false,"status":"completed"}
+{"type":"system","subtype":"compact_boundary","sessionId":"claude-compact-session","version":"2.1.226","uuid":"compact-boundary","parentUuid":"compact-terminal-0","isSidechain":false}
+{"type":"user","sessionId":"claude-compact-session","version":"2.1.226","uuid":"compact-user-1","parentUuid":"compact-boundary","isSidechain":false,"message":{"role":"user","content":"new synthetic"}}
+{"type":"assistant","sessionId":"claude-compact-session","version":"2.1.226","uuid":"compact-agent-1","parentUuid":"compact-user-1","isSidechain":false,"message":{"role":"assistant","content":"new answer","stop_reason":"end_turn"}}
+{"type":"system","subtype":"turn_duration","sessionId":"claude-compact-session","version":"2.1.226","uuid":"compact-terminal-1","parentUuid":"compact-agent-1","isSidechain":false,"status":"completed"}

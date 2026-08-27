@@ -1,0 +1,7 @@
+{"timestamp":1,"method":"session/update","params":{"sessionId":"grok-rewind-session","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"kept zero"},"_meta":{"promptIndex":0}},"_meta":{"promptId":"rewind-prompt-0"}}}
+{"timestamp":2,"method":"_x.ai/session/update","params":{"sessionId":"grok-rewind-session","update":{"sessionUpdate":"turn_completed","prompt_id":"rewind-prompt-0","stop_reason":"end_turn"}}}
+{"timestamp":3,"method":"session/update","params":{"sessionId":"grok-rewind-session","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"dead branch"},"_meta":{"promptIndex":1}},"_meta":{"promptId":"rewind-dead-1"}}}
+{"timestamp":4,"method":"_x.ai/session/update","params":{"sessionId":"grok-rewind-session","update":{"sessionUpdate":"turn_completed","prompt_id":"rewind-dead-1","stop_reason":"end_turn"}}}
+{"timestamp":5,"method":"_x.ai/session/update","params":{"sessionId":"grok-rewind-session","update":{"sessionUpdate":"rewind_marker","target_prompt_index":1,"created_at":"2026-01-01T00:00:00Z"}}}
+{"timestamp":6,"method":"session/update","params":{"sessionId":"grok-rewind-session","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"live branch"},"_meta":{"promptIndex":1}},"_meta":{"promptId":"rewind-live-1"}}}
+{"timestamp":7,"method":"_x.ai/session/update","params":{"sessionId":"grok-rewind-session","update":{"sessionUpdate":"turn_completed","prompt_id":"rewind-live-1","stop_reason":"end_turn"}}}

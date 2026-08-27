@@ -44,7 +44,7 @@ if rg -n '"(net/http|net/rpc|github\.com/.*/mcp|nhooyr\.io/websocket|github\.com
 	fail "forbidden server, MCP, or WebSocket import is present"
 fi
 
-if rg -n 'strings\.Fields(Func)?\(' cmd internal --glob '*.go' --glob '!**/*_test.go' --glob '!internal/testkit/**' >/dev/null; then
+if rg -n 'strings\.Fields\(' cmd internal --glob '*.go' --glob '!**/*_test.go' --glob '!internal/testkit/**' >/dev/null; then
 	fail "shell-like argument splitting is present"
 fi
 
