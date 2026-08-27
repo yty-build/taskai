@@ -1,0 +1,13 @@
+00|TaskAI / Task / Newest Task
+01|Manager manager-a | Manager A
+02|Codex | Working | sub:2 | A:3 D:1
+03|Session hierarchy
+04|> Manager Working Codex Manager A
+05|  └ Subordinate Answer Working Worker A…
+06|  └ Subordinate Follow Dormant Worker F…
+07|Selected Manager public ACP
+08|First public frame
+09|Second public frame
+12|Input>                            [Send]
+14|[Back] [Add] [Info] [Stop] [?]
+15|↑/↓ Manager  v/Enter details  Tab input…

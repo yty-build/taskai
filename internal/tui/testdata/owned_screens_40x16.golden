@@ -1,0 +1,225 @@
+## tasks-loading
+00|TaskAI / Tasks
+01|Loading metadata…
+02|Tasks  [Active]  All
+03|Created ↓ / Task          Active Dormant
+14|[Open] [Add Task] [Settings] [Help]
+15|↑/↓ select  Tab Active/All  Enter open …
+
+## tasks-active
+00|TaskAI / Tasks
+02|Tasks  [Active]  All
+03|Created ↓ / Task          Active Dormant
+04|> 08-27 Newest Task              A:3 D:1
+14|[Open] [Add Task] [Settings] [Help]
+15|↑/↓ select  Tab Active/All  Enter open …
+
+## tasks-all-history
+00|TaskAI / Tasks
+02|Tasks  Active  [All]
+03|Created ↓ / Task          Active Dormant
+04|> 08-27 Newest Task              A:3 D:1
+05|  08-27 Older Task               A:0 D:1
+14|[Open] [Add Task] [Settings] [Help]
+15|↑/↓ select  Tab Active/All  Enter open …
+
+## tasks-empty-no-provider
+00|TaskAI / Tasks
+02|Tasks  [Active]  All
+03|Created ↓ / Task          Active Dormant
+04|No Tasks yet. Add Task to begin.
+13|No providers enabled; setup is explicit…
+14|[Open] [Add Task] [Settings] [Help]
+15|↑/↓ select  Tab Active/All  Enter open …
+
+## tasks-no-active-history
+00|TaskAI / Tasks
+02|Tasks  [Active]  All
+03|Created ↓ / Task          Active Dormant
+04|No active Tasks. Choose All for history.
+14|[Open] [Add Task] [Settings] [Help]
+15|↑/↓ select  Tab Active/All  Enter open …
+
+## tasks-safe-error
+00|TaskAI / Tasks
+01|Metadata refresh failed (unavailable)
+02|Tasks  [Active]  All
+03|Created ↓ / Task          Active Dormant
+04|> 08-27 Newest Task              A:3 D:1
+14|[Open] [Add Task] [Settings] [Help]
+15|↑/↓ select  Tab Active/All  Enter open …
+
+## settings-standard
+00|TaskAI / Provider Settings
+01|Enable, authenticate, and recheck are e…
+02|────────────────────────────────────────
+03|> Codex       enabled | status:Connected
+04|  Worker      enabled | status:Connected
+05|  Disabl… disabled | status:Disconnected
+11|Capabilities are connector-conformance …
+12|Manager:yes  Subordinate:yes
+13|Resume:yes  Replay:no
+14|[Back] [Disable] [Auth] [Check] [?]
+15|↑/↓ select  Space enable/disable  a aut…
+
+## settings-empty
+00|TaskAI / Provider Settings
+01|Enable, authenticate, and recheck are e…
+02|────────────────────────────────────────
+03|No provider connectors registered.
+14|[Back] [Help]
+15|No provider selected; Enable, Authentic…
+
+## settings-disconnected-error
+00|TaskAI / Provider Settings
+01|Provider recheck failed (disconnected)
+02|────────────────────────────────────────
+03|> Codex    enabled | status:Disconnected
+04|  Worker      enabled | status:Connected
+05|  Disabl… disabled | status:Disconnected
+11|Capabilities are connector-conformance …
+12|Manager:yes  Subordinate:yes
+13|Resume:yes  Replay:no
+14|[Back] [Disable] [Auth] [Check] [?]
+15|↑/↓ select  Space enable/disable  a aut…
+
+## add-task-draft
+00|TaskAI / Tasks / Add Task
+02|Title is preserved exactly after bounde…
+04|>   Exact Task title
+14|[Back] [Add Task] [Help]
+15|Enter add  Esc back
+
+## add-task-validation-error
+00|TaskAI / Tasks / Add Task
+02|Title is preserved exactly after bounde…
+04|>
+06|Task title is required
+14|[Back] [Add Task] [Help]
+15|Enter add  Esc back
+
+## add-manager-standard
+00|TaskAI / Task / Add Manager
+01|Only enabled providers with a conformed…
+03|> Codex            M:Y R:Y P:N Connected
+11|Optional label> Exact Manager label
+14|[Back] [Create Manager] [Help]
+15|↑/↓ provider  Tab label  Enter create
+
+## add-manager-unavailable
+00|TaskAI / Task / Add Manager
+02|No enabled Manager-capable provider is …
+03|Enable, authenticate if needed, and rec…
+14|[Back] [Open Settings] [Help]
+15|Enter Settings  Esc back
+
+## add-manager-safe-error
+00|TaskAI / Task / Add Manager
+01|Only enabled providers with a conformed…
+03|> Codex            M:Y R:Y P:N Connected
+11|Optional label> Retry label
+12|Manager start failed (connector-unavail…
+14|[Back] [Create Manager] [Help]
+15|↑/↓ provider  Tab label  Enter create
+
+## workspace-standard
+00|TaskAI / Task / Newest Task
+01|Manager manager-a | Manager A
+02|Codex | Working | sub:2 | A:3 D:1
+03|Session hierarchy
+04|> Manager Working Codex Manager A
+05|  └ Subordinate Answer Working Worker A…
+06|  └ Subordinate Follow Dormant Worker F…
+07|Selected Manager public ACP
+08|First public frame
+09|Second public frame
+12|Input>                            [Send]
+14|[Back] [Add] [Info] [Stop] [?]
+15|↑/↓ Manager  v/Enter details  Tab input…
+
+## workspace-no-manager
+00|TaskAI / Task / Newest Task
+01|Selected Manager pane: unavailable
+02|Sessions active:0 dormant:0
+03|Session hierarchy
+04|No Manager Sessions. Add Manager.
+07|Selected Manager public ACP
+08|No selected Manager; subordinate input …
+12|Manager input unavailable: select or ad…
+14|[Back] [Add] [Info] [Stop] [?]
+15|↑/↓ Manager  v/Enter details  Tab input…
+
+## workspace-live-safe-error
+00|TaskAI / Task / Newest Task
+01|Manager manager-a | Manager A
+02|Codex | Working | sub:2 | A:3 D:1
+03|Session hierarchy
+04|> Manager Working Codex Manager A
+05|  └ Subordinate Answer Working Worker A…
+06|  └ Subordinate Follow Dormant Worker F…
+07|Selected Manager public ACP
+08|Live public frame
+11|Provider recheck failed (disconnected)
+12|Input>                            [Send]
+14|[Back] [Add] [Info] [Stop] [?]
+15|↑/↓ Manager  v/Enter details  Tab input…
+
+## workspace-answered-resume
+00|TaskAI / Task / Newest Task
+01|Manager manager-a | Manager A
+02|Codex | Dormant | sub:2 | A:1 D:3
+03|Session hierarchy
+04|> Manager Dormant Codex Manager A
+05|  └ Subordinate Answer Answered Worker …
+06|  └ Subordinate Follow Dormant Worker F…
+07|Selected Manager public ACP
+08|No public ACP frames received for this …
+12|Exact Session Resume [Resume] | state=D…
+14|[Back] [Add] [Info] [Stop] [?]
+15|↑/↓ Manager  v/Enter details  Tab input…
+
+## session-details
+00|TaskAI / Exact Session Details
+01|Session 2 of 3 in selected Manager tree
+03|Task ID: task-new
+04|Session ID: child-answer
+05|Parent Session ID: manager-a
+06|Role: subordinate
+07|Label: Answer child
+08|Provider ID: worker
+09|Provider: Worker
+10|Mode: answer
+11|State: Working
+12|Resume available: no
+13|Created: 2026-08-27T10:01:00.000000000Z
+14|[Previous] [Next] [Close] [Help]
+15|←/→ Session  ↑/↓ scroll  Esc/Enter close
+
+## help-modal
+00|TaskAI / Help
+02|Tasks: ↑/↓ select, Tab Active/All, Ente…
+03|Workspace: ↑/↓ Manager, v/Enter exact S…
+04|Lifecycle: Back detaches viewer; Stop i…
+05|Settings: Space enable, a authenticate,…
+06|Historical Manager: r exact Resume only…
+07|Manager input is sent only to the selec…
+08|Subordinates are depth one and never ha…
+10|No screen authenticates implicitly or s…
+14|[Close Help]
+15|? / Esc / Enter close
+
+## stop-confirmation
+00|TaskAI / Task / Newest Task
+01|Manager manager-a | Manager A
+02|Codex | Working | sub:2 | A:3 D:1
+03|Session hierarchy
+04|> Manager Working Codex Manager A
+05|  └ Subordinate Answer Working Worker A…
+06|  └ Subordinate Follow Dormant Worker F…
+07|────────────────────────────────────────
+08|Selected Manager: Manager A
+09|Stop selected Manager tree? [Yes] [No]
+10|────────────────────────────────────────
+12|Input>                            [Send]
+14|[Back] [Add] [Info] [Stop] [?]
+15|↑/↓ Manager  v/Enter details  Tab input…
