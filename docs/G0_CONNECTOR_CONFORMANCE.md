@@ -1,18 +1,18 @@
 # taskai — G0 connector conformance
 
-**Status:** BLOCKED — production implementation must not begin
+**Status:** REOPENED — owner-approved boundary authorized; production waits for revalidation
 
 **Date:** 2026-08-26
 
 **Scope:** Gate G0 manager, subordinate, Answer, Follow, Replay, detach, Resume, and authentication feasibility
 
-## Disposition
+## Original disposition under product vision v1.0
 
 The installed public ACP stack can prove the individual transport mechanics for downstream prompts, bounded successful Answer delivery, concurrent correlation, invocation-scoped Follow/reset, exact Resume, provider-native Replay, and viewer-independent runtime ownership.
 
 It cannot prove the complete product path without a forbidden boundary. A manager provider can launch nested ACP work through its native terminal tool, but the nested subordinate Session and prompt identities exist only inside that tool's content. Standard ACP does not expose a subordinate-created or parent-Session notification on the manager's outer connection.
 
-TaskAI therefore cannot mechanically create the required subordinate Session row and exact parent relationship without doing at least one currently prohibited action:
+TaskAI therefore could not mechanically create the required subordinate Session row and exact parent relationship without doing at least one action prohibited by product vision v1.0:
 
 - parsing manager tool input or output to discover delegation;
 - presenting a TaskAI or connector-owned delegation tool to the manager model;
@@ -20,7 +20,22 @@ TaskAI therefore cannot mechanically create the required subordinate Session row
 - inspecting a duplicate acpx transcript/session store; or
 - depending on private provider metadata or version-specific connector internals.
 
-Gate G0 is conjunctive. This observability failure, plus incomplete native non-success delivery to the manager model, blocks M01 scaffolding and every dependent production milestone.
+Gate G0 is conjunctive. This observability failure, plus incomplete native non-success delivery to the manager model, blocked M01 scaffolding and every dependent production milestone under that contract.
+
+## Product-owner amendment
+
+On 2026-08-26, the product owner authorized exactly one typed, connector-owned delegation capability presented to the manager model. Product vision v1.1 permits that capability to:
+
+1. accept the manager's mechanical operation, target provider or existing subordinate Session, opaque prompt payload, and Answer or Follow mode;
+2. establish and own direct downstream ACP connections;
+3. report the structural parent/child and prompt-turn correlation without parsing manager prose or tool-output content;
+4. return mechanically correlated public ACP content and native completion without semantic rewriting;
+5. serve explicit bounded Replay from the exact provider-native Session history used by Resume; and
+6. persist no prompt, answer, tool, event, replay, or user-context content in TaskAI storage.
+
+The owner also clarified manager context behavior. A new Manager Session receives the fixed TaskAI prefix once through the provider's supported native instruction/session mechanism, layered ahead of normal `CLAUDE.md`, `AGENTS.md`, or provider-equivalent discovery. TaskAI does not modify those files. Exact Resume uses the same opaque native Session reference, does not reinject the prefix or user context as a new turn, and must retain or restore the typed capability through a supported runtime configuration path. Unsupported combinations fail closed.
+
+This amendment resolves the architectural-policy blocker but does not retroactively pass G0. The authorized path must now pass the executable revalidation below before M01 begins.
 
 ## Installed boundary
 
@@ -61,9 +76,9 @@ The public acpx runtime can keep turn events and completion results separate and
 
 Codex currently exposes a private phase hint in connector metadata, but production conformance may not depend on undocumented provider metadata or a bundled connector implementation detail.
 
-## Minimal product-owner decision that would unblock the build
+## Authorized boundary requiring revalidation
 
-Permit one typed, connector-owned delegation capability presented to the manager model. It would:
+The now-approved typed, connector-owned delegation capability must:
 
 1. carry the exact target provider/Session, prompt, and Answer or Follow mode;
 2. use direct downstream ACP and report the mechanical parent/child relationship;
@@ -73,7 +88,23 @@ Permit one typed, connector-owned delegation capability presented to the manager
 6. persist no prompt, answer, tool, event, or replay content; and
 7. continue using provider-native Session history as Replay's only source.
 
-An equivalent future standard ACP manager/delegation extension would also unblock the build. Without one of those boundaries, implementing the Session tree requires violating the approved product contract.
+An equivalent future standard ACP manager/delegation extension may replace this boundary only through another explicit product-owner amendment.
+
+## Revalidation exit checklist
+
+G0 passes only after disposable real-provider probes demonstrate all of the following together:
+
+- the manager model invokes the typed capability without TaskAI prose or tool-output parsing;
+- a structural notification identifies the exact parent Manager Session, subordinate Session, provider, and prompt turn before downstream content is accepted;
+- three concurrent Answer calls with reordered completion remain independently correlated, including identical answer text;
+- success and every exercised non-success path return current public ACP content plus native completion without manufacturing an answer;
+- Follow streams one invocation live and resets after success, cancellation, refusal, exhaustion, malformed completion, and transport failure;
+- Replay 1 and Replay N use only the exact provider-native Session history used by Resume;
+- Start supplies the fixed manager prefix once and exposes the capability;
+- exact Resume uses the same opaque provider Session, retains the prefix/capability, and injects no duplicate context turn;
+- existing project instruction files are byte-for-byte unchanged;
+- viewer detach/reattach, authentication reuse, and metadata-only TaskAI persistence still pass; and
+- every disposable fixture and owned process is removed after evidence capture.
 
 ## Cleanup and repository audit
 

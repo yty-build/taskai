@@ -50,4 +50,4 @@ Gemini's fresh two-turn Resume probe was blocked before Session creation because
 
 Gate G0 item 8 is no longer a blocker: multiple real provider-native paths prove bounded Replay without a TaskAI content store.
 
-This does not by itself pass all of G0. The manager Answer completion/correlation boundary, Follow/reset behavior, and detach/reattach runtime ownership still require passing evidence before cleanup or production implementation begins.
+This does not by itself pass all of G0. The remaining connector boundary and executable revalidation are tracked in `docs/G0_CONNECTOR_CONFORMANCE.md`; cleanup or production implementation still waits for that gate to pass.

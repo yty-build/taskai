@@ -1,6 +1,6 @@
 # taskai — ACP manager workspace product vision
 
-**Status:** Approved product vision v1.0  
+**Status:** Approved product vision v1.1
 **Date:** 2026-08-26  
 **Current product surface:** Terminal application  
 **Portable boundary:** The same ACP-facing manager surface may support a future web or desktop client. Those clients are not part of this build.
@@ -28,7 +28,7 @@ Manager Session
   +----> Subordinate Session · Gemini
 ~~~
 
-TaskAI owns placement, connection lifecycle, provider configuration, Session metadata, and terminal presentation. It does not decide how work is decomposed, interpret tool calls, summarize subordinate output, invent result messages, or coordinate agents semantically.
+TaskAI owns placement, connection lifecycle, provider configuration, Session metadata, terminal presentation, and the fixed contract for one typed delegation capability. The manager-capable connector owns, exposes, and executes that capability; TaskAI core receives only its content-free mechanical child events. The manager decides whether and how to invoke it. Neither TaskAI core nor the connector decides how work is decomposed, interprets prompt content, summarizes subordinate output, invents result messages, or coordinates agents semantically.
 
 ## 3. Product model
 
@@ -56,7 +56,7 @@ TaskAI distinguishes connector capabilities without inventing a cross-provider b
 
 | Capability | Meaning |
 | --- | --- |
-| Manager | The connector's manager runtime can act as an ACP agent toward TaskAI and as an ACP client toward subordinate agents |
+| Manager | The connector's manager runtime can act as an ACP agent toward TaskAI and can expose the typed delegation capability that owns downstream ACP client connections |
 | Subordinate | The connector can run as an ACP agent and accept manager-owned ACP Sessions |
 | Resume | The connector can exactly resume its provider-owned Session |
 | Replay | The manager runtime can request bounded completed-invocation items from the exact provider-native Session history used by Resume |
@@ -193,6 +193,10 @@ Every user-created Manager Session starts with the product's opinionated manager
 - synthesize subordinate answers into one manager response to the user;
 - never ask TaskAI to interpret subordinate tools or results.
 
+The connector layers this fixed TaskAI manager prefix ahead of the provider's normal discovered project instructions, such as `CLAUDE.md`, `AGENTS.md`, or the provider-equivalent file. It uses the provider's supported system/developer-instruction or session-context mechanism and does not rewrite, prepend, or delete a user's repository instruction files.
+
+Context added by the user is sent once into the same provider-owned Manager Session through its native conversation mechanism. TaskAI stores no copy. The fixed prefix is supplied when the provider Session is created. Reload exactly resumes the recorded Session and restores only provider-supported capability/runtime configuration; it does not reinject the prefix or user context as a new conversation turn and never creates a replacement Session to make a newer prefix appear. A connector advertises Manager plus Resume only when its conformed paths preserve the fixed manager prefix and typed delegation capability this way. Otherwise that capability combination fails closed.
+
 ## 10. ACP wall and ownership
 
 The manager runtime is dual-role:
@@ -205,12 +209,15 @@ TaskAI terminal
 Manager runtime
     |-- ACP agent toward TaskAI
     |
-    |-- ACP client toward subordinate connector A
-    |-- ACP client toward subordinate connector B
-    +-- ACP client toward subordinate connector C
+    |-- typed delegation capability invoked by manager model
+    |     |-- ACP client toward subordinate connector A
+    |     |-- ACP client toward subordinate connector B
+    |     +-- ACP client toward subordinate connector C
 ~~~
 
-The Manager Session owns its subordinate ACP connections. TaskAI may establish, supervise, and record the mechanical Session relationship. For Replay, a provider adapter may read the exact native Session record used by that provider's Resume implementation, but TaskAI does not interpret the meaning of its content.
+The Manager Session owns its subordinate ACP connections through one connector-owned typed capability. The capability accepts only the mechanical operation, target provider or subordinate Session, opaque prompt payload, and Answer or Follow mode needed for delegation. It reports the structural parent/child Session relationship, forwards the prompt through direct downstream ACP, and returns the exact conformed final public ACP message with native completion in Answer, or the native exposed frame stream in Follow, without semantic rewriting. Replay uses the same capability against an explicitly named completed subordinate Session and reads the exact native Session record used by that provider's Resume implementation.
+
+The connector reports child creation and lifecycle to TaskAI core through a content-free mechanical event containing only parent and child TaskAI Session IDs, child provider, opaque native Session reference, lifecycle/behavior state, and transient request/turn correlation IDs. Prompt payloads, answers, Replay items, tool arguments, and tool results never enter this metadata path or TaskAI persistence.
 
 Wall invariants:
 
@@ -218,10 +225,11 @@ Wall invariants:
 2. Only that manager may prompt, cancel, follow, or replay it.
 3. Subordinate output returns only to that manager.
 4. A subordinate cannot address the user or a peer subordinate.
-5. TaskAI never injects a synthesized message into either agent.
-6. TaskAI never turns tool updates into a result object.
-7. Unknown ACP frames pass through the connector boundary without semantic projection.
-8. The provider remains the owner of conversation memory.
+5. Only the manager model invokes the typed capability; TaskAI core never invokes it or infers an invocation from prose or tool-output text.
+6. TaskAI core never converts subordinate output into a semantic result. The conformed connector may return the exact mechanically selected final ACP message and native completion as its transient provider-native capability result, but never summarizes, ranks, or changes its meaning.
+7. TaskAI never injects a synthesized message into either agent.
+8. Unknown ACP frames pass through the connector boundary without semantic projection.
+9. The provider remains the owner of conversation memory, including the manager's native record of capability calls and results.
 
 ## 11. Answer
 
@@ -311,16 +319,16 @@ Adapters may decode only the mechanical structure needed for bounded Replay: nat
 For a user request such as “Fix the authentication regression and verify the tests”:
 
 1. TaskAI sends the user's text to the selected Manager Session through ACP.
-2. The manager decides whether and how to delegate.
-3. The manager creates subordinate Sessions through manager-owned ACP connections.
-4. The manager sends each subordinate its exact assignment through ACP.
+2. The manager decides whether and how to delegate and invokes the typed capability.
+3. The connector mechanically creates or selects the subordinate Session and records its same-Task parent relationship.
+4. The capability sends the manager's opaque assignment to that subordinate through direct ACP.
 5. Answer subordinates work privately and return only their requested completed answers.
 6. Follow subordinates expose their current ACP activity live to the manager.
 7. The manager may request replay 1 or replay N from named completed subordinate Sessions.
 8. The manager integrates the information and emits its answer through ACP.
 9. TaskAI streams the manager's public answer to the terminal immediately.
 
-TaskAI never decides steps 2 through 8.
+TaskAI never makes the semantic decisions in steps 2 or 5 through 8. It performs only the typed, mechanically requested ACP operations in steps 3 and 4.
 
 ## 15. Streaming and rendering
 
@@ -353,7 +361,7 @@ detach terminal viewer
 
 Stopping a Manager Session is an explicit lifecycle action. In V1, its subordinate Sessions are stopped or marked interrupted as one owned runtime tree; they are never silently reassigned to another manager.
 
-Exact resume uses the opaque provider Session reference and only when the connector advertises Resume. TaskAI does not reconstruct provider context from UI output or replay items.
+Exact resume uses the opaque provider Session reference and only when the connector advertises Resume. The same provider-owned Session retains the manager prefix; the connector restores the delegation-capability runtime configuration only when the provider requires and supports it. TaskAI does not reinject context, reconstruct provider context from UI output or replay items, or fall back to a new Session on a configuration mismatch.
 
 Replay after a TaskAI or manager runtime restart reads the same provider-native Session history used by Resume. Availability follows the provider's own retention, compaction, and deletion behavior; TaskAI does not add a duplicate persistent transcript fallback.
 
@@ -431,6 +439,8 @@ TaskAI does not persist:
 
 Provider-owned state remains provider-owned.
 
+The fixed TaskAI manager prefix is shipped product configuration, not conversation state. User-added context and the manager's capability calls/results remain only in the provider-owned Session record; TaskAI does not duplicate them.
+
 For Replay, TaskAI may read the exact provider-owned Session history identified by a stored opaque provider reference. It does not copy that history into TaskAI persistence, retain it after the bounded operation, or enumerate unrelated provider Sessions.
 
 ## 21. Explicit non-goals
@@ -441,8 +451,8 @@ V1 does not include:
 - tmux;
 - provider-native terminal embedding;
 - web UI or HTTP API;
-- TaskAI delegation or inspection tools;
-- TaskAI-generated manager control messages;
+- any TaskAI model tool other than the single connector-owned typed delegation capability;
+- ad hoc TaskAI-generated manager control messages outside the fixed manager prefix and typed capability response;
 - custom agent-to-agent message envelopes;
 - semantic event normalization;
 - duplicate transcript storage or cross-Session search;
@@ -478,6 +488,8 @@ V1 does not include:
 | D18 | Detaching the viewer never stops work |
 | D19 | No MCP or tmux exists in the product architecture |
 | D20 | Future clients may reuse the manager ACP surface, but V1 is terminal-only |
+| D21 | Manager Sessions receive a fixed TaskAI prefix layered ahead of native project instructions without mutating repository instruction files |
+| D22 | One connector-owned typed capability executes manager-requested subordinate operations through direct ACP without TaskAI semantic coordination |
 
 ## 23. Acceptance scenarios
 
@@ -499,6 +511,13 @@ V1 does not include:
 - Add Session inside a Task.
 - Only enabled manager-capable providers are offered.
 - The new Session appears as a top-level manager.
+
+### Manager prefix and exact reload
+
+- Start a Manager Session in a project that already contains provider-native instruction files.
+- The manager receives the fixed TaskAI behavior before the provider-discovered project instructions, and no repository file changes.
+- Add context, reload TaskAI, and resume the same opaque provider Session.
+- The provider-owned context and typed delegation capability remain available without a replacement Session or TaskAI content copy.
 
 ### Multiple requested answers
 

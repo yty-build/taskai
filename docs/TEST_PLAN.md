@@ -1,6 +1,6 @@
 # taskai — terminal UX, UI, and product verification plan
 
-**Status:** Worker-ready verification contract v1.0
+**Status:** Worker-ready verification contract v1.1
 **Date:** 2026-08-26
 **Product contract:** `docs/UX_PRODUCT_VISION.md`
 **Build contract:** `build_plan.md`
@@ -14,7 +14,7 @@ The quality bar is:
 
 > A user can always understand where they are, what is running, which manager owns each subordinate, and what action is available—without TaskAI inventing provider behavior or retaining conversation content.
 
-This document specifies verification, not a new product layer. If it conflicts with `docs/UX_PRODUCT_VISION.md`, the vision wins. If a test would require MCP, tmux, provider-native terminal capture, a duplicate TaskAI transcript database, cross-Session history search, or semantic interpretation of agent output, reject the test and the implementation it implies.
+This document specifies verification, not a new product layer. If it conflicts with `docs/UX_PRODUCT_VISION.md`, the vision wins. If a test would require MCP, tmux, provider-native terminal capture, a duplicate TaskAI transcript database, cross-Session history search, semantic interpretation of agent output, or a second TaskAI model tool beyond the approved typed connector delegation capability, reject the test and the implementation it implies.
 
 ## 2. Verification principles
 
@@ -62,7 +62,7 @@ Provide programmable fixtures for:
 - delayed and concurrent completions;
 - known and unknown public ACP frame shapes.
 
-The fake manager—not TaskAI production code—decides when to create a subordinate, what assignment to send, and whether to use Answer, Follow, or Replay. Tests must fail if TaskAI parses manager prose to cause delegation.
+The fake manager—not TaskAI production code—decides when to invoke the typed delegation capability, create a subordinate, choose its provider, write its assignment, and request Answer, Follow, or Replay. Tests must fail if TaskAI parses manager prose or tool-output content to cause delegation.
 
 ### 4.2 Deterministic environment
 
@@ -337,13 +337,22 @@ Historical metadata remains visible without implying TaskAI transcript ownership
 
 ## 12. Answer, Follow, and Replay tests
 
-These are connector/runtime and provider-native-history-adapter contracts reflected by Session rows and the manager's public ACP surface. They are not new TaskAI keyboard commands, UI buttons, semantic messages, or provider-facing TaskAI tools.
+These are connector/runtime and provider-native-history-adapter contracts reflected by Session rows and the manager's public ACP surface. They are not new TaskAI keyboard commands, UI buttons, semantic messages, or model tools beyond the single approved connector-owned typed delegation capability.
+
+### ACP-500 — typed delegation boundary
+
+- The manager model explicitly invokes the one typed capability with a mechanical operation, target provider or existing subordinate Session, opaque prompt payload where applicable, and Answer or Follow mode.
+- The connector creates or selects the exact child, emits a structural same-Task parent/child notification, and sends the opaque prompt through direct downstream ACP.
+- TaskAI does not parse manager prose, shell commands, arbitrary JSON text, or tool-output content to discover delegation.
+- Capability responses mechanically correlate parent, child, prompt turn, public ACP content, and native completion without semantic rewriting or durable TaskAI content storage. TaskAI core receives only a content-free child event containing TaskAI parent/child IDs, provider, opaque native reference, lifecycle/behavior state, and transient request/turn IDs.
+- Calls from the user, a peer subordinate, or a different manager are rejected before downstream ACP activity.
 
 ### ACP-501 — Answer default
 
 - Every subordinate invocation begins in Answer unless the manager explicitly requests Follow for that invocation.
 - Intermediate subordinate messages, plans, tool updates, and execution output are not delivered into manager model context in Answer.
 - On success, only that invocation's final public ACP answer and native completion state are delivered to its manager.
+- Delivery occurs as the transient provider-native result of the manager-invoked typed capability; TaskAI core does not construct or inspect that result.
 - No prior answer, unrelated Session, or automatic replay is included.
 
 ### ACP-502 — multiple current answers
@@ -360,6 +369,7 @@ Cancellation, refusal, token exhaustion, malformed completion, and transport fai
 
 - Follow applies only when explicitly selected by the manager for one current invocation.
 - Exposed ACP frames reach the manager live and in order.
+- Frames are delivered through the same manager-invoked connector capability, not through a TaskAI follow-up prompt or UI command.
 - Unknown frames are forwarded without semantic projection.
 - The Task workspace can reflect Follow mechanically without interpreting frame meaning.
 
@@ -439,7 +449,18 @@ Stop is an explicit lifecycle action tied to the exact selected Manager Session.
 
 ### ACP-704 — exact Resume
 
-When Resume is advertised, restart the worker and use the same opaque provider reference exactly once. Resume failure never falls back to Start and never creates a replacement conversation. When Resume is unsupported, the UI says so rather than inferring context from output.
+When Resume is advertised, restart the worker and use the same opaque provider reference exactly once. Resume failure never falls back to Start and never creates a replacement conversation. Resume does not inject the fixed prefix or user-added context as a new turn. When Resume is unsupported, the UI says so rather than inferring context from output.
+
+### ACP-705 — manager prefix and capability retention
+
+- On new Manager Session creation, the connector layers the fixed TaskAI manager prefix ahead of provider-discovered project instructions through a supported native system/developer-instruction or session-context mechanism.
+- The manager can invoke the typed delegation capability on its first turn.
+- After exact Resume of the same opaque provider Session, the manager still follows the retained prefix and can invoke the same capability without TaskAI replaying or reinjecting context.
+- A connector that cannot prove this combination does not advertise Manager plus Resume.
+
+### ACP-706 — native instruction and context integrity
+
+Hash existing `CLAUDE.md`, `AGENTS.md`, and any provider-equivalent project instruction files before Manager Start, user context addition, detach, runtime restart, exact Resume, and stop. File bytes remain unchanged, absent files remain absent, and write monitoring observes no TaskAI write. The user-added context and manager capability call/result may exist in the exact provider-owned Session fixture, but no TaskAI database, log, cache, persisted socket artifact, or configuration value contains a copy.
 
 ### UX-705 — runtime failure
 
@@ -477,7 +498,7 @@ Fresh and upgraded TaskAI state contains only Task and Session as first-class pr
 
 ### SEC-802 — content canary audit
 
-Run normal, Answer, Follow, Replay, error, detach, and exact-resume flows with distinct canaries. Inspect every TaskAI-owned database, journal, log, cache, socket artifact, crash file, and configuration value. Find no prompt, answer, plan, tool, replay item, token stream, credential, cookie, auth-state, native Session path, or provider Session content. Separately verify that Replay read only the exact provider-owned fixture in place and neither modified nor copied it.
+Run normal, typed-delegation, Answer, Follow, Replay, user-context, error, detach, and exact-resume flows with distinct canaries. Inspect every TaskAI-owned database, journal, log, cache, socket artifact, crash file, and configuration value. Find no prompt, answer, plan, tool input/output, replay item, user context, token stream, credential, cookie, auth-state, native Session path, or provider Session content. Those content canaries may exist only in the exact provider-owned Session fixtures. Separately verify that Replay read only the exact provider-owned fixture in place and neither modified nor copied it.
 
 ### SEC-803 — filesystem and process safety
 
@@ -494,7 +515,7 @@ Fail production code or dependencies that introduce:
 - MCP;
 - tmux, terminal scraping, or native provider TUI embedding;
 - web UI, HTTP API, or WebSocket product surfaces;
-- TaskAI delegation/inspection tools;
+- any TaskAI model tool other than the single approved connector-owned typed delegation capability;
 - semantic event/result normalization;
 - duplicate transcript/message/tool persistence or cross-Session search;
 - workflow, broker, mailbox, or peer messaging;
@@ -504,6 +525,13 @@ Fail production code or dependencies that introduce:
 - old `acpctl` product paths or legacy compatibility shims.
 
 Documentation and negative test assertions may name forbidden concepts.
+
+### SEC-805 — manager context ownership
+
+- The fixed manager prefix is static shipped connector configuration, supplied once only on provider Session creation and never stored as a per-Session TaskAI value.
+- No typed-control arguments, prompts, Answer/Follow results, Replay items, or user-added context occur in TaskAI databases, logs, caches, persisted socket artifacts, or configuration.
+- The exact provider-owned Session fixture retains its original prefix, context, and provider-native capability calls/results across exact Resume.
+- Existing project instruction files remain byte-identical and absent fixture files remain absent through Start, Resume, detach, and stop.
 
 ## 17. End-to-end acceptance suite
 
@@ -531,17 +559,19 @@ Run these through the compiled binary and deterministic ACP fixtures. Each scena
 
 ### E2E-904 — create and use a Manager
 
-1. Add Session within a Task.
+1. Hash or record absence of native project instruction files, then add Session within a Task.
 2. Select an enabled Manager-capable provider and optional label.
-3. Submit a user prompt.
-4. Assert one top-level manager was created, the exact selected ACP connection received the prompt, and public manager output streamed into its pane.
+3. Assert the native new-Session context received the fixed prefix exactly once ahead of discovered project instructions and exposed the typed capability.
+4. Submit a user prompt, detach, restart the runtime, and exactly Resume the same opaque provider Session.
+5. Assert no replacement Start or context reinjection occurred, instruction files are unchanged, and the capability remains callable.
+6. Assert one top-level manager was created, the exact selected ACP connection received the prompt, and public manager output streamed into its pane.
 
 ### E2E-905 — multiple requested answers
 
-1. The fake manager opens three subordinate Sessions in Answer.
+1. The fake manager invokes the typed capability to open three subordinate Sessions in Answer; equivalent prose or JSON without an invocation creates none.
 2. Subordinates emit intermediate frames and complete out of order.
 3. Assert the manager receives exactly three current final answers and completion states, no intermediate frames, and no old answer.
-4. Assert the tree shows three correctly owned children and TaskAI performs no synthesis.
+4. Assert content-free mechanical child events produce three correctly owned tree rows and TaskAI performs no synthesis or content inspection.
 
 ### E2E-906 — Follow and reset
 
@@ -599,6 +629,8 @@ For every supported connector, record:
 - provider harness history API or native Session format and schema/version probe;
 - exact provider reference resolution and filesystem containment boundary;
 - Manager, Subordinate, Resume, and Replay claims;
+- manager-prefix source/precedence, one-time injection, typed-capability surface/version, and retention across exact Resume;
+- content-free child metadata event schema and ownership validation;
 - auth initiation and reuse behavior;
 - exact Start versus Resume calls;
 - Answer completion/public-message boundary;
@@ -636,6 +668,8 @@ Do not compare provider answer quality or snapshot provider-native UI. The smoke
 | D18 detach never stops work | UX-701, UX-702, E2E-910 |
 | D19 no MCP or tmux | UI-005, SEC-804 |
 | D20 terminal-only V1 | SEC-804, all PTY acceptance |
+| D21 fixed prefix without repository-file mutation | ACP-705, ACP-706, SEC-803, SEC-805 |
+| D22 one typed ACP delegation capability | ACP-500–ACP-505, SEC-804, real conformance |
 
 ## 20. Required commands and release evidence
 
@@ -672,12 +706,12 @@ No flaky test is muted, retried until green, or replaced by an arbitrary sleep. 
 Verification is complete only when:
 
 1. Every applicable test ID in this plan passes.
-2. Every approved decision D1–D20 has passing traceability evidence.
+2. Every approved decision D1–D22 has passing traceability evidence.
 3. All TaskAI-owned screens have semantic assertions and reviewed goldens at the required sizes.
 4. Every visible action has keyboard coverage and mouse parity where supported.
 5. Empty, loading/starting, working, dormant, interrupted, closed, disconnected, needs-repair, unsupported, and constrained-terminal states are covered.
-6. Answer, Follow/reset, Replay 1, Replay N, and multi-target Replay pass from exact provider-native Session history without a duplicate TaskAI content store.
-7. Detach and exact Resume tests prove no replacement conversation or viewer-owned runtime.
+6. Answer and Follow/reset pass over live ACP; Replay 1, Replay N, and multi-target Replay pass from exact provider-native Session history, all without a duplicate TaskAI content store.
+7. Detach and exact Resume tests prove no replacement conversation, context reinjection, repository instruction-file mutation, or viewer-owned runtime.
 8. Storage canary and forbidden-architecture scans are clean.
 9. Advertised connector capabilities have real conformance evidence.
 10. All required commands pass from a clean checkout containing only intentional source changes.
