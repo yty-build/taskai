@@ -2,12 +2,30 @@ package app
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/yty-build/acp-gateway/internal/buildinfo"
 )
+
+type fakeCommandExecutor struct {
+	viewCalls int
+	workCalls int
+	err       error
+}
+
+func (fake *fakeCommandExecutor) View(context.Context, IO) error {
+	fake.viewCalls++
+	return fake.err
+}
+
+func (fake *fakeCommandExecutor) Work(context.Context) error {
+	fake.workCalls++
+	return fake.err
+}
 
 func TestRun(t *testing.T) {
 	originalVersion := buildinfo.Version
@@ -20,6 +38,8 @@ func TestRun(t *testing.T) {
 		wantStatus int
 		wantStdout string
 		wantStderr string
+		wantViews  int
+		wantWorks  int
 	}{
 		{
 			name:       "help long",
@@ -41,8 +61,14 @@ func TestRun(t *testing.T) {
 		},
 		{
 			name:       "no arguments",
-			wantStatus: 1,
-			wantStderr: "taskai: interactive workspace is not implemented in this baseline\n",
+			wantStatus: 0,
+			wantViews:  1,
+		},
+		{
+			name:       "hidden worker",
+			args:       []string{hiddenWorkerArgument},
+			wantStatus: 0,
+			wantWorks:  1,
 		},
 		{
 			name:       "unknown argument",
@@ -62,8 +88,9 @@ func TestRun(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			var stdout bytes.Buffer
 			var stderr bytes.Buffer
+			executor := &fakeCommandExecutor{}
 
-			status := Run(test.args, &stdout, &stderr)
+			status := runCommand(t.Context(), test.args, IO{Out: &stdout, Err: &stderr}, executor)
 			if status != test.wantStatus {
 				t.Fatalf("Run() status = %d, want %d", status, test.wantStatus)
 			}
@@ -72,6 +99,28 @@ func TestRun(t *testing.T) {
 			}
 			if stderr.String() != test.wantStderr {
 				t.Fatalf("Run() stderr = %q, want %q", stderr.String(), test.wantStderr)
+			}
+			if executor.viewCalls != test.wantViews || executor.workCalls != test.wantWorks {
+				t.Fatalf("executor calls View=%d Work=%d, want %d/%d", executor.viewCalls, executor.workCalls, test.wantViews, test.wantWorks)
+			}
+		})
+	}
+}
+
+func TestCommandRuntimeErrorsAreSafeAndModeSpecific(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+	}{
+		{name: "viewer"},
+		{name: "worker", args: []string{hiddenWorkerArgument}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			executor := &fakeCommandExecutor{err: errors.New("credential=canary /provider/native/session")}
+			var stderr bytes.Buffer
+			status := runCommand(t.Context(), test.args, IO{Err: &stderr}, executor)
+			if status != 1 || stderr.String() != "taskai: transport_failed\n" {
+				t.Fatalf("status=%d stderr=%q", status, stderr.String())
 			}
 		})
 	}
@@ -82,7 +131,7 @@ func TestInformationalCommandsDoNotCreateState(t *testing.T) {
 	t.Setenv(StateDirEnvironment, stateDir)
 
 	for _, args := range [][]string{{"--help"}, {"--version"}} {
-		if status := Run(args, &bytes.Buffer{}, &bytes.Buffer{}); status != 0 {
+		if status := Run(t.Context(), args, IO{Out: &bytes.Buffer{}, Err: &bytes.Buffer{}}); status != 0 {
 			t.Fatalf("Run(%q) status = %d, want 0", args, status)
 		}
 	}

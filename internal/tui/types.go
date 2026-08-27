@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sort"
 	"time"
+
+	tea "charm.land/bubbletea/v2"
 )
 
 // TaskID and SessionID are opaque metadata identifiers. The TUI never derives
@@ -131,6 +133,16 @@ type ProviderActions interface {
 	SetEnabled(context.Context, ProviderID, bool) error
 	Authenticate(context.Context, ProviderID) error
 	Recheck(context.Context, ProviderID) error
+}
+
+// ProviderAuthExec is an optional interactive authentication boundary. When
+// present, the model runs the provider-owned command through tea.Exec so the
+// provider has exclusive terminal ownership and Bubble Tea releases/restores
+// raw mode around it. ProviderActions.Authenticate remains the deterministic
+// non-interactive fallback used by tests and ports without an interactive
+// command surface.
+type ProviderAuthExec interface {
+	AuthenticationCommand(context.Context, ProviderID) (tea.ExecCommand, error)
 }
 
 // RuntimeActions owns viewer attachment, exact-manager input and Resume, and

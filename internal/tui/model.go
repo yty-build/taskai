@@ -362,6 +362,31 @@ func (m *Model) refreshAfter(token uint64, action actionKind, selected SessionID
 	}
 }
 
+func (m *Model) authenticateCmd(token uint64, provider ProviderID) tea.Cmd {
+	interactive, ok := m.providers.(ProviderAuthExec)
+	if !ok {
+		return m.refreshAfter(token, actionAuthenticate, "", func(ctx context.Context) error {
+			return m.providers.Authenticate(ctx, provider)
+		})
+	}
+	command, err := interactive.AuthenticationCommand(m.ctx, provider)
+	if err != nil || command == nil {
+		if err == nil {
+			err = errors.New("authentication command unavailable")
+		}
+		return m.refreshAfter(token, actionAuthenticate, "", func(context.Context) error { return err })
+	}
+	ctx := m.ctx
+	catalog := m.catalog
+	return tea.Exec(command, func(actionErr error) tea.Msg {
+		snapshot, refreshErr := catalog.Snapshot(ctx)
+		return snapshotMsg{
+			token: token, action: actionAuthenticate, snapshot: snapshot,
+			hasSnapshot: refreshErr == nil, refreshErr: refreshErr, err: actionErr,
+		}
+	})
+}
+
 func (m *Model) simpleAction(token uint64, action actionKind, task TaskID, fn func(context.Context) error) tea.Cmd {
 	ctx := m.ctx
 	return func() tea.Msg { return actionMsg{token: token, action: action, task: task, err: fn(ctx)} }
@@ -1054,9 +1079,7 @@ func (m *Model) keySettings(msg tea.KeyPressMsg) tea.Cmd {
 		if token == 0 {
 			return nil
 		}
-		return m.refreshAfter(token, actionAuthenticate, "", func(ctx context.Context) error {
-			return m.providers.Authenticate(ctx, provider.ID)
-		})
+		return m.authenticateCmd(token, provider.ID)
 	case "r":
 		provider, ok := m.selectedProviderValue()
 		if !ok {
