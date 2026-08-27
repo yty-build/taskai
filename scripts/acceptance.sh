@@ -10,7 +10,7 @@ fail() {
 
 [ -x "$binary" ] || fail "taskai binary is not executable"
 
-temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/taskai-m01.XXXXXX")
+temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/taskai-acceptance.XXXXXX")
 trap 'find "$temporary_root" -depth -delete 2>/dev/null || true' EXIT HUP INT TERM
 state_dir="$temporary_root/state-must-remain-absent"
 
@@ -54,4 +54,4 @@ for built_file in bin/*; do
 	[ "$built_file" = "bin/taskai" ] || fail "a command other than taskai was built"
 done
 
-printf '%s\n' 'M01 scaffold acceptance only; no product E2E capability claimed'
+printf '%s\n' 'command-surface acceptance passed; interactive product E2E is not yet claimed'

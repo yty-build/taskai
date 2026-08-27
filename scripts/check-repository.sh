@@ -22,19 +22,107 @@ for forbidden_dir in \
 	[ ! -e "$forbidden_dir" ] || fail "forbidden production package is present: $forbidden_dir"
 done
 
-module_count=$(go list -m all | wc -l | tr -d ' ')
-[ "$module_count" -eq 1 ] || fail "M01 must remain stdlib-only"
+for internal_dir in internal/*; do
+	[ -d "$internal_dir" ] || continue
+	case "$internal_dir" in
+		internal/acp|internal/app|internal/buildinfo|internal/connector|internal/manager|internal/replay|\
+		internal/runtime|internal/session|internal/settings|internal/store|internal/task|internal/testkit|internal/tui)
+			;;
+		*) fail "unexpected internal package: $internal_dir" ;;
+	esac
+done
 
-if rg -n '"(net/http|net/rpc|github\.com/.*/mcp|nhooyr\.io/websocket|github\.com/gorilla/websocket)"' cmd internal --glob '*.go' >/dev/null; then
+GOWORK=off go mod verify >/dev/null || fail "module checksums failed verification"
+GOWORK=off go mod tidy -diff >/dev/null || fail "go.mod or go.sum is not tidy"
+
+if GOWORK=off go list -m -f '{{.Path}}' all | rg -i '(^|/)(mcp|tmux|websocket|gorilla/websocket)(/|$)' >/dev/null; then
+	fail "forbidden architecture dependency is present"
+fi
+
+if rg -n '"(net/http|net/rpc|github\.com/.*/mcp|nhooyr\.io/websocket|github\.com/gorilla/websocket)"' \
+	cmd internal --glob '*.go' --glob '!**/*_test.go' --glob '!internal/testkit/**' >/dev/null; then
 	fail "forbidden server, MCP, or WebSocket import is present"
+fi
+
+if rg -n 'strings\.Fields(Func)?\(' cmd internal --glob '*.go' --glob '!**/*_test.go' --glob '!internal/testkit/**' >/dev/null; then
+	fail "shell-like argument splitting is present"
+fi
+
+if rg -n '(^|[^A-Za-z])(sh|bash|zsh)[[:space:]]+-c([^A-Za-z]|$)' \
+	internal/connector internal/runtime internal/app --glob '*.go' --glob '!**/*_test.go' >/dev/null; then
+	fail "shell command execution is present"
+fi
+
+sql_importers=$(rg -l '"database/sql"' cmd internal --glob '*.go' --glob '!**/*_test.go' --glob '!internal/testkit/**' || true)
+for sql_file in $sql_importers; do
+	case "$sql_file" in internal/store/*) ;; *) fail "SQL import outside internal/store: $sql_file" ;; esac
+done
+
+exec_importers=$(rg -l '"os/exec"' cmd internal --glob '*.go' --glob '!**/*_test.go' --glob '!internal/testkit/**' || true)
+for exec_file in $exec_importers; do
+	case "$exec_file" in internal/connector/*|internal/runtime/*|internal/app/*) ;; *) fail "process launch outside approved boundary: $exec_file" ;; esac
+done
+
+if rg -n 'github\.com/yty-build/acp-gateway/internal/testkit' cmd internal/app \
+	--glob '*.go' --glob '!**/*_test.go' >/dev/null; then
+	fail "production composition imports internal/testkit"
 fi
 
 for responsibility in acp connector replay manager runtime settings store task session tui testkit; do
 	directory="internal/$responsibility"
 	[ -f "$directory/doc.go" ] || fail "missing package documentation: $directory/doc.go"
-	extra=$(find "$directory" -type f ! -name doc.go -print)
-	[ -z "$extra" ] || fail "M01 responsibility package contains implementation: $directory"
 done
+
+schema_files=$(rg -l 'CREATE[[:space:]]+TABLE' internal --glob '*.go' --glob '!**/*_test.go' || true)
+[ "$schema_files" = "internal/store/migrations.go" ] || fail "persistent schema exists outside the metadata migration boundary"
+
+schema_tables=$(rg --no-filename -o 'CREATE[[:space:]]+TABLE[[:space:]]+[a-z_]+' internal/store/migrations.go |
+	awk '{print $3}' | LC_ALL=C sort)
+expected_tables=$(printf '%s\n' provider_settings sessions tasks)
+[ "$schema_tables" = "$expected_tables" ] || fail "metadata schema must contain only tasks, sessions, and provider_settings"
+
+if rg -n 'CREATE[[:space:]]+TABLE[[:space:]]+(run|runs|invocation|invocations|event|events|frame|frames|message|messages|answer|answers|tool|tools|result|results|transcript|transcripts|replay|replays|artifact|artifacts|workflow|workflows|team|teams|mailbox|mailboxes|token|tokens)([[:space:](]|$)' \
+	internal/store --glob '*.go' >/dev/null; then
+	fail "prohibited durable product entity is present"
+fi
+
+if rg -n '(prompt|answer|thought|plan|tool_(input|output|call|result)|replay_(item|content)|transcript|token_stream|user_context)[[:space:]_]*(TEXT|BLOB)' \
+	internal/store --glob '*.go' --glob '!**/*_test.go' -i >/dev/null; then
+	fail "content-bearing metadata column is present"
+fi
+
+if rg -n '(ConversationRecord|updates\.jsonl|project-session-jsonl|conversation-record-json|app-server-thread-read)' \
+	cmd internal --glob '*.go' --glob '!internal/replay/**' --glob '!**/*_test.go' >/dev/null; then
+	fail "provider-native history reader escaped internal/replay"
+fi
+
+tool_name_definitions=$(rg --no-filename '^(const|var)[[:space:]]+[A-Za-z0-9_]*ToolName[[:space:]]*=' \
+	cmd internal --glob '*.go' --glob '!**/*_test.go' | wc -l | tr -d ' ')
+if [ -f internal/connector/delegate_schema.go ]; then
+	[ "$tool_name_definitions" -eq 1 ] || fail "production must define exactly one model-visible tool name"
+	rg --no-filename '^const[[:space:]]+DelegateToolName[[:space:]]*=[[:space:]]*"taskai_delegate"' \
+		internal/connector --glob '*.go' >/dev/null || fail "the sole typed capability is not taskai_delegate"
+else
+	[ "$tool_name_definitions" -eq 0 ] || fail "model-visible tool exists outside the connector boundary"
+fi
+
+prefix_definitions=$(rg --no-filename '^const[[:space:]]+ManagerPrefix[[:space:]]*=' \
+	cmd internal --glob '*.go' --glob '!**/*_test.go' | wc -l | tr -d ' ')
+if [ -f internal/connector/manager.go ]; then
+	[ "$prefix_definitions" -eq 1 ] || fail "fixed manager prefix must have one shipped definition"
+	resume_shape=$(awk '
+		/^type ThreadResumeParams struct/ { inside=1 }
+		inside { print }
+		inside && /^}/ { exit }
+	' internal/connector/manager.go)
+	case "$resume_shape" in
+		*DynamicTools*|*DeveloperInstructions*|*Prompt*|*Context*)
+			fail "exact Resume shape contains reinjection state"
+			;;
+	esac
+else
+	[ "$prefix_definitions" -eq 0 ] || fail "manager prefix exists outside the connector boundary"
+fi
 
 hash_file() {
 	if command -v shasum >/dev/null 2>&1; then
@@ -63,4 +151,4 @@ if git ls-files | rg '(^|/)(acpctl|taskai)(\.test)?$|(^|/)bin/|\.(out|prof)$' >/
 	fail "tracked binary or test artifact is present"
 fi
 
-printf '%s\n' 'security-check: repository boundaries verified for M01'
+printf '%s\n' 'security-check: repository and persistence boundaries verified'
