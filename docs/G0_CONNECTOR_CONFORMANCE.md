@@ -1,8 +1,8 @@
 # taskai — G0 connector conformance
 
-**Status:** REOPENED — owner-approved boundary authorized; production waits for revalidation
+**Status:** PASS — owner-approved typed boundary revalidated
 
-**Date:** 2026-08-26
+**Date:** 2026-08-27
 
 **Scope:** Gate G0 manager, subordinate, Answer, Follow, Replay, detach, Resume, and authentication feasibility
 
@@ -37,7 +37,7 @@ The owner also clarified manager context behavior. A new Manager Session receive
 
 This amendment resolves the architectural-policy blocker but does not retroactively pass G0. The authorized path must now pass the executable revalidation below before M01 begins.
 
-## Installed boundary
+## Original v1.0 installed boundary
 
 | Component | Version |
 | --- | --- |
@@ -51,7 +51,7 @@ This amendment resolves the architectural-policy blocker but does not retroactiv
 
 The exercised public wire boundary was newline-delimited ACP JSON-RPC over stdio. No MCP server, TaskAI tool, tmux product dependency, provider TUI automation, terminal scrape, workflow engine, or custom agent protocol was used.
 
-## G0 results
+## Original v1.0 G0 results
 
 | Item | Result | Evidence |
 | --- | --- | --- |
@@ -68,7 +68,7 @@ The exercised public wire boundary was newline-delimited ACP JSON-RPC over stdio
 
 Exact Resume also passed in the transport-reset probe: a fresh connector used the same opaque provider reference once, emitted no replacement `session/new`, and received no replayed history during Resume.
 
-## Public API limitations
+## Original public API limitations
 
 ACP `PromptResponse` carries completion state but not the final answer. Public answer text arrives through `agent_message_chunk` updates without a required final-answer discriminator. acpx quiet output concatenates message chunks and does not pair the text with `stopReason`.
 
@@ -106,6 +106,56 @@ G0 passes only after disposable real-provider probes demonstrate all of the foll
 - viewer detach/reattach, authentication reuse, and metadata-only TaskAI persistence still pass; and
 - every disposable fixture and owned process is removed after evidence capture.
 
+## Product vision v1.1 revalidation
+
+The complete checklist above now passes through the authorized typed boundary. The revalidation used one model-visible dynamic capability named `taskai_delegate`. Its strict, singular operations are mechanical parts of that one capability:
+
+- `start` accepts exactly one provider or existing subordinate Session, one opaque prompt, and one mode;
+- `next_answer` returns exactly one owned Answer completion in the connector-observed native completion order;
+- `follow_next` returns a bounded ordered frame batch and exact continuation correlation; and
+- Replay and cancellation remain explicit operations under the same capability.
+
+Batch starts and batch results were not used. Continuation handles are transient connector-owned correlations, not durable TaskAI entities. The connector validates operation-specific fields, ownership, and the pinned public ACP stop-reason allowlist before it performs downstream work.
+
+### Exercised v1.1 boundary
+
+| Component | Version or boundary |
+| --- | --- |
+| Manager | Codex App Server 0.150.1 with `thread/start`, restored dynamic tools, and exact `thread/resume` |
+| Upstream manager transport | Standard ACP initialize, Session new, Session prompt, native updates, and PromptResponse |
+| Subordinate | codex-acp 1.1.7 using bundled Codex CLI 0.145.0 |
+| ACP SDK / protocol | 1.3.0 / protocol 1 |
+| Wire transport | Newline-delimited ACP JSON-RPC over stdio |
+| Model-visible capability | One strict `taskai_delegate` dynamic tool |
+
+Codex App Server 0.150.1 serializes dynamic-tool handlers and its dynamic-tool response has no output-schema or progress-stream field. The conforming implementation therefore uses fast singular `start` calls so downstream ACP turns overlap, then singular continuation calls. Every provider-native result is one canonical JSON value in `inputText`, including exact correlation and continuation fields. The missing dynamic output schema is a version limitation, not a second protocol or semantic parsing path.
+
+### Revalidation results
+
+| Item | Result | Sanitized evidence |
+| --- | --- | --- |
+| Manager is an upstream ACP agent and downstream ACP client | PASS | A standard upstream ACP client drove the wrapper; the real Codex manager model invoked only `taskai_delegate`, whose connector owned direct downstream ACP |
+| Typed structural ownership | PASS | Four content-free lifecycle events identified parent Manager Session, child Session, provider, and prompt turn before subordinate prompt acceptance; TaskAI core received no prompt or answer content |
+| Concurrent Answer correlation | PASS | Starts were A, B, C; all three prompts were sent before any terminal; native completion and exposure were both B, A, C; A and B had byte-identical final answers but distinct Session and turn correlations |
+| Answer filtering and non-success | PASS | Only each current final public ACP answer plus native completion reached manager context; cancellation, refusal, token exhaustion, transport failure, and malformed completion produced no manufactured answer |
+| Malformed native completion | PASS | A stop reason outside the pinned public allowlist became correlated `malformed_completion` with `success:false` and zero answer bytes |
+| Live Follow | PASS | One real subordinate produced 53 ordered native frames; `start` plus seven exact `follow_next` calls exposed frames before native `end_turn`, without drops, duplication, reordering, or digest change |
+| Follow terminal reset | PASS | Success, cancellation, refusal, token exhaustion, malformed completion, and transport failure each invalidated the turn token; the same child's next invocation defaulted to Answer with no Follow polling |
+| Follow bounds and backpressure | PASS | A raw sequential ACP reader enforced 16 frames / 256 KiB high water, a 128 KiB frame bound, and eight-frame batches; stdout actually paused and resumed at high water with no overflow or spill |
+| Replay 1/N | PASS | `docs/G0_REPLAY_CONFORMANCE.md` proves exact provider-native Resume-history ranges for Codex, Claude Code, Gemini CLI, and Grok Build; TaskAI created no transcript, cache, seal, or runtime-content store |
+| Prefix and project instructions | PASS | New Manager `thread/start` supplied the fixed prefix once through `developerInstructions`, ahead of native project `AGENTS.md`; the project instruction files remained byte-for-byte unchanged |
+| Exact Resume | PASS | A fresh App Server resumed the same opaque thread, restored and invoked the dynamic capability, created no replacement Session, and received no reinjected prefix, project context, or user context turn |
+| Detach and authentication | PASS | The prior viewer-independent supervisor and existing-auth probes remain valid on the same public transport boundary |
+| Privacy, persistence, and cleanup | PASS | TaskAI-facing evidence contained structural metadata only; all content buffers and handles were transient; every disposable fixture and owned provider process was removed |
+
+The real manager made five additional stale or invalid `next_answer` attempts after the three valid answers. The connector rejected all five before downstream work and returned no extra answer. This is positive fail-closed boundary evidence and a production-hardening observation, not a G0 failure: the contract requires one independently correlated result per valid requested invocation, which the B, A, C exposures satisfied.
+
+The earlier fixture's hard-coded B, C, A oracle was also incorrect. The contract requires a native completion order different from start order; the observed B, A, C order satisfies that requirement without connector-controlled withholding or release.
+
+### G0 disposition
+
+Gate G0 passes. No forbidden prose parsing, tool-output parsing, MCP server, terminal scrape, provider TUI automation, TaskAI transcript store, private acpx hook, custom agent protocol, or tmux product dependency was used. Production work remains obligated to implement the exact strict, bounded, fail-closed behavior proven here and to advertise only version-conformed provider capabilities.
+
 ## Cleanup and repository audit
 
 - All disposable fixtures and owned probe processes were removed.
@@ -113,4 +163,5 @@ G0 passes only after disposable real-provider probes demonstrate all of the foll
 - Provider-owned synthetic Sessions created by the real probes were left under provider ownership and were neither inspected nor deleted.
 - The source and embedded product vision hashes remain identical.
 - Commit `78b8463` contains the provider-native Replay correction and evidence.
-- No production scaffold or feature code was created after the failed gate.
+- No production scaffold or feature code was created before this gate passed.
+- M01 is now unblocked.
