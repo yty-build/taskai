@@ -59,7 +59,7 @@ TaskAI distinguishes connector capabilities without inventing a cross-provider b
 | Manager | The connector's manager runtime can act as an ACP agent toward TaskAI and as an ACP client toward subordinate agents |
 | Subordinate | The connector can run as an ACP agent and accept manager-owned ACP Sessions |
 | Resume | The connector can exactly resume its provider-owned Session |
-| Replay | The manager runtime can request bounded completed-invocation replay from this connector without a TaskAI transcript database |
+| Replay | The manager runtime can request bounded completed-invocation items from the exact provider-native Session history used by Resume |
 
 A provider may be subordinate-capable without being manager-capable. TaskAI never adds provider-specific semantic workarounds to make a subordinate-only connector appear manager-capable.
 
@@ -110,7 +110,7 @@ Settings behavior:
 7. Capability labels are derived from connector conformance, not a hard-coded marketing claim.
 8. Disabling a provider prevents new Sessions but does not delete historical Session metadata or provider state.
 
-Credentials, provider authentication databases, tokens, cookies, and private provider transcripts never enter TaskAI storage.
+Credentials, provider authentication databases, tokens, and cookies never enter TaskAI storage. Provider-native Session history remains in the provider harness and is read in place only for exact bounded Replay.
 
 ## 7. Tasks screen
 
@@ -210,7 +210,7 @@ Manager runtime
     +-- ACP client toward subordinate connector C
 ~~~
 
-The Manager Session owns its subordinate ACP connections. TaskAI may establish, supervise, and record the mechanical Session relationship, but it does not read the meaning of the content that crosses those connections.
+The Manager Session owns its subordinate ACP connections. TaskAI may establish, supervise, and record the mechanical Session relationship. For Replay, a provider adapter may read the exact native Session record used by that provider's Resume implementation, but TaskAI does not interpret the meaning of its content.
 
 Wall invariants:
 
@@ -279,7 +279,7 @@ Replay rules:
 1. Replay is unavailable until the target invocation has completed.
 2. The manager names one or more subordinate Sessions.
 3. N applies independently to each named subordinate Session.
-4. Replay returns the exposed native ACP frames for the requested completed invocation ranges.
+4. Replay returns the provider-native persisted items for the requested completed invocation ranges.
 5. Replay never automatically includes another Session or an older range.
 6. Whole-Session replay is not exposed as the manager workflow.
 7. No replay is inserted automatically.
@@ -300,9 +300,11 @@ replay [Claude-A, Codex-B] 2
   -> last two completed invocations from each named Session
 ~~~
 
-Replay may include the messages, plans, tool-call updates, execution output, and completion state that the provider exposed through ACP. It never exposes provider-private state.
+Replay may include messages, plans, tool calls and results, execution output, reasoning summaries, and completion state present in the provider-native Session record. It never exposes credentials, authentication state, encrypted reasoning, unrelated Sessions, or provider data outside the native history used for Resume.
 
-TaskAI does not maintain a rolling answer buffer or transcript database. A replay-capable connector may retain opaque completed-turn cursors or use provider-owned ACP replay. If bounded replay cannot be supplied without TaskAI reconstructing history, Settings reports Replay as unsupported for that connector.
+The provider-native Session history is the canonical Replay source. TaskAI stores only the opaque provider Session reference and does not create a second transcript, replay journal, content cache, or search index. A provider adapter resolves that exact reference through a supported harness history API when one exists, otherwise through a version-conformed reader for the provider's native JSON or JSONL Session format.
+
+Adapters may decode only the mechanical structure needed for bounded Replay: native Session, turn, message, item, tool-call, tool-result, parent, ordering, status, timestamp, and completion fields. They must read only the named Session and requested completed range. If the native history is missing, expired, corrupt, concurrently unsafe, or uses an unconformed schema version, Settings reports Replay as unavailable rather than widening the read or inventing history.
 
 ## 14. Complete manager flow
 
@@ -331,7 +333,8 @@ Requirements:
 - apply backpressure rather than dropping or silently reordering frames;
 - keep unknown public content displayable through a bounded fallback;
 - never expose provider-private credential material;
-- never infer a hidden transcript from provider files;
+- never scan, search, or infer content from an unrelated provider Session;
+- prefer the provider's supported history API and use native-file readers only for explicitly conformed versions;
 - never use terminal screenshots, ANSI scraping, or tmux capture as conversation state.
 
 TaskAI may decode ACP envelope fields required for connection operation and rendering, including Session ID, request ID, method/update discriminator, message ID, lifecycle state, and stop reason. It must not interpret whether the work is correct or what the manager should do next.
@@ -350,9 +353,9 @@ detach terminal viewer
 
 Stopping a Manager Session is an explicit lifecycle action. In V1, its subordinate Sessions are stopped or marked interrupted as one owned runtime tree; they are never silently reassigned to another manager.
 
-Exact resume uses the opaque provider Session reference and only when the connector advertises Resume. TaskAI does not reconstruct provider context from UI output or replay frames.
+Exact resume uses the opaque provider Session reference and only when the connector advertises Resume. TaskAI does not reconstruct provider context from UI output or replay items.
 
-Manager-local bounded replay state may be unavailable after a manager runtime crash unless the subordinate connector can reproduce it through its advertised ACP Replay capability. TaskAI does not add a hidden persistent transcript fallback.
+Replay after a TaskAI or manager runtime restart reads the same provider-native Session history used by Resume. Availability follows the provider's own retention, compaction, and deletion behavior; TaskAI does not add a duplicate persistent transcript fallback.
 
 ## 17. Historical Tasks and Sessions
 
@@ -386,7 +389,7 @@ TaskAI marks the Manager Session interrupted and treats its subordinate runtime 
 
 ### Replay unsupported
 
-The manager sees Replay unavailable for that subordinate. TaskAI does not emulate it through a transcript database or whole-session crawl.
+The manager sees Replay unavailable for that subordinate. TaskAI does not substitute another Session, copy whole-Session history, guess an unconformed native schema, or create its own transcript.
 
 ### Authentication expires
 
@@ -423,10 +426,12 @@ TaskAI does not persist:
 - plans;
 - tool calls or tool outputs;
 - replay content;
-- provider-private transcript data;
+- provider-native Session content or paths;
 - terminal captures.
 
 Provider-owned state remains provider-owned.
+
+For Replay, TaskAI may read the exact provider-owned Session history identified by a stored opaque provider reference. It does not copy that history into TaskAI persistence, retain it after the bounded operation, or enumerate unrelated provider Sessions.
 
 ## 21. Explicit non-goals
 
@@ -440,8 +445,8 @@ V1 does not include:
 - TaskAI-generated manager control messages;
 - custom agent-to-agent message envelopes;
 - semantic event normalization;
-- transcript storage or search;
-- tool-call lookup;
+- duplicate transcript storage or cross-Session search;
+- semantic tool-call lookup outside an exact bounded Replay request;
 - automatic result delivery outside the parent manager;
 - peer-to-peer subordinate messaging;
 - nested subordinate hierarchies;
@@ -466,10 +471,10 @@ V1 does not include:
 | D11 | Follow is explicit, invocation-scoped, and automatically resets |
 | D12 | Replay is post-answer only and defaults to replay 1 |
 | D13 | Replay N applies per explicitly named subordinate Session |
-| D14 | Replay returns exposed ACP invocation frames, not a TaskAI reconstruction |
+| D14 | Replay returns bounded provider-native Session items, not a TaskAI reconstruction |
 | D15 | There is no Recall operation or automatic historical answer insertion |
-| D16 | Replay support is connector-capability-gated |
-| D17 | TaskAI stores no messages, tools, answers, or transcripts |
+| D16 | Replay support is provider-adapter and native-schema conformance-gated |
+| D17 | TaskAI creates no duplicate message, tool, answer, transcript, replay, or search store |
 | D18 | Detaching the viewer never stops work |
 | D19 | No MCP or tmux exists in the product architecture |
 | D20 | Future clients may reuse the manager ACP surface, but V1 is terminal-only |
@@ -524,7 +529,7 @@ V1 does not include:
 
 - Use a subordinate connector without Replay capability.
 - The manager cannot request replay from it.
-- No TaskAI transcript fallback is created.
+- No duplicate TaskAI transcript fallback is created.
 
 ### Detach
 
@@ -537,3 +542,4 @@ V1 does not include:
 - Inspect TaskAI persistence after normal use.
 - Find Task, Session, provider configuration, and opaque lifecycle metadata only.
 - Find no prompt, answer, tool, transcript, replay, token, or credential content.
+- Confirm Replay read the exact provider-owned Session in place and created no TaskAI-owned copy or index.

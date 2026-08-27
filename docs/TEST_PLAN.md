@@ -14,7 +14,7 @@ The quality bar is:
 
 > A user can always understand where they are, what is running, which manager owns each subordinate, and what action is available—without TaskAI inventing provider behavior or retaining conversation content.
 
-This document specifies verification, not a new product layer. If it conflicts with `docs/UX_PRODUCT_VISION.md`, the vision wins. If a test would require MCP, tmux, provider-native terminal capture, a transcript database, or semantic interpretation of agent output, reject the test and the implementation it implies.
+This document specifies verification, not a new product layer. If it conflicts with `docs/UX_PRODUCT_VISION.md`, the vision wins. If a test would require MCP, tmux, provider-native terminal capture, a duplicate TaskAI transcript database, cross-Session history search, or semantic interpretation of agent output, reject the test and the implementation it implies.
 
 ## 2. Verification principles
 
@@ -55,7 +55,8 @@ Provide programmable fixtures for:
 - a dual-role manager connector;
 - a subordinate-only connector;
 - a connector with and without exact Resume;
-- a connector with and without bounded Replay;
+- provider-native Session histories and adapters with and without bounded Replay;
+- versioned Codex, Claude, Gemini, and Grok native-history fixtures, including schema drift, compaction, rewind, partial writes, and retention loss;
 - connected, disconnected, needs-repair, missing-executable, and authentication-expired states;
 - successful, refused, cancelled, token-exhausted, malformed, oversized, and transport-failed turns;
 - delayed and concurrent completions;
@@ -91,7 +92,7 @@ The PTY driver must be able to:
 
 ### 4.4 Storage auditor
 
-Use unique canary values for prompts, answers, tool updates, replay frames, credentials, and auth state. After each privacy scenario, recursively inspect the TaskAI state root and database values. A canary match outside an explicitly test-owned transient fixture fails the suite.
+Use unique canary values for prompts, answers, tool updates, replay items, credentials, and auth state. After each privacy scenario, recursively inspect the TaskAI state root and database values. Prompt, answer, tool, or replay canaries may exist only in the exact test-owned provider Session fixture; any duplicate under TaskAI state fails the suite.
 
 The test harness may retain fixture content in memory to make assertions. That does not authorize production code to persist it.
 
@@ -261,7 +262,7 @@ The provider-owned auth screen itself is outside visual snapshot scope. Test the
 
 ### UX-204 — capability truth
 
-Manager, Subordinate, Resume, and Replay labels come from passed connector conformance. Unsupported capability controls are absent or unavailable with a concise explanation. Recheck updates mechanical status without changing capability claims that were not reconformed.
+Manager, Subordinate, and Resume labels come from passed connector conformance. Replay additionally requires conformance for the provider's supported history API or exact native Session schema/version, completed-turn grouping, and bounded item selection. Unsupported capability controls are absent or unavailable with a concise explanation. Recheck updates mechanical status without changing capability claims that were not reconformed.
 
 ### UX-205 — Settings visual states
 
@@ -332,11 +333,11 @@ The Task title, Sessions region, Add Session, selected manager identity, provide
 
 ### UX-407 — historical Sessions
 
-Historical metadata remains visible without implying transcript ownership. Selecting it either exactly resumes the same provider Session when advertised or displays Resume unavailable. TaskAI never reconstructs a conversation from rendered output, replay frames, or provider-private files.
+Historical metadata remains visible without implying TaskAI transcript ownership. Selecting it either exactly resumes the same provider Session when advertised or displays Resume unavailable. Selecting a row does not load native history automatically; an explicit manager Replay may read the exact provider Session through its conformed adapter.
 
 ## 12. Answer, Follow, and Replay tests
 
-These are connector/runtime contracts reflected by Session rows and the manager's public ACP surface. They are not new TaskAI keyboard commands, UI buttons, semantic messages, or provider-facing TaskAI tools.
+These are connector/runtime and provider-native-history-adapter contracts reflected by Session rows and the manager's public ACP surface. They are not new TaskAI keyboard commands, UI buttons, semantic messages, or provider-facing TaskAI tools.
 
 ### ACP-501 — Answer default
 
@@ -369,16 +370,17 @@ On success, cancellation, refusal, token exhaustion, or transport failure, Follo
 ### ACP-506 — Replay eligibility
 
 - Replay is unavailable before a target invocation completes.
-- Replay is available only when the target connector advertises and passes bounded Replay conformance.
-- Unsupported Replay remains unavailable; TaskAI creates no transcript, rolling buffer, whole-Session load, or private-history fallback.
+- Replay is available only when the target provider adapter passes exact-Session resolution, native schema/version, completed-turn, bounded-range, and item-fidelity conformance.
+- The adapter prefers a supported provider history API. Direct JSON/JSONL access is allowed only for explicitly conformed provider versions and the exact provider Session reference used by Resume.
+- Unsupported Replay remains unavailable; TaskAI creates no duplicate transcript, rolling buffer, whole-Session copy, search index, or unrelated-history fallback.
 
 ### ACP-507 — Replay 1
 
-After at least two completed invocations, an explicit replay request with no N returns only the exposed ACP frames for the most recent completed invocation of the named subordinate Session.
+After at least two completed invocations, an explicit replay request with no N returns only the provider-native persisted items for the most recent completed invocation of the named subordinate Session.
 
 ### ACP-508 — Replay N
 
-For a named subordinate with more than N completed invocations, replay N returns exactly the last N completed invocation streams, in their original invocation/frame ordering. Validate N boundaries, invalid values, and a request larger than the connector's available bounded history without silently widening to whole-Session replay.
+For a named subordinate with more than N completed invocations, replay N returns exactly the last N completed native item streams, in their original invocation/item ordering. Validate N boundaries, invalid values, compaction and rewind markers, an incomplete final write, native retention loss, and a request larger than available bounded history without silently widening to whole-Session replay.
 
 ### ACP-509 — multi-target Replay
 
@@ -386,7 +388,7 @@ For two or more named subordinate Sessions with different history lengths, repla
 
 ### ACP-510 — no automatic history
 
-Complete several invocations, switch managers, detach/reattach, and submit a new prompt. No previous answer or replay stream is inserted unless the manager explicitly requested the bounded Replay operation.
+Complete several invocations, switch managers, detach/reattach, and submit a new prompt. No previous answer or native replay item stream is inserted unless the manager explicitly requested the bounded Replay operation.
 
 ## 13. Streaming and content rendering tests
 
@@ -417,7 +419,7 @@ Interleave frames from two managers and several subordinates. The visible conver
 
 ### UI-606 — diagnostics do not leak private state
 
-Errors and generic frames must not print provider environment variables, credentials, auth database paths, private transcript paths, raw process command lines containing secrets, or content from another Session.
+Errors and generic frames must not print provider environment variables, credentials, auth database paths, native Session paths, raw process command lines containing secrets, or content from another Session.
 
 ## 14. Detach, lifecycle, and recovery tests
 
@@ -441,7 +443,7 @@ When Resume is advertised, restart the worker and use the same opaque provider r
 
 ### UX-705 — runtime failure
 
-A manager crash marks that manager and its subordinate runtime tree interrupted. The screen remains navigable, preserves historical metadata, and offers only actions supported by connector capability. Manager-local replay loss is not hidden by a TaskAI transcript fallback.
+A manager crash marks that manager and its subordinate runtime tree interrupted. The screen remains navigable, preserves historical metadata, and offers only actions supported by connector and native-history-adapter capability. Replay remains available only when the exact provider-owned Session history still exists and conforms; loss is not hidden by a duplicate TaskAI transcript fallback.
 
 ## 15. Failure-state matrix
 
@@ -456,6 +458,8 @@ Every row requires model, renderer, keyboard, and PTY coverage where applicable.
 | Manager start fails | Intended Session remains identifiable and failed/interrupted; no replacement Start |
 | Subordinate turn fails | Native failure reaches only its manager; no synthetic answer |
 | Replay unsupported | Unavailable for exact subordinate; no fallback or whole-Session option |
+| Native Session history missing/expired | Replay unavailable for exact subordinate; no substitute Session or cached copy |
+| Native Session schema drift/corruption | Bounded adapter error; no best-effort content guessing or unrelated scan |
 | Resume unsupported | Historical metadata remains; no reconstructed conversation |
 | Resume fails | Same Session shows failure; no new provider reference |
 | Malformed/oversized ACP | Bounded error; affected runtime isolated; terminal remains usable |
@@ -473,7 +477,7 @@ Fresh and upgraded TaskAI state contains only Task and Session as first-class pr
 
 ### SEC-802 — content canary audit
 
-Run normal, Answer, Follow, Replay, error, detach, and exact-resume flows with distinct canaries. Inspect databases, journals, logs, cache files, sockets, crash files, and configuration. Find no prompt, answer, plan, tool, replay frame, token stream, credential, cookie, auth-state, or provider-private transcript content.
+Run normal, Answer, Follow, Replay, error, detach, and exact-resume flows with distinct canaries. Inspect every TaskAI-owned database, journal, log, cache, socket artifact, crash file, and configuration value. Find no prompt, answer, plan, tool, replay item, token stream, credential, cookie, auth-state, native Session path, or provider Session content. Separately verify that Replay read only the exact provider-owned fixture in place and neither modified nor copied it.
 
 ### SEC-803 — filesystem and process safety
 
@@ -492,9 +496,10 @@ Fail production code or dependencies that introduce:
 - web UI, HTTP API, or WebSocket product surfaces;
 - TaskAI delegation/inspection tools;
 - semantic event/result normalization;
-- transcript/message/tool persistence or search;
+- duplicate transcript/message/tool persistence or cross-Session search;
 - workflow, broker, mailbox, or peer messaging;
-- provider-private history crawling;
+- provider-history readers outside the dedicated version-conformed adapter boundary;
+- unrelated Session enumeration, path traversal, symlink escape, or best-effort schema guessing;
 - nested subordinate hierarchies;
 - old `acpctl` product paths or legacy compatibility shims.
 
@@ -591,16 +596,19 @@ Real-provider tests are local and opt-in. They are required before the UI advert
 For every supported connector, record:
 
 - connector/version and ACP version;
+- provider harness history API or native Session format and schema/version probe;
+- exact provider reference resolution and filesystem containment boundary;
 - Manager, Subordinate, Resume, and Replay claims;
 - auth initiation and reuse behavior;
 - exact Start versus Resume calls;
 - Answer completion/public-message boundary;
 - Follow frame behavior and reset;
 - Replay 1, Replay N, and range-limit behavior when claimed;
+- completed-turn and item grouping across compaction, rewind, cancellation, partial writes, and provider retention;
 - detach/reattach behavior;
 - known unsupported behavior.
 
-At least one real connector must pass the dual-role Manager path, at least one must pass Subordinate, and at least one must pass bounded Replay before those product paths ship. Evidence is sanitized and never committed if it contains provider state or conversation content.
+At least one real connector must pass the dual-role Manager path, at least one must pass Subordinate, and at least one real provider-native history adapter must pass bounded Replay before those product paths ship. Evidence is sanitized and never committed if it contains provider state or conversation content.
 
 Do not compare provider answer quality or snapshot provider-native UI. The smoke test proves protocol and lifecycle claims only.
 
@@ -621,10 +629,10 @@ Do not compare provider answer quality or snapshot provider-native UI. The smoke
 | D11 invocation-scoped Follow/reset | ACP-504, ACP-505, E2E-906 |
 | D12 post-answer Replay defaults to 1 | ACP-506, ACP-507, E2E-907 |
 | D13 N applies per named Session | ACP-508, ACP-509, E2E-908 |
-| D14 Replay is exposed ACP, not reconstruction | ACP-507–ACP-509, SEC-802 |
+| D14 Replay is bounded provider-native Session items, not reconstruction | ACP-507–ACP-509, SEC-802 |
 | D15 no Recall/automatic history | ACP-510, UI-005, SEC-804 |
-| D16 Replay is capability-gated | UX-204, ACP-506, E2E-909 |
-| D17 no content persistence | SEC-801, SEC-802, E2E-913 |
+| D16 Replay is provider-adapter/schema-conformance-gated | UX-204, ACP-506, E2E-909 |
+| D17 no duplicate content persistence | SEC-801, SEC-802, E2E-913 |
 | D18 detach never stops work | UX-701, UX-702, E2E-910 |
 | D19 no MCP or tmux | UI-005, SEC-804 |
 | D20 terminal-only V1 | SEC-804, all PTY acceptance |
@@ -668,7 +676,7 @@ Verification is complete only when:
 3. All TaskAI-owned screens have semantic assertions and reviewed goldens at the required sizes.
 4. Every visible action has keyboard coverage and mouse parity where supported.
 5. Empty, loading/starting, working, dormant, interrupted, closed, disconnected, needs-repair, unsupported, and constrained-terminal states are covered.
-6. Answer, Follow/reset, Replay 1, Replay N, and multi-target Replay pass without a TaskAI content store.
+6. Answer, Follow/reset, Replay 1, Replay N, and multi-target Replay pass from exact provider-native Session history without a duplicate TaskAI content store.
 7. Detach and exact Resume tests prove no replacement conversation or viewer-owned runtime.
 8. Storage canary and forbidden-architecture scans are clean.
 9. Advertised connector capabilities have real conformance evidence.
