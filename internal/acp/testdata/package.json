@@ -1,8 +1,0 @@
-{
-  "name": "acpx",
-  "version": "0.13.0",
-  "type": "module",
-  "exports": {
-    "./runtime": "./runtime.js"
-  }
-}

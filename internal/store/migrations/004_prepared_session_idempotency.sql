@@ -1,4 +1,0 @@
--- Retired before release. Version 4 is preserved as a no-op because local
--- development databases may already report user_version=4. Migration 005
--- defensively drops the former prepared-Session index if such a database was
--- created by an earlier development build.

@@ -1,7 +1,0 @@
-name: opencode
-provider: opencode
-command: npx
-args:
-  - -y
-  - opencode-ai@1.18.18
-  - acp
