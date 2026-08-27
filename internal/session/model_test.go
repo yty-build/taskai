@@ -1,10 +1,8 @@
 package session
 
 import (
-	"encoding/json"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestStatuses(t *testing.T) {
@@ -18,72 +16,76 @@ func TestStatuses(t *testing.T) {
 	}
 }
 
-func TestCreateParamsValidation(t *testing.T) {
-	if err := (CreateParams{Agent: "codex"}).Validate(); err == nil {
-		t.Fatal("missing Task ID accepted")
+func TestCanResumeRequiresOwnerlessTerminalIdentity(t *testing.T) {
+	for _, status := range []Status{StatusStopped, StatusFailed, StatusDone, StatusCancelled} {
+		if !(Session{Status: status, ProviderRef: "provider-one"}).CanResume() {
+			t.Errorf("ownerless %s Session was not resumable", status)
+		}
 	}
-	if err := (CreateParams{TaskID: "T-1"}).Validate(); err == nil {
-		t.Fatal("missing agent accepted")
-	}
-	if err := (CreateParams{TaskID: "T-1", Agent: "codex", MetadataJSON: []byte("no")}).Validate(); err == nil {
-		t.Fatal("invalid metadata accepted")
-	}
-	verifiedAt := time.Now().UTC()
-	for name, params := range map[string]CreateParams{
-		"provider store without timestamp": {
-			TaskID: "T-1", Agent: "codex", ProviderConversationID: "canonical", ConversationIDSource: ConversationSourceProviderStore,
-		},
-		"timestamp without provider store": {
-			TaskID: "T-1", Agent: "codex", ProviderConversationID: "canonical", ConversationIDSource: ConversationSourceACP, ConversationIDVerifiedAt: &verifiedAt,
-		},
-		"verified native mismatch": {
-			TaskID: "T-1", Agent: "codex", ProviderConversationID: "canonical", NativeSessionID: "replacement",
-			ConversationIDSource: ConversationSourceProviderStore, ConversationIDVerifiedAt: &verifiedAt,
-		},
+	for _, current := range []Session{
+		{Status: StatusStarting, ProviderRef: "provider-one"},
+		{Status: StatusWaiting, ProviderRef: "provider-one"},
+		{Status: StatusStopped},
+		{Status: StatusStopped, ProviderRef: "provider-one", WorkerPID: 42},
+		{Status: StatusStopped, ProviderRef: "provider-one", WorkerSocket: "/worker.sock"},
 	} {
+		if current.CanResume() {
+			t.Errorf("Session unexpectedly resumable: %#v", current)
+		}
+	}
+}
+
+func TestCreateParamsValidation(t *testing.T) {
+	valid := CreateParams{ID: "S-child", TaskID: "T-1", ParentSessionID: "S-parent", Agent: "codex"}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid params rejected: %v", err)
+	}
+
+	tests := map[string]CreateParams{
+		"missing Task":       {Agent: "codex"},
+		"missing agent":      {TaskID: "T-1"},
+		"invalid metadata":   {TaskID: "T-1", Agent: "codex", MetadataJSON: []byte("{")},
+		"self parent":        {ID: "S-self", TaskID: "T-1", ParentSessionID: "S-self", Agent: "codex"},
+		"parent whitespace":  {TaskID: "T-1", ParentSessionID: " S-parent", Agent: "codex"},
+		"parent path":        {TaskID: "T-1", ParentSessionID: "../parent", Agent: "codex"},
+		"runtime whitespace": {TaskID: "T-1", Agent: "codex", RuntimeRef: " runtime"},
+		"invalid status":     {TaskID: "T-1", Agent: "codex", Status: "paused"},
+	}
+	if err := (CreateParams{TaskID: "T-1", Agent: "codex", ProviderRef: " provider-owned "}).Validate(); err != nil {
+		t.Fatalf("opaque provider reference rejected: %v", err)
+	}
+	for name, params := range tests {
 		t.Run(name, func(t *testing.T) {
 			if err := params.Validate(); err == nil {
-				t.Fatal("invalid identity state accepted")
+				t.Fatal("invalid params accepted")
 			}
 		})
 	}
 }
 
-func TestProviderOptionsFromSessionMetadata(t *testing.T) {
-	options, err := ParseProviderOptions(json.RawMessage(`{"permission":"read-approval","model":" org/模型@edge+v=2 ","reasoning_effort":" high "}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if options.Model != "org/模型@edge+v=2" || options.ReasoningEffort != "high" {
-		t.Fatalf("options = %#v", options)
-	}
+func TestProviderOptionsValidation(t *testing.T) {
 	for name, model := range map[string]string{
-		"leading option": "--dangerous", "bidi override": "safe\u202Eevil", "line separator": "safe\u2028evil", "nul": "safe\x00evil",
+		"bidi override":  "safe\u202Eevil",
+		"line separator": "safe\u2028evil",
+		"nul":            "safe\x00evil",
 	} {
 		t.Run(name, func(t *testing.T) {
-			body, marshalErr := json.Marshal(map[string]string{"model": model})
-			if marshalErr != nil {
-				t.Fatal(marshalErr)
-			}
-			if _, err := ParseProviderOptions(body); err == nil {
+			if err := (ProviderOptions{Model: model}).Validate(); err == nil {
 				t.Fatalf("invalid model %q was accepted", model)
 			}
 		})
 	}
-	tooLong, err := json.Marshal(map[string]string{"model": strings.Repeat("界", 86)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ParseProviderOptions(tooLong); err == nil || !strings.Contains(err.Error(), "256 bytes") {
+
+	if err := (ProviderOptions{Model: strings.Repeat("界", 86)}).Validate(); err == nil || !strings.Contains(err.Error(), "256 bytes") {
 		t.Fatalf("overlong model error = %v", err)
 	}
 	if err := (ProviderOptions{Model: string([]byte{0xff})}).Validate(); err == nil {
 		t.Fatal("invalid UTF-8 model was accepted")
 	}
-	if _, err := ParseProviderOptions(json.RawMessage(`{"reasoning_effort":"high;override=true"}`)); err == nil || !strings.Contains(err.Error(), "reasoning effort") {
-		t.Fatalf("invalid effort error = %v", err)
+	if options := (ProviderOptions{Model: "--opaque provider value", ReasoningEffort: "provider effort @ 2"}); options.Validate() != nil {
+		t.Fatalf("printable opaque provider values were rejected: %#v", options)
 	}
-	if _, err := ParseProviderOptions(json.RawMessage(`{"model":42}`)); err == nil || !strings.Contains(err.Error(), "must be a string") {
-		t.Fatalf("non-string model error = %v", err)
+	if err := (ProviderOptions{ReasoningEffort: "high\nlow"}).Validate(); err == nil || !strings.Contains(err.Error(), "reasoning effort") {
+		t.Fatalf("control-bearing effort error = %v", err)
 	}
 }

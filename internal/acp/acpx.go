@@ -2,29 +2,26 @@
 package acp
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
-	"sync/atomic"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/yty-build/acp-gateway/internal/agents"
-	gitrepo "github.com/yty-build/acp-gateway/internal/git"
 	"github.com/yty-build/acp-gateway/internal/identity"
+	"github.com/yty-build/acp-gateway/internal/session"
 )
 
 const (
 	SupportedACPXVersion = "0.13.0"
-	RuntimeTransport     = "acpx-runtime-v1"
-	maxStructuredLine    = 16 << 20
+	maxStructuredLine    = 2 << 20
+	maxProviderRefBytes  = 512
 )
 
 type PermissionMode string
@@ -59,25 +56,146 @@ func (t Target) validate() error {
 
 type StartSpec struct {
 	Target
-	ResumeACPSessionID             string
-	ExpectedProviderConversationID string
-	ExpectedNativeSessionID        string
-	ProviderStoreVerified          bool
-	Model                          string
-	ReasoningEffort                string
+	ResumeProviderRef string
+	Model             string
+	ReasoningEffort   string
 }
 
 type SessionInfo struct {
 	ConsoleSessionID string          `json:"consoleSessionId"`
-	ACPXRecordID     string          `json:"acpxRecordId"`
-	ACPSessionID     string          `json:"acpSessionId"`
-	NativeSessionID  string          `json:"nativeSessionId,omitempty"`
+	RuntimeRef       string          `json:"runtimeRef"`
+	ProviderRef      string          `json:"providerRef"`
 	Raw              json.RawMessage `json:"raw"`
 }
 
-// IdentityError means a transport observation cannot be proven to belong to
-// the immutable provider conversation recorded for a Task Console Session.
-// Callers must quarantine that transport rather than continue optimistically.
+const (
+	maxProviderOptionChoices = 128
+	maxProviderOptionLabel   = 256
+	maxProviderOptionGroup   = 128
+)
+
+// ProviderOptionChoice is one provider-advertised select value. Value is the
+// exact opaque token sent back through setConfigOption; Label and Group are
+// display-only provider text that has passed bounded printable validation.
+type ProviderOptionChoice struct {
+	Value string `json:"value"`
+	Label string `json:"label"`
+	Group string `json:"group,omitempty"`
+}
+
+// ProviderSelectCatalog describes one configurable select control advertised
+// by the ACP adapter. Unsupported controls remain explicit so transports can
+// disable, rather than invent, a dropdown.
+type ProviderSelectCatalog struct {
+	Supported         bool                   `json:"supported"`
+	CurrentValue      string                 `json:"current_value,omitempty"`
+	UnavailableReason string                 `json:"unavailable_reason,omitempty"`
+	Choices           []ProviderOptionChoice `json:"choices"`
+}
+
+// ProviderOptionCatalog is disposable live provider state for a Session. It
+// is never a persistent domain entity and contains no arbitrary status or
+// authentication payload from the adapter.
+type ProviderOptionCatalog struct {
+	Model           ProviderSelectCatalog `json:"model"`
+	ReasoningEffort ProviderSelectCatalog `json:"reasoning_effort"`
+}
+
+func (c ProviderOptionCatalog) Validate() error {
+	if err := validateProviderSelectCatalog("model", c.Model, false); err != nil {
+		return err
+	}
+	return validateProviderSelectCatalog("reasoning effort", c.ReasoningEffort, true)
+}
+
+// ValidateSelection proves that a requested tuple came from this exact live
+// catalog. Empty strings mean keep the provider's current/default value.
+func (c ProviderOptionCatalog) ValidateSelection(options session.ProviderOptions) error {
+	if err := options.Validate(); err != nil {
+		return err
+	}
+	if options.Model != "" && !catalogContains(c.Model, options.Model) {
+		return fmt.Errorf("requested model is not advertised by this Session provider")
+	}
+	if options.ReasoningEffort != "" && !catalogContains(c.ReasoningEffort, options.ReasoningEffort) {
+		return fmt.Errorf("requested reasoning effort is not advertised by this Session provider")
+	}
+	return nil
+}
+
+func catalogContains(catalog ProviderSelectCatalog, value string) bool {
+	if !catalog.Supported {
+		return false
+	}
+	for _, choice := range catalog.Choices {
+		if choice.Value == value {
+			return true
+		}
+	}
+	return false
+}
+
+func validateProviderSelectCatalog(name string, catalog ProviderSelectCatalog, reasoning bool) error {
+	if !catalog.Supported {
+		if catalog.CurrentValue != "" || len(catalog.Choices) != 0 {
+			return fmt.Errorf("unsupported provider %s catalog contains values", name)
+		}
+		switch catalog.UnavailableReason {
+		case "", "not_advertised", "ambiguous_or_invalid":
+		default:
+			return fmt.Errorf("unsupported provider %s catalog contains an invalid reason", name)
+		}
+		return nil
+	}
+	if catalog.UnavailableReason != "" {
+		return fmt.Errorf("supported provider %s catalog contains an unavailable reason", name)
+	}
+	if len(catalog.Choices) == 0 || len(catalog.Choices) > maxProviderOptionChoices {
+		return fmt.Errorf("provider %s catalog must contain between 1 and %d choices", name, maxProviderOptionChoices)
+	}
+	seen := make(map[string]struct{}, len(catalog.Choices))
+	for _, choice := range catalog.Choices {
+		options := session.ProviderOptions{Model: choice.Value}
+		if reasoning {
+			options = session.ProviderOptions{ReasoningEffort: choice.Value}
+		}
+		if err := options.Validate(); err != nil || choice.Value == "" {
+			return fmt.Errorf("provider %s catalog contains an invalid choice", name)
+		}
+		if _, exists := seen[choice.Value]; exists {
+			return fmt.Errorf("provider %s catalog contains duplicate choices", name)
+		}
+		seen[choice.Value] = struct{}{}
+		if choice.Label == "" || !boundedPrintable(choice.Label, maxProviderOptionLabel) || !boundedPrintable(choice.Group, maxProviderOptionGroup) {
+			return fmt.Errorf("provider %s catalog contains invalid display text", name)
+		}
+	}
+	if catalog.CurrentValue != "" {
+		options := session.ProviderOptions{Model: catalog.CurrentValue}
+		if reasoning {
+			options = session.ProviderOptions{ReasoningEffort: catalog.CurrentValue}
+		}
+		if err := options.Validate(); err != nil {
+			return fmt.Errorf("provider %s catalog contains an invalid current value", name)
+		}
+	}
+	return nil
+}
+
+func boundedPrintable(value string, limit int) bool {
+	if len(value) > limit || !utf8.ValidString(value) {
+		return false
+	}
+	for _, item := range value {
+		if !unicode.IsPrint(item) {
+			return false
+		}
+	}
+	return true
+}
+
+// IdentityError means a resumed transport returned a different opaque provider
+// reference. Callers must fail closed instead of silently replacing it.
 type IdentityError struct {
 	Operation string
 	Message   string
@@ -86,7 +204,7 @@ type IdentityError struct {
 func (e *IdentityError) Error() string {
 	operation := strings.TrimSpace(e.Operation)
 	if operation == "" {
-		operation = "provider conversation"
+		operation = "provider Session"
 	}
 	return fmt.Sprintf("acpx %s identity error: %s", operation, e.Message)
 }
@@ -95,60 +213,44 @@ func identityError(operation, format string, arguments ...any) error {
 	return &IdentityError{Operation: operation, Message: fmt.Sprintf(format, arguments...)}
 }
 
-// ValidateProviderConversation proves that adapter metadata still names the
-// immutable provider conversation recorded by the Task Console Session. ACP
-// and provider-native identifiers are distinct protocol concepts, so either
-// exact identifier may carry the canonical value.
-func ValidateProviderConversation(operation string, info SessionInfo, expected string) error {
-	expected = strings.TrimSpace(expected)
+// ValidateProviderRef proves that a restarted Port exact-resumed the provider
+// reference recorded for this Session.
+func ValidateProviderRef(operation string, info SessionInfo, expected string) error {
+	if err := ValidateProviderRefValue(operation, info.ProviderRef); err != nil {
+		return err
+	}
 	if expected == "" {
 		return nil
 	}
-	if strings.TrimSpace(info.ACPSessionID) == expected || strings.TrimSpace(info.NativeSessionID) == expected {
+	if issue := providerRefValidationIssue(expected); issue != "" {
+		return identityError(operation, "invalid expected provider reference: %s", issue)
+	}
+	if info.ProviderRef == expected {
 		return nil
 	}
-	if strings.TrimSpace(operation) == "" {
-		operation = "provider conversation"
-	}
-	return identityError(operation, "expected canonical provider conversation %q, received ACP %q and native %q", expected, info.ACPSessionID, info.NativeSessionID)
+	return identityError(operation, "expected provider reference %q, received %q", expected, info.ProviderRef)
 }
 
-// ValidateNativeSessionEvidence prevents an adapter from silently replacing
-// a previously observed native identifier while retaining the same ACP ID.
-func ValidateNativeSessionEvidence(operation string, info SessionInfo, expected string) error {
-	expected = strings.TrimSpace(expected)
-	if expected == "" {
-		return nil
-	}
-	if strings.TrimSpace(info.NativeSessionID) == expected {
-		return nil
-	}
-	if strings.TrimSpace(operation) == "" {
-		operation = "native Session evidence"
-	}
-	return identityError(operation, "expected native adapter ID %q, received %q", expected, info.NativeSessionID)
-}
-
-// ValidateSessionIdentity checks every stable identity field together. Once a
-// provider-store lookup has verified the canonical ID, a newly observed native
-// ID must equal that canonical ID; matching ACP evidence cannot mask drift.
-func ValidateSessionIdentity(operation string, info SessionInfo, expectedACP, expectedNative, canonical string, providerStoreVerified bool) error {
-	expectedACP = strings.TrimSpace(expectedACP)
-	if expectedACP != "" && strings.TrimSpace(info.ACPSessionID) != expectedACP {
-		return identityError(operation, "expected ACP Session ID %q, received %q", expectedACP, info.ACPSessionID)
-	}
-	if err := ValidateProviderConversation(operation, info, canonical); err != nil {
-		return err
-	}
-	if err := ValidateNativeSessionEvidence(operation, info, expectedNative); err != nil {
-		return err
-	}
-	canonical = strings.TrimSpace(canonical)
-	nativeID := strings.TrimSpace(info.NativeSessionID)
-	if providerStoreVerified && canonical != "" && nativeID != "" && nativeID != canonical {
-		return identityError(operation, "provider-store verified canonical conversation %q, received native adapter ID %q", canonical, nativeID)
+// ValidateProviderRefValue validates only the bounded opaque token shape. It
+// deliberately does not parse or normalize provider-owned identity.
+func ValidateProviderRefValue(operation, value string) error {
+	if issue := providerRefValidationIssue(value); issue != "" {
+		return identityError(operation, "%s", issue)
 	}
 	return nil
+}
+
+func providerRefValidationIssue(value string) string {
+	switch {
+	case value == "":
+		return "missing provider reference"
+	case len(value) > maxProviderRefBytes:
+		return fmt.Sprintf("provider reference exceeds %d bytes", maxProviderRefBytes)
+	case !utf8.ValidString(value):
+		return "provider reference is not valid UTF-8"
+	default:
+		return ""
+	}
 }
 
 type PromptSpec struct {
@@ -164,6 +266,7 @@ type Event struct {
 	Seq          uint64          `json:"seq"`
 	Stream       string          `json:"stream"`
 	Type         string          `json:"type"`
+	PermissionID string          `json:"permissionId,omitempty"`
 	Raw          json.RawMessage `json:"raw"`
 }
 
@@ -171,15 +274,6 @@ type PromptReceipt struct {
 	RequestID  string `json:"requestId"`
 	LastSeq    uint64 `json:"lastSeq"`
 	StopReason string `json:"stopReason,omitempty"`
-}
-
-type Status struct {
-	State           string          `json:"state"`
-	Summary         string          `json:"summary,omitempty"`
-	ACPXRecordID    string          `json:"acpxRecordId,omitempty"`
-	ACPSessionID    string          `json:"acpSessionId,omitempty"`
-	NativeSessionID string          `json:"nativeSessionId,omitempty"`
-	Raw             json.RawMessage `json:"raw"`
 }
 
 type CommandError struct {
@@ -216,6 +310,17 @@ type ProviderTurnError struct {
 	Retryable  bool
 }
 
+// ProviderPermissionRejectedError means the retained provider Port returned a
+// definite, correlated rejection before accepting one permission decision.
+// The caller may retry the same pending callback on that same Port. Every
+// transport, framing, continuity, or ambiguous response failure remains a
+// ProtocolError and makes the retained Port unusable.
+type ProviderPermissionRejectedError struct{}
+
+func (e *ProviderPermissionRejectedError) Error() string {
+	return "provider rejected the permission response; retry an offered response on the same pending permission"
+}
+
 // ProviderConfigurationError is the bounded public failure returned when an
 // ACP adapter cannot apply an explicitly requested model or reasoning effort.
 // It intentionally does not unwrap the provider/bridge error: provider stderr,
@@ -225,6 +330,15 @@ type ProviderConfigurationError struct{}
 
 func (e *ProviderConfigurationError) Error() string {
 	return "provider could not apply the requested model or reasoning effort; leave the controls on Provider default or choose values advertised by the provider"
+}
+
+// ProviderOptionsError is a bounded discovery failure. Provider status is
+// deliberately not wrapped because it may contain paths, credentials, or
+// adapter-specific payloads.
+type ProviderOptionsError struct{}
+
+func (e *ProviderOptionsError) Error() string {
+	return "provider model and reasoning options are unavailable for this Session; retry discovery on the same Session"
 }
 
 func (e *ProviderTurnError) Error() string {
@@ -240,15 +354,6 @@ func (e *ProviderTurnError) Error() string {
 
 func (e *ProtocolError) Error() string {
 	return fmt.Sprintf("acpx %s protocol error: %s", e.Operation, e.Message)
-}
-
-type Client struct {
-	binary   string
-	verified atomic.Bool
-}
-
-func NewClient(binary string) *Client {
-	return &Client{binary: binary}
 }
 
 // FindBinary locates acpx from ACPX_BINARY, PATH, or the documented user-local
@@ -270,12 +375,13 @@ func FindBinary() (string, error) {
 	return "", fmt.Errorf("acpx %s was not found; install with 'npm install --global --prefix ~/.local acpx@%s'", SupportedACPXVersion, SupportedACPXVersion)
 }
 
-// Probe pins the supported pre-1.0 acpx contract before any operation runs.
-func (c *Client) Probe(ctx context.Context) error {
-	if strings.TrimSpace(c.binary) == "" {
+// probeBinary pins the supported pre-1.0 acpx contract before the runtime
+// bridge starts. The gateway has no second detached acpx CLI transport.
+func probeBinary(ctx context.Context, binary string) error {
+	if strings.TrimSpace(binary) == "" {
 		return fmt.Errorf("acpx binary path is required")
 	}
-	command := exec.CommandContext(ctx, c.binary, "--version")
+	command := exec.CommandContext(ctx, binary, "--version")
 	output, err := command.CombinedOutput()
 	if err != nil {
 		return &CommandError{Operation: "version probe", ExitCode: exitCode(err), Stderr: string(output), Cause: err}
@@ -284,229 +390,10 @@ func (c *Client) Probe(ctx context.Context) error {
 	if version != SupportedACPXVersion {
 		return fmt.Errorf("unsupported acpx version %q; Agent Task Console V1 requires %s", version, SupportedACPXVersion)
 	}
-	c.verified.Store(true)
 	return nil
 }
 
 func NewRequestID() (string, error) { return identity.New("REQ") }
-
-func (c *Client) Start(ctx context.Context, spec StartSpec) (SessionInfo, error) {
-	target, err := c.ready(spec.Target)
-	if err != nil {
-		return SessionInfo{}, err
-	}
-	spec.Target = target
-	operation := []string{"sessions", "ensure", "--name", spec.ConsoleSessionID}
-	if spec.ResumeACPSessionID != "" {
-		operation = append(operation, "--resume-session", spec.ResumeACPSessionID)
-	}
-	raw, err := c.runControl(ctx, "session ensure", spec.Target, operation...)
-	if err != nil {
-		return SessionInfo{}, err
-	}
-	return parseSessionInfo(spec.ConsoleSessionID, raw)
-}
-
-func (c *Client) Resume(ctx context.Context, spec StartSpec) (SessionInfo, error) {
-	if strings.TrimSpace(spec.ResumeACPSessionID) == "" {
-		return SessionInfo{}, fmt.Errorf("ACP Session ID is required to resume")
-	}
-	return c.Start(ctx, spec)
-}
-
-func (c *Client) Inspect(ctx context.Context, target Target) (SessionInfo, error) {
-	target, err := c.ready(target)
-	if err != nil {
-		return SessionInfo{}, err
-	}
-	raw, err := c.runControl(ctx, "session inspect", target, "sessions", "show", target.ConsoleSessionID)
-	if err != nil {
-		return SessionInfo{}, err
-	}
-	return parseSessionInfo(target.ConsoleSessionID, raw)
-}
-
-func (c *Client) Status(ctx context.Context, target Target) (Status, error) {
-	target, err := c.ready(target)
-	if err != nil {
-		return Status{}, err
-	}
-	raw, err := c.runControl(ctx, "status", target, "status", "--session", target.ConsoleSessionID)
-	if err != nil {
-		return Status{}, err
-	}
-	var payload map[string]any
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return Status{}, &ProtocolError{Operation: "status", Message: err.Error()}
-	}
-	if stringField(payload, "status") == "" {
-		return Status{}, &ProtocolError{Operation: "status", Message: "missing status"}
-	}
-	return Status{
-		State: stringField(payload, "status"), Summary: stringField(payload, "summary"),
-		ACPXRecordID: stringField(payload, "acpxRecordId"), ACPSessionID: firstString(payload, "acpSessionId", "acpxSessionId"),
-		NativeSessionID: stringField(payload, "agentSessionId"), Raw: cloneRaw(raw),
-	}, nil
-}
-
-func (c *Client) Cancel(ctx context.Context, target Target) error {
-	target, err := c.ready(target)
-	if err != nil {
-		return err
-	}
-	_, err = c.runControl(ctx, "cancel", target, "cancel", "--session", target.ConsoleSessionID)
-	return err
-}
-
-func (c *Client) Prompt(ctx context.Context, spec PromptSpec, emit func(Event) error) (PromptReceipt, error) {
-	target, err := c.ready(spec.Target)
-	if err != nil {
-		return PromptReceipt{}, err
-	}
-	spec.Target = target
-	if strings.TrimSpace(spec.Message) == "" {
-		return PromptReceipt{}, fmt.Errorf("prompt message is required")
-	}
-	if spec.RequestID == "" {
-		requestID, err := NewRequestID()
-		if err != nil {
-			return PromptReceipt{}, err
-		}
-		spec.RequestID = requestID
-	}
-	if emit == nil {
-		emit = func(Event) error { return nil }
-	}
-
-	args := c.commandArgs(spec.Target, "prompt", "--session", spec.ConsoleSessionID, "--", spec.Message)
-	command := exec.CommandContext(ctx, c.binary, args...)
-	command.Dir = spec.WorkingDirectory
-	command.Env = commandEnvironment(spec.Profile.Environment)
-	stdout, err := command.StdoutPipe()
-	if err != nil {
-		return PromptReceipt{}, fmt.Errorf("open acpx prompt stdout: %w", err)
-	}
-	stderr, err := command.StderrPipe()
-	if err != nil {
-		return PromptReceipt{}, fmt.Errorf("open acpx prompt stderr: %w", err)
-	}
-	if err := command.Start(); err != nil {
-		return PromptReceipt{}, &CommandError{Operation: "prompt", ExitCode: -1, Cause: err}
-	}
-
-	var stderrBuffer bytes.Buffer
-	var stderrWait sync.WaitGroup
-	stderrWait.Add(1)
-	go func() {
-		defer stderrWait.Done()
-		_, _ = io.Copy(&stderrBuffer, stderr)
-	}()
-
-	receipt := PromptReceipt{RequestID: spec.RequestID}
-	var streamErr error
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 64*1024), maxStructuredLine)
-	for scanner.Scan() {
-		receipt.LastSeq++
-		raw := cloneRaw(scanner.Bytes())
-		if !json.Valid(raw) {
-			streamErr = &ProtocolError{Operation: "prompt", Message: fmt.Sprintf("malformed JSON at stream line %d", receipt.LastSeq)}
-			break
-		}
-		event, remoteErr := eventFromRaw(spec, receipt.LastSeq, raw)
-		if err := emit(event); err != nil {
-			streamErr = fmt.Errorf("consume acpx prompt event: %w", err)
-			break
-		}
-		if remoteErr != nil {
-			streamErr = remoteErr
-			break
-		}
-		if reason := stopReason(raw); reason != "" {
-			receipt.StopReason = reason
-		}
-	}
-	if err := scanner.Err(); err != nil && streamErr == nil {
-		streamErr = &ProtocolError{Operation: "prompt", Message: err.Error()}
-	}
-	if streamErr != nil && command.Process != nil {
-		_ = command.Process.Kill()
-	}
-	waitErr := command.Wait()
-	stderrWait.Wait()
-	if streamErr != nil {
-		return receipt, streamErr
-	}
-	if waitErr != nil {
-		if ctx.Err() != nil {
-			return receipt, ctx.Err()
-		}
-		return receipt, &CommandError{Operation: "prompt", ExitCode: exitCode(waitErr), Stderr: stderrBuffer.String(), Cause: waitErr}
-	}
-	return receipt, nil
-}
-
-func (c *Client) ready(target Target) (Target, error) {
-	if !c.verified.Load() {
-		return Target{}, fmt.Errorf("acpx compatibility has not been probed")
-	}
-	if err := target.validate(); err != nil {
-		return Target{}, err
-	}
-	workingDirectory, err := gitrepo.CanonicalPath(target.WorkingDirectory)
-	if err != nil {
-		return Target{}, fmt.Errorf("resolve agent working directory %q: %w", target.WorkingDirectory, err)
-	}
-	target.WorkingDirectory = workingDirectory
-	return target, nil
-}
-
-func (c *Client) runControl(ctx context.Context, label string, target Target, operation ...string) (json.RawMessage, error) {
-	args := c.commandArgs(target, operation...)
-	command := exec.CommandContext(ctx, c.binary, args...)
-	command.Dir = target.WorkingDirectory
-	command.Env = commandEnvironment(target.Profile.Environment)
-	var stdout, stderr bytes.Buffer
-	command.Stdout, command.Stderr = &stdout, &stderr
-	if err := command.Run(); err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		if raw, parseErr := singleJSONLine(stdout.Bytes()); parseErr == nil {
-			if remote := jsonRPCError(label, raw); remote != nil {
-				return nil, remote
-			}
-		}
-		detail := stderr.String()
-		if strings.TrimSpace(detail) == "" {
-			detail = stdout.String()
-		}
-		return nil, &CommandError{Operation: label, ExitCode: exitCode(err), Stderr: detail, Cause: err}
-	}
-	raw, err := singleJSONLine(stdout.Bytes())
-	if err != nil {
-		return nil, &ProtocolError{Operation: label, Message: err.Error()}
-	}
-	if remote := jsonRPCError(label, raw); remote != nil {
-		return nil, remote
-	}
-	return raw, nil
-}
-
-func (c *Client) commandArgs(target Target, operation ...string) []string {
-	args := []string{"--cwd", target.WorkingDirectory, "--format", "json", "--json-strict", "--auth-policy", "skip", "--ttl", "300"}
-	if target.Permission == PermissionApproveAll {
-		args = append(args, "--approve-all")
-	} else {
-		args = append(args, "--approve-reads", "--non-interactive-permissions", "fail")
-	}
-	if isBuiltIn(target.Profile) {
-		args = append(args, target.Profile.Command)
-	} else {
-		args = append(args, "--agent", encodeAgentCommand(target.Profile.Argv()))
-	}
-	return append(args, operation...)
-}
 
 func isBuiltIn(profile agents.Profile) bool {
 	if len(profile.Args) != 0 {
@@ -518,172 +405,6 @@ func isBuiltIn(profile agents.Profile) bool {
 	default:
 		return false
 	}
-}
-
-// encodeAgentCommand produces the quoting understood by acpx's parser. The
-// value is passed as one argv item to acpx; no shell evaluates it.
-func encodeAgentCommand(argv []string) string {
-	quoted := make([]string, len(argv))
-	for i, arg := range argv {
-		arg = strings.ReplaceAll(arg, `\`, `\\`)
-		arg = strings.ReplaceAll(arg, `"`, `\"`)
-		quoted[i] = `"` + arg + `"`
-	}
-	return strings.Join(quoted, " ")
-}
-
-func commandEnvironment(overrides map[string]string) []string {
-	environment := make(map[string]string)
-	for _, item := range os.Environ() {
-		name, value, ok := strings.Cut(item, "=")
-		if ok {
-			environment[name] = value
-		}
-	}
-	for name, value := range overrides {
-		environment[name] = value
-	}
-	names := make([]string, 0, len(environment))
-	for name := range environment {
-		names = append(names, name)
-	}
-	// Stable environments make subprocess fixture assertions deterministic.
-	sortStrings(names)
-	result := make([]string, 0, len(names))
-	for _, name := range names {
-		result = append(result, name+"="+environment[name])
-	}
-	return result
-}
-
-func sortStrings(values []string) {
-	for i := 1; i < len(values); i++ {
-		for j := i; j > 0 && values[j] < values[j-1]; j-- {
-			values[j], values[j-1] = values[j-1], values[j]
-		}
-	}
-}
-
-func singleJSONLine(output []byte) (json.RawMessage, error) {
-	lines := bytes.Split(bytes.TrimSpace(output), []byte("\n"))
-	if len(lines) != 1 || len(lines[0]) == 0 {
-		return nil, fmt.Errorf("expected one JSON object, received %d lines", len(lines))
-	}
-	if !json.Valid(lines[0]) {
-		return nil, fmt.Errorf("malformed JSON output")
-	}
-	return cloneRaw(lines[0]), nil
-}
-
-func parseSessionInfo(consoleID string, raw json.RawMessage) (SessionInfo, error) {
-	var payload map[string]any
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return SessionInfo{}, &ProtocolError{Operation: "session metadata", Message: err.Error()}
-	}
-	acpxRecordID := stringField(payload, "acpxRecordId")
-	if acpxRecordID == "" {
-		return SessionInfo{}, &ProtocolError{Operation: "session metadata", Message: "missing acpxRecordId"}
-	}
-	return SessionInfo{
-		ConsoleSessionID: consoleID, ACPXRecordID: acpxRecordID,
-		ACPSessionID:    firstString(payload, "acpSessionId", "acpxSessionId"),
-		NativeSessionID: stringField(payload, "agentSessionId"), Raw: cloneRaw(raw),
-	}, nil
-}
-
-func eventFromRaw(spec PromptSpec, sequence uint64, raw json.RawMessage) (Event, error) {
-	var payload map[string]any
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return Event{}, err
-	}
-	event := Event{
-		EventVersion: 1, SessionID: findSessionID(payload), RequestID: spec.RequestID,
-		Seq: sequence, Stream: "prompt", Type: eventType(payload), Raw: cloneRaw(raw),
-	}
-	return event, jsonRPCError("prompt", raw)
-}
-
-func eventType(payload map[string]any) string {
-	if value := stringField(payload, "type"); value != "" {
-		return value
-	}
-	if method := stringField(payload, "method"); method != "" {
-		if method == "session/update" {
-			if params, ok := payload["params"].(map[string]any); ok {
-				if update, ok := params["update"].(map[string]any); ok {
-					if kind := stringField(update, "sessionUpdate"); kind != "" {
-						return kind
-					}
-				}
-			}
-			return "session_update"
-		}
-		return strings.ReplaceAll(method, "/", "_")
-	}
-	if _, ok := payload["error"]; ok {
-		return "error"
-	}
-	if result, ok := payload["result"].(map[string]any); ok {
-		if _, exists := result["stopReason"]; exists {
-			return "prompt_result"
-		}
-	}
-	return "rpc"
-}
-
-func findSessionID(payload map[string]any) string {
-	if id := stringField(payload, "sessionId"); id != "" {
-		return id
-	}
-	for _, key := range []string{"params", "result"} {
-		if nested, ok := payload[key].(map[string]any); ok {
-			if id := stringField(nested, "sessionId"); id != "" {
-				return id
-			}
-		}
-	}
-	return ""
-}
-
-func stopReason(raw json.RawMessage) string {
-	var payload map[string]any
-	if json.Unmarshal(raw, &payload) != nil {
-		return ""
-	}
-	result, _ := payload["result"].(map[string]any)
-	return stringField(result, "stopReason")
-}
-
-func jsonRPCError(operation string, raw json.RawMessage) error {
-	var payload struct {
-		Error *struct {
-			Code    int             `json:"code"`
-			Message string          `json:"message"`
-			Data    json.RawMessage `json:"data"`
-		} `json:"error"`
-	}
-	if json.Unmarshal(raw, &payload) != nil || payload.Error == nil {
-		return nil
-	}
-	message := fmt.Sprintf("RPC %d: %s", payload.Error.Code, payload.Error.Message)
-	return &ProtocolError{Operation: operation, Message: message}
-}
-
-func stringField(payload map[string]any, key string) string {
-	if payload == nil {
-		return ""
-	}
-	value, _ := payload[key].(string)
-	return value
-}
-
-func firstString(payload map[string]any, keys ...string) string {
-	for _, key := range keys {
-		if value := stringField(payload, key); value != "" {
-			return value
-		}
-	}
-	return ""
 }
 
 func cloneRaw(value []byte) json.RawMessage {

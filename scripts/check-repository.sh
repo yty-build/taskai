@@ -62,7 +62,7 @@ if [ "$actual_tables" != "$expected_tables" ]; then
   exit 1
 fi
 
-for fixture in scripts/acceptance.sh scripts/check-repository.sh internal/acp/testdata/fake-acpx internal/native/testdata/fake-native; do
+for fixture in scripts/acceptance.sh scripts/check-repository.sh internal/acp/testdata/fake-acpx; do
   if [ ! -x "$fixture" ]; then
     printf 'deterministic fixture is not executable: %s\n' "$fixture" >&2
     exit 1

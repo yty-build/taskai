@@ -11,16 +11,32 @@ import (
 	"unicode/utf8"
 
 	"github.com/charmbracelet/x/ansi"
-	"github.com/yty-build/acp-gateway/internal/acp"
 	"github.com/yty-build/acp-gateway/internal/sessionlog"
 	"github.com/yty-build/acp-gateway/internal/worker"
 )
 
 const (
-	maxProjectedMessageBytes = 128 << 10
-	maxProjectedThoughtBytes = 32 << 10
-	maxToolDetailBytes       = 64 << 10
-	maxToolPreviewBytes      = 2 << 10
+	maxProjectedMessageBytes      = 128 << 10
+	maxProjectedThoughtBytes      = 32 << 10
+	maxProjectedErrorBytes        = 4 << 10
+	maxProjectedIdentifierBytes   = 256
+	maxProjectedPermissionIDBytes = 512
+	maxProjectedTitleBytes        = 1 << 10
+	maxProjectedMetadataBytes     = 2 << 10
+	maxProjectedKindBytes         = 128
+	maxProjectedStatusBytes       = 128
+	maxProjectedStopBytes         = 256
+	maxProjectedDecisionBytes     = 1 << 10
+	maxToolDetailBytes            = 64 << 10
+	maxToolPreviewBytes           = 2 << 10
+	maxProjectedRequests          = 128
+	maxProjectedTools             = 128
+	maxProjectedPermissions       = 128
+	maxProjectedPermissionOptions = 16
+	maxProjectedBlocks            = 512
+	maxProjectedErrorBlocks       = 16
+	maxProjectedLocations         = 32
+	maxToolPayloadDigests         = 64
 )
 
 // transcript is an incremental, viewer-only projection of append-only Session
@@ -29,27 +45,17 @@ const (
 type transcript struct {
 	requests []*transcriptRequest
 	byID     map[string]*transcriptRequest
-	seen     map[uint64]struct{}
-	metadata transcriptMetadata
-}
-
-type transcriptMetadata struct {
-	lastSequence uint64
-	usage        string
-	mode         string
-	model        string
-	commands     int
+	lastSeq  uint64
+	clipped  bool
 }
 
 type transcriptRequest struct {
 	id             string
-	committed      bool
 	state          turnState
 	stop           string
 	errorText      string
 	blocks         []*transcriptBlock
 	tools          map[string]*toolCard
-	plan           *transcriptBlock
 	permission     map[string]*permissionCard
 	assistantBytes int
 	thoughtBytes   int
@@ -62,7 +68,6 @@ type turnState string
 
 const (
 	turnReady      turnState = "ready"
-	turnQueued     turnState = "queued"
 	turnLive       turnState = "live"
 	turnCancelling turnState = "cancelling"
 	turnComplete   turnState = "complete"
@@ -78,26 +83,17 @@ const (
 	blockAssistant
 	blockThought
 	blockTool
-	blockPlan
 	blockPermission
 	blockError
 )
 
 type transcriptBlock struct {
 	kind       blockKind
-	source     string
 	id         string
 	text       string
-	legacy     bool
 	truncated  bool
 	tool       *toolCard
-	plan       []planEntry
 	permission *permissionCard
-}
-
-type planEntry struct {
-	content string
-	status  string
 }
 
 type toolCard struct {
@@ -131,79 +127,99 @@ type permissionOption struct {
 	kind string
 }
 
-func newTranscript() *transcript {
-	return &transcript{byID: make(map[string]*transcriptRequest), seen: make(map[uint64]struct{})}
+type projectionUsage struct {
+	bytes   int
+	objects int
+}
+
+func newTranscript() *transcript { return &transcript{byID: make(map[string]*transcriptRequest)} }
+
+func (t *transcript) retainedUsage() projectionUsage {
+	if t == nil {
+		return projectionUsage{}
+	}
+	usage := projectionUsage{bytes: 512, objects: 1}
+	for _, request := range t.requests {
+		usage.add(1024, request.id, request.stop, request.errorText)
+		for _, block := range request.blocks {
+			usage.add(192, block.id, block.text)
+		}
+		for _, tool := range request.tools {
+			usage.add(1024, tool.id, tool.title, tool.kind, tool.status, tool.metadata,
+				tool.preview, tool.detail, tool.detailLabel)
+			usage.bytes += len(tool.seenPayloads) * 64
+			usage.objects += len(tool.seenPayloads)
+		}
+		for _, permission := range request.permission {
+			usage.add(512, permission.id, permission.title, permission.kind, permission.state, permission.decision)
+			for _, option := range permission.options {
+				usage.add(192, option.id, option.name, option.kind)
+			}
+		}
+	}
+	return usage
+}
+
+func (u *projectionUsage) add(overhead int, values ...string) {
+	u.bytes += overhead
+	u.objects++
+	for _, value := range values {
+		u.bytes += len(value)
+	}
 }
 
 func (t *transcript) apply(line sessionlog.Line) bool {
 	if line.Seq == 0 {
 		return false
 	}
-	if _, duplicate := t.seen[line.Seq]; duplicate {
+	if line.Seq <= t.lastSeq {
 		return false
 	}
-	t.seen[line.Seq] = struct{}{}
-	if line.Seq > t.metadata.lastSequence {
-		t.metadata.lastSequence = line.Seq
+	if (t.lastSeq == 0 && line.Seq > 1) || (t.lastSeq != 0 && line.Seq != t.lastSeq+1) {
+		t.clipped = true
 	}
-
+	t.lastSeq = line.Seq
 	request := t.request(line.RequestID)
 	switch line.Type {
-	case "prompt_submitted":
-		message := jsonString(line.Data, "display_message")
-		if message == "" {
-			message = jsonString(line.Data, "message")
+	case worker.FrameClientCommand:
+		command := jsonString(line.Data, "command")
+		if request == nil {
+			break
 		}
-		if message != "" && request != nil {
-			request.setUserMessage(message, false)
-		}
-	case "prompt_ready":
-		if request != nil && request.state == "" {
+		switch command {
+		case "prompt":
+			request.setUserMessage(jsonString(line.Data, "text"))
 			request.state = turnReady
-		}
-	case "prompt_queued":
-		if request != nil && request.state == "" {
-			request.state = turnQueued
-		}
-	case "turn_started":
-		if request != nil {
-			request.state = turnLive
-		}
-	case "cancel_requested":
-		if request != nil {
+		case "cancel":
 			request.state = turnCancelling
 		}
-	case "turn_completed":
+	case worker.FrameProviderEvent:
 		if request != nil {
-			request.stop = jsonString(line.Data, "stopReason")
-			if request.stop == "cancelled" || request.state == turnCancelling {
-				request.state = turnCancelled
-			} else {
-				request.state = turnComplete
-			}
+			request.state = turnLive
+			t.applyProviderEvent(request, line.Data)
 		}
-	case "turn_error", "worker_error":
+	case worker.FrameProviderResult:
+		if request != nil {
+			request.applyProviderResult(line.Data)
+		}
+	case worker.FrameWorkerError:
 		if request == nil {
 			request = t.request(syntheticRequestID(line.Seq))
 		}
 		request.state = turnFailed
-		request.errorText = sanitizeDisplay(jsonString(line.Data, "message"))
-		if request.errorText == "" {
-			request.errorText = "The provider turn failed."
-		}
-		request.blocks = append(request.blocks, &transcriptBlock{kind: blockError, text: request.errorText})
-	case "permission_resolved":
+		request.appendError(jsonString(line.Data, "message"), "The Session worker encountered an error.")
+	case worker.FramePermissionResolved:
 		if request != nil {
 			request.resolvePermission(jsonString(line.Data, "permission_id"), jsonString(line.Data, "decision"))
 		}
-	case "permission_requested":
+	case worker.FramePermissionRequested:
 		if request != nil {
 			var pending worker.PendingPermission
 			if json.Unmarshal(line.Data, &pending) == nil {
 				request.upsertWorkerPermission(pending)
 			}
 		}
-	case "permission_abandoned":
+	case worker.FramePermissionAbandoned:
 		if request != nil {
 			decision := "cancelled"
 			if message := jsonString(line.Data, "message"); message != "" {
@@ -211,16 +227,75 @@ func (t *transcript) apply(line sessionlog.Line) bool {
 			}
 			request.resolvePermission(jsonString(line.Data, "permission_id"), decision)
 		}
-	case "acp":
-		t.applyACP(request, line)
 	}
 	return true
 }
 
+func (t *transcript) applyProviderEvent(request *transcriptRequest, data json.RawMessage) {
+	var event map[string]any
+	if json.Unmarshal(data, &event) != nil {
+		return
+	}
+	switch stringValue(event["type"]) {
+	case "text_delta":
+		text := stringValue(event["text"])
+		if stream := strings.ToLower(stringValue(event["stream"])); stream == "thought" || stream == "reasoning" {
+			request.appendThought(text)
+		} else {
+			request.appendMessage(blockAssistant, text, firstNonEmpty(stringValue(event["message_id"]), stringValue(event["messageId"])), maxProjectedMessageBytes)
+		}
+	case "tool_call":
+		request.upsertTool(normalizedToolUpdate(event))
+	case "error":
+		message := firstNonEmpty(stringValue(event["message"]), stringValue(object(event["error"])["message"]))
+		if message != "" {
+			request.state = turnFailed
+			request.appendError(message, "The provider reported an error.")
+		}
+	}
+}
+
+func normalizedToolUpdate(event map[string]any) map[string]any {
+	update := event
+	for _, key := range []string{"tool_call", "toolCall", "update"} {
+		if nested := object(event[key]); len(nested) > 0 {
+			update = nested
+			break
+		}
+	}
+	copy := make(map[string]any, len(update)+1)
+	for key, value := range update {
+		copy[key] = value
+	}
+	copy["toolCallId"] = firstNonEmpty(
+		stringValue(update["toolCallId"]), stringValue(update["tool_call_id"]), stringValue(update["id"]),
+	)
+	return copy
+}
+
+func (r *transcriptRequest) applyProviderResult(data json.RawMessage) {
+	status := strings.ToLower(jsonString(data, "status"))
+	var stopClipped bool
+	r.stop, stopClipped = boundedInline(jsonString(data, "stop_reason"), maxProjectedStopBytes)
+	r.contentClipped = r.contentClipped || stopClipped
+	switch status {
+	case "completed":
+		r.state = turnComplete
+	case "cancelled":
+		r.state = turnCancelled
+	case "failed":
+		r.state = turnFailed
+		r.appendError(jsonString(data, "message"), "The provider turn failed.")
+	}
+}
+
 func (t *transcript) request(id string) *transcriptRequest {
+	var idClipped bool
+	id, idClipped = boundedIdentifier(id, maxProjectedIdentifierBytes)
 	if strings.TrimSpace(id) == "" {
 		return nil
 	}
+	t.clipped = t.clipped || idClipped
 	if existing := t.byID[id]; existing != nil {
 		return existing
 	}
@@ -229,107 +304,32 @@ func (t *transcript) request(id string) *transcriptRequest {
 	}
 	t.byID[id] = request
 	t.requests = append(t.requests, request)
+	if len(t.requests) > maxProjectedRequests {
+		removed := t.requests[0]
+		delete(t.byID, removed.id)
+		t.requests = append([]*transcriptRequest(nil), t.requests[1:]...)
+		t.clipped = true
+	}
 	return request
 }
 
-func (t *transcript) applyACP(request *transcriptRequest, line sessionlog.Line) {
-	var event acp.Event
-	if json.Unmarshal(line.Data, &event) != nil {
-		return
-	}
-	var raw map[string]any
-	if json.Unmarshal(event.Raw, &raw) != nil {
-		return
-	}
-	if request == nil && event.RequestID != "" {
-		request = t.request(event.RequestID)
-	}
-	if request == nil {
-		t.applyACPMetadata(event.Type, raw)
-		return
-	}
-
-	params := object(raw["params"])
-	update := object(params["update"])
-	switch event.Type {
-	case "session_prompt":
-		request.setUserMessage(legacyDisplayMessage(sessionPromptText(params["prompt"])), true)
-	case "agent_message_chunk":
-		request.appendMessage(blockAssistant, stringValue(object(update["content"])["text"]), stringValue(update["messageId"]), maxProjectedMessageBytes)
-	case "agent_thought_chunk":
-		request.appendThought(stringValue(object(update["content"])["text"]))
-	case "user_message_chunk":
-		// prompt_submitted is the truthful user-facing source. Provider echoes
-		// are metadata and must not duplicate or reconstruct an injected prompt.
-	case "tool_call", "tool_call_update":
-		request.upsertTool(update)
-	case "plan", "plan_update":
-		request.upsertPlan(update)
-	case "session_request_permission":
-		request.upsertPermission(raw)
-	case "error":
-		message := stringValue(object(raw["error"])["message"])
-		if message != "" {
-			request.state = turnFailed
-			request.errorText = sanitizeDisplay(message)
-			request.blocks = append(request.blocks, &transcriptBlock{kind: blockError, text: request.errorText})
-		}
-	case "prompt_result":
-		result := object(raw["result"])
-		if stop := stringValue(result["stopReason"]); stop != "" {
-			request.stop = stop
-			if stop == "cancelled" {
-				request.state = turnCancelled
-			}
-		}
-	default:
-		t.applyACPMetadata(event.Type, raw)
-	}
-}
-
-func (t *transcript) applyACPMetadata(eventType string, raw map[string]any) {
-	params := object(raw["params"])
-	update := object(params["update"])
-	switch eventType {
-	case "usage_update":
-		if used := numberValue(update["used"]); used > 0 {
-			t.metadata.usage = fmt.Sprintf("%.0f", used)
-		}
-	case "available_commands_update":
-		if commands, ok := update["availableCommands"].([]any); ok {
-			t.metadata.commands = len(commands)
-		}
-	case "session_info_update":
-		t.metadata.mode = firstNonEmpty(stringValue(update["modeId"]), t.metadata.mode)
-		t.metadata.model = firstNonEmpty(stringValue(update["modelId"]), t.metadata.model)
-	}
-}
-
-func (r *transcriptRequest) hasUserMessage() bool {
-	for _, block := range r.blocks {
-		if block.kind == blockUser {
-			return true
-		}
-	}
-	return false
-}
-
-func (r *transcriptRequest) setUserMessage(text string, legacy bool) {
+func (r *transcriptRequest) setUserMessage(text string) {
 	text = sanitizeDisplay(text)
 	if strings.TrimSpace(text) == "" {
 		return
 	}
+	var clipped bool
+	text, clipped = truncateUTF8(text, maxProjectedMessageBytes)
+	r.contentClipped = r.contentClipped || clipped
 	for _, block := range r.blocks {
 		if block.kind != blockUser {
 			continue
 		}
-		if block.legacy && !legacy {
-			block.text = text
-			block.legacy = false
-		}
+		block.text = text
+		block.truncated = block.truncated || clipped
 		return
 	}
-	r.blocks = append(r.blocks, &transcriptBlock{kind: blockUser, text: text, legacy: legacy})
+	r.appendBlock(&transcriptBlock{kind: blockUser, text: text, truncated: clipped})
 }
 
 func (r *transcriptRequest) appendMessage(kind blockKind, text, id string, limit int) {
@@ -340,6 +340,9 @@ func (r *transcriptRequest) appendMessage(kind blockKind, text, id string, limit
 	if kind == blockAssistant && strings.TrimSpace(text) != "" {
 		r.assistantSeen = true
 	}
+	var idClipped bool
+	id, idClipped = boundedInline(id, maxProjectedIdentifierBytes)
+	r.contentClipped = r.contentClipped || idClipped
 	text, clipped := truncateUTF8Tail(text, limit)
 	r.contentClipped = r.contentClipped || clipped
 	r.makeRollingTextRoom(kind, len(text), limit)
@@ -352,7 +355,9 @@ func (r *transcriptRequest) appendMessage(kind blockKind, text, id string, limit
 	}
 	if block == nil {
 		block = &transcriptBlock{kind: kind, id: id}
-		r.blocks = append(r.blocks, block)
+		if !r.appendBlock(block) {
+			return
+		}
 	}
 	block.text += text
 	block.truncated = block.truncated || clipped
@@ -376,11 +381,49 @@ func (r *transcriptRequest) appendThought(text string) {
 	}
 	if block == nil {
 		block = &transcriptBlock{kind: blockThought}
-		r.blocks = append(r.blocks, block)
+		if !r.appendBlock(block) {
+			return
+		}
 	}
 	block.text += text
 	block.truncated = block.truncated || clipped
 	r.addRetainedBytes(blockThought, len(text))
+}
+
+func (r *transcriptRequest) appendBlock(block *transcriptBlock) bool {
+	if len(r.blocks) >= maxProjectedBlocks {
+		r.contentClipped = true
+		return false
+	}
+	r.blocks = append(r.blocks, block)
+	return true
+}
+
+func (r *transcriptRequest) appendError(message, fallback string) {
+	message = sanitizeDisplay(message)
+	if strings.TrimSpace(message) == "" {
+		message = fallback
+	}
+	message, clipped := truncateUTF8(message, maxProjectedErrorBytes)
+	r.errorText = message
+	r.contentClipped = r.contentClipped || clipped
+	errorBlocks := 0
+	lastError := -1
+	for index, block := range r.blocks {
+		if block.kind == blockError {
+			errorBlocks++
+			lastError = index
+		}
+	}
+	if errorBlocks >= maxProjectedErrorBlocks || len(r.blocks) >= maxProjectedBlocks {
+		r.contentClipped = true
+		if lastError >= 0 {
+			r.blocks[lastError].text = message
+			r.blocks[lastError].truncated = true
+		}
+		return
+	}
+	r.appendBlock(&transcriptBlock{kind: blockError, text: message, truncated: clipped})
 }
 
 func (r *transcriptRequest) retainedBytes(kind blockKind) int {
@@ -443,97 +486,88 @@ func (r *transcriptRequest) hasRetainedReasoning() bool {
 }
 
 func (r *transcriptRequest) upsertTool(update map[string]any) {
-	id := stringValue(update["toolCallId"])
+	id, idClipped := boundedInline(stringValue(update["toolCallId"]), maxProjectedIdentifierBytes)
+	r.contentClipped = r.contentClipped || idClipped
 	if id == "" {
 		return
 	}
 	tool := r.tools[id]
 	if tool == nil {
+		if len(r.tools) >= maxProjectedTools {
+			r.contentClipped = true
+			return
+		}
 		tool = &toolCard{id: id, seenPayloads: make(map[[sha256.Size]byte]struct{})}
+		if !r.appendBlock(&transcriptBlock{kind: blockTool, id: id, tool: tool}) {
+			return
+		}
 		r.tools[id] = tool
-		r.blocks = append(r.blocks, &transcriptBlock{kind: blockTool, id: id, tool: tool})
 	}
-	tool.title = mergeField(tool.title, stringValue(update["title"]))
-	tool.kind = mergeField(tool.kind, stringValue(update["kind"]))
-	tool.status = mergeField(tool.status, stringValue(update["status"]))
-	tool.metadata = mergeField(tool.metadata, toolMetadata(update))
+	tool.title = r.mergeProjectedField(tool.title, stringValue(update["title"]), maxProjectedTitleBytes)
+	tool.kind = r.mergeProjectedField(tool.kind, stringValue(update["kind"]), maxProjectedKindBytes)
+	tool.status = r.mergeProjectedField(tool.status, stringValue(update["status"]), maxProjectedStatusBytes)
+	metadata, metadataClipped := toolMetadata(update)
+	r.contentClipped = r.contentClipped || metadataClipped
+	tool.metadata = r.mergeProjectedField(tool.metadata, metadata, maxProjectedMetadataBytes)
 	tool.consumePayloads(update)
-}
-
-func (r *transcriptRequest) upsertPlan(update map[string]any) {
-	entries, _ := update["entries"].([]any)
-	if r.plan == nil {
-		r.plan = &transcriptBlock{kind: blockPlan}
-		r.blocks = append(r.blocks, r.plan)
-	}
-	if entries == nil {
-		return
-	}
-	latest := make([]planEntry, 0, len(entries))
-	for _, value := range entries {
-		entry := object(value)
-		content := sanitizeDisplay(stringValue(entry["content"]))
-		if content == "" {
-			continue
-		}
-		latest = append(latest, planEntry{content: content, status: sanitizeInline(stringValue(entry["status"]))})
-	}
-	r.plan.plan = latest
-}
-
-func (r *transcriptRequest) upsertPermission(raw map[string]any) {
-	params := object(raw["params"])
-	tool := object(params["toolCall"])
-	bridgeID := permissionRPCID(raw["id"])
-	if bridgeID == "" {
-		return
-	}
-	id := worker.PermissionConsoleID(r.id, bridgeID)
-	card := r.permission[id]
-	if card == nil {
-		card = &permissionCard{id: id, state: "waiting"}
-		r.permission[id] = card
-		r.blocks = append(r.blocks, &transcriptBlock{kind: blockPermission, id: id, permission: card})
-	}
-	card.title = mergeField(card.title, stringValue(tool["title"]))
-	card.kind = mergeField(card.kind, stringValue(tool["kind"]))
-	if values, ok := params["options"].([]any); ok && len(values) > 0 {
-		options := make([]permissionOption, 0, len(values))
-		for _, value := range values {
-			option := object(value)
-			options = append(options, permissionOption{
-				id: stringValue(option["optionId"]), name: sanitizeInline(stringValue(option["name"])), kind: stringValue(option["kind"]),
-			})
-		}
-		card.options = options
-	}
+	r.contentClipped = r.contentClipped || tool.detailClipped
 }
 
 func (r *transcriptRequest) upsertWorkerPermission(pending worker.PendingPermission) {
-	if pending.ID == "" {
+	id, idClipped := boundedIdentifier(pending.ID, maxProjectedPermissionIDBytes)
+	r.contentClipped = r.contentClipped || idClipped
+	if id == "" {
 		return
 	}
-	card := r.permission[pending.ID]
+	card := r.permission[id]
 	if card == nil {
-		card = &permissionCard{id: pending.ID, state: "waiting"}
-		r.permission[pending.ID] = card
-		r.blocks = append(r.blocks, &transcriptBlock{kind: blockPermission, id: pending.ID, permission: card})
-	}
-	card.title = mergeField(card.title, pending.Title)
-	card.kind = mergeField(card.kind, pending.Kind)
-	if len(pending.Options) > 0 {
-		card.options = card.options[:0]
-		for _, option := range pending.Options {
-			card.options = append(card.options, permissionOption{id: option.ID, name: sanitizeInline(option.Name), kind: option.Kind})
+		if len(r.permission) >= maxProjectedPermissions {
+			r.contentClipped = true
+			return
 		}
+		card = &permissionCard{id: id, state: "waiting"}
+		if !r.appendBlock(&transcriptBlock{kind: blockPermission, id: id, permission: card}) {
+			return
+		}
+		r.permission[id] = card
+	}
+	card.state = "waiting"
+	card.decision = ""
+	card.title = r.mergeProjectedField(card.title, pending.Title, maxProjectedTitleBytes)
+	card.kind = r.mergeProjectedField(card.kind, pending.Kind, maxProjectedKindBytes)
+	optionCount := min(len(pending.Options), maxProjectedPermissionOptions)
+	card.options = make([]permissionOption, 0, optionCount)
+	if len(pending.Options) > optionCount {
+		r.contentClipped = true
+	}
+	for _, option := range pending.Options[:optionCount] {
+		optionID, optionIDClipped := boundedIdentifier(option.ID, maxProjectedIdentifierBytes)
+		name, nameClipped := boundedInline(option.Name, maxProjectedTitleBytes)
+		kind, kindClipped := boundedInline(option.Kind, maxProjectedKindBytes)
+		r.contentClipped = r.contentClipped || optionIDClipped || nameClipped || kindClipped
+		card.options = append(card.options, permissionOption{id: optionID, name: name, kind: kind})
 	}
 }
 
 func (r *transcriptRequest) resolvePermission(id, decision string) {
+	var idClipped bool
+	id, idClipped = boundedIdentifier(id, maxProjectedPermissionIDBytes)
+	r.contentClipped = r.contentClipped || idClipped
 	if card := r.permission[id]; card != nil {
 		card.state = "resolved"
-		card.decision = sanitizeInline(decision)
+		var decisionClipped bool
+		card.decision, decisionClipped = boundedInline(decision, maxProjectedDecisionBytes)
+		r.contentClipped = r.contentClipped || decisionClipped
 	}
+}
+
+func (r *transcriptRequest) mergeProjectedField(existing, next string, limit int) string {
+	next, clipped := boundedInline(next, limit)
+	r.contentClipped = r.contentClipped || clipped
+	if next == "" {
+		return existing
+	}
+	return next
 }
 
 func (t *toolCard) consumePayloads(update map[string]any) {
@@ -552,6 +586,10 @@ func (t *toolCard) consumePayload(label string, value any, sensitive bool) {
 	}
 	digest := sha256.Sum256([]byte(text))
 	if _, duplicate := t.seenPayloads[digest]; duplicate {
+		return
+	}
+	if len(t.seenPayloads) >= maxToolPayloadDigests {
+		t.detailClipped = true
 		return
 	}
 	t.seenPayloads[digest] = struct{}{}
@@ -575,7 +613,9 @@ func (t *toolCard) consumePayload(label string, value any, sensitive bool) {
 	}
 	t.sensitive = t.sensitive || sensitive
 	t.detailLabel = label
-	t.detail, t.detailClipped = truncateUTF8(clean, maxToolDetailBytes)
+	var clipped bool
+	t.detail, clipped = truncateUTF8(clean, maxToolDetailBytes)
+	t.detailClipped = t.detailClipped || clipped
 	if !sensitive && bytes <= maxToolPreviewBytes {
 		t.preview = previewLines(clean, 3, 280)
 	} else {
@@ -594,6 +634,142 @@ func (t *transcript) pendingPermission() (*transcriptRequest, *permissionCard) {
 		}
 	}
 	return nil, nil
+}
+
+func boundedPendingPermissions(snapshot []worker.PendingPermission) ([]worker.PendingPermission, bool) {
+	count := min(len(snapshot), maxProjectedPermissions)
+	result := make([]worker.PendingPermission, 0, count)
+	clipped := len(snapshot) > count
+	for _, pending := range snapshot[:count] {
+		bounded := worker.PendingPermission{}
+		var fieldClipped bool
+		bounded.ID, fieldClipped = boundedIdentifier(pending.ID, maxProjectedPermissionIDBytes)
+		clipped = clipped || fieldClipped
+		bounded.RequestID, fieldClipped = boundedIdentifier(pending.RequestID, maxProjectedIdentifierBytes)
+		clipped = clipped || fieldClipped
+		bounded.Title, fieldClipped = boundedInline(pending.Title, maxProjectedTitleBytes)
+		clipped = clipped || fieldClipped
+		bounded.Kind, fieldClipped = boundedInline(pending.Kind, maxProjectedKindBytes)
+		clipped = clipped || fieldClipped
+		optionCount := min(len(pending.Options), maxProjectedPermissionOptions)
+		if len(pending.Options) > optionCount {
+			clipped = true
+		}
+		bounded.Options = make([]worker.PermissionOption, 0, optionCount)
+		for _, option := range pending.Options[:optionCount] {
+			boundedOption := worker.PermissionOption{}
+			boundedOption.ID, fieldClipped = boundedIdentifier(option.ID, maxProjectedIdentifierBytes)
+			clipped = clipped || fieldClipped
+			boundedOption.Name, fieldClipped = boundedInline(option.Name, maxProjectedTitleBytes)
+			clipped = clipped || fieldClipped
+			boundedOption.Kind, fieldClipped = boundedInline(option.Kind, maxProjectedKindBytes)
+			clipped = clipped || fieldClipped
+			bounded.Options = append(bounded.Options, boundedOption)
+		}
+		result = append(result, bounded)
+	}
+	return result, clipped
+}
+
+// reconcilePendingPermissions merges the worker's bounded status snapshot into
+// this disposable projection. The snapshot is authoritative for which cards
+// are still waiting; it does not synthesize Session Channel frames or advance
+// the replay cursor.
+func (t *transcript) reconcilePendingPermissions(snapshot []worker.PendingPermission) {
+	if t == nil {
+		return
+	}
+	limit := min(len(snapshot), maxProjectedPermissions)
+	if len(snapshot) > limit {
+		t.clipped = true
+	}
+	waiting := make(map[*permissionCard]struct{}, limit)
+	for _, pending := range snapshot[:limit] {
+		request := t.request(pending.RequestID)
+		if request == nil {
+			t.clipped = true
+			continue
+		}
+		request.upsertWorkerPermission(pending)
+		id, _ := boundedIdentifier(pending.ID, maxProjectedPermissionIDBytes)
+		if card := request.permission[id]; card != nil {
+			waiting[card] = struct{}{}
+		}
+	}
+	for _, request := range t.requests {
+		for _, card := range request.permission {
+			if card.state != "waiting" {
+				continue
+			}
+			if _, current := waiting[card]; current {
+				continue
+			}
+			card.state = "resolved"
+			card.decision = ""
+		}
+	}
+}
+
+func (t *transcript) compactToPendingPermissions() bool {
+	type retainedRequest struct {
+		request *transcriptRequest
+		cards   []*permissionCard
+	}
+	retained := make([]retainedRequest, 0, len(t.requests))
+	alreadyCompact := true
+	for _, request := range t.requests {
+		cards := make([]*permissionCard, 0, len(request.permission))
+		for _, block := range request.blocks {
+			if block.permission != nil && block.permission.state == "waiting" {
+				cards = append(cards, block.permission)
+			}
+		}
+		if len(cards) == 0 {
+			alreadyCompact = false
+			continue
+		}
+		retained = append(retained, retainedRequest{request: request, cards: cards})
+		if len(request.blocks) != len(cards) || len(request.tools) != 0 || len(request.permission) != len(cards) ||
+			request.stop != "" || request.errorText != "" || request.assistantBytes != 0 || request.thoughtBytes != 0 {
+			alreadyCompact = false
+			continue
+		}
+		for index, block := range request.blocks {
+			if block.permission != cards[index] {
+				alreadyCompact = false
+				break
+			}
+		}
+	}
+	if len(retained) == 0 || alreadyCompact && len(retained) == len(t.requests) {
+		return false
+	}
+
+	requests := make([]*transcriptRequest, 0, len(retained))
+	byID := make(map[string]*transcriptRequest, len(retained))
+	for _, item := range retained {
+		request := item.request
+		blocks := make([]*transcriptBlock, 0, len(item.cards))
+		permissions := make(map[string]*permissionCard, len(item.cards))
+		for _, card := range item.cards {
+			blocks = append(blocks, &transcriptBlock{kind: blockPermission, id: card.id, permission: card})
+			permissions[card.id] = card
+		}
+		request.stop = ""
+		request.errorText = ""
+		request.blocks = blocks
+		request.tools = make(map[string]*toolCard)
+		request.permission = permissions
+		request.assistantBytes = 0
+		request.thoughtBytes = 0
+		request.contentClipped = true
+		requests = append(requests, request)
+		byID[request.id] = request
+	}
+	t.requests = requests
+	t.byID = byID
+	t.clipped = true
+	return true
 }
 
 func (t *transcript) tools() []*toolCard {
@@ -689,49 +865,6 @@ func payloadText(value any) (string, int) {
 	return "", 0
 }
 
-func sessionPromptText(value any) string {
-	items, _ := value.([]any)
-	var parts []string
-	for _, item := range items {
-		entry := object(item)
-		if text := stringValue(entry["text"]); text != "" {
-			parts = append(parts, text)
-		}
-	}
-	return strings.Join(parts, "\n")
-}
-
-func legacyDisplayMessage(value string) string {
-	value = sanitizeDisplay(value)
-	lines := strings.Split(value, "\n")
-	if len(lines) == 0 || !strings.HasPrefix(lines[0], "Task ") || !strings.Contains(lines[0], ":") {
-		return value
-	}
-	title := strings.TrimSpace(strings.SplitN(lines[0], ":", 2)[1])
-	description, role := "", "worker"
-	for _, line := range lines[1:] {
-		switch {
-		case strings.HasPrefix(line, "Description: "):
-			description = strings.TrimSpace(strings.TrimPrefix(line, "Description: "))
-		case strings.HasPrefix(line, "Role: "):
-			role = strings.TrimSpace(strings.TrimPrefix(line, "Role: "))
-		}
-	}
-	extra := ""
-	if _, tail, found := strings.Cut(value, "\nSession-specific instructions:\n"); found {
-		extra = strings.TrimSpace(tail)
-	}
-	var builder strings.Builder
-	fmt.Fprintf(&builder, "Start work on %q as %s.", title, firstNonEmpty(role, "worker"))
-	if description != "" && description != "(none)" {
-		fmt.Fprintf(&builder, "\n\n%s", description)
-	}
-	if extra != "" {
-		fmt.Fprintf(&builder, "\n\n%s", extra)
-	}
-	return builder.String()
-}
-
 func contentIsSensitive(value any) bool {
 	items, _ := value.([]any)
 	for _, item := range items {
@@ -743,28 +876,37 @@ func contentIsSensitive(value any) bool {
 	return false
 }
 
-func toolMetadata(update map[string]any) string {
+func toolMetadata(update map[string]any) (string, bool) {
 	input := object(update["rawInput"])
 	for _, key := range []string{"command", "path", "filePath", "query", "pattern", "url"} {
 		if value := sanitizeInline(stringValue(input[key])); value != "" {
 			if key == "path" || key == "filePath" {
-				return filepath.Base(value)
+				value = filepath.Base(value)
 			}
-			return value
+			value, clipped := truncateUTF8(value, maxProjectedMetadataBytes)
+			return value, clipped
 		}
 	}
 	if locations, ok := update["locations"].([]any); ok {
-		var paths []string
-		for _, value := range locations {
-			path := stringValue(object(value)["path"])
+		locationCount := min(len(locations), maxProjectedLocations)
+		paths := make([]string, 0, locationCount)
+		clipped := len(locations) > locationCount
+		for _, value := range locations[:locationCount] {
+			path := sanitizeInline(stringValue(object(value)["path"]))
+			if path == "" {
+				continue
+			}
+			path, pathClipped := boundedInline(filepath.Base(path), maxProjectedTitleBytes)
+			clipped = clipped || pathClipped
 			if path != "" {
-				paths = append(paths, filepath.Base(path))
+				paths = append(paths, path)
 			}
 		}
 		sort.Strings(paths)
-		return strings.Join(paths, ", ")
+		metadata, metadataClipped := truncateUTF8(strings.Join(paths, ", "), maxProjectedMetadataBytes)
+		return metadata, clipped || metadataClipped
 	}
-	return ""
+	return "", false
 }
 
 func toolDisplayTitle(tool *toolCard) string {
@@ -790,19 +932,6 @@ func genericToolTitle(value string) bool {
 	default:
 		return false
 	}
-}
-
-func permissionRPCID(value any) string {
-	var rpc string
-	switch typed := value.(type) {
-	case string:
-		rpc = typed
-	case float64:
-		rpc = fmt.Sprintf("%.0f", typed)
-	case json.Number:
-		rpc = typed.String()
-	}
-	return rpc
 }
 
 func object(value any) map[string]any {
@@ -837,7 +966,7 @@ func sanitizeDisplay(value string) string {
 		case '\n', '\t':
 			return r
 		}
-		if unicode.IsControl(r) || r == '\u007f' {
+		if !unicode.IsPrint(r) {
 			return -1
 		}
 		return r
@@ -848,6 +977,21 @@ func sanitizeInline(value string) string {
 	value = sanitizeDisplay(value)
 	value = strings.Join(strings.Fields(value), " ")
 	return value
+}
+
+func boundedInline(value string, limit int) (string, bool) {
+	return truncateUTF8(sanitizeInline(value), limit)
+}
+
+func boundedIdentifier(value string, limit int) (string, bool) {
+	safe := strings.Map(func(item rune) rune {
+		if !unicode.IsPrint(item) {
+			return -1
+		}
+		return item
+	}, value)
+	bounded, clipped := truncateUTF8(safe, limit)
+	return bounded, clipped || safe != value
 }
 
 func truncateUTF8(value string, limit int) (string, bool) {
@@ -917,14 +1061,6 @@ func firstMeaningfulLine(value string) string {
 		}
 	}
 	return ""
-}
-
-func mergeField(existing, next string) string {
-	next = sanitizeInline(next)
-	if next == "" {
-		return existing
-	}
-	return next
 }
 
 func firstNonEmpty(values ...string) string {

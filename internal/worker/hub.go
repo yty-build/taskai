@@ -2,12 +2,12 @@ package worker
 
 import (
 	"sync"
-
-	"github.com/yty-build/acp-gateway/internal/sessionlog"
 )
 
+const maxHubSubscribers = 16
+
 type subscriber struct {
-	lines chan sessionlog.Line
+	wake chan struct{}
 }
 
 type hub struct {
@@ -22,16 +22,22 @@ func newHub(lastSequence uint64) *hub {
 	return &hub{lastSeq: lastSequence, subscribers: make(map[uint64]*subscriber)}
 }
 
-func (h *hub) add() (uint64, uint64, <-chan sessionlog.Line, bool) {
+func (h *hub) add() (uint64, uint64, <-chan struct{}, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed {
 		return 0, h.lastSeq, nil, false
 	}
+	if len(h.subscribers) >= maxHubSubscribers {
+		return 0, h.lastSeq, nil, false
+	}
 	h.nextID++
-	subscriber := &subscriber{lines: make(chan sessionlog.Line, 256)}
+	// The durable JSONL is the payload queue. The hub retains only one
+	// coalescing wake-up per viewer, so slow or staggered viewers cannot pin
+	// provider frame bytes in memory.
+	subscriber := &subscriber{wake: make(chan struct{}, 1)}
 	h.subscribers[h.nextID] = subscriber
-	return h.nextID, h.lastSeq, subscriber.lines, true
+	return h.nextID, h.lastSeq, subscriber.wake, true
 }
 
 func (h *hub) remove(id uint64) {
@@ -40,21 +46,27 @@ func (h *hub) remove(id uint64) {
 	delete(h.subscribers, id)
 }
 
-func (h *hub) broadcast(line sessionlog.Line) {
+func (h *hub) broadcast(sequence uint64) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed {
 		return
 	}
-	h.lastSeq = line.Seq
-	for id, subscriber := range h.subscribers {
+	h.lastSeq = sequence
+	for _, subscriber := range h.subscribers {
 		select {
-		case subscriber.lines <- line:
+		case subscriber.wake <- struct{}{}:
 		default:
-			close(subscriber.lines)
-			delete(h.subscribers, id)
+			// A wake-up is already pending. The subscriber reads the latest
+			// sequence from the hub and walks the durable suffix once awake.
 		}
 	}
+}
+
+func (h *hub) sequence() uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.lastSeq
 }
 
 func (h *hub) close() {
@@ -65,7 +77,7 @@ func (h *hub) close() {
 	}
 	h.closed = true
 	for id, subscriber := range h.subscribers {
-		close(subscriber.lines)
+		close(subscriber.wake)
 		delete(h.subscribers, id)
 	}
 }

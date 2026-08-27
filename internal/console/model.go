@@ -3,7 +3,6 @@ package console
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -16,7 +15,23 @@ import (
 	"github.com/yty-build/acp-gateway/internal/worker"
 )
 
-const refreshInterval = 750 * time.Millisecond
+const (
+	refreshInterval               = 750 * time.Millisecond
+	maxRetainedChannelFrames      = 512
+	maxRetainedChannelBytes       = 4 << 20
+	maxRetainedChannelTotalFrames = 2048
+	maxRetainedChannelTotalBytes  = 16 << 20
+	maxRetainedProjectionBytes    = 16 << 20
+	maxRetainedProjectionObjects  = 12288
+	initialReplayRecords          = 256
+	channelLineOverhead           = 256
+)
+
+type retainedChannelLine struct {
+	line    sessionlog.Line
+	bytes   int
+	ordinal uint64
+}
 
 type viewMode uint8
 
@@ -84,7 +99,7 @@ type confirmation struct {
 
 // Model is the Bubble Tea model shared by Task and direct Session attachment.
 // It owns only disposable viewer state. Closing it cancels subscriptions, never
-// a worker, an ACP turn, or a provider conversation.
+// a worker, a provider turn, or a provider conversation.
 type Model struct {
 	ctx     context.Context
 	backend Backend
@@ -96,14 +111,29 @@ type Model struct {
 	current  session.Session
 	selected int
 
-	histories                 map[string][]sessionlog.Line
+	histories                 map[string][]retainedChannelLine
+	historyBytes              map[string]int
+	historyClipped            map[string]bool
+	replayWindows             map[string]appservice.ReplayWindow
+	retainedHistoryBytes      int
+	retainedHistoryFrames     int
+	nextHistoryOrdinal        uint64
 	projections               map[string]*transcript
+	projectionBytes           map[string]int
+	projectionObjects         map[string]int
+	projectionOrdinals        map[string]uint64
+	projectionClipped         map[string]bool
+	projectionOverflow        map[string]bool
+	retainedProjectionBytes   int
+	retainedProjectionObjects int
+	nextProjectionOrdinal     uint64
 	cursors                   map[string]uint64
-	snapshotCursors           map[string]uint64
-	snapshotSources           map[string]appservice.ConversationSource
-	seen                      map[string]map[uint64]struct{}
-	conversationCommitPending map[string]bool
-	conversationCommitRetries map[string]int
+	permissionFrameCursors    map[string]uint64
+	permissionSnapshotCursors map[string]uint64
+	pendingPermissionSnapshot *queuedPermissionSnapshot
+	permissionDecisionsReady  map[string]bool
+	permissionBlockedReason   map[string]string
+	permissionZeroAuthority   map[string]bool
 
 	raw           bool
 	showReasoning bool
@@ -127,32 +157,34 @@ type Model struct {
 type refreshTickMsg struct{}
 
 type refreshMsg struct {
-	detail  *task.Detail
-	current *session.Session
-	lines   map[string][]sessionlog.Line
-	err     error
+	detail                  *task.Detail
+	current                 *session.Session
+	permissionSessionID     string
+	permissionSnapshot      *appservice.PermissionSnapshot
+	permissionSnapshotError error
+	err                     error
+}
+
+type permissionSnapshotMsg struct {
+	sessionID string
+	snapshot  appservice.PermissionSnapshot
+	err       error
+}
+
+type queuedPermissionSnapshot struct {
+	sessionID string
+	snapshot  appservice.PermissionSnapshot
+	clipped   bool
 }
 
 type actionMsg struct {
 	kind      string
 	sessionID string
+	draft     string
 	accepted  worker.Message
 	current   session.Session
 	err       error
 }
-
-type conversationMsg struct {
-	sessionID string
-	snapshot  appservice.ConversationSnapshot
-	err       error
-}
-
-type conversationRetryMsg struct {
-	sessionID string
-	attempt   int
-}
-
-const providerTranscriptReloadDelayedNotice = "Provider transcript reload is delayed; live ACP output remains current."
 
 func newTaskModel(parent context.Context, backend Backend, taskID string) (Model, context.CancelFunc, error) {
 	ctx, cancel := context.WithCancel(parent)
@@ -164,14 +196,29 @@ func newTaskModel(parent context.Context, backend Backend, taskID string) (Model
 	m := baseModel(ctx, backend)
 	m.mode = taskView
 	m.task = detail
-	for _, current := range detail.Sessions {
-		if err := m.loadStored(current); err != nil {
-			cancel()
-			m.manager.cancel()
-			return Model{}, func() {}, err
+	effective, windows, err := backend.TaskReplayWindows(ctx, taskID, nil, initialReplayRecords)
+	if err != nil {
+		m.manager.cancel()
+		cancel()
+		return Model{}, func() {}, err
+	}
+	for sessionID, cursor := range effective {
+		m.cursors[sessionID] = cursor
+	}
+	for sessionID, window := range windows {
+		m.replayWindows[sessionID] = window
+		m.historyClipped[sessionID] = window.Clipped
+	}
+	if len(detail.Sessions) > 0 {
+		selected := detail.Sessions[min(max(0, m.selected), len(detail.Sessions)-1)]
+		snapshot, snapshotErr := backend.PermissionSnapshot(ctx, selected.ID)
+		if snapshotErr != nil {
+			m.notice = "Permission status unavailable: " + snapshotErr.Error()
+		} else {
+			m.receivePermissionSnapshot(selected.ID, snapshot)
 		}
 	}
-	m.watchSessions(detail.Sessions)
+	m.manager.ensureTask(taskID, effective)
 	return m, func() { m.manager.cancel(); cancel() }, nil
 }
 
@@ -186,69 +233,41 @@ func newSessionModel(parent context.Context, backend Backend, sessionID string) 
 	m.mode = sessionView
 	m.direct = true
 	m.current = current
-	if err := m.loadStored(current); err != nil {
-		cancel()
+	cursor, clipped, err := backend.FreshReplayCursor(ctx, sessionID, initialReplayRecords)
+	if err != nil {
 		m.manager.cancel()
+		cancel()
 		return Model{}, func() {}, err
 	}
-	m.manager.ensure(current, m.cursors[current.ID])
+	m.cursors[current.ID] = cursor
+	m.replayWindows[current.ID] = replayWindow(cursor, clipped)
+	m.historyClipped[current.ID] = clipped
+	snapshot, snapshotErr := backend.PermissionSnapshot(ctx, current.ID)
+	if snapshotErr != nil {
+		m.notice = "Permission status unavailable: " + snapshotErr.Error()
+	} else {
+		m.receivePermissionSnapshot(current.ID, snapshot)
+	}
+	m.manager.ensureSession(current, m.cursors[current.ID])
 	return m, func() { m.manager.cancel(); cancel() }, nil
 }
 
 func baseModel(ctx context.Context, backend Backend) Model {
 	return Model{
 		ctx: ctx, backend: backend, manager: newWatchManager(ctx, backend),
-		histories: make(map[string][]sessionlog.Line), projections: make(map[string]*transcript),
-		cursors: make(map[string]uint64), snapshotCursors: make(map[string]uint64),
-		snapshotSources: make(map[string]appservice.ConversationSource), seen: make(map[string]map[uint64]struct{}),
-		conversationCommitPending: make(map[string]bool), conversationCommitRetries: make(map[string]int),
-		width: 100, height: 30,
+		histories: make(map[string][]retainedChannelLine), projections: make(map[string]*transcript),
+		historyBytes: make(map[string]int), historyClipped: make(map[string]bool), replayWindows: make(map[string]appservice.ReplayWindow),
+		projectionBytes: make(map[string]int), projectionObjects: make(map[string]int), projectionOrdinals: make(map[string]uint64),
+		projectionClipped: make(map[string]bool), projectionOverflow: make(map[string]bool),
+		cursors: make(map[string]uint64), permissionFrameCursors: make(map[string]uint64), permissionSnapshotCursors: make(map[string]uint64),
+		permissionDecisionsReady: make(map[string]bool), permissionBlockedReason: make(map[string]string),
+		permissionZeroAuthority: make(map[string]bool),
+		width:                   100, height: 30,
 	}
-}
-
-func (m *Model) loadStored(current session.Session) error {
-	snapshotLoaded := false
-	historyCursor := uint64(0)
-	snapshotWarning := ""
-	if backend, ok := m.backend.(conversationBackend); ok {
-		snapshot, err := backend.Conversation(m.ctx, current.ID)
-		if err == nil && isConversationSnapshot(snapshot) {
-			m.adoptConversationSnapshot(current.ID, snapshot)
-			m.conversationCommitPending[current.ID] = conversationSnapshotNeedsPromotion(current, snapshot)
-			snapshotLoaded = true
-			historyCursor = snapshot.GatewayCursor
-		}
-		if err == nil {
-			snapshotWarning = conversationSnapshotNotice(snapshot)
-			if snapshotWarning != "" {
-				m.notice = snapshotWarning
-			}
-		} else if strings.TrimSpace(current.ProviderConversationID) != "" {
-			m.conversationCommitPending[current.ID] = true
-		}
-	}
-	lines, err := m.backend.History(m.ctx, current.ID, historyCursor)
-	if err != nil {
-		if snapshotLoaded {
-			m.notice = strings.TrimSpace(snapshotWarning + " Conversation loaded; raw gateway diagnostics are temporarily unavailable.")
-			return nil
-		}
-		return fmt.Errorf("replay Session %s history: %w", current.ID, err)
-	}
-	for _, line := range lines {
-		m.addActivity(current.ID, line, false)
-	}
-	return nil
 }
 
 func (m Model) Init() tea.Cmd {
-	commands := []tea.Cmd{m.manager.wait(), refreshTickCmd()}
-	for sessionID, pending := range m.conversationCommitPending {
-		if pending {
-			commands = append(commands, m.scheduleConversationCommitRetry(sessionID))
-		}
-	}
-	return tea.Batch(commands...)
+	return tea.Batch(m.manager.wait(), refreshTickCmd())
 }
 
 func refreshTickCmd() tea.Cmd {
@@ -282,104 +301,31 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 				m.syncCurrentFromTask()
 			}
 			m.ensureVisibleSelection()
-			m.watchSessions(m.task.Sessions)
+			m.manager.ensureTask(m.task.Task.ID, m.cursors)
 		}
 		if message.current != nil {
 			m.current = *message.current
-			m.manager.ensure(m.current, m.cursors[m.current.ID])
+			m.manager.ensureSession(m.current, m.cursors[m.current.ID])
 		}
-		for sessionID, lines := range message.lines {
-			for _, line := range lines {
-				m.addActivity(sessionID, line, false)
-			}
+		if message.permissionSnapshotError != nil {
+			m.notice = "Permission status unavailable: " + message.permissionSnapshotError.Error()
+		} else if message.permissionSnapshot != nil {
+			m.receivePermissionSnapshot(message.permissionSessionID, *message.permissionSnapshot)
 		}
+		return m, nil
+	case permissionSnapshotMsg:
+		if message.err != nil {
+			m.notice = "Permission status unavailable: " + message.err.Error()
+			return m, nil
+		}
+		m.receivePermissionSnapshot(message.sessionID, message.snapshot)
 		return m, nil
 	case activityMsg:
 		m.addActivity(message.sessionID, message.line, true)
-		wait := m.manager.wait()
-		if message.line.Type == "provider_transcript_reconcile_warning" {
-			m.notice = providerTranscriptReloadDelayedNotice
-		}
-		if shouldReconcileConversation(message.line) {
-			if _, ok := m.backend.(conversationBackend); ok {
-				if message.line.Type == "turn_completed" {
-					m.ensureConversationCommitState()
-					m.conversationCommitPending[message.sessionID] = true
-					m.conversationCommitRetries[message.sessionID] = 0
-				}
-				return m, tea.Batch(wait, conversationSnapshotCmd(m.ctx, m.backend, message.sessionID))
-			}
-		}
-		return m, wait
-	case conversationMsg:
-		if message.err != nil {
-			m.notice = "Provider history refresh delayed; live ACP output remains current."
-			if m.canRetryConversationPromotion(message.sessionID) {
-				m.conversationCommitPending[message.sessionID] = true
-				return m, m.scheduleConversationCommitRetry(message.sessionID)
-			}
-			delete(m.conversationCommitPending, message.sessionID)
-			delete(m.conversationCommitRetries, message.sessionID)
-			return m, nil
-		}
-		if !isConversationSnapshot(message.snapshot) {
-			if notice := conversationSnapshotNotice(message.snapshot); notice != "" {
-				m.notice = notice
-			}
-			if m.canRetryConversationPromotion(message.sessionID) {
-				m.conversationCommitPending[message.sessionID] = true
-				return m, m.scheduleConversationCommitRetry(message.sessionID)
-			}
-			return m, nil
-		}
-		if m.snapshotSources[message.sessionID] == appservice.ConversationSourceProvider && message.snapshot.Source == appservice.ConversationSourceGateway {
-			m.notice = "Provider history refresh is delayed; live ACP output remains current."
-			current, hasSession := m.session(message.sessionID)
-			if hasSession && conversationSnapshotNeedsPromotion(current, message.snapshot) {
-				m.conversationCommitPending[message.sessionID] = true
-			}
-			if m.conversationCommitPending[message.sessionID] && m.canRetryConversationPromotion(message.sessionID) {
-				return m, m.scheduleConversationCommitRetry(message.sessionID)
-			}
-			delete(m.conversationCommitPending, message.sessionID)
-			delete(m.conversationCommitRetries, message.sessionID)
-			return m, nil
-		}
-		if notice := conversationSnapshotNotice(message.snapshot); notice != "" {
-			m.notice = notice
-		} else if message.snapshot.Source == appservice.ConversationSourceProvider && m.notice == providerTranscriptReloadDelayedNotice {
-			m.notice = ""
-		}
-		if !m.adoptConversationSnapshot(message.sessionID, message.snapshot) {
-			if m.conversationCommitPending[message.sessionID] && m.canRetryConversationPromotion(message.sessionID) {
-				return m, m.scheduleConversationCommitRetry(message.sessionID)
-			}
-			delete(m.conversationCommitPending, message.sessionID)
-			delete(m.conversationCommitRetries, message.sessionID)
-			return m, nil
-		}
-		current, hasSession := m.session(message.sessionID)
-		eligible := hasSession && conversationSnapshotNeedsPromotion(current, message.snapshot)
-		if eligible || (message.snapshot.Source == appservice.ConversationSourceGateway && hasSession && strings.TrimSpace(current.ProviderConversationID) != "" && m.conversationCommitPending[message.sessionID]) {
-			m.conversationCommitPending[message.sessionID] = true
-			return m, m.scheduleConversationCommitRetry(message.sessionID)
-		}
-		if message.snapshot.Source == appservice.ConversationSourceGateway && hasSession && strings.TrimSpace(current.ProviderConversationID) != "" {
-			return m, nil
-		}
-		delete(m.conversationCommitPending, message.sessionID)
-		delete(m.conversationCommitRetries, message.sessionID)
-		return m, nil
-	case conversationRetryMsg:
-		if !m.conversationCommitPending[message.sessionID] || m.conversationCommitRetries[message.sessionID] != message.attempt {
-			return m, nil
-		}
-		if !m.canRetryConversationPromotion(message.sessionID) {
-			delete(m.conversationCommitPending, message.sessionID)
-			delete(m.conversationCommitRetries, message.sessionID)
-			return m, nil
-		}
-		return m, conversationSnapshotCmd(m.ctx, m.backend, message.sessionID)
+		return m, m.manager.wait()
+	case taskActivityMsg:
+		m.addActivity(message.activity.SessionID, message.activity.Line, true)
+		return m, m.manager.wait()
 	case consoleErrorMsg:
 		m.notice = "Live stream: " + message.err.Error()
 		return m, m.manager.wait()
@@ -389,6 +335,10 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 		return m.handleAction(message)
 	case wizardReadyMsg:
 		return m.handleWizardReady(message)
+	case sessionConnectedMsg:
+		return m.handleSessionConnected(message)
+	case providerOptionsReadyMsg:
+		return m.handleProviderOptionsReady(message)
 	case sessionStartedMsg:
 		return m.handleSessionStarted(message)
 	case tea.MouseMsg:
@@ -459,19 +409,17 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 		m.composer.focused = true
 		m.composer.cursor = len(m.composer.value)
 		m.notice = "Enter sends · Ctrl+J adds a line · Esc keeps the draft"
-	case "n":
-		return m.attachCurrentNative()
 	case "esc", "c":
 		return m.confirmCurrent("cancel")
 	case "u":
-		return m, sessionActionCmd(m.ctx, m.backend, "resume", m.current.ID)
+		return m.resumeAction(m.current)
 	case "x", "s":
 		return m.confirmCurrent("stop")
 	case "r":
 		m.raw = !m.raw
 		m.scroll, m.unread = 0, 0
 		if m.raw {
-			m.notice = "Raw ACP/debug view enabled. Press r to return to the conversation."
+			m.notice = "Raw Session Channel frames enabled. Press r to return to the conversation."
 		} else {
 			m.notice = "Conversation view restored."
 		}
@@ -514,9 +462,7 @@ func (m Model) dispatchTaskAction(id actionID) (tea.Model, tea.Cmd) {
 	m.overlay = noOverlay
 	m.overlayEditor = composerState{}
 	switch id {
-	case actionNative:
-		return m.attachSelectedNative()
-	case actionACP:
+	case actionOpen:
 		return m.openSelected(false)
 	case actionMessage:
 		return m.openSelected(true)
@@ -563,7 +509,7 @@ func (m Model) handleOverlayKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if m.overlay == paletteOverlay {
-		actions := filteredTaskActions(m.overlayEditor.text())
+		actions := filteredTaskActions(m.overlayEditor.text(), m.selectedCanResume())
 		switch name {
 		case "up", "ctrl+p":
 			m.paletteIndex = max(0, m.paletteIndex-1)
@@ -719,6 +665,10 @@ func (m Model) handleConfirmation(name string) (tea.Model, tea.Cmd) {
 	case "y", "Y":
 		m.confirm = nil
 		if confirm.kind == "permission" {
+			if !m.permissionDecisionsReady[confirm.sessionID] {
+				m.notice = m.permissionUnavailableNotice(confirm.sessionID)
+				return m, nil
+			}
 			m.notice = "Sending the selected permission decision…"
 			return m, permissionDecisionCmd(m.ctx, m.backend, confirm.sessionID, confirm.permissionID, confirm.optionID)
 		}
@@ -780,43 +730,8 @@ func (m Model) handleMouse(event tea.MouseEvent) (tea.Model, tea.Cmd) {
 	}
 	m.selected = selected
 	current := m.task.Sessions[m.selected]
-	capability := nativeCapability(current)
-	if capability.available {
-		m.notice = "Selected " + current.ID + ". Enter opens " + capability.label + "; a opens the structured view."
-	} else {
-		m.notice = "Selected " + current.ID + ". Native CLI unavailable: " + capability.reason + "."
-	}
+	m.notice = "Selected " + current.ID + ". Enter opens its Session Channel; p opens it with the composer focused."
 	return m, nil
-}
-
-func (m Model) attachSelectedNative() (tea.Model, tea.Cmd) {
-	if len(m.task.Sessions) == 0 {
-		m.notice = "This Task has no Sessions. Press n to add one."
-		return m, nil
-	}
-	current := m.task.Sessions[m.selected]
-	return m.attachNative(current)
-}
-
-func (m Model) attachCurrentNative() (tea.Model, tea.Cmd) {
-	if strings.TrimSpace(m.current.ID) == "" {
-		m.notice = "No Session is selected for native attachment."
-		return m, nil
-	}
-	return m.attachNative(m.current)
-}
-
-func (m Model) attachNative(current session.Session) (tea.Model, tea.Cmd) {
-	capability := nativeCapability(current)
-	if !capability.available {
-		m.notice = "Native CLI unavailable for " + current.ID + ": " + capability.reason + "."
-		return m, nil
-	}
-	m.notice = "Opening " + capability.label + " for " + current.ID + " — same provider conversation…"
-	command := &nativeAttachCommand{ctx: m.ctx, backend: m.backend, sessionID: current.ID}
-	return m, tea.Exec(command, func(err error) tea.Msg {
-		return actionMsg{kind: "native", sessionID: current.ID, err: err}
-	})
 }
 
 func (m Model) openSelected(prompt bool) (tea.Model, tea.Cmd) {
@@ -832,7 +747,7 @@ func (m Model) openSelected(prompt bool) (tea.Model, tea.Cmd) {
 		m.composer.cursor = len(m.composer.value)
 		m.notice = "Enter sends · Ctrl+J adds a line · Esc keeps the draft"
 	}
-	return m, nil
+	return m, m.permissionSnapshotCmd(m.current.ID)
 }
 
 func (m Model) selectedAction(kind string) (tea.Model, tea.Cmd) {
@@ -841,8 +756,39 @@ func (m Model) selectedAction(kind string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	current := m.task.Sessions[m.selected]
+	if kind == "resume" {
+		return m.resumeAction(current)
+	}
 	m.notice = actionProgress(kind, current.ID)
 	return m, sessionActionCmd(m.ctx, m.backend, kind, current.ID)
+}
+
+func sessionCanResume(current session.Session) bool {
+	return current.CanResume()
+}
+
+func (m Model) selectedCanResume() bool {
+	return len(m.task.Sessions) > 0 && m.selected >= 0 && m.selected < len(m.task.Sessions) && sessionCanResume(m.task.Sessions[m.selected])
+}
+
+func (m Model) resumeAction(current session.Session) (tea.Model, tea.Cmd) {
+	if sessionCanResume(current) {
+		m.notice = actionProgress("resume", current.ID)
+		return m, sessionActionCmd(m.ctx, m.backend, "resume", current.ID)
+	}
+	switch {
+	case current.ProviderRef == "":
+		m.notice = "This Session has no saved provider identity and cannot be resumed; create a new Session."
+	case current.WorkerPID != 0 || current.WorkerSocket != "":
+		if current.Status == session.StatusFailed {
+			m.notice = "This Session retains quarantined worker ownership; manual provider-process teardown is required."
+		} else {
+			m.notice = "This Session worker is already running."
+		}
+	default:
+		m.notice = "This Session cannot be resumed in its current state."
+	}
+	return m, nil
 }
 
 func (m Model) confirmSelected(kind string) (tea.Model, tea.Cmd) {
@@ -863,9 +809,13 @@ func (m Model) withConfirmation(kind string, current session.Session) (tea.Model
 		m.notice = "There is no active turn to cancel."
 		return m, nil
 	}
-	message := "Cancel the active turn? The Session stays alive and queued steering can continue."
+	message := "Cancel the active turn? The Session and provider connection stay alive."
 	if kind == "stop" {
-		message = "Stop this Session worker? The conversation remains resumable."
+		if current.ProviderRef == "" {
+			message = "Stop this Session worker? No provider identity has been established, so continuing later requires a new Session."
+		} else {
+			message = "Stop this Session worker? The saved provider identity can be exact-resumed after teardown completes."
+		}
 	}
 	m.confirm = &confirmation{kind: kind, sessionID: current.ID, message: message}
 	return m, nil
@@ -878,6 +828,10 @@ func (m Model) confirmPermission(index int) (tea.Model, tea.Cmd) {
 	}
 	_, card := projection.pendingPermission()
 	if card == nil || index < 0 || index >= len(card.options) {
+		return m, nil
+	}
+	if !m.permissionDecisionsReady[m.current.ID] {
+		m.notice = m.permissionUnavailableNotice(m.current.ID)
 		return m, nil
 	}
 	option := card.options[index]
@@ -895,6 +849,14 @@ func (m Model) confirmPermission(index int) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m Model) permissionUnavailableNotice(sessionID string) string {
+	reason := strings.TrimSpace(m.permissionBlockedReason[sessionID])
+	if reason == "" {
+		return "Permission decision unavailable; refresh the live Session before choosing an option."
+	}
+	return "Permission decision unavailable: " + reason
+}
+
 func sessionIsActive(current session.Session, projection *transcript) bool {
 	if current.Status == session.StatusWorking {
 		return true
@@ -903,7 +865,7 @@ func sessionIsActive(current session.Session, projection *transcript) bool {
 		return false
 	}
 	state := projection.latestState()
-	return state == turnReady || state == turnQueued || state == turnLive || state == turnCancelling
+	return state == turnReady || state == turnLive || state == turnCancelling
 }
 
 func (m *Model) toggleToolDetail() {
@@ -918,7 +880,7 @@ func (m *Model) toggleToolDetail() {
 		m.notice = "Tool details collapsed."
 	} else {
 		m.expandedTool = tool.id
-		m.notice = "Showing bounded tool details. Raw ACP remains available with r."
+		m.notice = "Showing bounded tool details. Raw Session Channel frames remain available with r."
 	}
 	m.scroll = 0
 }
@@ -965,34 +927,34 @@ func (m *Model) currentTool() *toolCard {
 
 func (m Model) handleAction(message actionMsg) (tea.Model, tea.Cmd) {
 	if message.err != nil {
+		if message.kind == "prompt" && strings.TrimSpace(message.draft) != "" {
+			m.composer.value = []rune(message.draft)
+			m.composer.cursor = len(m.composer.value)
+			m.composer.focused = true
+		}
 		m.notice = actionLabel(message.kind) + " failed: " + message.err.Error()
 		return m, nil
 	}
 	switch message.kind {
 	case "prompt":
-		if message.accepted.State == "queued" {
-			m.notice = "Message queued; it will run after the active turn."
-		} else {
-			m.notice = "Message accepted by " + message.sessionID + "."
-		}
+		m.notice = "Message accepted by " + message.sessionID + "."
 	case "cancel":
 		m.notice = "Cancellation requested. This ends only the active turn; it does not pause or stop the Session."
 	case "resume":
 		m.notice = "Session worker resumed."
+		m.permissionZeroAuthority[message.sessionID] = false
+		m.permissionDecisionsReady[message.sessionID] = false
+		m.permissionBlockedReason[message.sessionID] = "Waiting for the resumed worker's permission status."
 		if message.current.ID == m.current.ID {
 			m.current = message.current
 		}
-		m.manager.ensure(message.current, m.cursors[message.current.ID])
+		if m.direct {
+			m.manager.ensureSession(message.current, m.cursors[message.current.ID])
+		}
 	case "stop":
-		m.notice = "Session worker stopped; the conversation remains resumable."
+		m.notice = "Session worker stopped."
 	case "permission":
 		m.notice = "Permission decision accepted. The agent turn continues in this Session."
-	case "native":
-		if m.mode == sessionView {
-			m.notice = "Back in the structured view. The provider CLI used the same conversation."
-		} else {
-			m.notice = "Back in Task Console. The provider CLI and structured view continue the same conversation."
-		}
 	}
 	return m, m.refreshCmd()
 }
@@ -1000,7 +962,7 @@ func (m Model) handleAction(message actionMsg) (tea.Model, tea.Cmd) {
 func promptCmd(ctx context.Context, backend Backend, sessionID, message string) tea.Cmd {
 	return func() tea.Msg {
 		accepted, err := backend.Prompt(ctx, sessionID, message)
-		return actionMsg{kind: "prompt", sessionID: sessionID, accepted: accepted, err: err}
+		return actionMsg{kind: "prompt", sessionID: sessionID, draft: message, accepted: accepted, err: err}
 	}
 }
 
@@ -1028,136 +990,6 @@ func sessionActionCmd(ctx context.Context, backend Backend, kind, sessionID stri
 	}
 }
 
-func conversationSnapshotCmd(ctx context.Context, backend Backend, sessionID string) tea.Cmd {
-	return func() tea.Msg {
-		provider, ok := backend.(conversationBackend)
-		if !ok {
-			return conversationMsg{sessionID: sessionID}
-		}
-		snapshot, err := provider.Conversation(ctx, sessionID)
-		return conversationMsg{sessionID: sessionID, snapshot: snapshot, err: err}
-	}
-}
-
-func isConversationSnapshot(snapshot appservice.ConversationSnapshot) bool {
-	return snapshot.Source == appservice.ConversationSourceProvider || snapshot.Source == appservice.ConversationSourceGateway
-}
-
-func conversationSnapshotNotice(snapshot appservice.ConversationSnapshot) string {
-	if warning := strings.TrimSpace(snapshot.Warning); warning != "" {
-		return warning
-	}
-	if snapshot.Truncated {
-		return "Earlier conversation history was omitted by bounded viewer limits."
-	}
-	return ""
-}
-
-// adoptConversationSnapshot constructs the replacement projection off-screen,
-// overlays only gateway positions captured after the snapshot, and publishes
-// both the projection and its coverage cursor in one Bubble Tea update. A
-// strictly older response cannot replace a newer adopted snapshot: doing so
-// could discard positions that have not reached the disposable viewer yet.
-func (m *Model) adoptConversationSnapshot(sessionID string, snapshot appservice.ConversationSnapshot) bool {
-	if m.histories == nil {
-		m.histories = make(map[string][]sessionlog.Line)
-	}
-	if m.seen == nil {
-		m.seen = make(map[string]map[uint64]struct{})
-	}
-	if m.snapshotCursors == nil {
-		m.snapshotCursors = make(map[string]uint64)
-	}
-	if m.snapshotSources == nil {
-		m.snapshotSources = make(map[string]appservice.ConversationSource)
-	}
-	if captured, adopted := m.snapshotCursors[sessionID]; adopted && snapshot.GatewayCursor < captured {
-		return false
-	}
-	projection := transcriptFromConversation(snapshot)
-	cursor := snapshot.GatewayCursor
-	retained := make([]sessionlog.Line, 0, len(m.histories[sessionID]))
-	for _, line := range m.histories[sessionID] {
-		if line.Seq > snapshot.GatewayCursor {
-			projection.apply(line)
-			cursor = max(cursor, line.Seq)
-			retained = append(retained, line)
-		}
-	}
-	if m.projections == nil {
-		m.projections = make(map[string]*transcript)
-	}
-	if m.cursors == nil {
-		m.cursors = make(map[string]uint64)
-	}
-	m.projections[sessionID] = projection
-	m.snapshotCursors[sessionID] = snapshot.GatewayCursor
-	m.snapshotSources[sessionID] = snapshot.Source
-	m.histories[sessionID] = retained
-	m.seen[sessionID] = make(map[uint64]struct{}, len(retained))
-	for _, line := range retained {
-		m.seen[sessionID][line.Seq] = struct{}{}
-	}
-	m.cursors[sessionID] = max(m.cursors[sessionID], cursor)
-	return true
-}
-
-func conversationSnapshotNeedsCommit(snapshot appservice.ConversationSnapshot) bool {
-	for _, turn := range snapshot.Turns {
-		if turn.Committed {
-			continue
-		}
-		for _, activity := range turn.Activities {
-			if activity.Display != nil && activity.Display.Type == "turn_state" && activity.Display.State == "complete" {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func conversationSnapshotNeedsPromotion(current session.Session, snapshot appservice.ConversationSnapshot) bool {
-	return strings.TrimSpace(current.ProviderConversationID) != "" &&
-		(snapshot.Source != appservice.ConversationSourceProvider || conversationSnapshotNeedsCommit(snapshot))
-}
-
-func conversationCommitRetryDelay(attempt int) time.Duration {
-	if attempt >= 6 {
-		return 10 * time.Second
-	}
-	delay := 220 * time.Millisecond * time.Duration(1<<max(0, attempt))
-	return min(delay, 3*time.Second)
-}
-
-func (m *Model) scheduleConversationCommitRetry(sessionID string) tea.Cmd {
-	m.ensureConversationCommitState()
-	attempt := m.conversationCommitRetries[sessionID]
-	delay := conversationCommitRetryDelay(attempt)
-	attempt++
-	m.conversationCommitRetries[sessionID] = attempt
-	return tea.Tick(delay, func(time.Time) tea.Msg {
-		return conversationRetryMsg{sessionID: sessionID, attempt: attempt}
-	})
-}
-
-func (m *Model) ensureConversationCommitState() {
-	if m.conversationCommitPending == nil {
-		m.conversationCommitPending = make(map[string]bool)
-	}
-	if m.conversationCommitRetries == nil {
-		m.conversationCommitRetries = make(map[string]int)
-	}
-}
-
-func shouldReconcileConversation(line sessionlog.Line) bool {
-	switch line.Type {
-	case "turn_completed", "turn_error", "native_refreshed", "native_refresh_recovered", "provider_transcript_reconciled", "acp_rehydrated":
-		return true
-	default:
-		return false
-	}
-}
-
 func actionProgress(kind, sessionID string) string {
 	switch kind {
 	case "cancel":
@@ -1172,9 +1004,6 @@ func actionProgress(kind, sessionID string) string {
 }
 
 func actionLabel(kind string) string {
-	if kind == "native" {
-		return "Native CLI"
-	}
 	if kind == "" {
 		return "Action"
 	}
@@ -1186,13 +1015,13 @@ func actionLabel(kind string) string {
 func (m Model) refreshCmd() tea.Cmd {
 	mode, direct := m.mode, m.direct
 	taskID, sessionID := m.task.Task.ID, m.current.ID
-	backend, ctx := m.backend, m.ctx
-	cursors := make(map[string]uint64, len(m.cursors))
-	for id, cursor := range m.cursors {
-		cursors[id] = cursor
+	if mode == taskView && len(m.task.Sessions) > 0 {
+		index := min(max(0, m.selected), len(m.task.Sessions)-1)
+		sessionID = m.task.Sessions[index].ID
 	}
+	backend, ctx := m.backend, m.ctx
 	return func() tea.Msg {
-		result := refreshMsg{lines: make(map[string][]sessionlog.Line)}
+		result := refreshMsg{permissionSessionID: sessionID}
 		if mode == taskView || !direct {
 			detail, err := backend.Task(ctx, taskID)
 			if err != nil {
@@ -1200,85 +1029,353 @@ func (m Model) refreshCmd() tea.Cmd {
 				return result
 			}
 			result.detail = &detail
-			for _, current := range detail.Sessions {
-				if current.WorkerSocket != "" && cursors[current.ID] != 0 {
-					continue
-				}
-				lines, err := backend.History(ctx, current.ID, cursors[current.ID])
-				if err != nil {
-					result.err = err
-					return result
-				}
-				result.lines[current.ID] = lines
+		} else {
+			current, err := backend.Session(ctx, sessionID)
+			if err != nil {
+				result.err = err
+				return result
 			}
-			return result
+			result.current = &current
 		}
-		current, err := backend.Session(ctx, sessionID)
-		if err != nil {
-			result.err = err
-			return result
-		}
-		result.current = &current
-		if current.WorkerSocket == "" {
-			result.lines[current.ID], result.err = backend.History(ctx, current.ID, cursors[current.ID])
+		if sessionID != "" {
+			snapshot, err := backend.PermissionSnapshot(ctx, sessionID)
+			if err != nil {
+				result.permissionSnapshotError = err
+			} else {
+				result.permissionSnapshot = &snapshot
+			}
 		}
 		return result
 	}
+}
+
+func (m Model) permissionSnapshotCmd(sessionID string) tea.Cmd {
+	if sessionID == "" {
+		return nil
+	}
+	backend, ctx := m.backend, m.ctx
+	return func() tea.Msg {
+		snapshot, err := backend.PermissionSnapshot(ctx, sessionID)
+		return permissionSnapshotMsg{sessionID: sessionID, snapshot: snapshot, err: err}
+	}
+}
+
+func (m *Model) receivePermissionSnapshot(sessionID string, snapshot appservice.PermissionSnapshot) {
+	if sessionID == "" || !m.permissionSnapshotRelevant(sessionID) {
+		return
+	}
+	var clipped bool
+	snapshot.Permissions, clipped = boundedPendingPermissions(snapshot.Permissions)
+	var fieldClipped bool
+	snapshot.BlockedCode, fieldClipped = boundedInline(snapshot.BlockedCode, maxProjectedKindBytes)
+	clipped = clipped || fieldClipped
+	snapshot.BlockedMessage, fieldClipped = boundedInline(snapshot.BlockedMessage, maxProjectedErrorBytes)
+	clipped = clipped || fieldClipped
+	if snapshot.Sequence == 0 {
+		queuedPositive := m.pendingPermissionSnapshot != nil && m.pendingPermissionSnapshot.sessionID == sessionID &&
+			m.pendingPermissionSnapshot.snapshot.Sequence > 0
+		if m.permissionSnapshotCursors[sessionID] > 0 || m.permissionFrameCursors[sessionID] > 0 || queuedPositive {
+			return
+		}
+		m.applyPermissionReadiness(sessionID, snapshot)
+		m.permissionZeroAuthority[sessionID] = !snapshot.DecisionsReady
+		return
+	}
+	if snapshot.Sequence < m.permissionSnapshotCursors[sessionID] {
+		return
+	}
+	if m.permissionFrameCursors[sessionID] > snapshot.Sequence {
+		return
+	}
+	if m.cursors[sessionID] >= snapshot.Sequence {
+		m.pendingPermissionSnapshot = nil
+		m.applyPermissionSnapshot(sessionID, snapshot, clipped)
+		return
+	}
+	if queued := m.pendingPermissionSnapshot; queued != nil && queued.sessionID == sessionID && queued.snapshot.Sequence > snapshot.Sequence {
+		return
+	}
+	m.pendingPermissionSnapshot = &queuedPermissionSnapshot{sessionID: sessionID, snapshot: snapshot, clipped: clipped}
+}
+
+func (m Model) permissionSnapshotRelevant(sessionID string) bool {
+	if m.mode == sessionView {
+		return m.current.ID == sessionID
+	}
+	if len(m.task.Sessions) == 0 {
+		return false
+	}
+	index := min(max(0, m.selected), len(m.task.Sessions)-1)
+	return m.task.Sessions[index].ID == sessionID
+}
+
+func (m *Model) applyQueuedPermissionSnapshot(sessionID string) {
+	queued := m.pendingPermissionSnapshot
+	if queued == nil || queued.sessionID != sessionID {
+		return
+	}
+	if !m.permissionSnapshotRelevant(sessionID) || m.permissionFrameCursors[sessionID] > queued.snapshot.Sequence ||
+		queued.snapshot.Sequence < m.permissionSnapshotCursors[sessionID] {
+		m.pendingPermissionSnapshot = nil
+		return
+	}
+	if m.cursors[sessionID] < queued.snapshot.Sequence {
+		return
+	}
+	m.pendingPermissionSnapshot = nil
+	m.applyPermissionSnapshot(sessionID, queued.snapshot, queued.clipped)
+}
+
+func (m *Model) applyPermissionSnapshot(sessionID string, snapshot appservice.PermissionSnapshot, clipped bool) {
+	if sessionID == "" {
+		return
+	}
+	m.applyPermissionReadiness(sessionID, snapshot)
+	m.permissionZeroAuthority[sessionID] = false
+	m.permissionSnapshotCursors[sessionID] = max(m.permissionSnapshotCursors[sessionID], snapshot.Sequence)
+	projection := m.projections[sessionID]
+	if projection == nil {
+		if len(snapshot.Permissions) == 0 {
+			return
+		}
+		projection = newTranscript()
+		projection.clipped = m.projectionClipped[sessionID]
+		m.projections[sessionID] = projection
+	}
+	projection.reconcilePendingPermissions(snapshot.Permissions)
+	projection.clipped = projection.clipped || clipped
+	m.updateProjectionRetention(sessionID)
+	if m.projections[sessionID] != nil {
+		delete(m.projectionOverflow, sessionID)
+	}
+}
+
+func (m *Model) applyPermissionReadiness(sessionID string, snapshot appservice.PermissionSnapshot) {
+	m.permissionDecisionsReady[sessionID] = snapshot.DecisionsReady
+	reason := firstNonEmpty(snapshot.BlockedMessage, humanizeLabel(snapshot.BlockedCode))
+	if snapshot.DecisionsReady {
+		reason = ""
+	}
+	m.permissionBlockedReason[sessionID] = reason
 }
 
 func (m *Model) addActivity(sessionID string, line sessionlog.Line, live bool) {
 	if line.Seq == 0 {
 		return
 	}
-	if m.seen[sessionID] == nil {
-		m.seen[sessionID] = make(map[uint64]struct{})
-	}
-	if _, duplicate := m.seen[sessionID][line.Seq]; duplicate {
+	if line.Seq <= m.cursors[sessionID] {
 		return
 	}
-	m.seen[sessionID][line.Seq] = struct{}{}
-	m.histories[sessionID] = append(m.histories[sessionID], line)
-	sort.SliceStable(m.histories[sessionID], func(i, j int) bool {
-		return m.histories[sessionID][i].Seq < m.histories[sessionID][j].Seq
-	})
+	if m.cursors[sessionID] == 0 && line.Seq > 1 {
+		m.historyClipped[sessionID] = true
+		if window, exists := m.replayWindows[sessionID]; !exists || !window.Clipped {
+			m.replayWindows[sessionID] = appservice.ReplayWindow{
+				Cursor: line.Seq - 1, EarliestSequence: line.Seq, Clipped: true,
+			}
+		}
+	}
+	if _, exists := m.replayWindows[sessionID]; !exists {
+		m.replayWindows[sessionID] = replayWindow(0, false)
+	}
 	m.cursors[sessionID] = max(m.cursors[sessionID], line.Seq)
-	// A successfully adopted ConversationSnapshot already represents every
-	// gateway position through its captured cursor. Keep late delivery in raw
-	// history for diagnostics, but never project it into the visible transcript
-	// a second time under its gateway request identity.
-	if line.Seq <= m.snapshotCursors[sessionID] {
-		return
+	if isPermissionFrame(line.Type) {
+		m.permissionFrameCursors[sessionID] = line.Seq
+		if line.Type == worker.FramePermissionRequested && !m.permissionZeroAuthority[sessionID] {
+			m.permissionDecisionsReady[sessionID] = true
+			m.permissionBlockedReason[sessionID] = ""
+		}
 	}
 	if m.projections[sessionID] == nil {
 		m.projections[sessionID] = newTranscript()
+		m.projections[sessionID].clipped = m.projectionClipped[sessionID]
 	}
 	m.projections[sessionID].apply(line)
+	m.updateProjectionRetention(sessionID)
+	retainedBytes := retainedChannelLineBytes(line)
+	if retainedBytes > maxRetainedChannelBytes {
+		m.historyClipped[sessionID] = true
+	} else {
+		m.nextHistoryOrdinal++
+		m.histories[sessionID] = append(m.histories[sessionID], retainedChannelLine{
+			line: line, bytes: retainedBytes, ordinal: m.nextHistoryOrdinal,
+		})
+		m.historyBytes[sessionID] += retainedBytes
+		m.retainedHistoryBytes += retainedBytes
+		m.retainedHistoryFrames++
+		for len(m.histories[sessionID]) > maxRetainedChannelFrames || m.historyBytes[sessionID] > maxRetainedChannelBytes {
+			m.dropOldestRetainedLine(sessionID)
+		}
+		for m.retainedHistoryFrames > maxRetainedChannelTotalFrames || m.retainedHistoryBytes > maxRetainedChannelTotalBytes {
+			oldestSession, ok := m.oldestRetainedSession()
+			if !ok {
+				m.retainedHistoryBytes = 0
+				m.retainedHistoryFrames = 0
+				break
+			}
+			m.dropOldestRetainedLine(oldestSession)
+		}
+	}
 	if live && m.mode == sessionView && m.current.ID == sessionID && m.scroll > 0 {
 		m.unread++
 	}
+	m.applyQueuedPermissionSnapshot(sessionID)
 }
 
-func (m *Model) watchSessions(sessions []session.Session) {
-	for _, current := range sessions {
-		m.manager.ensure(current, m.cursors[current.ID])
+func isPermissionFrame(lineType string) bool {
+	return lineType == worker.FramePermissionRequested || lineType == worker.FramePermissionResolved || lineType == worker.FramePermissionAbandoned
+}
+
+func retainedChannelLineBytes(line sessionlog.Line) int {
+	return channelLineOverhead + len(line.RequestID) + len(line.Type) + len(line.Data)
+}
+
+func replayWindow(cursor uint64, clipped bool) appservice.ReplayWindow {
+	earliest := cursor
+	if cursor != ^uint64(0) {
+		earliest++
+	}
+	return appservice.ReplayWindow{Cursor: cursor, EarliestSequence: earliest, Clipped: clipped}
+}
+
+func (m *Model) updateProjectionRetention(sessionID string) {
+	projection := m.projections[sessionID]
+	if projection == nil {
+		return
+	}
+	usage := projection.retainedUsage()
+	m.retainedProjectionBytes = max(0, m.retainedProjectionBytes-m.projectionBytes[sessionID]) + usage.bytes
+	m.retainedProjectionObjects = max(0, m.retainedProjectionObjects-m.projectionObjects[sessionID]) + usage.objects
+	m.projectionBytes[sessionID] = usage.bytes
+	m.projectionObjects[sessionID] = usage.objects
+	m.nextProjectionOrdinal++
+	m.projectionOrdinals[sessionID] = m.nextProjectionOrdinal
+	if m.retainedProjectionBytes > maxRetainedProjectionBytes || m.retainedProjectionObjects > maxRetainedProjectionObjects {
+		m.compactPendingProjections()
+	}
+	for m.retainedProjectionBytes > maxRetainedProjectionBytes || m.retainedProjectionObjects > maxRetainedProjectionObjects {
+		oldestSession, ok := m.oldestProjectionSession()
+		if !ok {
+			// A conforming Task stream has at most 512 Sessions, whose compact
+			// pending permission cards fit this budget. If a Backend violates that
+			// contract, remain bounded and disclose that the exact Session must be
+			// attached directly instead of silently falsifying accounting.
+			overflowSession := sessionID
+			_, ok = m.projections[overflowSession]
+			if !ok {
+				overflowSession, ok = m.oldestProjectionSessionIncludingPending()
+			}
+			if !ok || m.projections[overflowSession] == nil {
+				break
+			}
+			m.dropProjection(overflowSession)
+			m.projectionOverflow[overflowSession] = true
+			continue
+		}
+		m.dropProjection(oldestSession)
 	}
 }
 
-func (m Model) session(sessionID string) (session.Session, bool) {
-	for _, current := range m.task.Sessions {
-		if current.ID == sessionID {
-			return current, true
+func (m *Model) oldestProjectionSessionIncludingPending() (string, bool) {
+	var (
+		oldestSession string
+		oldestOrdinal uint64
+		found         bool
+	)
+	for sessionID := range m.projections {
+		ordinal := m.projectionOrdinals[sessionID]
+		if !found || ordinal < oldestOrdinal {
+			oldestSession = sessionID
+			oldestOrdinal = ordinal
+			found = true
 		}
 	}
-	if m.current.ID == sessionID {
-		return m.current, true
-	}
-	return session.Session{}, false
+	return oldestSession, found
 }
 
-func (m Model) canRetryConversationPromotion(sessionID string) bool {
-	current, ok := m.session(sessionID)
-	return ok && strings.TrimSpace(current.ProviderConversationID) != ""
+func (m *Model) oldestProjectionSession() (string, bool) {
+	var (
+		oldestSession string
+		oldestOrdinal uint64
+		found         bool
+	)
+	for sessionID, projection := range m.projections {
+		if _, pending := projection.pendingPermission(); pending != nil {
+			continue
+		}
+		ordinal := m.projectionOrdinals[sessionID]
+		if !found || ordinal < oldestOrdinal {
+			oldestSession = sessionID
+			oldestOrdinal = ordinal
+			found = true
+		}
+	}
+	return oldestSession, found
+}
+
+func (m *Model) compactPendingProjections() {
+	for sessionID, projection := range m.projections {
+		if !projection.compactToPendingPermissions() {
+			continue
+		}
+		usage := projection.retainedUsage()
+		m.retainedProjectionBytes = max(0, m.retainedProjectionBytes-m.projectionBytes[sessionID]) + usage.bytes
+		m.retainedProjectionObjects = max(0, m.retainedProjectionObjects-m.projectionObjects[sessionID]) + usage.objects
+		m.projectionBytes[sessionID] = usage.bytes
+		m.projectionObjects[sessionID] = usage.objects
+		m.projectionClipped[sessionID] = true
+	}
+}
+
+func (m *Model) dropProjection(sessionID string) {
+	if m.projections[sessionID] == nil {
+		return
+	}
+	m.retainedProjectionBytes = max(0, m.retainedProjectionBytes-m.projectionBytes[sessionID])
+	m.retainedProjectionObjects = max(0, m.retainedProjectionObjects-m.projectionObjects[sessionID])
+	delete(m.projections, sessionID)
+	delete(m.projectionBytes, sessionID)
+	delete(m.projectionObjects, sessionID)
+	delete(m.projectionOrdinals, sessionID)
+	m.projectionClipped[sessionID] = true
+}
+
+func (m *Model) dropOldestRetainedLine(sessionID string) {
+	history := m.histories[sessionID]
+	if len(history) == 0 {
+		return
+	}
+	dropped := history[0]
+	m.historyBytes[sessionID] = max(0, m.historyBytes[sessionID]-dropped.bytes)
+	m.retainedHistoryBytes = max(0, m.retainedHistoryBytes-dropped.bytes)
+	m.retainedHistoryFrames = max(0, m.retainedHistoryFrames-1)
+	history[0] = retainedChannelLine{}
+	history = history[1:]
+	if len(history) == 0 {
+		delete(m.histories, sessionID)
+		delete(m.historyBytes, sessionID)
+	} else {
+		m.histories[sessionID] = history
+	}
+	m.historyClipped[sessionID] = true
+}
+
+func (m *Model) oldestRetainedSession() (string, bool) {
+	var (
+		oldestSession string
+		oldestOrdinal uint64
+		found         bool
+	)
+	for sessionID, history := range m.histories {
+		if len(history) == 0 {
+			continue
+		}
+		if !found || history[0].ordinal < oldestOrdinal {
+			oldestSession = sessionID
+			oldestOrdinal = history[0].ordinal
+			found = true
+		}
+	}
+	return oldestSession, found
 }
 
 func (m *Model) syncCurrentFromTask() {

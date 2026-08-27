@@ -10,7 +10,6 @@ import (
 	"github.com/yty-build/acp-gateway/internal/render"
 	appservice "github.com/yty-build/acp-gateway/internal/service"
 	"github.com/yty-build/acp-gateway/internal/session"
-	"github.com/yty-build/acp-gateway/internal/sessionlog"
 )
 
 const (
@@ -57,27 +56,56 @@ func (m Model) renderSessionWizard(width, height int) string {
 	if !wizard.worktree {
 		worktree = "OFF · shared checkout"
 	}
+	locked := ""
+	agentHint := "   ↑/↓ choose"
+	toggleHint := "   Space toggles"
+	submitVerb := "connects provider"
+	if wizard.connectedID != "" {
+		locked = "   locked after provider connection"
+		agentHint = locked
+		toggleHint = locked
+		submitVerb = "configures and starts"
+		if !wizard.providerOptionsReady {
+			submitVerb = "reloads provider controls"
+		}
+	}
+	model := "Connect provider to load choices"
+	effort := model
+	if wizard.connectedID != "" && wizard.providerOptionsReady {
+		model = providerChoiceLabel(wizard.providerOptions.Model, wizard.modelIndex) + "   ↑/↓ choose"
+		effort = providerChoiceLabel(wizard.providerOptions.ReasoningEffort, wizard.effortIndex) + "   ↑/↓ choose"
+	} else if wizard.connectedID != "" {
+		model = "Reconnect required   locked"
+		effort = model
+	}
+	prompt := wizardEditorValue(wizard.prompt, wizard.field == wizardPrompt, "optional instructions")
 	fields := []string{
-		wizardFieldLine(wizard.field == wizardAgent, "Agent", profile.Name+" · "+profile.Provider+"   ↑/↓ choose", width),
-		wizardFieldLine(wizard.field == wizardRole, "Role", wizardEditorValue(wizard.role, wizard.field == wizardRole, "worker"), width),
-		wizardFieldLine(wizard.field == wizardModel, "Model", wizardEditorValue(wizard.model, wizard.field == wizardModel, "Provider default"), width),
-		wizardFieldLine(wizard.field == wizardReasoningEffort, "Reasoning", wizardEditorValue(wizard.reasoningEffort, wizard.field == wizardReasoningEffort, "Provider default"), width),
-		wizardFieldLine(wizard.field == wizardRepo, "Repository", wizardEditorValue(wizard.repo, wizard.field == wizardRepo, "."), width),
-		wizardFieldLine(wizard.field == wizardWorktree, "Worktree", worktree+"   Space toggles", width),
-		wizardFieldLine(wizard.field == wizardPermission, "Permission", permission+"   Space toggles", width),
-		wizardFieldLine(wizard.field == wizardPrompt, "Initial prompt", wizardEditorValue(wizard.prompt, wizard.field == wizardPrompt, "optional instructions"), width),
+		wizardFieldLine(wizard.field == wizardAgent, "Agent", profile.Name+" · "+profile.Provider+agentHint, width),
+		wizardFieldLine(wizard.field == wizardRole, "Role", wizardEditorValue(wizard.role, wizard.field == wizardRole && wizard.connectedID == "", "worker")+locked, width),
+		wizardFieldLine(wizard.field == wizardRepo, "Repository", wizardEditorValue(wizard.repo, wizard.field == wizardRepo && wizard.connectedID == "", ".")+locked, width),
+		wizardFieldLine(wizard.field == wizardWorktree, "Worktree", worktree+toggleHint, width),
+		wizardFieldLine(wizard.field == wizardPermission, "Permission", permission+toggleHint, width),
+		wizardFieldLine(wizard.field == wizardModel, "Model", model, width),
+		wizardFieldLine(wizard.field == wizardReasoningEffort, "Reasoning", effort, width),
+		wizardFieldLine(wizard.field == wizardPrompt, "Initial prompt", prompt, width),
 	}
 	bodyHeight := max(1, height-len(header)-3)
 	body := padLines(append([]string{""}, fields...), bodyHeight, width)
 	notice := ""
-	if wizard.submitting {
-		notice = "Starting Session and submitting its initial turn…"
+	if wizard.submitting && wizard.connectedID == "" {
+		notice = "Connecting one Session Port and loading provider-advertised choices…"
+	} else if wizard.submitting && !wizard.providerOptionsReady {
+		notice = "Resuming this Session Port and reloading its provider controls…"
+	} else if wizard.submitting {
+		notice = "Applying advertised choices and submitting the initial turn…"
 	} else if wizard.errorNotice != "" {
 		notice = "ERROR · " + wizard.errorNotice
+	} else if wizard.connectedID != "" {
+		notice = "Connected " + wizard.connectedID + " · no prompt sent yet"
 	}
-	footer := "Tab/Shift+Tab move · Enter advances · Ctrl+S starts · Ctrl+J newline · Esc dismisses"
+	footer := "Tab/Shift+Tab move · Enter advances · Ctrl+S " + submitVerb + " · Ctrl+J newline · Esc dismisses"
 	lines := append(header, body...)
-	lines = append(lines, noticeLine(notice, width), fitLine(footer, width), fitLine("New Session will open automatically after it starts.", width))
+	lines = append(lines, noticeLine(notice, width), fitLine(footer, width), fitLine("Model and reasoning values come from this live provider Port; nothing is hard-coded.", width))
 	return renderScreen(lines, width, height)
 }
 
@@ -118,9 +146,16 @@ func (m Model) renderTask(width, height int) string {
 	item := m.task.Task
 	layout := layoutTaskWorkspace(width, height)
 	title := "TASK · " + safeText(item.Title)
+	subtitle := taskSubtitle(item.Description, len(m.task.Sessions))
+	if clipped := m.clippedReplayWindowCount(); clipped > 0 {
+		subtitle += fmt.Sprintf(" · %d replay window(s) clipped", clipped)
+	}
+	if clipped := m.clippedProjectionCount(); clipped > 0 {
+		subtitle += fmt.Sprintf(" · %d projection(s) clipped", clipped)
+	}
 	header := []string{
 		topBar(title, statusBadge(string(item.Status)), width),
-		fitLine("  "+safeText(item.ID)+" · "+taskSubtitle(item.Description, len(m.task.Sessions)), width),
+		fitLine("  "+safeText(item.ID)+" · "+subtitle, width),
 		horizontalRule(width),
 	}
 
@@ -229,6 +264,9 @@ func (m Model) sessionAttention(current session.Session) string {
 	projection := m.projections[current.ID]
 	if projection != nil {
 		if _, permission := projection.pendingPermission(); permission != nil {
+			if !m.permissionDecisionsReady[current.ID] {
+				return "Approval retained · decisions are unavailable for this worker"
+			}
 			return "Approval required · agent is waiting for a decision"
 		}
 		switch projection.latestState() {
@@ -237,7 +275,7 @@ func (m Model) sessionAttention(current session.Session) string {
 		case turnFailed:
 			return "Turn failed · open the structured view for details"
 		case turnComplete:
-			return "Response complete · conversation remains resumable"
+			return "Response complete · Session remains available"
 		case turnIncomplete:
 			return "Provider turn is incomplete · open the conversation for available history"
 		case turnCancelled:
@@ -265,15 +303,11 @@ func joinColumns(left, right []string, leftWidth, rightWidth int) []string {
 
 func (m Model) taskFooter(width int) string {
 	if width < 56 {
-		return fitLine("Enter Native  a View  n New  q Detach", width)
+		return fitLine("Enter Open  p Message  n New  q Detach", width)
 	}
 	type footerItem struct {
 		id   actionID
 		text string
-	}
-	capability := nativeCLICapability{}
-	if len(m.task.Sessions) > 0 && m.selected >= 0 && m.selected < len(m.task.Sessions) {
-		capability = nativeCapability(m.task.Sessions[m.selected])
 	}
 	actionItem := func(id actionID) footerItem {
 		action, ok := taskActionForID(id)
@@ -281,16 +315,13 @@ func (m Model) taskFooter(width int) string {
 			return footerItem{id: id}
 		}
 		label := valueOr(action.FooterLabel, action.Label)
-		if id == actionNative && !capability.available {
-			label = "Native N/A"
-		}
 		return footerItem{id: id, text: displayActionKey(action.Key) + " " + label}
 	}
 
 	// These actions remain visible at the minimum supported width. Optional
 	// context is added only when it cannot push New Session or detach off-screen.
 	required := []footerItem{
-		actionItem(actionNative), actionItem(actionACP), actionItem(actionNew),
+		actionItem(actionOpen), actionItem(actionNew),
 		actionItem(actionHelp), actionItem(actionDetach),
 	}
 	optional := []footerItem{
@@ -307,7 +338,7 @@ func (m Model) taskFooter(width int) string {
 	items := func() []string {
 		ordered := []footerItem{
 			{text: "↑/↓ Select"},
-			actionItem(actionNative), actionItem(actionACP), actionItem(actionNew), actionItem(actionMessage),
+			actionItem(actionOpen), actionItem(actionNew), actionItem(actionMessage),
 			actionItem(actionFilter), actionItem(actionPalette), actionItem(actionHelp), actionItem(actionDetach),
 		}
 		var result []string
@@ -353,22 +384,25 @@ func (m Model) renderOverlay(width, height int) string {
 	var body []string
 	switch m.overlay {
 	case helpOverlay:
-		title, subtitle, footer = "KEYBOARD HELP", "The provider CLI and structured view continue the same conversation.", "Esc/?/Enter closes help"
+		title, subtitle, footer = "KEYBOARD HELP", "This viewer reads and controls the Session Channel; detaching never stops it.", "Esc/?/Enter closes help"
 		if m.mode == taskView {
 			body = append(body, "NAVIGATION", "  ↑/↓ or j/k    Select a Session", "")
 			for _, action := range taskActions {
+				if action.ID == actionResume && !m.selectedCanResume() {
+					continue
+				}
 				body = append(body, fmt.Sprintf("  %-8s %-22s %s", displayActionKey(action.Key), action.Label, action.Description))
 			}
 		} else {
 			body = []string{
-				"CONVERSATION VIEW", "  n              Open the exact conversation in the provider's native CLI", "  p / i / Enter  Compose a message", "  ↑/↓ PgUp/PgDn Scroll history", "  End            Follow live output",
+				"SESSION CHANNEL", "  p / i / Enter  Compose a message", "  ↑/↓ PgUp/PgDn Scroll history", "  End            Follow live output",
 				"  1-9            Choose an offered permission", "  d              Expand selected tool", "  [ / ]          Select tool", "  o              Toggle reasoning",
-				"  r              Toggle raw ACP events", "  Esc / c        Cancel active turn", "  b              Back to Task", "  q              Detach viewer",
+				"  r              Toggle raw channel frames", "  Esc / c        Cancel active turn", "  b              Back to Task", "  q              Detach viewer",
 			}
 		}
 	case paletteOverlay:
 		title, subtitle, footer = "COMMAND PALETTE", "> "+editorDisplay(m.overlayEditor), "Type to filter · ↑/↓ choose · Enter run · Esc close"
-		actions := filteredTaskActions(m.overlayEditor.text())
+		actions := filteredTaskActions(m.overlayEditor.text(), m.selectedCanResume())
 		for index, action := range actions {
 			marker := "  "
 			if index == m.paletteIndex {
@@ -408,6 +442,12 @@ func editorDisplay(editor composerState) string {
 func (m Model) sessionSummary(sessionID string) string {
 	projection := m.projections[sessionID]
 	if projection == nil {
+		if m.projectionOverflow[sessionID] {
+			return "Projection limit · attach Session directly"
+		}
+		if m.projectionClipped[sessionID] {
+			return "Conversation projection clipped"
+		}
 		return "No conversation yet"
 	}
 	return projection.latestSummary()
@@ -417,15 +457,13 @@ func (m Model) renderSession(width, height int) string {
 	current := m.current
 	provider := strings.ToUpper(valueOr(current.Agent, "agent"))
 	metadata := provider + " · " + valueOr(current.Role, "worker") + " · " + humanizeLabel(appservice.PermissionLabel(current))
-	providerOptions, _ := session.ParseProviderOptions(current.MetadataJSON)
-	metadata += " · model " + valueOr(providerOptions.Model, "provider default") + " · effort " + valueOr(providerOptions.ReasoningEffort, "provider default")
 	location := "Task " + safeText(current.TaskID) + " · " + compactSessionPath(current)
 	if width >= 92 {
 		metadata = fitSplitMetadata("  "+metadata, location, width)
 	} else {
 		metadata = "  " + metadata + " · " + location
 	}
-	title := "CONVERSATION · SESSION " + safeText(current.ID)
+	title := "SESSION CHANNEL · " + safeText(current.ID)
 	if width < 56 {
 		title = "SESSION " + safeText(current.ID) + " · VIEW"
 	}
@@ -441,19 +479,24 @@ func (m Model) renderSession(width, height int) string {
 	var allBody []string
 	if m.raw {
 		allBody = renderRawHistory(m.histories[current.ID], width)
-		if captured, bounded := m.snapshotCursors[current.ID]; bounded {
-			allBody = append([]string{
-				fitLine(fmt.Sprintf("Pre-snapshot raw is not retained (≤%d).", captured), width),
-				fitLine("Full: acpctl session logs <id> --raw", width),
-				horizontalRule(width),
-			}, allBody...)
-		}
 	} else {
 		allBody = renderConversation(m.projections[current.ID], provider, width, conversationOptions{
-			showReasoning: m.showReasoning,
-			expandedTool:  m.expandedTool,
-			selectedTool:  m.selectedTool,
+			showReasoning:     m.showReasoning,
+			expandedTool:      m.expandedTool,
+			selectedTool:      m.selectedTool,
+			permissionReady:   m.permissionDecisionsReady[current.ID],
+			permissionBlocked: m.permissionBlockedReason[current.ID],
 		})
+	}
+	if notice := m.replayWindowNotice(current.ID); notice != "" {
+		allBody = append([]string{notice, ""}, allBody...)
+	}
+	if !m.raw && m.projectionClipped[current.ID] {
+		notice := "PROJECTION CLIPPED · earlier conversation cards were evicted from this disposable view; use raw channel frames or on-disk JSONL"
+		if m.projectionOverflow[current.ID] {
+			notice = "PROJECTION LIMIT · this Task view cannot retain another actionable approval; attach this exact Session directly"
+		}
+		allBody = append([]string{notice, ""}, allBody...)
 	}
 	body := viewportLines(allBody, bodyHeight, m.scroll, width)
 	notice := m.sessionNotice(width)
@@ -463,6 +506,52 @@ func (m Model) renderSession(width, height int) string {
 	lines = append(lines, composer...)
 	lines = append(lines, footer)
 	return renderScreen(lines, width, height)
+}
+
+func (m Model) replayWindowNotice(sessionID string) string {
+	window, clipped := m.effectiveReplayWindow(sessionID)
+	if !clipped {
+		return ""
+	}
+	return fmt.Sprintf("REPLAY CLIPPED · earliest_sequence=%d · cursor=%d · raw JSONL on disk remains authoritative", window.EarliestSequence, window.Cursor)
+}
+
+func (m Model) effectiveReplayWindow(sessionID string) (appservice.ReplayWindow, bool) {
+	if !m.historyClipped[sessionID] {
+		return appservice.ReplayWindow{}, false
+	}
+	window, exists := m.replayWindows[sessionID]
+	if !exists {
+		window = replayWindow(0, true)
+	}
+	if history := m.histories[sessionID]; len(history) > 0 &&
+		(window.EarliestSequence == 0 || history[0].line.Seq > window.EarliestSequence) {
+		window = replayWindow(history[0].line.Seq-1, true)
+	} else if len(m.histories[sessionID]) == 0 && m.cursors[sessionID] > window.Cursor {
+		window = replayWindow(m.cursors[sessionID], true)
+	}
+	window.Clipped = true
+	return window, true
+}
+
+func (m Model) clippedReplayWindowCount() int {
+	count := 0
+	for _, current := range m.task.Sessions {
+		if m.historyClipped[current.ID] {
+			count++
+		}
+	}
+	return count
+}
+
+func (m Model) clippedProjectionCount() int {
+	count := 0
+	for _, current := range m.task.Sessions {
+		if m.projectionClipped[current.ID] {
+			count++
+		}
+	}
+	return count
 }
 
 func (m Model) sessionNotice(width int) string {
@@ -481,27 +570,21 @@ func (m Model) sessionFooter(width int) string {
 		mode = "r Conversation"
 	}
 	approval := ""
-	if projection := m.projections[m.current.ID]; projection != nil {
+	if projection := m.projections[m.current.ID]; projection != nil && m.permissionDecisionsReady[m.current.ID] {
 		if _, card := projection.pendingPermission(); card != nil && len(card.options) > 0 {
 			approval = fmt.Sprintf("1-%d choose approval", min(9, len(card.options)))
 		}
 	}
-	nativeAction := "n Native CLI"
-	compactNativeAction := "n Native"
-	if !nativeCapability(m.current).available {
-		nativeAction = "n Native N/A"
-		compactNativeAction = "n N/A"
-	}
-	required := []string{nativeAction, "p Message", "Esc Cancel"}
+	required := []string{"p Message", "Esc Cancel"}
 	if approval != "" {
-		required = []string{approval, nativeAction, "p Message", "Esc Cancel"}
+		required = []string{approval, "p Message", "Esc Cancel"}
 	}
 	if !m.direct {
 		required = append(required, "b Back")
 	}
 	required = append(required, "q Detach")
 	if width < 56 {
-		items := []string{compactNativeAction, "p Write"}
+		items := []string{"p Write"}
 		if approval != "" {
 			items = append([]string{approval}, items...)
 		} else {
@@ -528,9 +611,11 @@ func (m Model) sessionFooter(width int) string {
 }
 
 type conversationOptions struct {
-	showReasoning bool
-	expandedTool  string
-	selectedTool  string
+	showReasoning     bool
+	expandedTool      string
+	selectedTool      string
+	permissionReady   bool
+	permissionBlocked string
 }
 
 func renderConversation(projection *transcript, agent string, width int, options conversationOptions) []string {
@@ -539,6 +624,9 @@ func renderConversation(projection *transcript, agent string, width int, options
 	}
 	contentWidth := max(20, width-4)
 	var lines []string
+	if projection.clipped {
+		lines = append(lines, "… earlier conversation activity omitted from this bounded terminal view", "")
+	}
 	for requestIndex, request := range projection.requests {
 		if requestIndex > 0 {
 			lines = append(lines, "", sectionRule(width))
@@ -551,13 +639,7 @@ func renderConversation(projection *transcript, agent string, width int, options
 				lines = append(lines, indentWrapped(block.text, contentWidth, "  ")...)
 			case blockAssistant:
 				if block == completedResponse {
-					if block.source == "provider" {
-						lines = append(lines, "✓ RESPONSE · "+agent+" · saved")
-					} else {
-						lines = append(lines, "✓ RESPONSE · "+agent+" · complete")
-					}
-				} else if block.source == "provider" {
-					lines = append(lines, "● "+agent+" · earlier response")
+					lines = append(lines, "✓ RESPONSE · "+agent+" · complete")
 				} else {
 					lines = append(lines, "● "+agent+" · update")
 				}
@@ -569,10 +651,8 @@ func renderConversation(projection *transcript, agent string, width int, options
 				lines = append(lines, renderThought(block, contentWidth, options.showReasoning)...)
 			case blockTool:
 				lines = append(lines, renderTool(block.tool, width, options)...)
-			case blockPlan:
-				lines = append(lines, renderPlan(block.plan, contentWidth)...)
 			case blockPermission:
-				lines = append(lines, renderPermission(block.permission, width)...)
+				lines = append(lines, renderPermission(block.permission, width, options.permissionReady, options.permissionBlocked)...)
 			case blockError:
 				lines = append(lines, "! ERROR")
 				lines = append(lines, indentWrapped(block.text, contentWidth, "  ")...)
@@ -584,7 +664,7 @@ func renderConversation(projection *transcript, agent string, width int, options
 			lines = append(lines, "  ◇ Earlier reasoning is outside this bounded view.")
 		}
 		if request.state == turnComplete && !request.assistantSeen {
-			lines = append(lines, "  ! Turn completed without a visible response; open the provider CLI for more detail.")
+			lines = append(lines, "  ! Turn completed without a visible response; inspect channel diagnostics for more detail.")
 		} else if request.state == turnComplete && request.completedResponse() == nil {
 			lines = append(lines, "  ! Assistant output is outside this bounded view; inspect the local Session log.")
 		}
@@ -600,14 +680,10 @@ func renderConversation(projection *transcript, agent string, width int, options
 
 func renderThought(block *transcriptBlock, width int, expanded bool) []string {
 	count := logicalLines(block.text)
-	source := ""
-	if block.source == "provider" {
-		source = " · saved"
-	}
 	if !expanded {
-		return []string{fmt.Sprintf("  ▸ Reasoning%s · %d line(s) · o expand", source, count)}
+		return []string{fmt.Sprintf("  ▸ Reasoning · %d line(s) · o expand", count)}
 	}
-	lines := []string{"  ▾ Reasoning" + source}
+	lines := []string{"  ▾ Reasoning"}
 	wrapped := indentWrapped(block.text, width, "  │ ")
 	if len(wrapped) > 10 {
 		wrapped = append(wrapped[:10], "  ╰ … reasoning clipped in this view")
@@ -652,7 +728,7 @@ func renderTool(tool *toolCard, width int, options conversationOptions) []string
 	if options.expandedTool == tool.id {
 		detail := indentWrapped(tool.detail, max(10, width-7), "  │  ")
 		if len(detail) > 6 {
-			detail = append(detail[:6], "  │  … details clipped; press r for complete raw events")
+			detail = append(detail[:6], "  │  … details clipped; press r for raw channel frames")
 		}
 		if len(detail) == 0 {
 			detail = []string{"  │  No provider output was attached to this tool call."}
@@ -667,23 +743,7 @@ func renderTool(tool *toolCard, width int, options conversationOptions) []string
 	return lines
 }
 
-func renderPlan(entries []planEntry, width int) []string {
-	if len(entries) == 0 {
-		return nil
-	}
-	lines := []string{"  ▾ Plan"}
-	for index, entry := range entries {
-		branch := "├─"
-		if index == len(entries)-1 {
-			branch = "╰─"
-		}
-		line := "  " + branch + " " + planStatusGlyph(entry.status) + " " + entry.content
-		lines = append(lines, indentWrapped(line, width, "")...)
-	}
-	return lines
-}
-
-func renderPermission(card *permissionCard, width int) []string {
+func renderPermission(card *permissionCard, width int, decisionsReady bool, blockedReason string) []string {
 	if card == nil {
 		return nil
 	}
@@ -694,10 +754,16 @@ func renderPermission(card *permissionCard, width int) []string {
 			"  ╰─ resolved · " + valueOr(card.decision, "decision recorded"),
 		}
 	}
-	lines := []string{
-		"  ╭─ APPROVAL REQUIRED · " + fitLine(title, max(1, width-29)),
-		"  │  The agent is waiting; detach safely leaves this request open.",
+	lines := []string{"  ╭─ APPROVAL REQUIRED · " + fitLine(title, max(1, width-29))}
+	if !decisionsReady {
+		lines = append(lines, "  │  Decision unavailable · "+valueOr(blockedReason, "refresh the live Session before choosing"))
+		for _, option := range card.options {
+			label := valueOr(option.name, strings.ReplaceAll(option.kind, "_", " "))
+			lines = append(lines, "  │  offered · "+label)
+		}
+		return append(lines, "  ╰─ this retained card cannot be submitted yet")
 	}
+	lines = append(lines, "  │  The agent is waiting; detach safely leaves this request open.")
 	for index, option := range card.options {
 		label := valueOr(option.name, strings.ReplaceAll(option.kind, "_", " "))
 		if option.kind == "allow_always" || option.kind == "reject_always" {
@@ -713,8 +779,6 @@ func renderTurnState(state turnState) string {
 	switch state {
 	case turnReady:
 		return "  ◌ Message accepted"
-	case turnQueued:
-		return "  ◌ Message queued"
 	case turnLive:
 		return "  ● Agent is working…"
 	case turnCancelling:
@@ -732,12 +796,13 @@ func renderTurnState(state turnState) string {
 	}
 }
 
-func renderRawHistory(history []sessionlog.Line, width int) []string {
+func renderRawHistory(history []retainedChannelLine, width int) []string {
 	if len(history) == 0 {
 		return []string{"No raw Session history yet."}
 	}
 	var lines []string
-	for _, line := range history {
+	for _, retained := range history {
+		line := retained.line
 		raw := sanitizeDisplay(render.Activity(line, true))
 		wrapped := ansi.Hardwrap(raw, max(10, width), true)
 		lines = append(lines, strings.Split(wrapped, "\n")...)
@@ -1018,19 +1083,6 @@ func toolStatusGlyph(status string) string {
 	}
 }
 
-func planStatusGlyph(status string) string {
-	switch status {
-	case "completed", "complete":
-		return "✓"
-	case "in_progress", "running":
-		return "●"
-	case "failed", "error":
-		return "!"
-	default:
-		return "○"
-	}
-}
-
 func humanBytes(size int) string {
 	if size < 1024 {
 		return fmt.Sprintf("%d B", size)
@@ -1046,7 +1098,7 @@ func safeText(value string) string {
 		if r == '\n' || r == '\r' || r == '\t' {
 			return ' '
 		}
-		if unicode.IsControl(r) || r == '\u007f' {
+		if !unicode.IsPrint(r) {
 			return -1
 		}
 		return r

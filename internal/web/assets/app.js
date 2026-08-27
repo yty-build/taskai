@@ -4,13 +4,17 @@ const page = document.body.dataset.page;
 const textEncoder = new TextEncoder();
 const LIMITS = Object.freeze({
   assistant: 128 << 10, thought: 32 << 10, tool: 64 << 10, toolTotal: 256 << 10,
-  plan: 128 << 10, diagnostics: 1000, turns: 256, blocksPerTurn: 512,
-  toolsPerTurn: 256, permissions: 128, retained: 16 << 20, announcement: 768,
-  reconcileEvents: 2048, reconcileBytes: 4 << 20
+  diagnostics: 1000, diagnosticBytes: 8 << 20, diagnosticSample: 512 << 10,
+  turns: 256, blocksPerTurn: 512,
+  toolsPerTurn: 256, permissions: 128, permissionOptions: 16, retained: 16 << 20, announcement: 768,
+  identifier: 256, permissionIdentifier: 512, title: 1024, metadata: 512,
+  kind: 128, status: 128, errorProvenance: 256, stopReason: 512, permissionDecision: 512,
+  replayReady: 1024
 });
 
-async function apiRequest(path, method = "GET", body) {
+async function apiRequest(path, method = "GET", body, requestOptions = {}) {
   const options = { method, headers: { Accept: "application/json" } };
+  if (requestOptions.signal) options.signal = requestOptions.signal;
   if (body !== undefined) {
     options.headers["Content-Type"] = "application/json";
     options.body = JSON.stringify(body);
@@ -51,44 +55,118 @@ function offerRepositorySuggestion(notice, input, error) {
   use.addEventListener("click", () => {
     input.value = path;
     input.focus();
-    setNotice(notice, "Repository selected. Review the path, then press Start Session again.");
+    setNotice(notice, "Repository selected. Review the path, then connect the Session.");
   });
   notice.classList.toggle("has-action", true);
   notice.replaceChildren(explanation, use);
   return true;
 }
 
-const sessionStartWarningMessages = Object.freeze({
-  session_start_failed: "This Session was created but could not start. Its saved status and any established provider identity are shown here; inspect them before trying again.",
-  session_started_with_warning: "This Session started, but its Task status update did not complete. The conversation remains available.",
+const providerOptionSpecs = Object.freeze({
+  model: Object.freeze({ label: "Model", valueLimit: 256 }),
+  reasoning_effort: Object.freeze({ label: "Reasoning effort", valueLimit: 128 }),
 });
 
-function rememberSessionStartWarning(result) {
-  const sessionID = typeof result?.session?.id === "string" ? result.session.id : "";
-  const code = typeof result?.warning?.code === "string" ? result.warning.code : "";
-  if (!sessionID || sessionID.length > 256 || !sessionStartWarningMessages[code]) return false;
-  try {
-    window.sessionStorage?.setItem(`session-start-warning:${sessionID}`, code);
-    return true;
-  } catch (_) {
-    return false;
-  }
+function boundedProviderOptionText(value, limit) {
+  if (typeof value !== "string") return "";
+  return truncateUTF8(value.replace(/[\u0000-\u001f\u007f]/g, ""), limit).text;
 }
 
-function restoreSessionStartWarning(sessionID, notice = document.querySelector("#action-notice")) {
-  if (!sessionID || !notice) return false;
-  const key = `session-start-warning:${sessionID}`;
-  let code = "";
-  try {
-    code = window.sessionStorage?.getItem(key) || "";
-    window.sessionStorage?.removeItem(key);
-  } catch (_) {
-    return false;
+function normalizedProviderChoices(control, valueLimit) {
+  if (control?.supported !== true || !Array.isArray(control.choices)) return [];
+  const choices = [];
+  const seen = new Set();
+  for (const candidate of control.choices.slice(0, 256)) {
+    const value = typeof candidate?.value === "string" ? candidate.value : "";
+    if (!value || textEncoder.encode(value).length > valueLimit || seen.has(value)) continue;
+    const label = boundedProviderOptionText(candidate.label, 256) || value;
+    const group = boundedProviderOptionText(candidate.group, 80);
+    seen.add(value);
+    choices.push({ value, label, group });
   }
-  const message = sessionStartWarningMessages[code];
-  if (!message) return false;
-  setNotice(notice, message, code === "session_start_failed");
-  return true;
+  return choices;
+}
+
+function renderProviderOptionControl(select, badge, control, spec) {
+  if (!select || !spec) return { choices: [], reason: "not_advertised" };
+  const defaultOption = document.createElement("option");
+  defaultOption.value = "";
+  const currentValue = boundedProviderOptionText(control?.current_value, 96);
+  defaultOption.textContent = currentValue ? `Keep current (${currentValue})` : "Keep current provider default";
+  const choices = normalizedProviderChoices(control, spec.valueLimit);
+  const children = [defaultOption];
+  const groups = new Map();
+  for (const choice of choices) {
+    const option = document.createElement("option");
+    option.value = choice.value;
+    option.textContent = choice.label;
+    if (!choice.group) {
+      children.push(option);
+      continue;
+    }
+    let group = groups.get(choice.group);
+    if (!group) {
+      group = document.createElement("optgroup");
+      group.label = choice.group;
+      groups.set(choice.group, group);
+      children.push(group);
+    }
+    group.append(option);
+  }
+  select.replaceChildren(...children);
+  select.value = "";
+  select.disabled = choices.length === 0;
+  select.dataset.providerSupported = String(choices.length > 0);
+  const reason = ["not_advertised", "ambiguous_or_invalid"].includes(control?.unavailable_reason)
+    ? control.unavailable_reason : (choices.length > 0 ? "" : "not_advertised");
+  select.dataset.unavailableReason = reason;
+  if (badge) {
+    badge.textContent = choices.length > 0 ? `${choices.length} available` : (reason === "ambiguous_or_invalid" ? "Unavailable" : "Provider default only");
+    badge.classList.toggle("available", choices.length > 0);
+    badge.classList.toggle("unavailable", choices.length === 0);
+  }
+  return { choices, reason };
+}
+
+function renderProviderOptions(form, result) {
+  const catalog = result?.provider_options || {};
+  let availableControls = 0;
+  const unavailable = [];
+  for (const [name, spec] of Object.entries(providerOptionSpecs)) {
+    const select = form?.querySelector(`[data-provider-option="${name}"]`);
+    const badge = form?.querySelector(`[data-provider-option-badge="${name}"]`);
+    const rendered = renderProviderOptionControl(select, badge, catalog[name], spec);
+    if (rendered.choices.length > 0) availableControls += 1;
+    else unavailable.push({ label: spec.label, reason: rendered.reason });
+  }
+  const panel = form?.querySelector("[data-provider-options]");
+  panel?.classList.toggle("provider-options-ready", true);
+  panel?.setAttribute("aria-busy", "false");
+  const status = form?.querySelector("[data-provider-options-status]");
+  if (status) {
+    const invalid = unavailable.filter((item) => item.reason === "ambiguous_or_invalid").map((item) => item.label);
+    const messages = [];
+    if (invalid.length > 0) {
+      messages.push(`${invalid.join(" and ")} choices were ambiguous or invalid, so those controls are unavailable.`);
+    }
+    if (availableControls > 0) messages.push("Keep the current values or choose exact advertised values, then apply changes.");
+    else if (messages.length === 0) messages.push("This agent does not advertise configurable model or reasoning effort.");
+    if (unavailable.length > 0) messages.push("Unavailable controls keep their current values.");
+    status.textContent = messages.join(" ");
+  }
+  return availableControls;
+}
+
+function providerSelection(form, name) {
+  const select = form?.querySelector(`[data-provider-option="${name}"]`);
+  if (!select || select.disabled) return "";
+  const value = typeof select.value === "string" ? select.value : "";
+  if (!value) return "";
+  const choices = Array.from(select.querySelectorAll?.("option") || []);
+  if (!choices.some((option) => option.value === value)) {
+    throw new Error("Provider choices changed. Reload the available options before applying them.");
+  }
+  return value;
 }
 
 function permissionActionErrorMessage(error) {
@@ -117,8 +195,21 @@ function setStatus(element, status) {
   element.replaceChildren(dot, document.createTextNode(statusLabel(status)));
 }
 
+function setSessionDisplayStatus(element, item) {
+  setStatus(element, item?.status);
+}
+
+function sessionDisplayStatus(item) {
+  return { tone: statusTone(item?.status), label: statusLabel(item?.status) };
+}
+
 function agentInitial(value) {
   return Array.from(String(value || "A").trim())[0]?.toUpperCase() || "A";
+}
+
+function sessionRoleLabel(item) {
+  const role = String(item?.role || "Session");
+  return item?.parent_session_id ? `Child · ${role}` : role;
 }
 
 function findNavSession(sessionID) {
@@ -209,15 +300,23 @@ function bindShell() {
     });
   }
   for (const button of document.querySelectorAll("[data-close-dialog]")) {
-    button.addEventListener("click", () => button.closest("dialog")?.close());
+    button.addEventListener("click", () => {
+      const dialog = button.closest("dialog");
+      if (dialog?.querySelector('[data-provider-options-form][aria-busy="true"]')) return;
+      dialog?.close();
+    });
   }
   for (const dialog of document.querySelectorAll("dialog")) {
+    dialog.addEventListener("cancel", (event) => {
+      if (dialog.querySelector('[data-provider-options-form][aria-busy="true"]')) event.preventDefault();
+    });
     dialog.addEventListener("close", () => {
       const target = dialogReturnFocus.get(dialog);
       if (target && !document.querySelector("dialog[open]")) window.setTimeout(() => target.focus(), 0);
     });
     dialog.addEventListener("click", (event) => {
       if (event.target !== dialog) return;
+      if (dialog.querySelector('[data-provider-options-form][aria-busy="true"]')) return;
       const bounds = dialog.getBoundingClientRect();
       const inside = event.clientX >= bounds.left && event.clientX <= bounds.right && event.clientY >= bounds.top && event.clientY <= bounds.bottom;
       if (!inside) dialog.close();
@@ -247,37 +346,144 @@ function bindTaskCreation() {
   });
 }
 
+function resultSessionID(result) {
+  const sessionID = typeof result?.session?.id === "string" ? result.session.id : "";
+  return sessionID && sessionID.length <= 256 ? sessionID : "";
+}
+
+function sessionIdentityPayload(form) {
+  const data = new FormData(form);
+  return {
+    agent: data.get("agent"),
+    role: data.get("role"),
+    repo_path: data.get("repo_path"),
+    worktree: data.has("worktree"),
+    approve_all: data.has("approve_all"),
+    allow_shared_checkout: data.has("allow_shared_checkout")
+  };
+}
+
+async function submitSessionCreation(form, path, notice) {
+  if (!beginFormSubmission(form)) return;
+  const submit = form.querySelector("button[type=submit]");
+  submit.disabled = true;
+  setNotice(notice, "Connecting Session…");
+  try {
+    const result = await apiRequest(path, "POST", sessionIdentityPayload(form));
+    const sessionID = resultSessionID(result);
+    if (!sessionID) throw new Error("The server did not return a Session.");
+    window.location.assign(`/sessions/${encodeURIComponent(sessionID)}`);
+  } catch (error) {
+    const repoInput = form.querySelector('input[name="repo_path"]');
+    if (!offerRepositorySuggestion(notice, repoInput, error)) setNotice(notice, error.message, true);
+    endFormSubmission(form);
+    submit.disabled = false;
+  }
+}
+
 function bindSessionCreation(taskID) {
   const form = document.querySelector("#create-session-form");
-  const notice = document.querySelector("#session-form-notice");
   if (!form || !taskID) return;
+  const notice = document.querySelector("#session-form-notice");
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    submitSessionCreation(form, `/api/v1/tasks/${encodeURIComponent(taskID)}/sessions`, notice);
+  });
+}
+
+function bindChildSessionCreation(sessionID) {
+  const form = document.querySelector("#create-child-session-form");
+  if (!form || !sessionID) return;
+  const notice = document.querySelector("#child-session-form-notice");
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    submitSessionCreation(form, `/api/v1/sessions/${encodeURIComponent(sessionID)}/children`, notice);
+  });
+}
+
+async function loadProviderOptions(sessionID, form = document.querySelector("#provider-config-form")) {
+  if (!form || !sessionID) return false;
+  if (!providerOptionsCanLoad()) {
+    syncProviderDependentControls();
+    return false;
+  }
+  const streamEpoch = sessionStreamBoundaryEpoch;
+  const connectionEpoch = providerConnectionEpoch;
+  const runtimeEpoch = runtimeStatusEpoch;
+  const requestEpoch = ++providerOptionsRequestEpoch;
+  const requestIsCurrent = () => requestEpoch === providerOptionsRequestEpoch &&
+    streamEpoch === sessionStreamBoundaryEpoch && connectionEpoch === providerConnectionEpoch &&
+    runtimeEpoch === runtimeStatusEpoch && providerOptionsCanLoad();
+  const panel = form.querySelector("[data-provider-options]");
+  const submit = form.querySelector("button[type=submit]");
+  const status = form.querySelector("[data-provider-options-status]");
+  panel?.setAttribute("aria-busy", "true");
+  if (submit) submit.disabled = true;
+  setNotice(status, "Loading the controls advertised by this agent…");
+  try {
+    const result = await apiRequest(`/api/v1/sessions/${encodeURIComponent(sessionID)}/provider-options`);
+    if (!requestIsCurrent()) return false;
+    renderProviderOptions(form, result);
+    syncProviderDependentControls();
+    return true;
+  } catch (error) {
+    if (!requestIsCurrent()) return false;
+    if (error?.code === "session_starting") {
+      setNotice(status, "Waiting for the provider connection…");
+    } else {
+      setNotice(status, error.message, true);
+    }
+    return false;
+  } finally {
+    if (requestEpoch === providerOptionsRequestEpoch) panel?.setAttribute("aria-busy", "false");
+    syncProviderDependentControls();
+  }
+}
+
+function bindProviderConfig(sessionID) {
+  const form = document.querySelector("#provider-config-form");
+  if (!form || !sessionID) return;
+  const notice = document.querySelector("#provider-config-notice");
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
+    if (!providerOptionsCanLoad()) {
+      setNotice(notice, "Wait until the Session is connected and idle before changing provider options.", true);
+      syncProviderDependentControls();
+      return;
+    }
+    if (!beginFormSubmission(form)) return;
     const submit = form.querySelector("button[type=submit]");
     submit.disabled = true;
-    setNotice(notice, "Starting Session and connecting the agent…");
     try {
-      const data = new FormData(form);
-      const result = await apiRequest(`/api/v1/tasks/${encodeURIComponent(taskID)}/sessions`, "POST", {
-        agent: data.get("agent"), role: data.get("role"), repo_path: data.get("repo_path"), prompt: data.get("prompt"),
-        model: data.get("model"), reasoning_effort: data.get("reasoning_effort"),
-        worktree: data.has("worktree"), approve_all: data.has("approve_all"), allow_shared_checkout: data.has("allow_shared_checkout")
-      });
-      rememberSessionStartWarning(result);
-      window.location.assign(`/sessions/${encodeURIComponent(result.session.id)}`);
+      const model = providerSelection(form, "model");
+      const reasoningEffort = providerSelection(form, "reasoning_effort");
+      if (!model && !reasoningEffort) {
+        setNotice(notice, "Choose at least one new value to apply.");
+        return;
+      }
+      const config = {};
+      if (model) config.model = model;
+      if (reasoningEffort) config.reasoning_effort = reasoningEffort;
+      setNotice(notice, "Applying provider configuration…");
+      const result = await apiRequest(`/api/v1/sessions/${encodeURIComponent(sessionID)}/config`, "POST", config);
+      if (result?.provider_options) renderProviderOptions(form, result);
+      else await loadProviderOptions(sessionID, form);
+      setNotice(notice, "Provider configuration applied.");
     } catch (error) {
-      const repoInput = form.querySelector('input[name="repo_path"]');
-      if (!offerRepositorySuggestion(notice, repoInput, error)) setNotice(notice, error.message, true);
-      submit.disabled = false;
+      setNotice(notice, error.message, true);
+    } finally {
+      endFormSubmission(form);
+      syncProviderDependentControls();
     }
   });
 }
 
 function makeSessionRow(item) {
   const link = document.createElement("a");
-  link.className = item.role === "reviewer" ? "session-row reviewer" : "session-row";
+  link.className = `session-row${item.parent_session_id ? " child-session" : ""}`;
   link.href = `/sessions/${encodeURIComponent(item.id)}`;
   link.dataset.sessionId = item.id;
+  if (item.parent_session_id) link.dataset.parentSessionId = item.parent_session_id;
 
   const avatar = document.createElement("span");
   avatar.className = "provider-avatar";
@@ -288,7 +494,7 @@ function makeSessionRow(item) {
   const title = document.createElement("strong");
   title.append(document.createTextNode(item.agent), document.createTextNode(" · "));
   const role = document.createElement("small");
-  role.textContent = item.role;
+  role.textContent = sessionRoleLabel(item);
   title.append(role);
   const context = document.createElement("span");
   const path = item.repo_path || "No checkout";
@@ -299,7 +505,7 @@ function makeSessionRow(item) {
   const state = document.createElement("span");
   state.className = "session-row-state";
   const status = document.createElement("span");
-  setStatus(status, item.status);
+  setSessionDisplayStatus(status, item);
   const permission = document.createElement("small");
   permission.textContent = item.permission;
   state.append(status, permission);
@@ -312,16 +518,18 @@ function makeSessionRow(item) {
 }
 
 function updateSessionRow(link, item) {
-  link.className = item.role === "reviewer" ? "session-row reviewer" : "session-row";
+  link.className = `session-row${item.parent_session_id ? " child-session" : ""}`;
   link.href = `/sessions/${encodeURIComponent(item.id)}`;
   link.dataset.sessionId = item.id;
+  if (item.parent_session_id) link.dataset.parentSessionId = item.parent_session_id;
+  else delete link.dataset.parentSessionId;
   const avatar = link.querySelector(".provider-avatar");
   if (avatar) avatar.textContent = agentInitial(item.agent);
   const title = link.querySelector(".session-row-copy > strong");
   if (title) {
     title.replaceChildren(document.createTextNode(item.agent), document.createTextNode(" · "));
     const role = document.createElement("small");
-    role.textContent = item.role;
+    role.textContent = sessionRoleLabel(item);
     title.append(role);
   }
   const context = link.querySelector(".session-row-copy > span");
@@ -330,7 +538,7 @@ function updateSessionRow(link, item) {
     const checkout = path.split("/").filter(Boolean).pop() || path;
     context.textContent = `${checkout}${item.worktree_path ? " · isolated worktree" : ""}`;
   }
-  setStatus(link.querySelector(".session-row-state .status"), item.status);
+  setSessionDisplayStatus(link.querySelector(".session-row-state .status"), item);
   const permission = link.querySelector(".session-row-state small");
   if (permission) permission.textContent = item.permission;
 }
@@ -341,15 +549,23 @@ async function refreshTask(taskID) {
   setStatus(document.querySelector("#task-status"), result.task.status);
   const count = document.querySelector("#session-count");
   if (count) count.textContent = String(result.sessions.length);
-  const signature = JSON.stringify(result.sessions.map((item) => [item.id, item.status, item.agent, item.role, item.permission, item.updated_at]));
+  const signature = JSON.stringify(result.sessions.map((item) => [item.id, item.parent_session_id, item.status, item.agent, item.role, item.permission, item.updated_at]));
   if (signature === taskSessionSignature) return;
   taskSessionSignature = signature;
   for (const item of result.sessions) {
     const navLink = findNavSession(item.id);
+    if (navLink) {
+      navLink.classList.toggle("child-session", Boolean(item.parent_session_id));
+      if (item.parent_session_id) navLink.dataset.parentSessionId = item.parent_session_id;
+      else delete navLink.dataset.parentSessionId;
+      const role = navLink.querySelector("small");
+      if (role) role.textContent = sessionRoleLabel(item);
+    }
     const dot = navLink?.querySelector(".status-dot");
     if (dot) {
-      dot.className = `status-dot status-${statusTone(item.status)}`;
-      dot.setAttribute("aria-label", statusLabel(item.status));
+      const display = sessionDisplayStatus(item);
+      dot.className = `status-dot status-${display.tone}`;
+      dot.setAttribute("aria-label", display.label);
     }
   }
   const list = document.querySelector("#session-list");
@@ -427,6 +643,47 @@ function truncateUTF8Tail(value, limit) {
   return { text: result.text, bytes: bytes - result.dropped, clipped: true };
 }
 
+function retainedTextBytes(...values) {
+  let total = 0;
+  for (const value of values) total += textEncoder.encode(String(value || "")).length;
+  return total;
+}
+
+function boundedTranscriptText(value, limit) {
+  if (value === undefined || value === null) return "";
+  return boundedProviderOptionText(String(value), limit);
+}
+
+function transcriptIdentifierDigest(value) {
+  let first = 0x811c9dc5;
+  let second = 0x9e3779b9;
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index);
+    first = Math.imul(first ^ unit, 0x01000193) >>> 0;
+    second = Math.imul(second ^ unit, 0x85ebca6b) >>> 0;
+  }
+  return `${value.length.toString(36)}-${first.toString(36)}-${second.toString(36)}`;
+}
+
+function boundedTranscriptIdentifier(value, fallback = "") {
+  let source = value === undefined || value === null ? "" : String(value);
+  if (!source) source = String(fallback || "");
+  source = source.replace(/[\u0000-\u001f\u007f]/g, "");
+  if (!source) source = String(fallback || "").replace(/[\u0000-\u001f\u007f]/g, "");
+  const bounded = truncateUTF8(source, LIMITS.identifier);
+  if (!bounded.clipped) return bounded.text;
+  const suffix = `…#${transcriptIdentifierDigest(source)}`;
+  const suffixBytes = retainedTextBytes(suffix);
+  return `${truncateUTF8(source, Math.max(0, LIMITS.identifier - suffixBytes)).text}${suffix}`;
+}
+
+function exactPermissionIdentifier(value, limit) {
+  if (value === undefined || value === null) return "";
+  const identifier = String(value);
+  if (!identifier || /[\u0000-\u001f\u007f-\u009f]/.test(identifier)) return "";
+  return textEncoder.encode(identifier).length <= limit ? identifier : "";
+}
+
 function makeRollingTextRoom(turn, type, byteField, incomingBytes, limit) {
   let needed = Math.max(0, turn[byteField] + incomingBytes - limit);
   while (needed > 0) {
@@ -457,7 +714,7 @@ function endFormSubmission(form) {
 
 function applyOptimisticPromptState(turn, acceptedState) {
   if (turn.lifecycleSeen) return false;
-  turn.state = acceptedState === "queued" ? "queued" : acceptedState === "ready" ? "ready" : "working";
+  turn.state = acceptedState === "ready" ? "ready" : "working";
   recordTurnLifecycle(turn, turn.state, {});
   return true;
 }
@@ -472,10 +729,13 @@ function applyOptimisticPromptReceipt(turn, acceptedState) {
 
 function newTranscriptState() {
   return {
-    turns: [], byRequest: new Map(), permissions: new Map(), diagnostics: [],
-    renderTimer: 0, shouldStick: true, newUpdates: 0, lastPosition: 0, historyClipped: false,
-    permissionOverflow: false, retainedBytes: 0, source: "gateway-log", checkpoint: "",
-    sourceWarning: "", snapshotTruncated: false
+    turns: [], byRequest: new Map(), permissions: new Map(), permissionSizes: new Map(), diagnostics: [], diagnosticSizes: [],
+    renderTimer: 0, shouldStick: true, newUpdates: 0, lastSequence: 0, framesClipped: false,
+    permissionAuthoritySequence: 0, pendingPermissionSnapshot: null,
+    replayReady: false, replayCursor: 0, replayEarliestSequence: 0, replayClipped: false,
+    replayGapCursor: 0, replayGapEarliestSequence: 0,
+    streamErrorCode: "", streamErrorMessage: "",
+    diagnosticsClipped: false, diagnosticBytes: 0, permissionOverflow: false, retainedBytes: 0
   };
 }
 
@@ -500,7 +760,7 @@ function queueConversationAnnouncement(text, status = "") {
       // Terminal state supersedes the earlier working state for this turn.
       pendingConversationStatus = status;
     } else if (pendingTerminal && !pendingConversationStatus.includes(status.trim())) {
-      // A queued turn may start before this batch is announced. Preserve both
+      // A later turn may start before this batch is announced. Preserve both
       // the completed boundary and the next turn's working state.
       pendingConversationStatus += status;
     } else if (!pendingTerminal) {
@@ -525,42 +785,109 @@ function queueConversationAnnouncement(text, status = "") {
   }, 700);
 }
 
-function noteStreamActivity(activity) {
+function noteStreamFrame(frame) {
   if (!streamAnnouncementsReady) return;
-  const display = activity.display;
-  if (!display) return;
-  if (display.type === "assistant_chunk") queueConversationAnnouncement(display.text || "");
-  if (display.type === "turn_state" && display.state === "working") queueConversationAnnouncement("", " Agent is working.");
-  if (display.type === "turn_state" && ["complete", "cancelled"].includes(display.state)) {
-    queueConversationAnnouncement("", display.state === "cancelled" ? " Response stopped." : " Response complete.");
+  const data = frame?.data || {};
+  if (frame.type === "provider_event" && data.type === "text_delta" && !providerTextIsThought(data)) {
+    queueConversationAnnouncement(data.text || "");
+  }
+  if (frame.type === "client_command" && data.command === "prompt") queueConversationAnnouncement("", " Agent is working.");
+  if (frame.type === "provider_result" && ["completed", "cancelled"].includes(data.status)) {
+    queueConversationAnnouncement("", data.status === "cancelled" ? " Response stopped." : " Response complete.");
   }
 }
 
-function activityPosition(activity) {
-  const position = Number(activity?.position);
-  return Number.isFinite(position) && position > 0 ? position : Number.POSITIVE_INFINITY;
+function frameSequence(frame) {
+  const sequence = Number(frame?.seq);
+  return Number.isFinite(sequence) && sequence > 0 ? sequence : Number.POSITIVE_INFINITY;
+}
+
+function rememberReplayReady(encoded) {
+  if (typeof encoded !== "string" || encoded.length > LIMITS.replayReady || retainedTextBytes(encoded) > LIMITS.replayReady) return false;
+  let detail;
+  try { detail = JSON.parse(encoded); } catch (_) { return false; }
+  const cursor = detail?.cursor;
+  const earliest = detail?.earliest_sequence;
+  if (!Number.isSafeInteger(cursor) || cursor < 0 || cursor >= Number.MAX_SAFE_INTEGER ||
+    !Number.isSafeInteger(earliest) || earliest !== cursor + 1 || typeof detail?.clipped !== "boolean") return false;
+  if ((!detail.clipped && cursor !== transcriptState.lastSequence) ||
+    (detail.clipped && (cursor === 0 || cursor < transcriptState.lastSequence))) return false;
+  transcriptState.replayReady = true;
+  transcriptState.replayCursor = cursor;
+  transcriptState.replayEarliestSequence = earliest;
+  transcriptState.replayClipped = detail.clipped;
+  transcriptState.lastSequence = Math.max(transcriptState.lastSequence, cursor);
+  // A declared replay cursor is also the minimum safe permission-snapshot
+  // watermark. A clipped prefix may contain a resolution that this viewer
+  // never saw, so an older GET must not resurrect it.
+  transcriptState.permissionAuthoritySequence = Math.max(transcriptState.permissionAuthoritySequence, cursor);
+  if (detail.clipped && transcriptState.replayGapEarliestSequence === 0) {
+    transcriptState.replayGapCursor = cursor;
+    transcriptState.replayGapEarliestSequence = earliest;
+  }
+  if (detail.clipped) transcriptState.framesClipped = true;
+  return true;
+}
+
+function activityLimitNoticeText() {
+  if (transcriptState.replayGapEarliestSequence > 0) {
+    return `Initial bounded replay began at sequence ${transcriptState.replayGapEarliestSequence} after effective cursor ${transcriptState.replayGapCursor}. Earlier Session activity is outside this browser view.`;
+  }
+  return transcriptState.framesClipped ? "Earlier activity is outside this bounded browser view." : "";
+}
+
+function activityLimitNotice(container) {
+  const text = activityLimitNoticeText();
+  if (!text) return null;
+  let notice = container.querySelector("#activity-limit-note");
+  if (!notice) {
+    notice = document.createElement("div");
+    notice.id = "activity-limit-note";
+    notice.className = "activity-limit-note";
+  }
+  notice.textContent = text;
+  return notice;
+}
+
+function streamErrorNotice(container) {
+  if (!transcriptState.streamErrorMessage) return null;
+  let notice = container.querySelector("#stream-error-notice");
+  if (!notice) {
+    notice = document.createElement("div");
+    notice.id = "stream-error-notice";
+    notice.className = "error-card stream-error-notice";
+  }
+  notice.textContent = transcriptState.streamErrorMessage;
+  return notice;
+}
+
+function syncConversationChildren(container, desired) {
+  for (let index = 0; index < desired.length; index += 1) {
+    if (container.children[index] !== desired[index]) container.insertBefore(desired[index], container.children[index] || null);
+  }
+  while (container.children.length > desired.length) container.lastElementChild.remove();
 }
 
 function orderedTurns() {
-  return [...transcriptState.turns].sort((left, right) => left.firstPosition - right.firstPosition);
+  return [...transcriptState.turns].sort((left, right) => left.firstSequence - right.firstSequence);
 }
 
-function activityTimestamp(activity) {
-  const value = Date.parse(activity?.timestamp || "");
+function frameTimestamp(frame) {
+  const value = Date.parse(frame?.timestamp || "");
   return Number.isFinite(value) ? value : 0;
 }
 
-function recordTurnActivityTime(turn, activity) {
-  const value = activityTimestamp(activity);
+function recordTurnFrameTime(turn, frame) {
+  const value = frameTimestamp(frame);
   if (!value) return;
   if (!turn.firstTimestamp || value < turn.firstTimestamp) turn.firstTimestamp = value;
   if (!turn.lastTimestamp || value > turn.lastTimestamp) turn.lastTimestamp = value;
 }
 
-function recordTurnLifecycle(turn, state, activity) {
-  state = String(state || "").trim().toLowerCase();
+function recordTurnLifecycle(turn, state, frame) {
+  state = boundedTranscriptText(state, LIMITS.status).trim().toLowerCase();
   if (!state) return;
-  const timestamp = activityTimestamp(activity);
+  const timestamp = frameTimestamp(frame);
   const previous = turn.lifecycle[turn.lifecycle.length - 1];
   if (previous?.state === state) {
     if (timestamp) previous.timestamp = timestamp;
@@ -571,19 +898,49 @@ function recordTurnLifecycle(turn, state, activity) {
 }
 
 function turnRetainedBytes(turn) {
-  let total = 0;
+  let total = retainedTextBytes(turn.id, turn.state, turn.stopReason);
+  for (const item of turn.lifecycle) total += retainedTextBytes(item.state);
+  for (const permissionID of turn.permissionIDs) total += retainedTextBytes(permissionID);
   for (const block of turn.blocks) {
-    if (["user", "assistant", "thought"].includes(block.type)) total += block.bytes || 0;
-    if (block.type === "error") total += textEncoder.encode(block.text || "").length;
-    if (block.type === "plan") {
-      for (const entry of block.entries || []) total += textEncoder.encode(`${entry.content || ""}${entry.status || ""}`).length;
+    if (["user", "assistant", "thought"].includes(block.type)) {
+      total += block.bytes || 0;
+      total += retainedTextBytes(block.messageID);
     }
+    if (block.type === "error") {
+      total += retainedTextBytes(block.text, block.errorSource, block.errorCode);
+    }
+    if (block.type === "status") total += retainedTextBytes(block.text, block.tag);
     if (block.type === "tool") {
       total += block.detailBytes || 0;
-      total += textEncoder.encode(`${block.title || ""}${block.kind || ""}${block.status || ""}${block.metadata || ""}${block.preview || ""}${block.detailLabel || ""}`).length;
+      total += retainedTextBytes(block.id, block.title, block.kind, block.status, block.metadata, block.preview, block.detailLabel);
     }
   }
   return total;
+}
+
+function permissionRetainedBytes(permission) {
+  let total = retainedTextBytes(
+    permission?.id, permission?.request_id, permission?.title, permission?.kind,
+    permission?.state, permission?.decision
+  );
+  for (const option of permission?.options || []) {
+    total += retainedTextBytes(option.id, option.name, option.kind);
+  }
+  return total;
+}
+
+function refreshTurnRetention(turn) {
+  const next = turnRetainedBytes(turn);
+  transcriptState.retainedBytes += next - (turn.retainedBytes || 0);
+  turn.retainedBytes = next;
+}
+
+function storePermissionRecord(permission) {
+  const previous = transcriptState.permissionSizes.get(permission.id) || 0;
+  const next = permissionRetainedBytes(permission);
+  transcriptState.permissions.set(permission.id, permission);
+  transcriptState.permissionSizes.set(permission.id, next);
+  transcriptState.retainedBytes += next - previous;
 }
 
 function removeTurn(turn) {
@@ -591,21 +948,23 @@ function removeTurn(turn) {
   transcriptState.byRequest.delete(turn.id);
   transcriptState.retainedBytes = Math.max(0, transcriptState.retainedBytes - (turn.retainedBytes || 0));
   turn.element?.remove();
-  for (const permissionID of turn.permissionIDs) {
-    if (transcriptState.permissions.get(permissionID)?.state !== "waiting") transcriptState.permissions.delete(permissionID);
+  for (const permissionID of [...turn.permissionIDs]) {
+    if (transcriptState.permissions.get(permissionID)?.state !== "waiting") removePermissionRecord(permissionID);
   }
-  transcriptState.historyClipped = true;
+  transcriptState.framesClipped = true;
 }
 
-function updateTurnRetention(turn) {
-  const next = turnRetainedBytes(turn);
-  transcriptState.retainedBytes += next - (turn.retainedBytes || 0);
-  turn.retainedBytes = next;
+function enforceTranscriptRetention(protectedTurn = null) {
   while (transcriptState.retainedBytes > LIMITS.retained) {
-    const candidate = orderedTurns().find((item) => item !== turn);
+    const candidate = orderedTurns().find((item) => item !== protectedTurn);
     if (!candidate) break;
     removeTurn(candidate);
   }
+}
+
+function updateTurnRetention(turn) {
+  refreshTurnRetention(turn);
+  enforceTranscriptRetention(turn);
 }
 
 function trimTurns() {
@@ -644,193 +1003,274 @@ function touchBlock(block) {
   block.revision = (block.revision || 0) + 1;
 }
 
-function turnFor(activity) {
-  const requestID = activity.request_id || `local:${activity.position}`;
+function turnFor(frame) {
+  const requestID = boundedTranscriptIdentifier(frame.request_id || frame.data?.request_id, `local:${frame.seq}`);
   let turn = transcriptState.byRequest.get(requestID);
   if (turn) {
-    turn.firstPosition = Math.min(turn.firstPosition, activityPosition(activity));
-    recordTurnActivityTime(turn, activity);
+    turn.firstSequence = Math.min(turn.firstSequence, frameSequence(frame));
+    recordTurnFrameTime(turn, frame);
     return turn;
   }
   turn = {
-    id: requestID, firstPosition: activityPosition(activity), state: "", stopReason: "", blocks: [],
-    tools: new Map(), plan: null, error: null, permissionIDs: new Set(),
+    id: requestID, firstSequence: frameSequence(frame), state: "", stopReason: "", blocks: [],
+    tools: new Map(), error: null, permissionIDs: new Set(),
     assistantBytes: 0, thoughtBytes: 0, toolBytes: 0, retainedBytes: 0, assistantSeen: false, reasoningSeen: false,
-    lifecycle: [], firstTimestamp: 0, lastTimestamp: 0, surface: "acp",
-    lifecycleSeen: false, committed: false, contentClipped: false, dirty: true, element: null, overviewElement: null
+    lifecycle: [], firstTimestamp: 0, lastTimestamp: 0,
+    lifecycleSeen: false, contentClipped: false, dirty: true, element: null, overviewElement: null
   };
-  recordTurnActivityTime(turn, activity);
+  recordTurnFrameTime(turn, frame);
   transcriptState.byRequest.set(requestID, turn);
   transcriptState.turns.push(turn);
   return turn;
 }
 
-function applyDisplay(activity, turn) {
-  const display = activity.display;
-  if (!display) return;
-  switch (display.type) {
-  case "legacy_user_message": {
-    if (turn.blocks.some((item) => item.type === "user")) break;
-    const value = truncateUTF8(display.text || "", LIMITS.assistant);
-    if (turn.blocks.length >= LIMITS.blocksPerTurn) {
-      turn.contentClipped = true;
-      break;
-    }
-    turn.blocks.unshift({ type: "user", text: value.text, bytes: value.bytes, clipped: value.clipped || Boolean(display.truncated), legacy: true, revision: 1 });
-    turn.dirty = true;
-    break;
-  }
-  case "user_message": {
-    let block = turn.blocks.find((item) => item.type === "user");
-    if (!block) {
-      block = { type: "user", text: "", bytes: 0, clipped: false };
-      if (turn.blocks.length >= LIMITS.blocksPerTurn) {
-        turn.contentClipped = true;
-        break;
-      }
-      turn.blocks.unshift(block);
-    }
-    const value = truncateUTF8(display.text || "", LIMITS.assistant);
-    block.text = value.text;
-    block.bytes = value.bytes;
-    block.clipped = value.clipped || Boolean(display.truncated);
-    block.legacy = false;
-    touchBlock(block);
-    turn.dirty = true;
-    break;
-  }
-  case "assistant_chunk": {
-    if (String(display.text || "").trim()) turn.assistantSeen = true;
-    const incoming = truncateUTF8Tail(display.text || "", LIMITS.assistant);
-    makeRollingTextRoom(turn, "assistant", "assistantBytes", incoming.bytes, LIMITS.assistant);
-    const previous = turn.blocks[turn.blocks.length - 1];
-    const source = activity.kind === "provider_transcript" ? "provider" : "acp";
-    const compatible = previous?.type === "assistant" && previous.source === source && (previous.messageID === display.message_id || !previous.messageID || !display.message_id);
-    const block = compatible ? previous : { type: "assistant", source, text: "", bytes: 0, clipped: false, leadingClipped: false, trailingClipped: false, messageID: display.message_id || "", key: activity.position };
-    if (!compatible && (!makeTextBlockSlot(turn) || !appendTurnBlock(turn, block))) break;
-    block.text += incoming.text;
-    block.bytes += incoming.bytes;
-    turn.assistantBytes += incoming.bytes;
-    block.leadingClipped = block.leadingClipped || incoming.clipped;
-    block.trailingClipped = block.trailingClipped || Boolean(display.truncated);
-    turn.contentClipped = turn.contentClipped || incoming.clipped || Boolean(display.truncated);
-    touchBlock(block);
-    turn.dirty = true;
-    break;
-  }
-  case "thought_chunk": {
-    if (String(display.text || "").trim()) turn.reasoningSeen = true;
-    const incoming = truncateUTF8Tail(display.text || "", LIMITS.thought);
-    makeRollingTextRoom(turn, "thought", "thoughtBytes", incoming.bytes, LIMITS.thought);
-    const source = activity.kind === "provider_transcript" ? "provider" : "acp";
-    const previous = turn.blocks[turn.blocks.length - 1];
-    const block = previous?.type === "thought" && previous.source === source ? previous : { type: "thought", source, text: "", bytes: 0, clipped: false, leadingClipped: false, trailingClipped: false, key: activity.position };
-    if (block !== previous && (!makeTextBlockSlot(turn) || !appendTurnBlock(turn, block))) break;
-    block.text += incoming.text;
-    block.bytes += incoming.bytes;
-    turn.thoughtBytes += incoming.bytes;
-    block.leadingClipped = block.leadingClipped || incoming.clipped;
-    block.trailingClipped = block.trailingClipped || Boolean(display.truncated);
-    turn.contentClipped = turn.contentClipped || incoming.clipped || Boolean(display.truncated);
-    touchBlock(block);
-    turn.dirty = true;
-    break;
-  }
-  case "tool_upsert": {
-    const patch = display.tool;
-    if (!patch?.id) break;
-    let block = turn.tools.get(patch.id);
-    if (!block) {
-      if (turn.tools.size >= LIMITS.toolsPerTurn) {
-        turn.contentClipped = true;
-        turn.dirty = true;
-        break;
-      }
-      block = { type: "tool", id: patch.id, title: "", kind: "", status: "", metadata: "", preview: "", detail: "", detailBytes: 0, clipped: false, sensitive: false };
-      if (!appendTurnBlock(turn, block)) break;
-      turn.tools.set(patch.id, block);
-    }
-    for (const field of ["title", "kind", "status", "metadata", "detail_label"]) {
-      if (patch[field]) block[field === "detail_label" ? "detailLabel" : field] = patch[field];
-    }
-    if (patch.detail) {
-      const available = Math.min(LIMITS.tool, Math.max(0, LIMITS.toolTotal - turn.toolBytes + block.detailBytes));
-      const detail = truncateUTF8(patch.detail, available);
-      turn.toolBytes = turn.toolBytes - block.detailBytes + detail.bytes;
-      block.detail = detail.text;
-      block.detailBytes = detail.bytes;
-      block.clipped = detail.clipped || Boolean(patch.detail_clipped);
-    }
-    block.sensitive = block.sensitive || Boolean(patch.sensitive);
-    if (block.sensitive) {
-      block.preview = "";
-    } else if (patch.preview) {
-      block.preview = truncateUTF8(patch.preview, 2 << 10).text.split("\n").slice(0, 3).join("\n");
-    }
-    touchBlock(block);
-    turn.dirty = true;
-    break;
-  }
-  case "plan_replace": {
-    if (!turn.plan) {
-      turn.plan = { type: "plan", entries: [] };
-      if (!appendTurnBlock(turn, turn.plan)) {
-        turn.plan = null;
-        break;
-      }
-    }
-    let remaining = LIMITS.plan;
-    turn.plan.entries = [];
-    for (const entry of (display.plan || []).slice(0, 128)) {
-      const content = truncateUTF8(entry.content || "", remaining);
-      if (!content.text) continue;
-      turn.plan.entries.push({ content: content.text, status: truncateUTF8(entry.status || "", 64).text });
-      remaining -= content.bytes;
-      if (remaining <= 0) break;
-    }
-    touchBlock(turn.plan);
-    turn.dirty = true;
-    break;
-  }
-  case "error_upsert": {
-    if (!turn.error) {
-	  turn.error = { type: "error", text: "", errorSource: "", errorCode: "", retryable: false };
-      if (!appendTurnBlock(turn, turn.error)) {
-        turn.error = null;
-        break;
-      }
-    }
-    turn.error.text = truncateUTF8(display.text || "The provider turn failed.", LIMITS.assistant).text;
-	turn.error.errorSource = display.error_source || "";
-	turn.error.errorCode = display.error_code || "";
-	turn.error.retryable = Boolean(display.retryable);
-    touchBlock(turn.error);
-    turn.state = "error";
-    recordTurnLifecycle(turn, "error", activity);
-    turn.lifecycleSeen = true;
-    turn.dirty = true;
-    updateRuntimeStatusFromDisplay(display);
-    break;
-  }
-  case "turn_state":
-    turn.state = display.state || turn.state;
-    turn.stopReason = display.stop_reason || turn.stopReason;
-    recordTurnLifecycle(turn, turn.state, activity);
-    turn.lifecycleSeen = true;
-    turn.dirty = true;
-    updateRuntimeStatusFromDisplay(display);
-    break;
-  }
+function providerTextIsThought(data) {
+  const stream = boundedTranscriptText(data?.stream, LIMITS.status).toLowerCase();
+  const tag = boundedTranscriptText(data?.tag, LIMITS.status).toLowerCase();
+  return ["thought", "reasoning", "analysis"].some((value) => stream.includes(value) || tag.includes(value));
 }
 
-function rememberPermission(activity, turn) {
-  const permission = activity.permission;
-  if (!permission?.id) return;
+function boundedJSON(value, limit = LIMITS.tool) {
+  if (value === undefined || value === null) return "";
+  let encoded;
+  try { encoded = typeof value === "string" ? value : JSON.stringify(value, null, 2); } catch (_) { encoded = String(value); }
+  return truncateUTF8(encoded, limit).text;
+}
+
+function rememberDiagnosticFrame(frame) {
+  let encoded;
+  try { encoded = JSON.stringify(frame); } catch (_) { encoded = ""; }
+  let value = frame;
+  let bytes = textEncoder.encode(encoded).length;
+  if (!encoded || bytes > LIMITS.diagnosticBytes) {
+    const sample = truncateUTF8(encoded || String(frame), LIMITS.diagnosticSample);
+    value = {
+      session_id: frame?.session_id, seq: frame?.seq, request_id: frame?.request_id,
+      type: frame?.type, timestamp: frame?.timestamp, cursor: frame?.cursor,
+      data: { diagnostic_clipped: true, raw_prefix: sample.text }
+    };
+    bytes = textEncoder.encode(JSON.stringify(value)).length;
+    transcriptState.diagnosticsClipped = true;
+  }
+  while (transcriptState.diagnostics.length >= LIMITS.diagnostics ||
+    (transcriptState.diagnostics.length > 0 && transcriptState.diagnosticBytes + bytes > LIMITS.diagnosticBytes)) {
+    transcriptState.diagnostics.shift();
+    transcriptState.diagnosticBytes = Math.max(0, transcriptState.diagnosticBytes - (transcriptState.diagnosticSizes.shift() || 0));
+    transcriptState.diagnosticsClipped = true;
+  }
+  transcriptState.diagnostics.push(value);
+  transcriptState.diagnosticSizes.push(bytes);
+  transcriptState.diagnosticBytes += bytes;
+}
+
+function upsertUserFrame(turn, data) {
+  let block = turn.blocks.find((item) => item.type === "user");
+  if (!block) {
+    block = { type: "user", text: "", bytes: 0, clipped: false };
+    if (turn.blocks.length >= LIMITS.blocksPerTurn) {
+      turn.contentClipped = true;
+      return;
+    }
+    turn.blocks.unshift(block);
+  }
+  const value = truncateUTF8(data.text || "", LIMITS.assistant);
+  block.text = value.text;
+  block.bytes = value.bytes;
+  block.clipped = value.clipped;
+  touchBlock(block);
+  turn.dirty = true;
+}
+
+function appendProviderText(turn, frame, data) {
+  const thought = providerTextIsThought(data);
+  const type = thought ? "thought" : "assistant";
+  const byteField = thought ? "thoughtBytes" : "assistantBytes";
+  const limit = thought ? LIMITS.thought : LIMITS.assistant;
+  if (String(data.text || "").trim()) {
+    if (thought) turn.reasoningSeen = true;
+    else turn.assistantSeen = true;
+  }
+  const incoming = truncateUTF8Tail(data.text || "", limit);
+  makeRollingTextRoom(turn, type, byteField, incoming.bytes, limit);
+  const previous = turn.blocks[turn.blocks.length - 1];
+  const messageID = boundedTranscriptIdentifier(data.messageId || data.message_id || data.tag);
+  const compatible = previous?.type === type && (type === "thought" || previous.messageID === messageID || !previous.messageID || !messageID);
+  const block = compatible ? previous : {
+    type, text: "", bytes: 0, clipped: false, leadingClipped: false, trailingClipped: false,
+    messageID, key: frame.seq
+  };
+  if (!compatible && (!makeTextBlockSlot(turn) || !appendTurnBlock(turn, block))) return;
+  block.text += incoming.text;
+  block.bytes += incoming.bytes;
+  turn[byteField] += incoming.bytes;
+  block.leadingClipped = block.leadingClipped || incoming.clipped;
+  block.trailingClipped = block.trailingClipped || Boolean(data.truncated);
+  turn.contentClipped = turn.contentClipped || incoming.clipped || Boolean(data.truncated);
+  touchBlock(block);
+  turn.dirty = true;
+}
+
+function upsertToolFrame(turn, frame, data) {
+  const id = boundedTranscriptIdentifier(data.toolCallId || data.tool_call_id || data.id, `tool:${frame.seq}`);
+  let block = turn.tools.get(id);
+  if (!block) {
+    if (turn.tools.size >= LIMITS.toolsPerTurn) {
+      turn.contentClipped = true;
+      turn.dirty = true;
+      return;
+    }
+    block = { type: "tool", id, title: "", kind: "", status: "", metadata: "", preview: "", detail: "", detailBytes: 0, clipped: false, sensitive: false };
+    if (!appendTurnBlock(turn, block)) return;
+    turn.tools.set(id, block);
+  }
+  block.title = boundedTranscriptText(data.title || data.name, LIMITS.title) || block.title || "Tool call";
+  block.kind = boundedTranscriptText(data.kind, LIMITS.kind) || block.kind;
+  block.status = boundedTranscriptText(data.status, LIMITS.status) || block.status || "updated";
+  const metadata = data.tag ?? data.metadata;
+  if (metadata !== undefined && metadata !== null) {
+    block.metadata = typeof metadata === "string"
+      ? boundedTranscriptText(metadata, LIMITS.metadata)
+      : boundedJSON(metadata, LIMITS.metadata);
+  }
+  const rawDetail = data.content ?? data.rawOutput ?? data.output ?? data.result;
+  if (rawDetail !== undefined) {
+    const available = Math.min(LIMITS.tool, Math.max(0, LIMITS.toolTotal - turn.toolBytes + block.detailBytes));
+    const detail = truncateUTF8(boundedJSON(rawDetail, available), available);
+    turn.toolBytes = turn.toolBytes - block.detailBytes + detail.bytes;
+    block.detail = detail.text;
+    block.detailBytes = detail.bytes;
+    block.clipped = detail.clipped;
+  }
+  block.sensitive = block.sensitive || Boolean(data.sensitive);
+  touchBlock(block);
+  turn.dirty = true;
+}
+
+function appendProviderStatus(turn, frame, data) {
+  const text = boundedProviderOptionText(data.text || data.status || data.state, 2048);
+  if (!text) return;
+  appendTurnBlock(turn, { type: "status", text, tag: boundedTranscriptText(data.tag, LIMITS.status), key: frame.seq });
+}
+
+function upsertTurnError(turn, frame, data, fallback) {
+  if (!turn.error) {
+    turn.error = { type: "error", text: "", errorSource: "", errorCode: "", retryable: null };
+    if (!appendTurnBlock(turn, turn.error)) {
+      turn.error = null;
+      return;
+    }
+  }
+  turn.error.text = boundedTranscriptText(data.message || fallback, LIMITS.assistant);
+  turn.error.errorSource = boundedTranscriptText(data.source, LIMITS.errorProvenance);
+  turn.error.errorCode = boundedTranscriptText(data.code, LIMITS.errorProvenance);
+  turn.error.retryable = typeof data.retryable === "boolean" ? data.retryable : null;
+  touchBlock(turn.error);
+  turn.state = "error";
+  recordTurnLifecycle(turn, "error", frame);
+  turn.lifecycleSeen = true;
+  turn.dirty = true;
+  reconcileRuntimeStatusSoon();
+}
+
+function normalizePermissionOptions(options) {
+  if (!Array.isArray(options)) return [];
+  if (options.length > LIMITS.permissionOptions) transcriptState.framesClipped = true;
+  const normalized = [];
+  const seen = new Set();
+  for (const option of options.slice(0, LIMITS.permissionOptions)) {
+    const id = exactPermissionIdentifier(option?.id, LIMITS.identifier);
+    if (!id || seen.has(id)) {
+      transcriptState.framesClipped = true;
+      continue;
+    }
+    seen.add(id);
+    normalized.push({
+      id,
+      name: boundedTranscriptText(option?.name, LIMITS.title),
+      kind: boundedTranscriptText(option?.kind, LIMITS.kind)
+    });
+  }
+  return normalized;
+}
+
+function normalizePermissionRecord(value, forcedState = "") {
+  const id = exactPermissionIdentifier(value?.id, LIMITS.permissionIdentifier);
+  if (!id) {
+    transcriptState.framesClipped = true;
+    return null;
+  }
+  const result = {
+    id,
+    request_id: boundedTranscriptIdentifier(value?.request_id || value?.requestID),
+    title: boundedTranscriptText(value?.title, LIMITS.title),
+    kind: boundedTranscriptText(value?.kind, LIMITS.kind),
+    state: boundedTranscriptText(forcedState || value?.state, LIMITS.status) || "waiting",
+    decision: boundedTranscriptText(value?.decision ?? value?.reason, LIMITS.permissionDecision)
+  };
+  if (Array.isArray(value?.options)) result.options = normalizePermissionOptions(value.options);
+  return result;
+}
+
+function setTurnStateFromFrame(turn, frame, state) {
+  state = boundedTranscriptText(state, LIMITS.status).trim().toLowerCase();
+  const normalized = state === "completed" ? "complete" : state;
+  turn.state = normalized || turn.state;
+  turn.stopReason = boundedTranscriptText(
+    frame.data?.stop_reason || frame.data?.stopReason || turn.stopReason,
+    LIMITS.stopReason
+  );
+  recordTurnLifecycle(turn, turn.state, frame);
+  turn.lifecycleSeen = true;
+  turn.dirty = true;
+  reconcileRuntimeStatusSoon();
+}
+
+function applyFrameData(frame, turn) {
+  const data = frame.data || {};
+  if (frame.type === "client_command") {
+    if (data.command === "prompt") {
+      upsertUserFrame(turn, data);
+      setTurnStateFromFrame(turn, frame, "working");
+    } else if (data.command === "cancel") {
+      setTurnStateFromFrame(turn, frame, "cancelling");
+    }
+    return;
+  }
+  if (frame.type === "provider_event") {
+    if (data.type === "text_delta") appendProviderText(turn, frame, data);
+    else if (data.type === "tool_call") upsertToolFrame(turn, frame, data);
+    else if (data.type === "status") appendProviderStatus(turn, frame, data);
+    else if (data.type === "error") upsertTurnError(turn, frame, data, "The provider reported an error.");
+    return;
+  }
+  if (frame.type === "provider_result") {
+    if (data.status === "failed") upsertTurnError(turn, frame, data, "The provider turn failed.");
+    else setTurnStateFromFrame(turn, frame, data.status || "complete");
+    return;
+  }
+  if (frame.type === "worker_error") upsertTurnError(turn, frame, data, "The Session worker failed.");
+}
+
+function rememberPermission(frame, turn) {
+  const data = frame.data || {};
+  if (!["permission_requested", "permission_resolved", "permission_abandoned"].includes(frame.type)) return;
+  transcriptState.permissionAuthoritySequence = Math.max(transcriptState.permissionAuthoritySequence, Number(frame.seq) || 0);
+  let permission;
+  if (frame.type === "permission_requested") permission = normalizePermissionRecord(data, "waiting");
+  else if (frame.type === "permission_resolved") {
+    permission = normalizePermissionRecord({ id: data.permission_id, decision: data.decision }, "resolved");
+  } else if (frame.type === "permission_abandoned") {
+    permission = normalizePermissionRecord({ id: data.permission_id, reason: data.reason }, "abandoned");
+  }
+  if (!permission) return;
   const existing = transcriptState.permissions.get(permission.id) || {};
-  const merged = { ...existing, ...permission };
+  const merged = { ...existing };
+  for (const [key, value] of Object.entries(permission)) {
+    if (value !== "" || ["id", "state", "options"].includes(key)) merged[key] = value;
+  }
   if ((!permission.options || permission.options.length === 0) && existing.options) merged.options = existing.options;
   if (!ensurePermissionCapacity(permission.id)) return;
-  transcriptState.permissions.set(permission.id, merged);
+  storePermissionRecord(merged);
   turn.permissionIDs.add(permission.id);
   turn.dirty = true;
   enforcePermissionBound();
@@ -838,8 +1278,7 @@ function rememberPermission(activity, turn) {
 
 function flagPermissionOverflow() {
   transcriptState.permissionOverflow = true;
-  activeEventSource?.close();
-  activeEventSource = null;
+  invalidateActiveSessionSource();
   const state = document.querySelector("#stream-state");
   state?.classList.remove("connected");
   const label = state?.querySelector("span");
@@ -847,9 +1286,16 @@ function flagPermissionOverflow() {
 }
 
 function removePermissionRecord(id) {
+  const bytes = transcriptState.permissionSizes.get(id) || 0;
   transcriptState.permissions.delete(id);
-  for (const item of transcriptState.turns) item.permissionIDs.delete(id);
-  transcriptState.historyClipped = true;
+  transcriptState.permissionSizes.delete(id);
+  transcriptState.retainedBytes = Math.max(0, transcriptState.retainedBytes - bytes);
+  for (const item of transcriptState.turns) {
+    if (!item.permissionIDs.delete(id)) continue;
+    refreshTurnRetention(item);
+    item.dirty = true;
+  }
+  transcriptState.framesClipped = true;
 }
 
 function ensurePermissionCapacity(permissionID) {
@@ -878,369 +1324,39 @@ function enforcePermissionBound() {
   if (transcriptState.permissions.size < LIMITS.permissions) transcriptState.permissionOverflow = false;
 }
 
-function applyActivity(activity) {
-  const position = Number(activity.position) || 0;
-  if (position > 0 && position <= transcriptState.lastPosition) return false;
-  transcriptState.lastPosition = Math.max(transcriptState.lastPosition, position);
-  transcriptState.diagnostics.push({
-    position: activity.position, request_id: activity.request_id, kind: activity.kind,
-    timestamp: activity.timestamp, activity: activity.activity
-  });
-  if (transcriptState.diagnostics.length > LIMITS.diagnostics) transcriptState.diagnostics.shift();
-  if (!activity.display && !activity.permission) return true;
-  const turn = turnFor(activity);
-  rememberPermission(activity, turn);
-  applyDisplay(activity, turn);
+function applyFrame(frame) {
+  const sequence = Number(frame.seq) || 0;
+  if (sequence > 0 && sequence <= transcriptState.lastSequence) return false;
+  if (transcriptState.lastSequence === 0 && sequence > 1) transcriptState.framesClipped = true;
+  transcriptState.lastSequence = Math.max(transcriptState.lastSequence, sequence);
+  rememberDiagnosticFrame(frame);
+  if (frame.type === "connection") {
+    setProviderConnectionState(frame.data?.state || "");
+    applyQueuedPermissionSnapshot();
+    return true;
+  }
+  const turnTypes = ["client_command", "provider_event", "provider_result", "permission_requested", "permission_resolved", "permission_abandoned", "worker_error"];
+  if (!turnTypes.includes(frame.type)) {
+    applyQueuedPermissionSnapshot();
+    return true;
+  }
+  const dataType = frame.data?.type;
+  if (frame.type === "provider_event" && !["text_delta", "tool_call", "status", "error"].includes(dataType)) {
+    applyQueuedPermissionSnapshot();
+    return true;
+  }
+  if (frame.type === "client_command" && !["prompt", "cancel"].includes(frame.data?.command)) {
+    applyQueuedPermissionSnapshot();
+    return true;
+  }
+  const turn = turnFor(frame);
+  rememberPermission(frame, turn);
+  applyFrameData(frame, turn);
   updateActionVisibility(currentSessionRuntimeStatus);
   updateTurnRetention(turn);
   trimTurns();
+  applyQueuedPermissionSnapshot();
   return true;
-}
-
-function applySnapshotActivity(activity) {
-  const turn = turnFor(activity);
-  rememberPermission(activity, turn);
-  applyDisplay(activity, turn);
-  updateTurnRetention(turn);
-  trimTurns();
-  return turn;
-}
-
-function buildConversationSnapshot(snapshot, buffered = []) {
-  const candidate = newTranscriptState();
-  candidate.source = snapshot.source || "gateway-log";
-  candidate.checkpoint = snapshot.checkpoint || "";
-  candidate.sourceWarning = snapshot.warning || "";
-  candidate.snapshotTruncated = Boolean(snapshot.truncated);
-  candidate.historyClipped = candidate.snapshotTruncated;
-  const previous = transcriptState;
-  transcriptState = candidate;
-  try {
-    let snapshotPosition = 0;
-    for (const [turnIndex, snapshotTurn] of (snapshot.turns || []).entries()) {
-      const requestID = snapshotTurn.key || `snapshot:${turnIndex + 1}`;
-      for (const activity of (snapshotTurn.activities || [])) {
-        snapshotPosition += 1;
-        applySnapshotActivity({ ...activity, position: snapshotPosition, request_id: requestID });
-      }
-      const turn = candidate.byRequest.get(requestID);
-      if (turn) {
-        turn.committed = Boolean(snapshotTurn.committed);
-        turn.surface = ["acp", "native", "unknown"].includes(snapshotTurn.surface) ? snapshotTurn.surface : "unknown";
-      }
-      if (turn && snapshotTurn.committed && !turn.lifecycleSeen) {
-        turn.state = "complete";
-        recordTurnLifecycle(turn, "complete", {});
-        turn.lifecycleSeen = true;
-        turn.dirty = true;
-      }
-    }
-    candidate.diagnostics = Array.isArray(snapshot.diagnostics) ? snapshot.diagnostics.slice(-LIMITS.diagnostics) : candidate.diagnostics;
-    candidate.lastPosition = Math.max(candidate.lastPosition, Number(snapshot.gateway_cursor) || 0);
-    for (const activity of buffered) {
-      if ((Number(activity.position) || 0) > candidate.lastPosition) applyActivity(activity);
-    }
-    return candidate;
-  } finally {
-    transcriptState = previous;
-  }
-}
-
-function turnUserText(turn) {
-  return turn.blocks.find((block) => block.type === "user")?.text?.trim() || "";
-}
-
-function turnAssistantText(turn) {
-  return turn.blocks.filter((block) => block.type === "assistant").map((block) => block.text || "").join("\n").trim();
-}
-
-function normalizedPresentationText(value) {
-  return String(value || "").replace(/\s+/g, " ").trim();
-}
-
-function matchingOldTurn(turn, oldTurns, used) {
-  const exact = oldTurns.find((item) => !used.has(item) && item.id === turn.id);
-  if (exact) return exact;
-  const user = normalizedPresentationText(turnUserText(turn));
-  const assistant = normalizedPresentationText(turnAssistantText(turn));
-  const matches = oldTurns.filter((item) => {
-    if (used.has(item)) return false;
-    const oldUser = normalizedPresentationText(turnUserText(item));
-    const oldAssistant = normalizedPresentationText(turnAssistantText(item));
-    if (user && oldUser && user !== oldUser) return false;
-    if (!assistant || !oldAssistant) return Boolean(user && oldUser && user === oldUser);
-    return assistant === oldAssistant || assistant.endsWith(oldAssistant) || oldAssistant.endsWith(assistant);
-  });
-  // Fuzzy ACP-to-provider matching only preserves presentation state. If
-  // repeated turns make it ambiguous, replace the nodes atomically instead
-  // of attaching focus or selection to the wrong turn.
-  return matches.length === 1 ? matches[0] : null;
-}
-
-function matchingOldBlock(block, oldBlocks, used) {
-  const matches = oldBlocks.filter((item) => {
-    if (used.has(item) || item.type !== block.type) return false;
-    if (block.type === "tool") return item.id === block.id;
-    if (["assistant", "thought", "user"].includes(block.type)) {
-      const nextText = normalizedPresentationText(block.text);
-      const oldText = normalizedPresentationText(item.text);
-      return Boolean(nextText && oldText) && (nextText === oldText || nextText.endsWith(oldText) || oldText.endsWith(nextText));
-    }
-    return true;
-  });
-  return matches.length === 1 ? matches[0] : null;
-}
-
-function blockPresentationMatches(left, right) {
-  if (!left || !right || left.type !== right.type) return false;
-  if (["assistant", "thought", "user", "error"].includes(left.type)) {
-    return left.text === right.text && blockWasClipped(left) === blockWasClipped(right);
-  }
-  if (left.type === "tool") {
-    return ["id", "title", "kind", "status", "metadata", "preview", "detail", "detailLabel", "clipped", "sensitive"]
-      .every((field) => left[field] === right[field]);
-  }
-  if (left.type === "plan") return JSON.stringify(left.entries || []) === JSON.stringify(right.entries || []);
-  return false;
-}
-
-function adoptConversationPresentation(previous, candidate) {
-  candidate.shouldStick = previous.shouldStick;
-  candidate.newUpdates = previous.newUpdates;
-  const usedTurns = new Set();
-  for (const turn of candidate.turns) {
-    const oldTurn = matchingOldTurn(turn, previous.turns, usedTurns);
-    if (!oldTurn) continue;
-    usedTurns.add(oldTurn);
-    turn.element = oldTurn.element;
-    turn.overviewElement = oldTurn.overviewElement;
-    const usedBlocks = new Set();
-    for (const block of turn.blocks) {
-      const oldBlock = matchingOldBlock(block, oldTurn.blocks, usedBlocks);
-      if (!oldBlock) continue;
-      usedBlocks.add(oldBlock);
-      block.element = oldBlock.element;
-      // Reuse the stable DOM node so open/focus/selection state survives, but
-      // force a patch when the provider-committed text differs from the
-      // provisional ACP block. Equal revision counters are not content IDs.
-      block.renderedRevision = blockPresentationMatches(block, oldBlock) ? oldBlock.renderedRevision : -1;
-      block.renderedContext = oldBlock.renderedContext;
-    }
-  }
-  for (const [id, permission] of previous.permissions) {
-    if (permission.state !== "waiting" || candidate.permissions.has(id)) continue;
-    if (candidate.permissions.size >= LIMITS.permissions) {
-      candidate.permissionOverflow = true;
-      candidate.historyClipped = true;
-      continue;
-    }
-    candidate.permissions.set(id, permission);
-  }
-}
-
-let conversationSnapshotSignature = "";
-let conversationReconcileInFlight = false;
-let conversationReconcilePending = false;
-let conversationReconcileBuffer = [];
-let conversationReconcileBufferBytes = 0;
-let conversationReconcileOverflow = false;
-let conversationReconcileTimer = 0;
-let conversationReconcileAttempts = 0;
-let providerAuthorityRetryTimer = 0;
-
-function hasUncommittedTerminalTurns(state = transcriptState) {
-  // Cancelled and failed turns are intentionally never committed as provider
-  // conversation history, so only successful completed turns need polling.
-  return state.turns.some((turn) => !turn.committed && turn.state === "complete");
-}
-
-function scheduleProviderCommitRetry(sessionID) {
-  if (!hasUncommittedTerminalTurns()) return;
-  // Provider stores normally commit within the first few attempts. Keep a
-  // low-frequency tail retry while the viewer remains open so a slow fsync,
-  // WAL checkpoint, or provider-side compaction cannot leave a completed ACP
-  // turn permanently provisional.
-  const delay = conversationReconcileAttempts < 6
-    ? Math.min(3000, 220 * (2 ** conversationReconcileAttempts))
-    : 10000;
-  conversationReconcileAttempts = Math.min(conversationReconcileAttempts + 1, 6);
-  scheduleConversationReconcile(sessionID, delay);
-}
-
-function clearProviderAuthorityRetry() {
-  if (providerAuthorityRetryTimer) window.clearTimeout?.(providerAuthorityRetryTimer);
-  providerAuthorityRetryTimer = 0;
-}
-
-function scheduleProviderAuthorityRetry(sessionID) {
-  if (providerAuthorityRetryTimer) return;
-  // This retry is intentionally independent from completed-turn commit
-  // polling. An idle or empty gateway fallback still needs to discover later
-  // native/provider history without requiring another ACP event.
-  providerAuthorityRetryTimer = window.setTimeout(() => {
-    providerAuthorityRetryTimer = 0;
-    reconcileConversation(sessionID).catch(() => {});
-  }, 10000);
-}
-
-function conversationHistorySummary(state = transcriptState) {
-  const turns = state?.turns || [];
-  const saved = turns.filter((turn) => turn.committed).length;
-  const unsaved = turns.filter((turn) => !turn.committed);
-  const active = unsaved.filter((turn) => !["complete", "cancelled", "incomplete", "interrupted", "error", "failed"].includes(turn.state)).length;
-  const saving = unsaved.filter((turn) => turn.state === "complete").length;
-  const stopped = unsaved.filter((turn) => ["cancelled", "incomplete", "interrupted", "error", "failed"].includes(turn.state)).length;
-  const tools = turns.reduce((count, turn) => count + (turn.blocks || []).filter((block) => block.type === "tool").length, 0);
-  const bounded = Boolean(state?.snapshotTruncated || state?.historyClipped);
-  const shortParts = [];
-  if (saved > 0) shortParts.push(`${saved} saved${saved === 1 ? " turn" : " turns"}`);
-  if (active > 0) shortParts.push(`${active} live${active === 1 ? " turn" : " turns"}`);
-  if (saving > 0) shortParts.push(`${saving} saving`);
-  if (stopped > 0) shortParts.push(`${stopped} unsaved`);
-  let short = shortParts.join(" · ") || "No history yet";
-  if (saved === 0 && active > 0 && tools > 0) short += ` · ${tools} steps`;
-  if (bounded) short += " · partial";
-  const savedCopy = `${saved} saved provider ${saved === 1 ? "turn" : "turns"}`;
-  let detail = saved > 0 ? savedCopy : "No saved provider turns yet";
-  if (active > 0) detail += ` · ${active} live ${active === 1 ? "turn" : "turns"} can be saved after successful completion`;
-  if (saving > 0) detail += ` · ${saving} completed ${saving === 1 ? "turn is" : "turns are"} waiting for provider commit`;
-  if (stopped > 0) detail += ` · ${stopped} failed, interrupted, or cancelled ${stopped === 1 ? "turn remains" : "turns remain"} unsaved history`;
-  if (tools > 0) detail += ` · ${tools} tool ${tools === 1 ? "step" : "steps"} loaded`;
-  detail += bounded ? " · older content is outside this bounded view" : " · all available history is loaded";
-  return { short, detail, saved, active, saving, stopped, tools, bounded };
-}
-
-function updateHistorySummary(state = transcriptState) {
-  const summary = conversationHistorySummary(state);
-  const label = document.querySelector("#history-summary");
-  if (label) {
-    label.textContent = summary.short;
-    label.className = `history-summary${summary.active > 0 || summary.saving > 0 ? " live" : ""}${summary.bounded ? " bounded" : ""}`;
-    label.setAttribute("title", summary.detail);
-    label.setAttribute("aria-label", summary.detail);
-  }
-  return summary;
-}
-
-function updateHistorySource(source, warning = "") {
-  const label = document.querySelector("#history-source");
-  if (!label) return;
-  const summary = conversationHistorySummary();
-  label.textContent = source === "provider-store"
-    ? summary.detail
-    : warning || "Gateway JSONL fallback + live ACP stream";
-}
-
-function snapshotSignature(snapshot) {
-  return JSON.stringify([
-    snapshot.source, snapshot.checkpoint, snapshot.gateway_cursor, snapshot.warning, snapshot.truncated,
-    (snapshot.turns || []).map((turn) => [turn.key, turn.committed, turn.surface, (turn.activities || []).map((item) => [item.position, item.kind, item.request_id])]),
-  ]);
-}
-
-function applySuccessfulConversationMetadata(snapshot) {
-  const nextWarning = snapshot.warning || "";
-  const changed = transcriptState.source !== snapshot.source || transcriptState.sourceWarning !== nextWarning;
-  transcriptState.source = snapshot.source;
-  transcriptState.sourceWarning = nextWarning;
-  updateHistorySource(snapshot.source, nextWarning);
-  return changed;
-}
-
-async function reconcileConversation(sessionID, { initial = false } = {}) {
-  if (conversationReconcileInFlight) {
-    conversationReconcilePending = true;
-    return false;
-  }
-  conversationReconcileInFlight = true;
-  conversationReconcileBuffer = [];
-  conversationReconcileBufferBytes = 0;
-  conversationReconcileOverflow = false;
-  try {
-    const snapshot = await apiRequest(`/api/v1/sessions/${encodeURIComponent(sessionID)}/conversation`);
-    if (conversationReconcileOverflow) {
-      transcriptState.sourceWarning = "Provider history refresh was deferred while live activity was busy; live output remains current.";
-      updateHistorySource(transcriptState.source, transcriptState.sourceWarning);
-      scheduleTranscriptRender();
-      conversationReconcilePending = true;
-      return false;
-    }
-    const signature = snapshotSignature(snapshot);
-    if (snapshot.source === "provider-store") clearProviderAuthorityRetry();
-    else scheduleProviderAuthorityRetry(sessionID);
-    // A gateway snapshot is authoritative enough to bootstrap one atomic,
-    // bounded view and seed SSE from its captured cursor. On later refreshes,
-    // however, it represents a transient loss of provider-store authority;
-    // keep the already-rendered provider/live state instead of replacing it
-    // with an older or differently-clipped fallback projection.
-    if (snapshot.source !== "provider-store" && !initial) {
-      transcriptState.sourceWarning = snapshot.warning || "Provider history is unavailable; showing gateway history.";
-      updateHistorySource(snapshot.source, transcriptState.sourceWarning);
-      scheduleTranscriptRender();
-      scheduleProviderCommitRetry(sessionID);
-      return false;
-    }
-    if (!initial && signature === conversationSnapshotSignature && conversationReconcileBuffer.length === 0) {
-      if (applySuccessfulConversationMetadata(snapshot)) scheduleTranscriptRender();
-      scheduleProviderCommitRetry(sessionID);
-      return false;
-    }
-    const previous = transcriptState;
-    const candidate = buildConversationSnapshot(snapshot, conversationReconcileBuffer);
-    adoptConversationPresentation(previous, candidate);
-    if (previous.renderTimer) window.clearTimeout?.(previous.renderTimer);
-    transcriptState = candidate;
-    conversationSnapshotSignature = signature;
-    updateHistorySource(candidate.source, candidate.sourceWarning);
-    renderConversation();
-    if (hasUncommittedTerminalTurns(candidate)) scheduleProviderCommitRetry(sessionID);
-    else conversationReconcileAttempts = 0;
-    return true;
-  } catch (_) {
-    transcriptState.sourceWarning = "Provider history refresh is delayed; live ACP output remains current.";
-    updateHistorySource(transcriptState.source, transcriptState.sourceWarning);
-    if (!initial) {
-      scheduleTranscriptRender();
-    }
-    scheduleProviderCommitRetry(sessionID);
-    scheduleProviderAuthorityRetry(sessionID);
-    return false;
-  } finally {
-    conversationReconcileBuffer = [];
-    conversationReconcileBufferBytes = 0;
-    conversationReconcileOverflow = false;
-    conversationReconcileInFlight = false;
-    if (conversationReconcilePending) {
-      conversationReconcilePending = false;
-      scheduleConversationReconcile(sessionID, 120);
-    }
-  }
-}
-
-function bufferConversationActivity(activity) {
-  if (!conversationReconcileInFlight || conversationReconcileOverflow) return;
-  let bytes = 0;
-  try {
-    bytes = textEncoder.encode(JSON.stringify(activity)).length;
-  } catch (_) {
-    conversationReconcileOverflow = true;
-  }
-  if (conversationReconcileOverflow || conversationReconcileBuffer.length >= LIMITS.reconcileEvents || conversationReconcileBufferBytes + bytes > LIMITS.reconcileBytes) {
-    conversationReconcileBuffer = [];
-    conversationReconcileBufferBytes = 0;
-    conversationReconcileOverflow = true;
-    return;
-  }
-  conversationReconcileBuffer.push(activity);
-  conversationReconcileBufferBytes += bytes;
-}
-
-function scheduleConversationReconcile(sessionID, delay = 140) {
-  window.clearTimeout?.(conversationReconcileTimer);
-  conversationReconcileTimer = window.setTimeout(() => {
-    conversationReconcileTimer = 0;
-    reconcileConversation(sessionID).catch(() => {});
-  }, delay);
 }
 
 function nearBottom(element) {
@@ -1370,9 +1486,7 @@ function messageElement(block, assistantName, context = {}) {
   const author = document.createElement("strong");
   author.textContent = assistantName;
   const phase = document.createElement("span");
-  phase.textContent = context.final
-    ? (block.source === "provider" ? "Final response · saved" : "Final response")
-    : block.source === "provider" ? "Earlier response" : context.streaming ? "Working" : "Earlier update";
+  phase.textContent = context.final ? "Final response" : context.streaming ? "Working" : "Earlier update";
   meta.append(author, phase);
   const body = document.createElement("div");
   body.className = "message-body";
@@ -1392,21 +1506,19 @@ function clippedNote(block = {}) {
   const note = document.createElement("div");
   note.className = "message-clipped";
   if (block.leadingClipped) {
-    note.textContent = "Earlier output was omitted to keep this view responsive; the newest ACP output is preserved.";
+    note.textContent = "Earlier output was omitted to keep this view responsive; the newest output is preserved.";
   } else if (block.trailingClipped) {
-    note.textContent = "The provider marked this ACP output as truncated.";
+    note.textContent = "The agent marked this output as truncated.";
   } else {
-    note.textContent = "Display clipped for safety; the provider transcript remains authoritative.";
+    note.textContent = "Display clipped to keep this browser view responsive.";
   }
   return note;
 }
 
-function thoughtElement(block, context = {}) {
+function thoughtElement(block) {
   const details = document.createElement("details");
-  const source = block.source === "provider" ? "provider-history" : context.streaming ? "live-acp" : "captured-acp";
-  details.className = `thought-card ${source}`;
+  details.className = "thought-card";
   details.dataset.detailKey = "reasoning";
-  details.dataset.source = source;
   details.open = true;
   const summary = document.createElement("summary");
   summary.className = "thought-summary";
@@ -1422,7 +1534,7 @@ function thoughtElement(block, context = {}) {
   heading.append(title, metrics);
   const state = document.createElement("span");
   state.className = "thought-source";
-  state.textContent = block.source === "provider" ? "Saved" : context.streaming ? "Live" : "Captured";
+  state.textContent = "Agent";
   summary.append(heading, state);
   const content = document.createElement("div");
   content.className = "thought-content";
@@ -1477,45 +1589,34 @@ function toolElement(tool) {
   return details;
 }
 
-function planElement(block) {
-  const card = document.createElement("section");
-  card.className = "plan-card";
-  const heading = document.createElement("h3");
-  heading.textContent = "Current plan";
-  const list = document.createElement("ul");
-  list.className = "plan-list";
-  for (const entry of block.entries) {
-    const item = document.createElement("li");
-    const status = String(entry.status || "").replaceAll("_", "-");
-    if (["completed", "done"].includes(status)) item.className = "completed";
-    if (["in-progress", "in_progress", "working"].includes(status)) item.className = "in-progress";
-    const mark = document.createElement("span");
-    mark.className = "plan-mark";
-    mark.textContent = item.className === "completed" ? "✓" : item.className === "in-progress" ? "●" : "○";
-    const text = document.createElement("span");
-    text.textContent = entry.content;
-    item.append(mark, text);
-    list.append(item);
-  }
-  card.append(heading, list);
-  return card;
+function providerStatusElement(block) {
+  const status = document.createElement("div");
+  status.className = "provider-status";
+  const label = document.createElement("strong");
+  label.textContent = block.tag ? block.tag.replaceAll("_", " ") : "Provider status";
+  const text = document.createElement("span");
+  text.textContent = block.text;
+  status.append(label, text);
+  return status;
 }
 
 function renderBlockElement(block, assistantName, context = {}) {
   if (block.type === "user" || block.type === "assistant") return messageElement(block, assistantName, context);
-  if (block.type === "thought") return thoughtElement(block, context);
+  if (block.type === "thought") return thoughtElement(block);
   if (block.type === "tool") return toolElement(block);
-  if (block.type === "plan") return block.entries.length > 0 ? planElement(block) : null;
+  if (block.type === "status") return providerStatusElement(block);
   if (block.type === "error") {
     const error = document.createElement("div");
     error.className = "error-card";
     error.textContent = block.text;
-	if (block.errorSource === "provider" && block.errorCode) {
-	  const detail = document.createElement("small");
-	  const label = ({busy:"Provider busy", conflict:"Provider conflict", rate_limited:"Rate limited", rejected:"Provider rejected", provider_error:"Provider error"})[block.errorCode] || "Provider error";
-	  detail.textContent = `${label} · ${block.retryable ? "Retryable" : "Not marked retryable"}`;
-	  error.append(detail);
-	}
+    if (block.errorSource || block.errorCode || block.retryable !== null) {
+      const detail = document.createElement("small");
+      detail.className = "error-provenance";
+      const fields = [block.errorSource, block.errorCode].filter(Boolean).map((value) => String(value).replaceAll("_", " "));
+      if (block.retryable !== null) fields.push(block.retryable ? "retryable" : "not retryable");
+      detail.textContent = fields.join(" · ");
+      error.append(detail);
+    }
     return error;
   }
   return null;
@@ -1538,18 +1639,12 @@ function turnHasWaitingPermission(turn) {
   return false;
 }
 
-function turnSurfaceLabel(turn) {
-  if (turn.surface === "native") return "Native CLI turn";
-  if (turn.surface === "unknown") return "Provider turn";
-  return "ACP turn";
-}
-
 function turnStatusLabel(turn) {
   if (turnHasWaitingPermission(turn)) return "Approval required";
   return ({
-    ready: "Accepted", queued: "Queued", working: "Working", cancelling: "Stopping", cancelled: "Stopped",
+    ready: "Accepted", working: "Working", cancelling: "Stopping", cancelled: "Stopped",
     incomplete: "Incomplete", interrupted: "Interrupted", error: "Failed", failed: "Failed", complete: "Complete"
-  })[turn.state] || (turn.committed ? "Complete" : "Pending");
+  })[turn.state] || "Pending";
 }
 
 function turnStatusTone(turn) {
@@ -1572,13 +1667,10 @@ function turnDurationLabel(turn) {
 
 function turnLifecycleLabel(turn) {
   const labels = ({
-    ready: "Accepted", queued: "Queued", working: "Working", cancelling: "Stopping", cancelled: "Stopped",
+    ready: "Accepted", working: "Working", cancelling: "Stopping", cancelled: "Stopped",
     incomplete: "Incomplete", interrupted: "Interrupted", error: "Failed", failed: "Failed", complete: "Complete"
   });
   const states = (turn.lifecycle || []).map((item) => labels[item.state] || "").filter(Boolean);
-  if (turn.surface !== "acp" && states.length === 1 && states[0] === "Complete") {
-    return "Provider history → Complete";
-  }
   return states.join(" → ") || turnStatusLabel(turn);
 }
 
@@ -1603,19 +1695,19 @@ function turnOverviewElement(turn) {
     overview.setAttribute("role", "group");
     const main = document.createElement("div");
     main.className = "turn-overview-main";
-    overview._surfaceLabel = document.createElement("strong");
+    overview._turnLabel = document.createElement("strong");
     overview._statusLabel = document.createElement("span");
     overview._durationLabel = document.createElement("span");
     overview._toolsLabel = document.createElement("span");
     overview._reasoningLabel = document.createElement("span");
-    main.append(overview._surfaceLabel, overview._statusLabel, overview._durationLabel, overview._toolsLabel, overview._reasoningLabel);
+    main.append(overview._turnLabel, overview._statusLabel, overview._durationLabel, overview._toolsLabel, overview._reasoningLabel);
     overview._lifecycleLabel = document.createElement("div");
     overview._lifecycleLabel.className = "turn-overview-lifecycle";
     overview.append(main, overview._lifecycleLabel);
     turn.overviewElement = overview;
   }
-  overview.className = `turn-overview surface-${turn.surface || "unknown"}`;
-  setTextIfChanged(overview._surfaceLabel, turnSurfaceLabel(turn));
+  overview.className = "turn-overview";
+  setTextIfChanged(overview._turnLabel, "Agent turn");
   overview._statusLabel.className = `turn-overview-status status-${turnStatusTone(turn)}`;
   setTextIfChanged(overview._statusLabel, turnStatusLabel(turn));
   const duration = turnDurationLabel(turn);
@@ -1625,7 +1717,7 @@ function turnOverviewElement(turn) {
   setTextIfChanged(overview._toolsLabel, toolCount ? `${toolCount} ${toolCount === 1 ? "tool" : "tools"}` : "No tools");
   setTextIfChanged(overview._reasoningLabel, turnHasReasoning(turn) ? "Reasoning available" : "Reasoning not provided");
   setTextIfChanged(overview._lifecycleLabel, turnLifecycleLabel(turn));
-  overview.setAttribute("aria-label", `${turnSurfaceLabel(turn)}. ${turnStatusLabel(turn)}. ${accessibleDurationLabel(duration)}${overview._toolsLabel.textContent}. ${overview._reasoningLabel.textContent}. ${overview._lifecycleLabel.textContent}.`);
+  overview.setAttribute("aria-label", `Agent turn. ${turnStatusLabel(turn)}. ${accessibleDurationLabel(duration)}${overview._toolsLabel.textContent}. ${overview._reasoningLabel.textContent}. ${overview._lifecycleLabel.textContent}.`);
   return overview;
 }
 
@@ -1640,11 +1732,11 @@ function renderTurnTail(turn) {
     resolved.textContent = permission.state === "abandoned" ? "Permission request closed" : `Permission resolved${permission.decision ? ` · ${permission.decision.replaceAll("_", " ")}` : ""}`;
     tail.append(resolved);
   }
-  if (["queued", "working", "cancelling", "cancelled"].includes(turn.state)) {
+  if (["working", "cancelling", "cancelled"].includes(turn.state)) {
     const state = document.createElement("div");
     state.className = "turn-state-line";
     const dot = document.createElement("i");
-    const copy = ({ queued: "Queued for the next turn", working: "Working…", cancelling: "Stopping response…", cancelled: "Response stopped" })[turn.state];
+    const copy = ({ working: "Working…", cancelling: "Stopping response…", cancelled: "Response stopped" })[turn.state];
     state.append(dot, document.createTextNode(copy));
     tail.append(state);
   }
@@ -1654,18 +1746,18 @@ function renderTurnTail(turn) {
     if (turnHasReasoning(turn) && !retainedReasoning) {
       const unavailable = document.createElement("div");
       unavailable.className = "reasoning-unavailable";
-      unavailable.textContent = "Earlier reasoning is outside this bounded view; committed provider history remains unchanged.";
+      unavailable.textContent = "Earlier reasoning is outside this bounded browser view.";
       tail.append(unavailable);
     }
     if (!turn.assistantSeen) {
       const missing = document.createElement("div");
       missing.className = "response-missing";
-      missing.textContent = "The turn completed without a retained assistant response. Check Diagnostics or open the native provider CLI.";
+      missing.textContent = "The turn completed without an assistant response in this activity stream. Check Diagnostics for more detail.";
       tail.append(missing);
     } else if (!retainedResponse) {
       const missing = document.createElement("div");
       missing.className = "response-missing";
-      missing.textContent = "Assistant output is outside this bounded view; open the native provider CLI or local diagnostics for more detail.";
+      missing.textContent = "Assistant output is outside this bounded view; check Diagnostics for more detail.";
       tail.append(missing);
     }
   }
@@ -1678,7 +1770,7 @@ function renderTurnTail(turn) {
   return tail;
 }
 
-const selectionScopeSelectors = [".message-body", ".thought-content", ".tool-detail", ".tool-inline-preview", ".plan-list", ".error-card"];
+const selectionScopeSelectors = [".message-body", ".thought-content", ".tool-detail", ".tool-inline-preview", ".error-card"];
 
 function selectionOffsets(root) {
   const selection = window.getSelection?.();
@@ -1810,7 +1902,7 @@ function focusIndex(root) {
 
 function patchBlockElement(block, assistantName, context = {}) {
   const previous = block.element;
-  const contextKey = `${block.source || "acp"}:${context.streaming ? "streaming" : "stored"}:${context.final ? "final" : "update"}`;
+  const contextKey = `${context.streaming ? "streaming" : "recorded"}:${context.final ? "final" : "update"}`;
   if (previous && block.renderedRevision === block.revision && block.renderedContext === contextKey) return previous;
   const selection = previous ? selectionOffsets(previous) : null;
   const focusedIndex = previous ? focusIndex(previous) : -1;
@@ -1882,11 +1974,10 @@ function patchTurnElement(turn, assistantName) {
 function captureConversationScrollAnchor(scroller, container) {
   if (!scroller || !container || transcriptState.shouldStick || typeof scroller.getBoundingClientRect !== "function") return null;
   const scrollerTop = scroller.getBoundingClientRect().top;
-  // Prefer a semantic block over its containing turn. Reconciliation can add
-  // stored reasoning above a reused response inside the same turn; anchoring
-  // only the article would let the response jump even though its own viewer
-  // block survives. Keeping the block object lets patchBlockElement replace
-  // its DOM node while this anchor follows block.element to the replacement.
+  // Prefer a content block over its containing turn. Incoming frames can
+  // insert or replace content in the same turn; anchoring only the article
+  // would let a visible block jump. Keeping the block object lets the anchor
+  // follow its replacement element.
   for (const turn of orderedTurns()) {
     for (const block of turn.blocks) {
       const element = block.element;
@@ -1921,13 +2012,13 @@ function renderConversation() {
   const container = document.querySelector("#conversation");
   const scroller = document.querySelector("#conversation-scroll");
   if (!container || !scroller) return;
-  updateHistorySummary();
   const priorTop = scroller.scrollTop;
   const scrollAnchor = captureConversationScrollAnchor(scroller, container);
   const assistantName = document.querySelector(".session-title h1")?.firstChild?.textContent?.trim() || "Agent";
   if (transcriptState.turns.length === 0) {
-    if (!container.querySelector(".conversation-empty")) {
-      const empty = document.createElement("div");
+    let empty = container.querySelector(".conversation-empty");
+    if (!empty) {
+      empty = document.createElement("div");
       empty.className = "conversation-empty";
       const icon = document.createElement("span");
       icon.className = "empty-orbit";
@@ -1935,50 +2026,27 @@ function renderConversation() {
       const heading = document.createElement("h2");
       heading.textContent = "Start the conversation";
       const copy = document.createElement("p");
-      copy.textContent = "Send a message below. This structured ACP view remains linked to the provider's canonical conversation.";
+      copy.textContent = "Send a message below. Agent activity appears here as it arrives.";
       empty.append(icon, heading, copy);
-      if (transcriptState.sourceWarning) {
-        const source = document.createElement("p");
-        source.className = "muted";
-        source.textContent = transcriptState.sourceWarning;
-        empty.append(source);
-      }
-      container.replaceChildren(empty);
     }
+    const desired = [];
+    const streamError = streamErrorNotice(container);
+    const notice = activityLimitNotice(container);
+    if (streamError) desired.push(streamError);
+    if (notice) desired.push(notice);
+    desired.push(empty);
+    syncConversationChildren(container, desired);
   } else {
     const desired = [];
-    if (transcriptState.sourceWarning || transcriptState.snapshotTruncated) {
-      let sourceNotice = container.querySelector("#conversation-source-note");
-      if (!sourceNotice) {
-        sourceNotice = document.createElement("div");
-        sourceNotice.id = "conversation-source-note";
-        sourceNotice.className = "history-limit-note";
-      }
-      sourceNotice.textContent = transcriptState.sourceWarning || (transcriptState.source === "provider-store"
-        ? "Older provider history is outside this bounded view."
-        : "Earlier gateway history is outside this bounded view.");
-      desired.push(sourceNotice);
-    }
-    if (transcriptState.historyClipped) {
-      let notice = container.querySelector("#history-limit-note");
-      if (!notice) {
-        notice = document.createElement("div");
-        notice.id = "history-limit-note";
-        notice.className = "history-limit-note";
-      }
-      notice.textContent = transcriptState.source === "provider-store"
-        ? "Earlier conversation is outside this bounded browser view; committed provider history remains unchanged."
-        : "Earlier conversation is outside this bounded browser view; the private gateway JSONL remains unchanged.";
-      desired.push(notice);
-    }
+    const streamError = streamErrorNotice(container);
+    const notice = activityLimitNotice(container);
+    if (streamError) desired.push(streamError);
+    if (notice) desired.push(notice);
     for (const turn of orderedTurns()) {
       if (!turn.element || turn.dirty) patchTurnElement(turn, assistantName);
       desired.push(turn.element);
     }
-    for (let index = 0; index < desired.length; index += 1) {
-      if (container.children[index] !== desired[index]) container.insertBefore(desired[index], container.children[index] || null);
-    }
-    while (container.children.length > desired.length) container.lastElementChild.remove();
+    syncConversationChildren(container, desired);
   }
   renderApprovalShelf();
   renderDiagnostics();
@@ -2075,7 +2143,7 @@ function confirmPersistentChoice(option) {
   const dialog = document.querySelector("#permission-confirm-dialog");
   if (!(dialog instanceof HTMLDialogElement)) return Promise.resolve(false);
   const copy = dialog.querySelector("#permission-confirm-copy");
-  if (copy) copy.textContent = `${option.name || option.kind} may apply to later tool requests in this provider conversation.`;
+  if (copy) copy.textContent = `${option.name || option.kind} may apply to later tool requests in this Session.`;
   return new Promise((resolve) => {
     let settled = false;
     const finish = (value) => {
@@ -2108,12 +2176,13 @@ async function submitPermission(permission, option) {
   setNotice(notice, "Sending permission decision…");
   try {
     const sessionID = document.body.dataset.sessionId;
-    await apiRequest(`/api/v1/sessions/${encodeURIComponent(sessionID)}/permissions/decision`, "POST", {
+    await apiRequest(`/api/v1/sessions/${encodeURIComponent(sessionID)}/permissions/response`, "POST", {
       permission_id: permission.id, option_id: option.id, cancelled: false
     });
-    transcriptState.permissions.set(permission.id, { ...permission, state: "resolved", decision: option.kind });
+    storePermissionRecord({ ...permission, state: "resolved", decision: boundedTranscriptText(option.kind, LIMITS.permissionDecision) });
     markPermissionDirty(permission.id);
     enforcePermissionBound();
+    enforceTranscriptRetention();
     const rejected = String(option.kind).startsWith("reject");
     setNotice(notice, rejected ? "Permission rejected. The agent will continue without that action." : "Permission allowed. The agent can continue.");
     scheduleTranscriptRender();
@@ -2129,16 +2198,62 @@ async function submitPermission(permission, option) {
 
 async function refreshPermissions() {
   const sessionID = document.body.dataset.sessionId;
+  const connectionEpoch = providerConnectionEpoch;
+  const streamEpoch = sessionStreamBoundaryEpoch;
   const result = await apiRequest(`/api/v1/sessions/${encodeURIComponent(sessionID)}/permissions`);
-  const ready = Boolean(result.decisions_ready);
-  const blockedCode = String(result.blocked_code || "");
-  const blockedMessage = String(result.blocked_message || "");
-  const readinessChanged = ready !== permissionDecisionsReady || blockedCode !== permissionDecisionBlockedCode || blockedMessage !== permissionDecisionBlockedMessage;
-  permissionDecisionsReady = ready;
-  permissionDecisionBlockedCode = blockedCode;
-  permissionDecisionBlockedMessage = blockedMessage;
-  if (readinessChanged) renderedPermissionSignature = "";
-  return reconcilePermissionSnapshot(result.permissions || []) || readinessChanged;
+  if (connectionEpoch !== providerConnectionEpoch || streamEpoch !== sessionStreamBoundaryEpoch) return false;
+  return receivePermissionSnapshot(result);
+}
+
+function receivePermissionSnapshot(result) {
+  result = result && typeof result === "object" ? result : {};
+  const sequence = Number(result.sequence);
+  if (!Number.isSafeInteger(sequence) || sequence < 0) return false;
+  const permissions = Array.isArray(result.permissions) ? result.permissions.slice(0, LIMITS.permissions + 1) : [];
+  const snapshot = {
+    sequence,
+    permissions,
+    ready: Boolean(result.decisions_ready),
+    blockedCode: boundedTranscriptText(result.blocked_code, LIMITS.errorProvenance),
+    blockedMessage: boundedTranscriptText(result.blocked_message, 2048)
+  };
+  // Sequence zero is an offline/upgrade/readiness observation, not an
+  // authoritative permission-list watermark. Preserve any durable cards and
+  // only disable their controls until a current v7 worker can answer.
+  if (sequence === 0) return applyPermissionSnapshotReadiness(snapshot);
+  if (sequence < transcriptState.permissionAuthoritySequence) return false;
+  if (sequence > transcriptState.lastSequence) {
+    const pending = transcriptState.pendingPermissionSnapshot;
+    if (!pending || sequence >= pending.sequence) transcriptState.pendingPermissionSnapshot = snapshot;
+    return false;
+  }
+  transcriptState.pendingPermissionSnapshot = null;
+  return applyPermissionSnapshot(snapshot);
+}
+
+function applyPermissionSnapshotReadiness(snapshot) {
+  const changed = snapshot.ready !== permissionDecisionsReady ||
+    snapshot.blockedCode !== permissionDecisionBlockedCode ||
+    snapshot.blockedMessage !== permissionDecisionBlockedMessage;
+  permissionDecisionsReady = snapshot.ready;
+  permissionDecisionBlockedCode = snapshot.blockedCode;
+  permissionDecisionBlockedMessage = snapshot.blockedMessage;
+  if (changed) renderedPermissionSignature = "";
+  return changed;
+}
+
+function applyPermissionSnapshot(snapshot) {
+  if (snapshot.sequence < transcriptState.permissionAuthoritySequence) return false;
+  transcriptState.permissionAuthoritySequence = Math.max(transcriptState.permissionAuthoritySequence, snapshot.sequence);
+  const readinessChanged = applyPermissionSnapshotReadiness(snapshot);
+  return reconcilePermissionSnapshot(snapshot.permissions) || readinessChanged;
+}
+
+function applyQueuedPermissionSnapshot() {
+  const snapshot = transcriptState.pendingPermissionSnapshot;
+  if (!snapshot || transcriptState.lastSequence < snapshot.sequence) return false;
+  transcriptState.pendingPermissionSnapshot = null;
+  return applyPermissionSnapshot(snapshot);
 }
 
 function reconcilePermissionSnapshot(received) {
@@ -2147,25 +2262,28 @@ function reconcilePermissionSnapshot(received) {
     flagPermissionOverflow();
     return true;
   }
-  const waiting = new Set(received.map((permission) => permission.id));
+  const normalized = received.map((permission) => normalizePermissionRecord(permission, "waiting")).filter(Boolean);
+  if (normalized.length !== received.length) return true;
+  const waiting = new Set(normalized.map((permission) => permission.id));
   let changed = false;
   // The GET is authoritative. Retire disappeared waiting records before
   // admitting replacements so an exact-cap snapshot can swap IDs safely.
   for (const [id, permission] of transcriptState.permissions) {
     if (permission.state === "waiting" && !waiting.has(id)) {
-      transcriptState.permissions.set(id, { ...permission, state: "resolved" });
+      storePermissionRecord({ ...permission, state: "resolved" });
       markPermissionDirty(id);
       changed = true;
     }
   }
-  for (const permission of received) {
-    if (!permission?.id || !ensurePermissionCapacity(permission.id)) continue;
+  for (const permission of normalized) {
+    if (!ensurePermissionCapacity(permission.id)) continue;
     const permissionChanged = JSON.stringify(transcriptState.permissions.get(permission.id)) !== JSON.stringify(permission);
     if (permissionChanged) changed = true;
-    transcriptState.permissions.set(permission.id, permission);
+    storePermissionRecord(permission);
     if (permissionChanged) markPermissionDirty(permission.id);
   }
   enforcePermissionBound();
+  enforceTranscriptRetention();
   return changed;
 }
 
@@ -2179,20 +2297,25 @@ function renderDiagnostics() {
   const feed = document.querySelector("#diagnostics-feed");
   if (!feed || !document.querySelector("#diagnostics-dialog")?.open) return;
   const fragment = document.createDocumentFragment();
-  if (transcriptState.diagnostics.length === 0) {
+  if (transcriptState.diagnosticsClipped) {
+    const clipped = document.createElement("p");
+    clipped.className = "activity-limit-note";
+    clipped.textContent = "Earlier or oversized diagnostic detail is outside this bounded browser view.";
+    fragment.append(clipped);
+  } else if (transcriptState.diagnostics.length === 0) {
     const empty = document.createElement("p");
     empty.className = "muted";
     empty.textContent = "Waiting for activity…";
     fragment.append(empty);
   }
-  for (const activity of transcriptState.diagnostics) {
+  for (const frame of transcriptState.diagnostics) {
     const row = document.createElement("article");
     row.className = "diagnostic-row";
     const meta = document.createElement("div");
     meta.className = "diagnostic-meta";
-    meta.textContent = `#${activity.position}\n${activity.kind}`;
+    meta.textContent = `#${frame.seq}\n${frame.type}`;
     const data = document.createElement("pre");
-    data.textContent = JSON.stringify(activity, null, 2);
+    data.textContent = JSON.stringify(frame, null, 2);
     row.append(meta, data);
     fragment.append(row);
   }
@@ -2200,79 +2323,150 @@ function renderDiagnostics() {
 }
 
 let activeEventSource = null;
-function shouldReconcileConversationKind(kind) {
-  return ["turn_completed", "turn_error", "native_refreshed", "native_refresh_recovered", "provider_transcript_reconciled", "acp_rehydrated"].includes(kind);
+let sessionReplayResetAttempted = false;
+let sessionStreamEpoch = 0;
+let sessionStreamBoundaryEpoch = 0;
+let sessionStreamReady = false;
+
+function isActiveSessionSource(source, epoch) {
+  return activeEventSource === source && sessionStreamEpoch === epoch;
 }
 
-function noteProviderTranscriptReconcileWarning(kind, sessionID = document.body.dataset.sessionId) {
-  if (kind !== "provider_transcript_reconcile_warning") return false;
-  transcriptState.sourceWarning = "Provider transcript reload is delayed; live ACP output remains current.";
-  updateHistorySource(transcriptState.source, transcriptState.sourceWarning);
-  if (sessionID) scheduleProviderAuthorityRetry(sessionID);
+function setSessionStreamReady(source, epoch, ready) {
+  if (!isActiveSessionSource(source, epoch)) return false;
+  if (sessionStreamReady !== ready) {
+    sessionStreamReady = ready;
+    sessionStreamBoundaryEpoch += 1;
+  }
+  if (!ready) streamAnnouncementsReady = false;
+  syncProviderDependentControls();
   return true;
 }
 
-function attachActivityStream(path) {
-  if (!window.EventSource) return;
+function closeActiveSessionSource(source, epoch) {
+  if (!isActiveSessionSource(source, epoch)) return false;
+  source.close();
+  activeEventSource = null;
+  sessionStreamEpoch += 1;
+  sessionStreamReady = false;
+  sessionStreamBoundaryEpoch += 1;
+  streamAnnouncementsReady = false;
+  syncProviderDependentControls();
+  return true;
+}
+
+function invalidateActiveSessionSource() {
   activeEventSource?.close();
+  activeEventSource = null;
+  sessionStreamEpoch += 1;
+  sessionStreamReady = false;
+  sessionStreamBoundaryEpoch += 1;
+  streamAnnouncementsReady = false;
+  syncProviderDependentControls();
+}
+
+function attachSessionChannel(path) {
+  invalidateActiveSessionSource();
+  if (!window.EventSource) return;
   const state = document.querySelector("#stream-state");
   // `seed` applies only to this EventSource's first request. On automatic
   // reconnect the server prefers EventSource's advancing Last-Event-ID, so a
   // stale URL seed can never conflict with the live cursor.
   const separator = path.includes("?") ? "&" : "?";
-  const streamPath = transcriptState.lastPosition > 0 ? `${path}${separator}seed=${transcriptState.lastPosition}` : path;
+  const streamPath = transcriptState.lastSequence > 0 ? `${path}${separator}seed=${transcriptState.lastSequence}` : path;
   const source = new EventSource(streamPath);
   activeEventSource = source;
+  const sourceEpoch = sessionStreamEpoch;
   source.onopen = () => {
+    if (!isActiveSessionSource(source, sourceEpoch)) return;
     state?.classList.add("connected");
     const label = state?.querySelector("span");
-    if (label) label.textContent = "Live";
+    if (label) label.textContent = sessionStreamReady ? "Live" : "Synchronizing";
   };
-  source.addEventListener("ready", () => { streamAnnouncementsReady = true; });
-  source.addEventListener("activity", (event) => {
+  source.addEventListener("ready", (event) => {
+    if (!isActiveSessionSource(source, sourceEpoch)) return;
+    const accepted = rememberReplayReady(event?.data || "");
+    if (!accepted) {
+      setSessionStreamReady(source, sourceEpoch, false);
+      return;
+    }
+    setSessionStreamReady(source, sourceEpoch, true);
+    transcriptState.streamErrorCode = "";
+    transcriptState.streamErrorMessage = "";
+    const label = state?.querySelector("span");
+    if (label) label.textContent = "Live";
+    const sessionID = document.body.dataset.sessionId;
+    if (sessionID) refreshPermissions().then((changed) => { if (changed) scheduleTranscriptRender(); }).catch(() => {});
+    applyQueuedPermissionSnapshot();
+    streamAnnouncementsReady = true;
+    renderConversation();
+    scheduleProviderOptionsAfterConnection();
+  });
+  source.addEventListener("frame", (event) => {
+    if (!isActiveSessionSource(source, sourceEpoch) || !sessionStreamReady) return;
     try {
-      const activity = JSON.parse(event.data);
-      bufferConversationActivity(activity);
-      noteStreamActivity(activity);
-      if (applyActivity(activity)) scheduleTranscriptRender();
-      if (noteProviderTranscriptReconcileWarning(activity.kind)) scheduleTranscriptRender();
-      if (shouldReconcileConversationKind(activity.kind)) {
-        conversationReconcileAttempts = 0;
-        scheduleConversationReconcile(document.body.dataset.sessionId, activity.kind === "turn_completed" ? 100 : 180);
-      }
+      const frame = JSON.parse(event.data);
+      noteStreamFrame(frame);
+      sessionReplayResetAttempted = false;
+      if (applyFrame(frame)) scheduleTranscriptRender();
     } catch (_) {
       state?.classList.remove("connected");
       const label = state?.querySelector("span");
       if (label) label.textContent = "Invalid update";
     }
   });
+  source.addEventListener("channel_error", (event) => {
+    if (!isActiveSessionSource(source, sourceEpoch)) return;
+    let detail = {};
+    try { detail = JSON.parse(event.data || "{}"); } catch (_) {}
+    closeActiveSessionSource(source, sourceEpoch);
+    state?.classList.remove("connected");
+    const label = state?.querySelector("span");
+    if (detail.code === "replay_cursor_reset" && detail.reset_cursor && !sessionReplayResetAttempted) {
+      sessionReplayResetAttempted = true;
+      transcriptState = newTranscriptState();
+      transcriptState.framesClipped = true;
+      if (label) label.textContent = "Resetting replay";
+      renderConversation();
+      const resetEpoch = sessionStreamEpoch;
+      window.setTimeout(() => {
+        if (activeEventSource !== null || sessionStreamEpoch !== resetEpoch) return;
+        attachSessionChannel(path);
+      }, 50);
+      return;
+    }
+    transcriptState.streamErrorCode = boundedTranscriptText(detail.code, LIMITS.errorProvenance);
+    transcriptState.streamErrorMessage = boundedTranscriptText(detail.message, 2048) ||
+      (detail.code === "replay_unavailable"
+        ? "Saved Session activity is unavailable. Resume this Session to establish a new channel."
+        : "The Session activity stream is unavailable.");
+    renderConversation();
+    if (label) {
+      label.textContent = detail.code === "replay_cursor_reset" ? "History gap" :
+        (detail.code === "replay_unavailable" ? "Replay unavailable" : "Stream unavailable");
+    }
+  });
   source.onerror = () => {
+    if (!isActiveSessionSource(source, sourceEpoch)) return;
+    setSessionStreamReady(source, sourceEpoch, false);
     state?.classList.remove("connected");
     const label = state?.querySelector("span");
     if (label) label.textContent = "Reconnecting";
   };
-  window.setTimeout(() => { if (transcriptState.turns.length === 0) renderConversation(); }, 450);
-  window.addEventListener("beforeunload", () => source.close(), { once: true });
-}
-
-function reconcileStreamAvailability(sessionID, running) {
-  const state = document.querySelector("#stream-state");
-  if (!running && activeEventSource) {
-    activeEventSource.close();
-    activeEventSource = null;
-    state?.classList.remove("connected");
-    const label = state?.querySelector("span");
-    if (label) label.textContent = "Stored history";
-  } else if (running && !activeEventSource && !transcriptState.permissionOverflow) {
-    attachActivityStream(`/api/v1/sessions/${encodeURIComponent(sessionID)}/stream`);
-  }
+  window.setTimeout(() => {
+    if (isActiveSessionSource(source, sourceEpoch) && transcriptState.turns.length === 0) renderConversation();
+  }, 450);
+  window.addEventListener("beforeunload", () => {
+    if (isActiveSessionSource(source, sourceEpoch)) closeActiveSessionSource(source, sourceEpoch);
+  }, { once: true });
 }
 
 function hasLocallyPreparingTurn() {
-  return transcriptState.turns.some((turn) => !turn.committed && ["ready", "working", "cancelling"].includes(turn.state));
+  return transcriptState.turns.some((turn) => ["ready", "working", "cancelling"].includes(turn.state));
 }
 
 function sessionActionVisible(action, visibleStatuses, status) {
+	if (action === "resume" && !currentSessionResumable) return false;
   return visibleStatuses.includes(status) || (action === "cancel" && hasLocallyPreparingTurn());
 }
 
@@ -2282,24 +2476,110 @@ function updateActionVisibility(status) {
     const visible = sessionActionVisible(action.dataset.action || "", action.dataset.visibleStatus.split(","), status);
     action.dataset.statusHidden = visible ? "false" : "true";
   }
-  const submitCopy = document.querySelector(".send-button span");
-  const submit = document.querySelector(".send-button");
-  const queueing = ["working", "starting"].includes(status);
-  if (submitCopy) submitCopy.textContent = queueing ? "Queue" : "Send";
-  if (submit) submit.setAttribute("aria-label", queueing ? "Queue message" : "Send message");
 }
 
 let currentSessionRuntimeStatus = document.body.dataset.sessionStatus || "";
+let currentSessionResumable = document.body.dataset.sessionResumable === "true";
+let currentProviderConnectionState = currentSessionRuntimeStatus === "starting"
+  ? "connecting"
+  : (["waiting", "working"].includes(currentSessionRuntimeStatus) ? "connected" : "disconnected");
+let providerConnectionEpoch = 0;
+let runtimeStatusEpoch = 0;
+let providerOptionsLoadTimer = 0;
+let providerOptionsRequestEpoch = 0;
+
+function providerCommandBoundaryReady() {
+  return Boolean(activeEventSource) && sessionStreamReady && currentProviderConnectionState === "connected";
+}
+
+function providerOptionsCanLoad() {
+  return providerCommandBoundaryReady() && currentSessionRuntimeStatus === "waiting";
+}
+
+function setComposerConnectionReady(ready) {
+  const form = document.querySelector("#prompt-form");
+  const textarea = form?.querySelector("textarea");
+  const submit = form?.querySelector('button[type="submit"]');
+  if (textarea) textarea.disabled = !ready;
+  if (submit) submit.disabled = !ready || form?.dataset.submitting === "true";
+  const hint = document.querySelector("#composer-hint");
+  if (hint) hint.textContent = ready ? "Enter to send · Shift+Enter for a new line" : "Synchronizing the Session channel…";
+}
+
+function setProviderOptionsConnectionReady(ready) {
+  const form = document.querySelector("#provider-config-form");
+  if (!form) return;
+  const panel = form.querySelector("[data-provider-options]");
+  ready = ready && panel?.getAttribute("aria-busy") !== "true";
+  let available = false;
+  for (const name of Object.keys(providerOptionSpecs)) {
+    const select = form.querySelector(`[data-provider-option="${name}"]`);
+    const supported = select?.dataset.providerSupported === "true";
+    if (select) select.disabled = !ready || !supported;
+    available ||= supported;
+  }
+  const submit = form.querySelector("button[type=submit]");
+  if (submit) submit.disabled = !ready || !available || form.dataset.submitting === "true";
+}
+
+function syncProviderDependentControls() {
+  setComposerConnectionReady(providerCommandBoundaryReady());
+  setProviderOptionsConnectionReady(providerOptionsCanLoad());
+}
+
+function scheduleProviderOptionsAfterConnection() {
+  window.clearTimeout?.(providerOptionsLoadTimer);
+  providerOptionsLoadTimer = window.setTimeout(() => {
+    if (!providerOptionsCanLoad()) return;
+    const sessionID = document.body.dataset.sessionId;
+    if (sessionID) loadProviderOptions(sessionID).catch(() => {});
+  }, 25);
+}
+
+function setProviderConnectionState(state) {
+  state = boundedTranscriptText(state, LIMITS.status).trim().toLowerCase();
+  if (!state) return;
+  const changed = state !== currentProviderConnectionState;
+  if (changed) providerConnectionEpoch += 1;
+  currentProviderConnectionState = state;
+  if (state === "connecting") {
+    window.clearTimeout?.(providerOptionsLoadTimer);
+    syncProviderDependentControls();
+    setRuntimeStatus("starting");
+    return;
+  }
+  if (state === "connected") {
+    if (currentSessionRuntimeStatus === "starting") setRuntimeStatus("waiting");
+    syncProviderDependentControls();
+    scheduleProviderOptionsAfterConnection();
+    const sessionID = document.body.dataset.sessionId;
+    if (changed && sessionID) refreshPermissions().then((updated) => { if (updated) scheduleTranscriptRender(); }).catch(() => {});
+    return;
+  }
+  window.clearTimeout?.(providerOptionsLoadTimer);
+  syncProviderDependentControls();
+  if (["failed", "stopped", "cancelled"].includes(state)) {
+    invalidateActiveSessionSource();
+    setRuntimeStatus(state);
+    const streamState = document.querySelector("#stream-state");
+    streamState?.classList.remove("connected");
+    const label = streamState?.querySelector("span");
+    if (label) label.textContent = statusLabel(state);
+  }
+  const sessionID = document.body.dataset.sessionId;
+  if (changed && sessionID) refreshPermissions().then((updated) => { if (updated) scheduleTranscriptRender(); }).catch(() => {});
+}
+
 function setRuntimeStatus(status) {
+  status = boundedTranscriptText(status, LIMITS.status).trim().toLowerCase();
   if (!status) return;
+  const changed = status !== currentSessionRuntimeStatus;
+  if (changed) runtimeStatusEpoch += 1;
   currentSessionRuntimeStatus = status;
   renderSessionStatus();
   updateActionVisibility(status);
-}
-
-function updateRuntimeStatusFromDisplay(display) {
-  if (page !== "session" || !display) return;
-  if (display.type === "error_upsert" || display.type === "turn_state") reconcileRuntimeStatusSoon();
+  syncProviderDependentControls();
+  if (changed && providerOptionsCanLoad()) scheduleProviderOptionsAfterConnection();
 }
 
 let runtimeReconcileTimer = 0;
@@ -2326,20 +2606,16 @@ function renderSessionStatus() {
 async function refreshSession(sessionID) {
   const result = await apiRequest(`/api/v1/sessions/${encodeURIComponent(sessionID)}`);
   const current = result.session;
+	currentSessionResumable = current.resumable === true;
   setRuntimeStatus(current.status);
-  const conversation = document.querySelector("#conversation-state");
-  if (conversation) conversation.textContent = current.conversation_verified ? "Verified" : (current.conversation_ready ? "Linked" : "Pending provider identity");
-  const continuity = document.querySelector("#continuity-chip");
-  if (continuity) {
-    continuity.className = `continuity-chip${current.conversation_verified ? " verified" : (current.conversation_ready ? " linked" : "")}`;
-    continuity.textContent = current.conversation_verified ? "✓ Verified" : (current.conversation_ready ? "↔ Linked" : "○ Linking");
-  }
+  if (current.status === "starting") setProviderConnectionState("connecting");
+  else if (["failed", "stopped", "cancelled"].includes(current.status)) setProviderConnectionState(current.status);
   const navDot = findNavSession(sessionID)?.querySelector(".status-dot");
   if (navDot) {
-    navDot.className = `status-dot status-${statusTone(current.status)}`;
-    navDot.setAttribute("aria-label", statusLabel(current.status));
+    const display = sessionDisplayStatus(current);
+    navDot.className = `status-dot status-${display.tone}`;
+    navDot.setAttribute("aria-label", display.label);
   }
-  reconcileStreamAvailability(sessionID, current.worker_running);
   return current;
 }
 
@@ -2362,9 +2638,14 @@ function bindComposer(sessionID) {
   });
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
+    if (!providerCommandBoundaryReady()) {
+      setNotice(notice, "Wait for the Session channel to finish synchronizing.", true);
+      syncProviderDependentControls();
+      return;
+    }
     if (!beginFormSubmission(form)) return;
-    const message = textarea.value.trim();
-    if (!message) {
+    const message = textarea.value;
+    if (!message.trim()) {
       endFormSubmission(form);
       return;
     }
@@ -2373,7 +2654,8 @@ function bindComposer(sessionID) {
     setNotice(notice, "Sending…");
     try {
       const result = await apiRequest(`/api/v1/sessions/${encodeURIComponent(sessionID)}/prompt`, "POST", { message });
-      const turn = transcriptState.byRequest.get(result.request_id) || turnFor({ request_id: result.request_id, position: Number.POSITIVE_INFINITY });
+      const requestID = boundedTranscriptIdentifier(result.request_id, "local:pending");
+      const turn = transcriptState.byRequest.get(requestID) || turnFor({ request_id: result.request_id, seq: Number.POSITIVE_INFINITY, data: {} });
       if (!turn.blocks.some((block) => block.type === "user")) {
         const value = truncateUTF8(message, LIMITS.assistant);
         if (turn.blocks.length < LIMITS.blocksPerTurn) turn.blocks.unshift({ type: "user", text: value.text, bytes: value.bytes, clipped: value.clipped });
@@ -2384,15 +2666,15 @@ function bindComposer(sessionID) {
       trimTurns();
       textarea.value = "";
       resize();
-      setNotice(notice, result.state === "queued" ? "Message queued for the next ACP turn." : "Message accepted; loading the exact conversation before dispatch.");
+      setNotice(notice, "Message accepted.");
       transcriptState.shouldStick = true;
       scheduleTranscriptRender();
     } catch (error) {
       setNotice(notice, error.message, true);
     } finally {
       endFormSubmission(form);
-      submit.disabled = false;
-      textarea.focus();
+      syncProviderDependentControls();
+      if (!textarea.disabled) textarea.focus();
     }
   });
   if (!window.matchMedia("(pointer: coarse)").matches) window.setTimeout(() => textarea.focus(), 0);
@@ -2410,6 +2692,10 @@ function bindSessionControls(sessionID) {
         setNotice(notice, action === "cancel" ? "Cancellation requested. The Session remains resumable." : `${action[0].toUpperCase()}${action.slice(1)} completed.`);
         button.closest("dialog")?.close();
         await refreshSession(sessionID);
+        if (action === "resume") {
+          setProviderConnectionState("connecting");
+          attachSessionChannel(`/api/v1/sessions/${encodeURIComponent(sessionID)}/stream`);
+        }
       } catch (error) {
         setNotice(notice, error.message, true);
       } finally {
@@ -2417,27 +2703,6 @@ function bindSessionControls(sessionID) {
       }
     });
   }
-
-  const reviewForm = document.querySelector("#review-form");
-  const reviewNotice = document.querySelector("#review-notice");
-  reviewForm?.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const submit = reviewForm.querySelector("button[type=submit]");
-    submit.disabled = true;
-    setNotice(reviewNotice, "Creating independent reviewer Session…");
-    try {
-      const data = new FormData(reviewForm);
-      const result = await apiRequest(`/api/v1/sessions/${encodeURIComponent(sessionID)}/review`, "POST", {
-        agent: data.get("agent"), model: data.get("model"), reasoning_effort: data.get("reasoning_effort"),
-        allow_active_producer: data.has("allow_active_producer")
-      });
-      rememberSessionStartWarning(result);
-      window.location.assign(`/sessions/${encodeURIComponent(result.session.id)}`);
-    } catch (error) {
-      setNotice(reviewNotice, error.message, true);
-      submit.disabled = false;
-    }
-  });
 
   const scroller = document.querySelector("#conversation-scroll");
   const jump = document.querySelector("#jump-latest");
@@ -2472,17 +2737,14 @@ if (page === "task") {
 
 if (page === "session") {
   const sessionID = document.body.dataset.sessionId;
-  const taskID = document.body.dataset.taskId;
-  bindSessionCreation(taskID);
+  attachSessionChannel(`/api/v1/sessions/${encodeURIComponent(sessionID)}/stream`);
   bindComposer(sessionID);
   bindSessionControls(sessionID);
-  restoreSessionStartWarning(sessionID);
+  bindProviderConfig(sessionID);
+  bindChildSessionCreation(sessionID);
   updateActionVisibility(document.body.dataset.sessionStatus);
-  (async () => {
-    await reconcileConversation(sessionID, { initial: true });
-    attachActivityStream(`/api/v1/sessions/${encodeURIComponent(sessionID)}/stream`);
-    refreshPermissions().then(scheduleTranscriptRender).catch(() => {});
-  })();
+  syncProviderDependentControls();
+  refreshPermissions().then(scheduleTranscriptRender).catch(() => {});
   window.setInterval(() => {
     if (document.hidden) return;
     refreshSession(sessionID).catch(() => {});

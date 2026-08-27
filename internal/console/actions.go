@@ -5,8 +5,7 @@ import "strings"
 type actionID string
 
 const (
-	actionNative  actionID = "native"
-	actionACP     actionID = "acp"
+	actionOpen    actionID = "open"
 	actionMessage actionID = "message"
 	actionNew     actionID = "new"
 	actionCancel  actionID = "cancel"
@@ -29,12 +28,11 @@ type consoleAction struct {
 // taskActions is the single source for direct keys, help, the command palette,
 // and contextual footer labels.
 var taskActions = []consoleAction{
-	{ID: actionNative, Key: "enter", Label: "Native CLI", FooterLabel: "Native CLI", Description: "Open this exact conversation in the provider's real CLI"},
-	{ID: actionACP, Key: "a", Label: "Structured view", FooterLabel: "View", Description: "Open the gateway conversation, tools, and approvals"},
-	{ID: actionMessage, Key: "p", Label: "Message in structured view", FooterLabel: "Message", Description: "Open the conversation with the message composer focused"},
+	{ID: actionOpen, Key: "enter", Label: "Open Session", FooterLabel: "Open", Description: "Attach this disposable viewer to the Session Channel"},
+	{ID: actionMessage, Key: "p", Label: "Message Session", FooterLabel: "Message", Description: "Open the Session Channel with the message composer focused"},
 	{ID: actionNew, Key: "n", Label: "New Session", FooterLabel: "New Session", Description: "Add another agent Session to this Task"},
-	{ID: actionCancel, Key: "c", Label: "Cancel turn", FooterLabel: "Cancel", Description: "Request cancellation of only the selected active ACP turn"},
-	{ID: actionResume, Key: "u", Label: "Resume worker", FooterLabel: "Resume", Description: "Resume the selected Session worker"},
+	{ID: actionCancel, Key: "c", Label: "Cancel turn", FooterLabel: "Cancel", Description: "Request cancellation of only the selected active provider turn"},
+	{ID: actionResume, Key: "u", Label: "Resume worker", FooterLabel: "Resume", Description: "Exact-resume a stopped Session with a saved provider identity"},
 	{ID: actionStop, Key: "x", Label: "Stop worker", FooterLabel: "Stop", Description: "Stop the worker without deleting provider conversation state"},
 	{ID: actionFilter, Key: "/", Label: "Filter Sessions", FooterLabel: "Filter", Description: "Filter by ID, agent, role, status, repo, or activity"},
 	{ID: actionPalette, Key: ":", Label: "Command palette", FooterLabel: "Commands", Description: "Search every action available on this screen"},
@@ -60,13 +58,17 @@ func taskActionForKey(key string) (consoleAction, bool) {
 	return consoleAction{}, false
 }
 
-func filteredTaskActions(query string) []consoleAction {
+func filteredTaskActions(query string, allowResume bool) []consoleAction {
 	query = strings.ToLower(strings.TrimSpace(query))
-	if query == "" {
-		return append([]consoleAction(nil), taskActions...)
-	}
 	var result []consoleAction
 	for _, action := range taskActions {
+		if action.ID == actionResume && !allowResume {
+			continue
+		}
+		if query == "" {
+			result = append(result, action)
+			continue
+		}
 		haystack := strings.ToLower(action.Key + " " + action.Label + " " + action.Description)
 		if strings.Contains(haystack, query) {
 			result = append(result, action)

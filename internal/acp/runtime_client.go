@@ -30,35 +30,45 @@ type RuntimeClient struct {
 	stateDirectory string
 	verified       atomic.Bool
 
-	mu       sync.Mutex
-	bridge   *runtimeBridge
-	target   *Target
-	identity runtimeIdentityExpectation
-	blocked  error
-	closed   bool
-}
-
-type runtimeIdentityExpectation struct {
-	ACP                   string
-	Native                string
-	Canonical             string
-	ProviderStoreVerified bool
+	mu      sync.Mutex
+	bridge  *runtimeBridge
+	target  *Target
+	blocked error
+	closed  bool
 }
 
 var errBridgeTeardownInProgress = fmt.Errorf("previous acpx runtime process tree is still terminating")
+
+const maxNormalizedEventTypeBytes = 128
 
 func NewRuntimeClient(binary, stateDirectory string) *RuntimeClient {
 	return &RuntimeClient{binary: binary, stateDirectory: stateDirectory}
 }
 
 func (c *RuntimeClient) Probe(ctx context.Context) error {
-	probe := NewClient(c.binary)
-	if err := probe.Probe(ctx); err != nil {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return fmt.Errorf("acpx runtime client is closed")
+	}
+	if c.verified.Load() {
+		return nil
+	}
+	binary := c.binary
+	if strings.TrimSpace(binary) == "" {
+		var err error
+		binary, err = FindBinary()
+		if err != nil {
+			return err
+		}
+	}
+	if err := probeBinary(ctx, binary); err != nil {
 		return err
 	}
-	if _, err := installedPackageRoot(c.binary); err != nil {
+	if _, err := installedPackageRoot(binary); err != nil {
 		return err
 	}
+	c.binary = binary
 	c.verified.Store(true)
 	return nil
 }
@@ -68,71 +78,26 @@ func (c *RuntimeClient) Start(ctx context.Context, spec StartSpec) (SessionInfo,
 	if err != nil {
 		return SessionInfo{}, err
 	}
-	c.bindIdentity(spec, info)
 	return info, nil
 }
 
 func (c *RuntimeClient) Resume(ctx context.Context, spec StartSpec) (SessionInfo, error) {
-	if strings.TrimSpace(spec.ResumeACPSessionID) == "" {
-		return SessionInfo{}, fmt.Errorf("ACP Session ID is required to resume")
+	if err := ValidateProviderRefValue("runtime resume request", spec.ResumeProviderRef); err != nil {
+		return SessionInfo{}, err
 	}
 	info, err := c.ensure(ctx, spec)
 	if err != nil {
 		c.discardBridge()
 		return SessionInfo{}, providerFacingTurnError(err)
 	}
-	if info.ACPSessionID == "" {
+	if info.ProviderRef == "" {
 		c.discardBridge()
-		return SessionInfo{}, identityError("runtime resume", "expected ACP Session ID %q, received %q", spec.ResumeACPSessionID, info.ACPSessionID)
+		return SessionInfo{}, identityError("runtime resume", "expected provider reference %q, received %q", spec.ResumeProviderRef, info.ProviderRef)
 	}
-	if err := ValidateSessionIdentity("runtime resume", info, spec.ResumeACPSessionID, spec.ExpectedNativeSessionID, spec.ExpectedProviderConversationID, spec.ProviderStoreVerified); err != nil {
-		c.discardBridge()
-		return SessionInfo{}, err
-	}
-	c.bindIdentity(spec, info)
-	return info, nil
-}
-
-// Refresh closes an idle ACP provider process and resumes the exact same ACP
-// conversation for an explicit transport refresh or identity-recovery action.
-func (c *RuntimeClient) Refresh(ctx context.Context, spec StartSpec) (SessionInfo, error) {
-	if strings.TrimSpace(spec.ResumeACPSessionID) == "" {
-		return SessionInfo{}, fmt.Errorf("ACP Session ID is required to refresh")
-	}
-	target, err := c.readyTarget(spec.Target)
-	if err != nil {
-		return SessionInfo{}, err
-	}
-	providerOptions := session.ProviderOptions{Model: strings.TrimSpace(spec.Model), ReasoningEffort: strings.TrimSpace(spec.ReasoningEffort)}
-	if err := providerOptions.Validate(); err != nil {
-		return SessionInfo{}, err
-	}
-	bridge, err := c.existingBridge(target)
-	if err != nil {
-		return SessionInfo{}, err
-	}
-	agentName, useBuiltin := runtimeAgentConfiguration(target.Profile)
-	var payload bridgeSession
-	err = bridge.call(ctx, bridgeCommand{
-		Type: "refresh", SessionKey: target.ConsoleSessionID, Agent: agentName, UseBuiltin: useBuiltin,
-		Argv: bridgeAgentArgv(target.Profile), Environment: cloneProfileEnvironment(target.Profile.Environment),
-		CWD: target.WorkingDirectory, PermissionMode: target.Permission, ResumeSessionID: spec.ResumeACPSessionID,
-		Model: providerOptions.Model, ReasoningEffort: providerOptions.ReasoningEffort,
-	}, &payload)
-	if err != nil {
-		c.discardBridge()
-		return SessionInfo{}, providerFacingTurnError(err)
-	}
-	info, err := bridgeSessionInfo(target, payload)
-	if err != nil {
+	if err := ValidateProviderRef("runtime resume", info, spec.ResumeProviderRef); err != nil {
 		c.discardBridge()
 		return SessionInfo{}, err
 	}
-	if err := ValidateSessionIdentity("runtime refresh", info, spec.ResumeACPSessionID, spec.ExpectedNativeSessionID, spec.ExpectedProviderConversationID, spec.ProviderStoreVerified); err != nil {
-		c.discardBridge()
-		return SessionInfo{}, err
-	}
-	c.bindIdentity(spec, info)
 	return info, nil
 }
 
@@ -145,7 +110,7 @@ func (c *RuntimeClient) Configure(ctx context.Context, spec StartSpec) (SessionI
 	if err != nil {
 		return SessionInfo{}, err
 	}
-	providerOptions := session.ProviderOptions{Model: strings.TrimSpace(spec.Model), ReasoningEffort: strings.TrimSpace(spec.ReasoningEffort)}
+	providerOptions := session.ProviderOptions{Model: spec.Model, ReasoningEffort: spec.ReasoningEffort}
 	if err := providerOptions.Validate(); err != nil {
 		return SessionInfo{}, err
 	}
@@ -157,7 +122,14 @@ func (c *RuntimeClient) Configure(ctx context.Context, spec StartSpec) (SessionI
 	if err := bridge.call(ctx, bridgeCommand{
 		Type: "configure", Model: providerOptions.Model, ReasoningEffort: providerOptions.ReasoningEffort,
 	}, &payload); err != nil {
-		c.discardBridge()
+		var remote *bridgeRemoteCommandError
+		if retainedPortUnavailableError(err) {
+			c.discardBridge()
+			return SessionInfo{}, &ProtocolError{Operation: "provider configuration", Message: "retained provider Port is unavailable"}
+		}
+		if !errors.As(err, &remote) {
+			c.discardBridge()
+		}
 		return SessionInfo{}, &ProviderConfigurationError{}
 	}
 	info, err := bridgeSessionInfo(target, payload)
@@ -165,16 +137,56 @@ func (c *RuntimeClient) Configure(ctx context.Context, spec StartSpec) (SessionI
 		c.discardBridge()
 		return SessionInfo{}, err
 	}
-	if err := ValidateSessionIdentity("runtime provider configuration", info, spec.ResumeACPSessionID, spec.ExpectedNativeSessionID, spec.ExpectedProviderConversationID, spec.ProviderStoreVerified); err != nil {
+	if err := ValidateProviderRef("runtime provider configuration", info, spec.ResumeProviderRef); err != nil {
 		c.discardBridge()
 		return SessionInfo{}, err
 	}
-	c.bindIdentity(spec, info)
 	return info, nil
 }
 
+// ProviderOptions returns only bounded select choices advertised for this
+// already-established provider conversation. Callers persist identity before
+// invoking this method; discovery never creates a second hidden conversation.
+func (c *RuntimeClient) ProviderOptions(ctx context.Context, spec StartSpec) (ProviderOptionCatalog, error) {
+	target, err := c.readyTarget(spec.Target)
+	if err != nil {
+		return ProviderOptionCatalog{}, err
+	}
+	bridge, err := c.existingBridge(target)
+	if err != nil {
+		return ProviderOptionCatalog{}, err
+	}
+	var payload bridgeSession
+	if err := bridge.call(ctx, bridgeCommand{Type: "provider_options"}, &payload); err != nil {
+		var remote *bridgeRemoteCommandError
+		if retainedPortUnavailableError(err) {
+			c.discardBridge()
+			return ProviderOptionCatalog{}, &ProtocolError{Operation: "provider option discovery", Message: "retained provider Port is unavailable"}
+		}
+		if errors.As(err, &remote) {
+			return ProviderOptionCatalog{}, &ProviderOptionsError{}
+		}
+		c.discardBridge()
+		return ProviderOptionCatalog{}, &ProtocolError{Operation: "provider option discovery", Message: "provider connection failed"}
+	}
+	info, err := bridgeSessionInfo(target, payload)
+	if err != nil {
+		c.discardBridge()
+		return ProviderOptionCatalog{}, err
+	}
+	if err := ValidateProviderRef("runtime provider option discovery", info, spec.ResumeProviderRef); err != nil {
+		c.discardBridge()
+		return ProviderOptionCatalog{}, err
+	}
+	if err := payload.ProviderOptions.Validate(); err != nil {
+		c.discardBridge()
+		return ProviderOptionCatalog{}, &ProtocolError{Operation: "provider option discovery", Message: "invalid provider configuration catalog"}
+	}
+	return payload.ProviderOptions, nil
+}
+
 // providerFacingTurnError classifies only explicit provider-facing
-// contention/rejection codes while opening or refreshing an exact provider
+// contention/rejection codes while opening an exact provider
 // conversation. Generic bridge, framing, permission, and identity failures
 // remain protocol errors so the worker retains its recovery/quarantine path.
 func providerFacingTurnError(err error) error {
@@ -204,13 +216,36 @@ func providerActivationFailureCode(value string) bool {
 	}
 }
 
+func providerPermissionRejectionError(err error) bool {
+	var remote *bridgeRemoteCommandError
+	if !errors.As(err, &remote) {
+		return false
+	}
+	return providerPermissionRejectionCode(remote.code) || providerPermissionRejectionCode(remote.detailCode)
+}
+
+func providerPermissionRejectionCode(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 128 {
+		return false
+	}
+	value = strings.NewReplacer("-", "_", " ", "_").Replace(strings.ToLower(value))
+	switch value {
+	case "permission_rejected", "permission_response_rejected", "provider_rejected":
+		return true
+	default:
+		return false
+	}
+}
+
+func retainedPortUnavailableError(err error) bool {
+	var remote *bridgeRemoteCommandError
+	return errors.As(err, &remote) && remote.code == "retained_port_unavailable"
+}
+
 func (c *RuntimeClient) ensure(ctx context.Context, spec StartSpec) (SessionInfo, error) {
 	target, err := c.readyTarget(spec.Target)
 	if err != nil {
-		return SessionInfo{}, err
-	}
-	providerOptions := session.ProviderOptions{Model: strings.TrimSpace(spec.Model), ReasoningEffort: strings.TrimSpace(spec.ReasoningEffort)}
-	if err := providerOptions.Validate(); err != nil {
 		return SessionInfo{}, err
 	}
 	bridge, err := c.bridgeFor(ctx, target)
@@ -222,8 +257,7 @@ func (c *RuntimeClient) ensure(ctx context.Context, spec StartSpec) (SessionInfo
 	err = bridge.call(ctx, bridgeCommand{
 		Type: "ensure", SessionKey: target.ConsoleSessionID, Agent: agentName, UseBuiltin: useBuiltin,
 		Argv: bridgeAgentArgv(target.Profile), Environment: cloneProfileEnvironment(target.Profile.Environment),
-		CWD: target.WorkingDirectory, PermissionMode: target.Permission, ResumeSessionID: spec.ResumeACPSessionID,
-		Model: providerOptions.Model, ReasoningEffort: providerOptions.ReasoningEffort,
+		CWD: target.WorkingDirectory, PermissionMode: target.Permission, ResumeSessionID: spec.ResumeProviderRef,
 	}, &payload)
 	if err != nil {
 		return SessionInfo{}, err
@@ -310,9 +344,19 @@ func (c *RuntimeClient) Prompt(ctx context.Context, spec PromptSpec, emit func(E
 			case "permission_abandoned":
 				continue
 			case "turn_result":
-				return runtimeTurnResult(receipt, message.Result)
+				completed, resultErr := runtimeTurnResult(receipt, message.Result)
+				var protocolErr *ProtocolError
+				if errors.As(resultErr, &protocolErr) {
+					c.discardBridge()
+				}
+				return completed, resultErr
 			case "error":
-				return receipt, providerFacingTurnError(bridgeRemoteError(message))
+				remoteErr := bridgeRemoteError(message)
+				if retainedPortUnavailableError(remoteErr) {
+					c.discardBridge()
+					return receipt, &ProtocolError{Operation: "prompt dispatch", Message: "retained provider Port is unavailable"}
+				}
+				return receipt, providerFacingTurnError(remoteErr)
 			}
 		}
 	}
@@ -336,37 +380,11 @@ func (c *RuntimeClient) Cancel(ctx context.Context, target Target) error {
 	return bridge.call(ctx, bridgeCommand{Type: "cancel", Reason: "cancelled by Task Console"}, nil)
 }
 
-func (c *RuntimeClient) Inspect(ctx context.Context, target Target) (SessionInfo, error) {
-	target, err := c.readyTarget(target)
-	if err != nil {
-		return SessionInfo{}, err
-	}
-	bridge, err := c.existingBridge(target)
-	if err != nil {
-		return SessionInfo{}, err
-	}
-	var payload bridgeSession
-	if err := bridge.call(ctx, bridgeCommand{Type: "inspect"}, &payload); err != nil {
-		return SessionInfo{}, err
-	}
-	info, err := bridgeSessionInfo(target, payload)
-	if err != nil {
-		c.discardBridge()
-		return SessionInfo{}, err
-	}
-	expected := c.identityExpectation()
-	if err := ValidateSessionIdentity("runtime inspect", info, expected.ACP, expected.Native, expected.Canonical, expected.ProviderStoreVerified); err != nil {
-		c.discardBridge()
-		return SessionInfo{}, err
-	}
-	return info, nil
-}
-
 func (c *RuntimeClient) DecidePermission(ctx context.Context, permissionID, optionID string, cancelled bool) error {
-	if strings.TrimSpace(permissionID) == "" {
+	if permissionID == "" {
 		return fmt.Errorf("permission ID is required")
 	}
-	if !cancelled && strings.TrimSpace(optionID) == "" {
+	if !cancelled && optionID == "" {
 		return fmt.Errorf("permission option ID is required")
 	}
 	c.mu.Lock()
@@ -376,24 +394,40 @@ func (c *RuntimeClient) DecidePermission(ctx context.Context, permissionID, opti
 	if closed || bridge == nil {
 		return fmt.Errorf("acpx runtime bridge is unavailable")
 	}
-	return bridge.call(ctx, bridgeCommand{
+	err := bridge.call(ctx, bridgeCommand{
 		Type: "permission_decision", PermissionID: permissionID, OptionID: optionID, Cancelled: cancelled,
 	}, nil)
+	if err == nil {
+		return nil
+	}
+	if providerPermissionRejectionError(err) {
+		return &ProviderPermissionRejectedError{}
+	}
+	// A decision may have reached the provider even when its acknowledgement
+	// did not reach us. The retained Port can no longer prove whether this
+	// callback is pending, so it must never be reused in-process.
+	c.discardBridge()
+	return &ProtocolError{Operation: "permission decision", Message: "retained provider Port continuity is unavailable"}
 }
 
 func (c *RuntimeClient) Close() error {
 	c.mu.Lock()
 	if c.closed {
+		blocked := c.blocked
 		c.mu.Unlock()
-		return nil
+		return blocked
 	}
 	c.closed = true
 	bridge := c.bridge
+	blocked := c.blocked
 	c.mu.Unlock()
 	if bridge == nil {
-		return nil
+		return blocked
 	}
-	return bridge.closeProcess()
+	if err := bridge.closeProcess(); err != nil {
+		return err
+	}
+	return blocked
 }
 
 func (c *RuntimeClient) readyTarget(target Target) (Target, error) {
@@ -447,9 +481,9 @@ func (c *RuntimeClient) existingBridge(target Target) (*runtimeBridge, error) {
 	return c.bridge, nil
 }
 
-// discardBridge tears down a bridge whose provider identity or refresh state
-// can no longer be trusted. It deliberately keeps the client reusable so an
-// exact Resume can establish a fresh bridge before later ACP work.
+// discardBridge tears down a bridge whose provider identity can no longer be
+// trusted. A worker never replaces it in-process; recovery starts a new worker
+// and performs one startup Resume.
 func (c *RuntimeClient) discardBridge() {
 	c.mu.Lock()
 	bridge := c.bridge
@@ -468,28 +502,6 @@ func (c *RuntimeClient) discardBridge() {
 		}
 		c.mu.Unlock()
 	}
-}
-
-func (c *RuntimeClient) bindIdentity(spec StartSpec, info SessionInfo) {
-	canonical := strings.TrimSpace(spec.ExpectedProviderConversationID)
-	if canonical == "" {
-		canonical = strings.TrimSpace(info.NativeSessionID)
-	}
-	if canonical == "" {
-		canonical = strings.TrimSpace(info.ACPSessionID)
-	}
-	c.mu.Lock()
-	c.identity = runtimeIdentityExpectation{
-		ACP: strings.TrimSpace(info.ACPSessionID), Native: strings.TrimSpace(info.NativeSessionID),
-		Canonical: canonical, ProviderStoreVerified: spec.ProviderStoreVerified,
-	}
-	c.mu.Unlock()
-}
-
-func (c *RuntimeClient) identityExpectation() runtimeIdentityExpectation {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.identity
 }
 
 func sameRuntimeTarget(left, right Target) bool {
@@ -516,70 +528,23 @@ func runtimeEvent(spec PromptSpec, sequence uint64, encoded json.RawMessage) (Ev
 		return Event{}, &ProtocolError{Operation: "runtime event", Message: err.Error()}
 	}
 	typeName, _ := payload["type"].(string)
-	eventType := "runtime_status"
-	var raw any
-	switch typeName {
-	case "text_delta":
-		text, _ := payload["text"].(string)
-		stream, _ := payload["stream"].(string)
-		eventType = "agent_message_chunk"
-		if stream == "thought" {
-			eventType = "agent_thought_chunk"
-		}
-		raw = runtimeSessionUpdate(spec, eventType, map[string]any{
-			"content": map[string]any{"type": "text", "text": text},
-		})
-	case "tool_call":
-		eventType, _ = payload["tag"].(string)
-		if eventType != "tool_call" && eventType != "tool_call_update" {
-			eventType = "tool_call_update"
-		}
-		update := cloneRuntimeMap(payload, "type", "tag", "text")
-		if _, exists := update["title"]; !exists {
-			if title, ok := payload["text"].(string); ok {
-				update["title"] = title
-			}
-		}
-		raw = runtimeSessionUpdate(spec, eventType, update)
-	case "status":
-		eventType, _ = payload["tag"].(string)
-		if eventType == "" {
-			eventType = "runtime_status"
-		}
-		raw = runtimeSessionUpdate(spec, eventType, cloneRuntimeMap(payload, "type", "tag"))
-	case "error":
-		eventType = "error"
-		raw = map[string]any{"jsonrpc": "2.0", "error": map[string]any{"message": payload["message"], "code": payload["code"]}}
-	default:
-		return Event{}, &ProtocolError{Operation: "runtime event", Message: fmt.Sprintf("unknown event type %q", typeName)}
-	}
-	rawJSON, err := json.Marshal(raw)
-	if err != nil {
-		return Event{}, err
+	if typeName == "" || strings.TrimSpace(typeName) != typeName || !boundedPrintable(typeName, maxNormalizedEventTypeBytes) {
+		return Event{}, &ProtocolError{Operation: "runtime event", Message: "invalid event type"}
 	}
 	return Event{
 		EventVersion: 1, SessionID: spec.ConsoleSessionID, RequestID: spec.RequestID,
-		Seq: sequence, Stream: "prompt", Type: eventType, Raw: rawJSON,
+		Seq: sequence, Stream: "prompt", Type: typeName, Raw: cloneRaw(encoded),
 	}, nil
 }
 
 func runtimePermissionEvent(spec PromptSpec, sequence uint64, message bridgeMessage) (Event, error) {
-	if strings.TrimSpace(message.PermissionID) == "" || !json.Valid(message.Request) {
+	if message.PermissionID == "" || !json.Valid(message.Request) {
 		return Event{}, &ProtocolError{Operation: "runtime permission", Message: "invalid permission envelope"}
-	}
-	var params map[string]any
-	if err := json.Unmarshal(message.Request, &params); err != nil {
-		return Event{}, err
-	}
-	raw, err := json.Marshal(map[string]any{
-		"jsonrpc": "2.0", "id": message.PermissionID, "method": "session/request_permission", "params": params,
-	})
-	if err != nil {
-		return Event{}, err
 	}
 	return Event{
 		EventVersion: 1, SessionID: spec.ConsoleSessionID, RequestID: spec.RequestID,
-		Seq: sequence, Stream: "prompt", Type: "session_request_permission", Raw: raw,
+		Seq: sequence, Stream: "prompt", Type: "session_request_permission",
+		PermissionID: message.PermissionID, Raw: cloneRaw(message.Request),
 	}, nil
 }
 
@@ -599,45 +564,34 @@ func runtimeTurnResult(receipt PromptReceipt, encoded json.RawMessage) (PromptRe
 	}
 	switch result.Status {
 	case "completed":
-		receipt.StopReason = firstNonEmptyString(result.StopReason, "end_turn")
+		receipt.StopReason = firstNonBlankString(result.StopReason, "end_turn")
 		return receipt, nil
 	case "cancelled":
 		receipt.StopReason = "cancelled"
 		return receipt, nil
 	case "failed":
+		if strings.EqualFold(strings.TrimSpace(result.Error.Code), "NO_SESSION") {
+			return receipt, &ProtocolError{
+				Operation: "runtime turn result",
+				Message:   "provider Port no longer addresses the saved conversation",
+			}
+		}
 		return receipt, &ProviderTurnError{
 			Code: result.Error.Code, DetailCode: result.Error.DetailCode,
-			Message: firstNonEmptyString(result.Error.Message, "provider turn failed"), Retryable: result.Error.Retryable,
+			Message: firstNonBlankString(result.Error.Message, "provider turn failed"), Retryable: result.Error.Retryable,
 		}
 	default:
 		return receipt, &ProtocolError{Operation: "runtime turn result", Message: fmt.Sprintf("unknown status %q", result.Status)}
 	}
 }
 
-func runtimeSessionUpdate(spec PromptSpec, eventType string, fields map[string]any) map[string]any {
-	update := make(map[string]any, len(fields)+1)
-	update["sessionUpdate"] = eventType
-	for name, value := range fields {
-		update[name] = value
-	}
-	return map[string]any{
-		"jsonrpc": "2.0", "method": "session/update",
-		"params": map[string]any{"sessionId": spec.ConsoleSessionID, "update": update},
-	}
-}
-
-func cloneRuntimeMap(source map[string]any, excluded ...string) map[string]any {
-	skip := make(map[string]struct{}, len(excluded))
-	for _, name := range excluded {
-		skip[name] = struct{}{}
-	}
-	result := make(map[string]any, len(source))
-	for name, value := range source {
-		if _, omitted := skip[name]; !omitted {
-			result[name] = value
+func firstNonBlankString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
 		}
 	}
-	return result
+	return ""
 }
 
 var _ PermissionResponder = (*RuntimeClient)(nil)

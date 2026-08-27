@@ -1,20 +1,18 @@
 package console
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
-	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/yty-build/acp-gateway/internal/acp"
 	"github.com/yty-build/acp-gateway/internal/agents"
-	"github.com/yty-build/acp-gateway/internal/presentation"
 	appservice "github.com/yty-build/acp-gateway/internal/service"
 	"github.com/yty-build/acp-gateway/internal/session"
 	"github.com/yty-build/acp-gateway/internal/sessionlog"
@@ -22,50 +20,62 @@ import (
 	"github.com/yty-build/acp-gateway/internal/worker"
 )
 
-type fakeBackend struct {
-	mu           sync.Mutex
-	detail       task.Detail
-	sessions     map[string]session.Session
-	histories    map[string][]sessionlog.Line
-	historyCalls []historyCall
-	prompts      []promptCall
-	permissions  []permissionCall
-	cancelled    []string
-	resumed      []string
-	stopped      []string
-	starts       []appservice.StartSessionParams
-	profiles     []agents.Profile
-	promptState  string
-	native       []string
+type fakeConsoleBackend struct {
+	mu               sync.Mutex
+	detail           task.Detail
+	sessions         map[string]session.Session
+	history          map[string][]sessionlog.Line
+	permissionState  map[string]appservice.PermissionSnapshot
+	permissionReads  map[string]int
+	profiles         []agents.Profile
+	providerOptions  acp.ProviderOptionCatalog
+	promptErr        error
+	prompts          []string
+	configured       []session.ProviderOptions
+	launches         []string
+	cancelled        int
+	resumed          int
+	stopped          int
+	taskFollowCalls  int
+	sessionFollows   int
+	freshReplayCalls int
+	taskAttempts     int
+	taskAttempted    chan struct{}
+	taskChanged      chan struct{}
 }
 
-type conversationFakeBackend struct {
-	*fakeBackend
-	snapshot appservice.ConversationSnapshot
+func newFakeConsoleBackend() *fakeConsoleBackend {
+	current := session.Session{
+		ID: "S-1", TaskID: "T-1", Agent: "codex", Provider: "openai", Role: "worker",
+		RepoPath: "/repo", Status: session.StatusWaiting,
+	}
+	return &fakeConsoleBackend{
+		detail: task.Detail{
+			Task:     task.Task{ID: "T-1", Title: "Ship the channel", Status: task.StatusWorking},
+			Sessions: []session.Session{current},
+		},
+		sessions:        map[string]session.Session{"S-1": current},
+		history:         make(map[string][]sessionlog.Line),
+		permissionState: make(map[string]appservice.PermissionSnapshot),
+		permissionReads: make(map[string]int),
+		taskAttempted:   make(chan struct{}, 1024),
+		taskChanged:     make(chan struct{}, 1),
+		profiles: []agents.Profile{
+			{Name: "codex", Provider: "openai", Command: "codex"},
+			{Name: "claude", Provider: "anthropic", Command: "claude"},
+		},
+		providerOptions: acp.ProviderOptionCatalog{
+			Model: acp.ProviderSelectCatalog{Supported: true, CurrentValue: "provider-model", Choices: []acp.ProviderOptionChoice{
+				{Value: "model-a", Label: "Model A"}, {Value: "model-b", Label: "Model B", Group: "Fast"},
+			}},
+			ReasoningEffort: acp.ProviderSelectCatalog{Supported: true, CurrentValue: "medium", Choices: []acp.ProviderOptionChoice{
+				{Value: "low", Label: "Low"}, {Value: "high", Label: "High"},
+			}},
+		},
+	}
 }
 
-func (f *conversationFakeBackend) Conversation(context.Context, string) (appservice.ConversationSnapshot, error) {
-	return f.snapshot, nil
-}
-
-type promptCall struct {
-	sessionID string
-	message   string
-}
-
-type historyCall struct {
-	sessionID string
-	cursor    uint64
-}
-
-type permissionCall struct {
-	sessionID    string
-	permissionID string
-	optionID     string
-	cancelled    bool
-}
-
-func (f *fakeBackend) Task(context.Context, string) (task.Detail, error) {
+func (f *fakeConsoleBackend) Task(context.Context, string) (task.Detail, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	result := f.detail
@@ -73,1232 +83,1240 @@ func (f *fakeBackend) Task(context.Context, string) (task.Detail, error) {
 	return result, nil
 }
 
-func (f *fakeBackend) Session(_ context.Context, id string) (session.Session, error) {
+func (f *fakeConsoleBackend) Session(_ context.Context, id string) (session.Session, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.sessions[id], nil
+	current, ok := f.sessions[id]
+	if !ok {
+		return session.Session{}, errors.New("missing Session")
+	}
+	return current, nil
 }
 
-func (f *fakeBackend) History(_ context.Context, id string, cursor uint64) ([]sessionlog.Line, error) {
+func (f *fakeConsoleBackend) FreshReplayCursor(_ context.Context, id string, maxRecords int) (uint64, bool, error) {
+	if maxRecords <= 0 {
+		return 0, false, errors.New("max records must be positive")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.historyCalls = append(f.historyCalls, historyCall{sessionID: id, cursor: cursor})
-	var result []sessionlog.Line
-	for _, line := range f.histories[id] {
+	f.freshReplayCalls++
+	history := f.history[id]
+	if len(history) <= maxRecords {
+		return 0, false, nil
+	}
+	return history[len(history)-maxRecords-1].Seq, true, nil
+}
+
+func (f *fakeConsoleBackend) PermissionSnapshot(_ context.Context, id string) (appservice.PermissionSnapshot, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.permissionReads[id]++
+	snapshot := f.permissionState[id]
+	snapshot.Permissions = append([]worker.PendingPermission(nil), snapshot.Permissions...)
+	for index := range snapshot.Permissions {
+		snapshot.Permissions[index].Options = append([]worker.PermissionOption(nil), snapshot.Permissions[index].Options...)
+	}
+	return snapshot, nil
+}
+
+func (f *fakeConsoleBackend) Follow(ctx context.Context, id string, cursor uint64, consume func(sessionlog.Line) error) error {
+	f.mu.Lock()
+	f.sessionFollows++
+	history := append([]sessionlog.Line(nil), f.history[id]...)
+	current := f.sessions[id]
+	f.mu.Unlock()
+	for _, line := range history {
 		if line.Seq > cursor {
-			result = append(result, line)
+			if err := consume(line); err != nil {
+				return err
+			}
 		}
 	}
-	return result, nil
-}
-
-func (f *fakeBackend) Follow(ctx context.Context, _ string, _ uint64, _ func(sessionlog.Line) error) error {
+	if current.WorkerSocket == "" {
+		return nil
+	}
 	<-ctx.Done()
 	return ctx.Err()
 }
 
-func (f *fakeBackend) Prompt(_ context.Context, id, message string) (worker.Message, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.prompts = append(f.prompts, promptCall{sessionID: id, message: message})
-	state := f.promptState
-	if state == "" {
-		state = "ready"
+func (f *fakeConsoleBackend) TaskReplayWindows(_ context.Context, _ string, cursors map[string]uint64, maxRecords int) (map[string]uint64, map[string]appservice.ReplayWindow, error) {
+	if maxRecords <= 0 {
+		return nil, nil, errors.New("max records must be positive")
 	}
-	return worker.Message{Type: "accepted", RequestID: "req-test", State: state}, nil
-}
-
-func (f *fakeBackend) DecidePermission(_ context.Context, sessionID, permissionID, optionID string, cancelled bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.permissions = append(f.permissions, permissionCall{
-		sessionID: sessionID, permissionID: permissionID, optionID: optionID, cancelled: cancelled,
-	})
+	effective := make(map[string]uint64, len(f.detail.Sessions))
+	windows := make(map[string]appservice.ReplayWindow, len(f.detail.Sessions))
+	for _, current := range f.detail.Sessions {
+		position := cursors[current.ID]
+		clipped := false
+		history := f.history[current.ID]
+		if position == 0 && len(history) > maxRecords {
+			position = history[len(history)-maxRecords-1].Seq
+			clipped = true
+		}
+		earliest := position
+		if position != ^uint64(0) {
+			earliest++
+		}
+		effective[current.ID] = position
+		windows[current.ID] = appservice.ReplayWindow{Cursor: position, EarliestSequence: earliest, Clipped: clipped}
+	}
+	return effective, windows, nil
+}
+
+func (f *fakeConsoleBackend) FollowTask(ctx context.Context, _ string, cursors map[string]uint64, consume func(appservice.TaskActivity) error) error {
+	if cursors == nil {
+		cursors = make(map[string]uint64)
+	}
+	f.mu.Lock()
+	f.taskFollowCalls++
+	f.mu.Unlock()
+	for {
+		f.mu.Lock()
+		var available []appservice.TaskActivity
+		for _, current := range f.detail.Sessions {
+			for _, line := range f.history[current.ID] {
+				if line.Seq > cursors[current.ID] {
+					available = append(available, appservice.TaskActivity{SessionID: current.ID, Line: line})
+				}
+			}
+		}
+		f.mu.Unlock()
+		sort.Slice(available, func(i, j int) bool {
+			left, right := available[i], available[j]
+			if left.Line.Timestamp.Equal(right.Line.Timestamp) {
+				if left.SessionID == right.SessionID {
+					return left.Line.Seq < right.Line.Seq
+				}
+				return left.SessionID < right.SessionID
+			}
+			if left.Line.Timestamp.IsZero() {
+				return true
+			}
+			if right.Line.Timestamp.IsZero() {
+				return false
+			}
+			return left.Line.Timestamp.Before(right.Line.Timestamp)
+		})
+		for _, activity := range available {
+			f.mu.Lock()
+			f.taskAttempts++
+			f.mu.Unlock()
+			select {
+			case f.taskAttempted <- struct{}{}:
+			default:
+			}
+			if err := consume(activity); err != nil {
+				return err
+			}
+			cursors[activity.SessionID] = activity.Line.Seq
+		}
+		if len(available) > 0 {
+			continue
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-f.taskChanged:
+			timer.Stop()
+		case <-timer.C:
+		}
+	}
+}
+
+func (f *fakeConsoleBackend) Prompt(_ context.Context, _ string, message string) (worker.Message, error) {
+	f.prompts = append(f.prompts, message)
+	if f.promptErr != nil {
+		return worker.Message{}, f.promptErr
+	}
+	return worker.Message{Type: "accepted", RequestID: "REQ-new", State: "ready"}, nil
+}
+
+func (*fakeConsoleBackend) DecidePermission(context.Context, string, string, string, bool) error {
 	return nil
 }
 
-func (f *fakeBackend) Cancel(_ context.Context, id string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.cancelled = append(f.cancelled, id)
+func (f *fakeConsoleBackend) Cancel(context.Context, string) error {
+	f.cancelled++
 	return nil
 }
 
-func (f *fakeBackend) Resume(_ context.Context, id string) (session.Session, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.resumed = append(f.resumed, id)
+func (f *fakeConsoleBackend) Resume(_ context.Context, id string) (session.Session, error) {
+	f.resumed++
 	current := f.sessions[id]
-	current.WorkerSocket = "/tmp/" + id + ".sock"
-	current.Status = session.StatusWaiting
+	current.WorkerSocket = "/tmp/worker.sock"
 	f.sessions[id] = current
 	return current, nil
 }
 
-func (f *fakeBackend) Stop(_ context.Context, id string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.stopped = append(f.stopped, id)
+func TestResumeActionRequiresExactIdentityAndClearOwnership(t *testing.T) {
+	backend := newFakeConsoleBackend()
+	model := baseModel(context.Background(), backend)
+	model.mode = taskView
+	model.task = backend.detail
+
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}})
+	model = updated.(Model)
+	if command != nil || backend.resumed != 0 || !strings.Contains(model.notice, "no saved provider identity") {
+		t.Fatalf("identityless Resume command=%v calls=%d notice=%q", command != nil, backend.resumed, model.notice)
+	}
+	model.overlay = paletteOverlay
+	model.width, model.height = 100, 30
+	if strings.Contains(model.View(), "Resume worker") {
+		t.Fatalf("identityless command palette advertised Resume:\n%s", model.View())
+	}
+
+	quarantined := backend.detail.Sessions[0]
+	quarantined.ProviderRef = "provider-ref"
+	quarantined.WorkerPID = 42
+	quarantined.WorkerSocket = "/tmp/quarantined.sock"
+	quarantined.Status = session.StatusFailed
+	model.overlay = noOverlay
+	model.task.Sessions[0] = quarantined
+	updated, command = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}})
+	model = updated.(Model)
+	if command != nil || backend.resumed != 0 || !strings.Contains(model.notice, "quarantined worker ownership") {
+		t.Fatalf("quarantined Resume command=%v calls=%d notice=%q", command != nil, backend.resumed, model.notice)
+	}
+
+	resumable := quarantined
+	resumable.WorkerPID = 0
+	resumable.WorkerSocket = ""
+	resumable.Status = session.StatusStopped
+	model.task.Sessions[0] = resumable
+	updated, command = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}})
+	model = updated.(Model)
+	if command == nil {
+		t.Fatal("resumable Session did not produce a Resume command")
+	}
+	updated, _ = model.Update(command())
+	model = updated.(Model)
+	if backend.resumed != 1 || !strings.Contains(model.notice, "resumed") {
+		t.Fatalf("resumable calls=%d notice=%q", backend.resumed, model.notice)
+	}
+}
+
+func (f *fakeConsoleBackend) Stop(context.Context, string) error {
+	f.stopped++
 	return nil
 }
 
-func (f *fakeBackend) AvailableAgents(context.Context) ([]agents.Profile, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+func (f *fakeConsoleBackend) AvailableAgents(context.Context) ([]agents.Profile, error) {
 	return append([]agents.Profile(nil), f.profiles...), nil
 }
 
-func (f *fakeBackend) StartSession(_ context.Context, params appservice.StartSessionParams) (appservice.LaunchResult, error) {
+func (f *fakeConsoleBackend) ConnectSession(_ context.Context, params appservice.StartSessionParams) (ProviderSession, error) {
+	current := session.Session{
+		ID: "S-2", TaskID: params.TaskID, Agent: params.Agent, Provider: "openai", Role: params.Role,
+		RepoPath: params.RepoPath, Status: session.StatusWaiting, WorkerSocket: "/tmp/S-2.sock",
+	}
+	f.sessions[current.ID] = current
+	return ProviderSession{Session: current, Options: f.providerOptions}, nil
+}
+
+func (f *fakeConsoleBackend) LoadProviderOptions(_ context.Context, id string) (ProviderSession, error) {
+	return ProviderSession{Session: f.sessions[id], Options: f.providerOptions}, nil
+}
+
+func (f *fakeConsoleBackend) ConfigureSession(_ context.Context, id string, options session.ProviderOptions) (ProviderSession, error) {
+	f.configured = append(f.configured, options)
+	return ProviderSession{Session: f.sessions[id], Options: f.providerOptions}, nil
+}
+
+func (f *fakeConsoleBackend) PromptSession(_ context.Context, id, prompt string) (appservice.LaunchResult, error) {
+	f.launches = append(f.launches, prompt)
+	return appservice.LaunchResult{Session: f.sessions[id], RequestID: "REQ-first", State: "ready", Started: true}, nil
+}
+
+func (f *fakeConsoleBackend) addTaskSession(current session.Session, history []sessionlog.Line) {
+	f.mu.Lock()
+	f.detail.Sessions = append(f.detail.Sessions, current)
+	f.sessions[current.ID] = current
+	f.history[current.ID] = append([]sessionlog.Line(nil), history...)
+	f.mu.Unlock()
+	select {
+	case f.taskChanged <- struct{}{}:
+	default:
+	}
+}
+
+func (f *fakeConsoleBackend) followCounts() (taskCalls, sessionCalls, freshCalls, taskAttempts int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.starts = append(f.starts, params)
-	created := session.Session{
-		ID: "S-3", TaskID: params.TaskID, Role: params.Role, Agent: params.Agent, Provider: "test",
-		RepoPath: params.RepoPath, WorktreePath: "/worktrees/three", Branch: "agent/S-3",
-		Status: session.StatusWorking, WorkerSocket: "/tmp/S-3.sock",
+	return f.taskFollowCalls, f.sessionFollows, f.freshReplayCalls, f.taskAttempts
+}
+
+func TestTaskConsoleReplaysOnlySessionChannelJSONL(t *testing.T) {
+	backend := newFakeConsoleBackend()
+	backend.history["S-1"] = []sessionlog.Line{
+		testLine(1, "REQ-1", worker.FrameClientCommand, map[string]any{"command": "prompt", "text": "Hello"}),
+		testLine(2, "REQ-1", worker.FrameProviderEvent, map[string]any{"type": "text_delta", "stream": "output", "text": "Hi immediately"}),
+		testLine(3, "REQ-1", worker.FrameProviderResult, map[string]any{"status": "completed", "stop_reason": "end_turn"}),
 	}
-	f.sessions[created.ID] = created
-	f.detail.Sessions = append(f.detail.Sessions, created)
-	return appservice.LaunchResult{Session: created, RequestID: "REQ-3", State: "ready"}, nil
-}
-
-func (f *fakeBackend) AttachNative(_ context.Context, id string, _ io.Reader, _, _ io.Writer) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.native = append(f.native, id)
-	return nil
-}
-
-func TestTaskConsoleShowsEverySessionAndDetachesOnlyViewer(t *testing.T) {
-	backend := newConsoleBackend()
 	model, cancel, err := newTaskModel(context.Background(), backend, "T-1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer cancel()
-
-	view := model.View()
-	for _, want := range []string{"TASK · Investigate gateway", "T-1", "researcher", "GEMINI", "one", "implementer", "CODEX", "two", "waiting", "No conversation yet"} {
-		if !strings.Contains(view, want) {
-			t.Fatalf("Task view missing %q:\n%s", want, view)
+	for range 3 {
+		select {
+		case message := <-model.manager.events:
+			updated, _ := model.Update(message)
+			model = updated.(Model)
+		case <-time.After(time.Second):
+			t.Fatal("Session Channel replay did not arrive asynchronously")
 		}
 	}
-	if strings.Contains(view, "Aggregate activity") || strings.Contains(view, "worker ready") {
-		t.Fatalf("Task view leaked the old aggregate event feed:\n%s", view)
+	if model.cursors["S-1"] != 3 || len(model.histories["S-1"]) != 3 {
+		t.Fatalf("replay cursor/history = %d/%d", model.cursors["S-1"], len(model.histories["S-1"]))
 	}
-
-	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
-	model = updated.(Model)
-	if _, ok := command().(tea.QuitMsg); !ok {
-		t.Fatalf("q command = %T, want tea.QuitMsg", command())
-	}
-	backend.mu.Lock()
-	defer backend.mu.Unlock()
-	if len(backend.cancelled) != 0 || len(backend.stopped) != 0 {
-		t.Fatalf("detach mutated worker: cancelled=%v stopped=%v", backend.cancelled, backend.stopped)
-	}
-}
-
-func TestTaskConsoleKeyboardMouseAndExplicitPromptTarget(t *testing.T) {
-	backend := newConsoleBackend()
-	backend.promptState = "queued"
-	model, cancel, err := newTaskModel(context.Background(), backend, "T-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cancel()
-
-	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyDown})
-	model = updated.(Model)
-	if model.selected != 1 {
-		t.Fatalf("keyboard selected = %d, want 1", model.selected)
-	}
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
-	model = updated.(Model)
-	if model.mode != sessionView || model.current.ID != "S-2" || !model.composer.focused {
-		t.Fatalf("prompt drill = mode %d, Session %s, input %v", model.mode, model.current.ID, model.composer.focused)
-	}
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("steer only this")})
-	model = updated.(Model)
-	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	model = updated.(Model)
-	result := command()
-	updated, _ = model.Update(result)
-	model = updated.(Model)
-	if !strings.Contains(model.notice, "Message queued") {
-		t.Fatalf("queued notice = %q", model.notice)
-	}
-	backend.mu.Lock()
-	if len(backend.prompts) != 1 || backend.prompts[0] != (promptCall{sessionID: "S-2", message: "steer only this"}) {
-		backend.mu.Unlock()
-		t.Fatalf("prompt calls = %#v", backend.prompts)
-	}
-	backend.mu.Unlock()
-
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
-	model = updated.(Model)
-	updated, nativeCommand := model.Update(tea.MouseMsg(tea.MouseEvent{X: 2, Y: 5, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft}))
-	model = updated.(Model)
-	if model.mode != taskView || model.selected != 0 || nativeCommand != nil {
-		t.Fatalf("mouse selection: selected=%d mode=%d command=%v", model.selected, model.mode, nativeCommand)
-	}
-	backend.mu.Lock()
-	defer backend.mu.Unlock()
-	if len(backend.native) != 0 {
-		t.Fatalf("single click opened native CLI: %v", backend.native)
-	}
-}
-
-func TestTaskConsoleNativeDefaultACPActionFilterHelpAndPalette(t *testing.T) {
-	backend := newConsoleBackend()
-	model, cancel, err := newTaskModel(context.Background(), backend, "T-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cancel()
-
-	updated, nativeCommand := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	model = updated.(Model)
-	if model.mode != taskView || nativeCommand != nil || !strings.Contains(model.notice, "Native CLI unavailable") || !strings.Contains(model.notice, "structured view") {
-		t.Fatalf("unsupported native surface: mode=%d command=%v notice=%q", model.mode, nativeCommand, model.notice)
-	}
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
-	model = updated.(Model)
-	if model.mode != sessionView || model.current.ID != "S-1" || model.composer.focused || !strings.Contains(model.View(), "CONVERSATION · SESSION S-1") {
-		t.Fatalf("Structured ACP action = mode %d Session %s composer=%v\n%s", model.mode, model.current.ID, model.composer.focused, model.View())
-	}
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
-	model = updated.(Model)
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
-	model = updated.(Model)
-	updated, nativeCommand = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	model = updated.(Model)
-	if model.mode != taskView || nativeCommand == nil || !strings.Contains(model.notice, "Opening Codex CLI") || !strings.Contains(model.notice, "same provider conversation") {
-		t.Fatalf("Enter did not choose native CLI: mode=%d command=%v notice=%q", model.mode, nativeCommand, model.notice)
-	}
-	direct := &nativeAttachCommand{ctx: context.Background(), backend: backend, sessionID: "S-2", input: strings.NewReader(""), output: io.Discard, stderr: io.Discard}
-	if err := direct.Run(); err != nil {
-		t.Fatal(err)
-	}
-	backend.mu.Lock()
-	if !reflect.DeepEqual(backend.native, []string{"S-2"}) {
-		backend.mu.Unlock()
-		t.Fatalf("native calls = %v", backend.native)
-	}
-	backend.mu.Unlock()
-
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
-	model = updated.(Model)
-	if model.mode != sessionView || model.current.ID != "S-2" || model.composer.focused {
-		t.Fatalf("ACP action = mode %d Session %s composer=%v", model.mode, model.current.ID, model.composer.focused)
-	}
-	if !strings.Contains(model.View(), "n Native CLI") {
-		t.Fatalf("Structured ACP footer does not expose native handoff:\n%s", model.View())
-	}
-	updated, nativeFromSession := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
-	model = updated.(Model)
-	if nativeFromSession == nil || !strings.Contains(model.notice, "Opening Codex CLI") || model.mode != sessionView {
-		t.Fatalf("Structured ACP n handoff: command=%v notice=%q mode=%d", nativeFromSession, model.notice, model.mode)
-	}
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("?")})
-	model = updated.(Model)
-	if !strings.Contains(model.View(), "n              Open the exact conversation in the provider's native CLI") {
-		t.Fatalf("Structured ACP help does not document native handoff:\n%s", model.View())
-	}
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
-	model = updated.(Model)
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
-	model = updated.(Model)
-
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
-	model = updated.(Model)
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("codex")})
-	model = updated.(Model)
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	model = updated.(Model)
-	if model.overlay != noOverlay || model.filter != "codex" || model.selected != 1 || len(model.filteredSessionIndices()) != 1 {
-		t.Fatalf("filter state: overlay=%d filter=%q selected=%d matches=%v", model.overlay, model.filter, model.selected, model.filteredSessionIndices())
-	}
-
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("?")})
-	model = updated.(Model)
-	if model.overlay != helpOverlay || !strings.Contains(model.View(), "KEYBOARD HELP") || !strings.Contains(model.View(), "provider CLI") || !strings.Contains(model.View(), "structured view") || strings.Contains(model.View(), "harness") {
-		t.Fatalf("help overlay:\n%s", model.View())
-	}
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
-	model = updated.(Model)
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(":")})
-	model = updated.(Model)
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("new")})
-	model = updated.(Model)
-	if model.overlay != paletteOverlay || !strings.Contains(model.View(), "New Session") || strings.Contains(model.View(), "Cancel turn") {
-		t.Fatalf("filtered command palette:\n%s", model.View())
-	}
-}
-
-func TestTaskConsoleMouseUsesScrolledNavigatorWindow(t *testing.T) {
-	backend := newConsoleBackend()
-	model, cancel, err := newTaskModel(context.Background(), backend, "T-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cancel()
-	for index := 3; index <= 9; index++ {
-		model.task.Sessions = append(model.task.Sessions, session.Session{
-			ID: fmt.Sprintf("S-%d", index), TaskID: "T-1", Agent: "codex", Role: "worker", Status: session.StatusWaiting,
-		})
-	}
-	model.width, model.height = 100, 16
-	model.selected = len(model.task.Sessions) - 1
-	layout := layoutTaskWorkspace(model.width, model.height)
-	indices, start, visible := model.taskSessionWindow(layout.Navigator.Height)
-	if start == 0 || visible >= len(indices) {
-		t.Fatalf("test did not create a scrolled window: start=%d visible=%d total=%d", start, visible, len(indices))
-	}
-	hits := model.taskSessionHits(layout)
-	if len(hits) == 0 {
-		t.Fatal("layout exposed no visible Session hit targets")
-	}
-	updated, command := model.Update(tea.MouseMsg(tea.MouseEvent{
-		X: hits[0].Rect.X, Y: hits[0].Rect.Y, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft,
-	}))
-	model = updated.(Model)
-	if command != nil || model.selected != indices[start] {
-		t.Fatalf("scrolled mouse selected index %d, want %d; command=%v", model.selected, indices[start], command)
-	}
-}
-
-func TestTaskConsoleMouseUsesResponsiveLayoutHitRegions(t *testing.T) {
-	for _, width := range []int{40, 60, 80, 120} {
-		t.Run(fmt.Sprintf("%d-columns", width), func(t *testing.T) {
-			model := visualTaskModel()
-			model.width, model.height = width, 24
-			model.selected = 1
-			layout := layoutTaskWorkspace(model.width, model.height)
-			hits := model.taskSessionHits(layout)
-			if len(hits) < 2 {
-				t.Fatalf("%d-column layout exposed %d Session targets", width, len(hits))
-			}
-			updated, command := model.handleMouse(tea.MouseEvent{
-				X:      hits[0].Rect.X + hits[0].Rect.Width/2,
-				Y:      hits[0].Rect.Y,
-				Action: tea.MouseActionPress, Button: tea.MouseButtonLeft,
-			})
-			model = updated.(Model)
-			if command != nil || model.selected != 0 {
-				t.Fatalf("%d-column hit selected=%d command=%v", width, model.selected, command)
-			}
-			if layout.Preview.Width > 0 {
-				updated, command = model.handleMouse(tea.MouseEvent{
-					X: layout.Preview.X, Y: layout.Preview.Y,
-					Action: tea.MouseActionPress, Button: tea.MouseButtonLeft,
-				})
-				model = updated.(Model)
-				if command != nil || model.selected != 0 {
-					t.Fatalf("%d-column preview click changed selection=%d command=%v", width, model.selected, command)
-				}
-			}
-		})
-	}
-}
-
-func TestTaskConsoleMouseWheelMovesFilteredSelectionAcrossResponsiveLayouts(t *testing.T) {
-	for _, width := range []int{40, 60, 80, 120} {
-		t.Run(fmt.Sprintf("%d-columns", width), func(t *testing.T) {
-			model := visualTaskModel()
-			model.task.Sessions = nil
-			for index := 0; index < 10; index++ {
-				agent := "claude"
-				if index%2 == 0 {
-					agent = "codex"
-				}
-				model.task.Sessions = append(model.task.Sessions, session.Session{
-					ID: fmt.Sprintf("S-%02d", index), TaskID: "T-VISUAL", Agent: agent,
-					Role: "worker", Status: session.StatusWaiting,
-				})
-			}
-			model.width, model.height = width, 16
-			model.filter = "codex"
-			model.selected = 0
-			model.scroll, model.unread = 7, 2
-			matches := model.filteredSessionIndices()
-			if !reflect.DeepEqual(matches, []int{0, 2, 4, 6, 8}) {
-				t.Fatalf("filtered Sessions = %v", matches)
-			}
-			layout := layoutTaskWorkspace(model.width, model.height)
-			for position := 1; position < len(matches); position++ {
-				updated, command := model.handleMouse(tea.MouseEvent{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown})
-				model = updated.(Model)
-				if command != nil || model.selected != matches[position] {
-					t.Fatalf("wheel step %d selected=%d, want %d; command=%v", position, model.selected, matches[position], command)
-				}
-				indices, start, visible := model.taskSessionWindow(layout.Navigator.Height)
-				selectedPosition := -1
-				for candidate, actual := range indices {
-					if actual == model.selected {
-						selectedPosition = candidate
-						break
-					}
-				}
-				if selectedPosition < start || selectedPosition >= start+visible {
-					t.Fatalf("selected Session is outside visible window: selectedPosition=%d start=%d visible=%d", selectedPosition, start, visible)
-				}
-			}
-			updated, command := model.handleMouse(tea.MouseEvent{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown})
-			model = updated.(Model)
-			if command != nil || model.selected != matches[len(matches)-1] {
-				t.Fatalf("wheel moved past filtered end: selected=%d command=%v", model.selected, command)
-			}
-			updated, command = model.handleMouse(tea.MouseEvent{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp})
-			model = updated.(Model)
-			if command != nil || model.selected != matches[len(matches)-2] || model.scroll != 7 || model.unread != 2 {
-				t.Fatalf("wheel up state: selected=%d scroll=%d unread=%d command=%v", model.selected, model.scroll, model.unread, command)
-			}
-		})
-	}
-}
-
-func TestSessionConsoleMouseWheelRetainsTranscriptScrolling(t *testing.T) {
-	model := visualSessionModel(t)
-	model.scroll, model.unread = 3, 2
-	updated, command := model.handleMouse(tea.MouseEvent{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp})
-	model = updated.(Model)
-	if command != nil || model.scroll != 6 || model.unread != 2 {
-		t.Fatalf("wheel up state: scroll=%d unread=%d command=%v", model.scroll, model.unread, command)
-	}
-	updated, command = model.handleMouse(tea.MouseEvent{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown})
-	model = updated.(Model)
-	updated, command = model.handleMouse(tea.MouseEvent{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown})
-	model = updated.(Model)
-	if command != nil || model.scroll != 0 || model.unread != 0 {
-		t.Fatalf("wheel down state: scroll=%d unread=%d command=%v", model.scroll, model.unread, command)
-	}
-}
-
-func TestTaskFooterUsesActionRegistryAndKeepsNewSessionVisible(t *testing.T) {
-	backend := newConsoleBackend()
-	model, cancel, err := newTaskModel(context.Background(), backend, "T-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cancel()
-	newAction, ok := taskActionForID(actionNew)
-	if !ok {
-		t.Fatal("New Session action is missing from the registry")
-	}
-	wantNew := displayActionKey(newAction.Key) + " " + newAction.FooterLabel
-	for _, width := range []int{60, 72, 80, 91, 92, 120} {
-		model.width, model.height = width, 24
-		lines := strings.Split(model.View(), "\n")
-		footer := lines[len(lines)-1]
-		if !strings.Contains(footer, wantNew) || strings.Contains(footer, "…") {
-			t.Fatalf("%d-column footer does not expose %q intact: %q", width, wantNew, footer)
-		}
-		for _, want := range []string{"a View", "? Help", "q Detach"} {
-			if !strings.Contains(footer, want) {
-				t.Fatalf("%d-column footer missing %q: %q", width, want, footer)
-			}
-		}
-	}
-	model.selected, model.width = 1, 60
-	availableFooter := strings.Split(model.View(), "\n")[model.height-1]
-	if !strings.Contains(availableFooter, "Enter Native CLI") || !strings.Contains(availableFooter, wantNew) || strings.Contains(availableFooter, "…") {
-		t.Fatalf("minimum-width available footer is not intact: %q", availableFooter)
-	}
-	model.width = 120
-	footer := strings.Split(model.View(), "\n")[model.height-1]
-	for _, want := range []string{"p Message", "/ Filter", ": Commands"} {
-		if !strings.Contains(footer, want) {
-			t.Fatalf("wide footer missing %q: %q", want, footer)
-		}
-	}
-}
-
-func TestTaskNativeCapabilityUsesSupportedMappingAndCanonicalIdentity(t *testing.T) {
-	verifiedAt := time.Now().UTC()
-	tests := []struct {
-		name      string
-		current   session.Session
-		available bool
-		want      string
-	}{
-		{name: "supported pending verification", current: session.Session{Agent: "claude", ProviderConversationID: "claude-id", RepoPath: "/repo"}, available: true, want: "safety checked on open"},
-		{name: "supported verified", current: session.Session{Agent: "opencode", ProviderConversationID: "ses-id", RepoPath: "/repo", ConversationIDVerifiedAt: &verifiedAt}, available: true, want: "identity verified"},
-		{name: "missing identity", current: session.Session{Agent: "codex", RepoPath: "/repo"}, want: "exact provider conversation identity"},
-		{name: "unsupported mapping", current: session.Session{Agent: "gemini", ProviderConversationID: "gemini-id", RepoPath: "/repo"}, want: "no supported exact native resume command"},
-		{name: "missing checkout", current: session.Session{Agent: "grok", ProviderConversationID: "grok-id"}, want: "no checkout path"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			capability := nativeCapability(test.current)
-			if capability.available != test.available || !strings.Contains(capability.status+" "+capability.reason, test.want) {
-				t.Fatalf("capability = %#v, want available=%t and %q", capability, test.available, test.want)
-			}
-		})
-	}
-}
-
-func TestTaskMouseCannotClickThroughInteractiveLayers(t *testing.T) {
-	backend := newConsoleBackend()
-	base, cancel, err := newTaskModel(context.Background(), backend, "T-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cancel()
-	base.selected = 1
-	base.scroll, base.unread = 7, 2
-	tests := []struct {
-		name   string
-		setup  func(*Model)
-		active func(Model) bool
-	}{
-		{name: "help", setup: func(m *Model) { m.overlay = helpOverlay }, active: func(m Model) bool { return m.overlay == helpOverlay }},
-		{name: "palette", setup: func(m *Model) { m.overlay = paletteOverlay }, active: func(m Model) bool { return m.overlay == paletteOverlay }},
-		{name: "filter", setup: func(m *Model) { m.overlay = filterOverlay }, active: func(m Model) bool { return m.overlay == filterOverlay }},
-		{name: "wizard", setup: func(m *Model) { m.wizard = &sessionWizard{} }, active: func(m Model) bool { return m.wizard != nil }},
-		{name: "composer", setup: func(m *Model) { m.composer.focused = true }, active: func(m Model) bool { return m.composer.focused }},
-		{name: "confirmation", setup: func(m *Model) { m.confirm = &confirmation{kind: "stop", sessionID: "S-2"} }, active: func(m Model) bool { return m.confirm != nil }},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			model := base
-			test.setup(&model)
-			updated, command := model.Update(tea.MouseMsg(tea.MouseEvent{X: 2, Y: 5, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft}))
-			model = updated.(Model)
-			if command != nil || model.selected != 1 || !test.active(model) {
-				t.Fatalf("click reached Task navigator: selected=%d command=%v", model.selected, command)
-			}
-			updated, command = model.Update(tea.MouseMsg(tea.MouseEvent{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown}))
-			model = updated.(Model)
-			if command != nil || model.selected != 1 || model.scroll != 7 || model.unread != 2 || !test.active(model) {
-				t.Fatalf("wheel reached underlying view: selected=%d scroll=%d unread=%d command=%v", model.selected, model.scroll, model.unread, command)
-			}
-		})
-	}
-}
-
-func TestInteractivePromptPreservesSpaceKeyInput(t *testing.T) {
-	for _, attachment := range []string{"task", "session"} {
-		t.Run(attachment, func(t *testing.T) {
-			backend := newConsoleBackend()
-			var model Model
-			var cancel context.CancelFunc
-			var err error
-			if attachment == "task" {
-				model, cancel, err = newTaskModel(context.Background(), backend, "T-1")
-			} else {
-				model, cancel, err = newSessionModel(context.Background(), backend, "S-1")
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer cancel()
-
-			applyKey := func(key tea.KeyMsg) tea.Cmd {
-				updated, command := model.Update(key)
-				model = updated.(Model)
-				return command
-			}
-			applyKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
-			for _, key := range []tea.KeyMsg{
-				{Type: tea.KeySpace, Runes: []rune{' '}},
-				{Type: tea.KeySpace, Runes: []rune{' '}},
-				{Type: tea.KeyRunes, Runes: []rune("T05x")},
-				{Type: tea.KeyBackspace},
-				{Type: tea.KeySpace, Runes: []rune{' '}},
-				{Type: tea.KeyRunes, Runes: []rune("targeted")},
-				{Type: tea.KeySpace, Runes: []rune{' '}},
-				{Type: tea.KeySpace, Runes: []rune{' '}},
-				{Type: tea.KeyRunes, Runes: []rune("only")},
-			} {
-				applyKey(key)
-			}
-			command := applyKey(tea.KeyMsg{Type: tea.KeyEnter})
-			if command == nil {
-				t.Fatal("Enter did not submit the prompt")
-			}
-			updated, _ := model.Update(command())
-			model = updated.(Model)
-
-			backend.mu.Lock()
-			prompts := append([]promptCall(nil), backend.prompts...)
-			backend.mu.Unlock()
-			want := promptCall{sessionID: "S-1", message: "  T05 targeted  only"}
-			if len(prompts) != 1 || prompts[0] != want {
-				t.Fatalf("prompt calls = %#v, want %#v", prompts, []promptCall{want})
-			}
-			if model.composer.focused || len(model.composer.value) != 0 || !strings.Contains(model.notice, "accepted") {
-				t.Fatalf("submitted input state: mode=%v input=%q notice=%q", model.composer.focused, model.composer.value, model.notice)
-			}
-		})
-	}
-}
-
-func TestSessionConsoleReplaysThenDeduplicatesLiveAndTogglesRaw(t *testing.T) {
-	backend := newConsoleBackend()
-	model, cancel, err := newSessionModel(context.Background(), backend, "S-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cancel()
-	if got := len(model.histories["S-1"]); got != 1 {
-		t.Fatalf("stored history = %d lines, want 1", got)
-	}
-
-	duplicate := backend.histories["S-1"][0]
-	updated, command := model.Update(activityMsg{sessionID: "S-1", line: duplicate})
-	model = updated.(Model)
-	if command == nil {
-		t.Fatal("live update did not continue subscription")
-	}
-	live := projectionACPLine(2, "REQ-LIVE", "agent_message_chunk", sessionUpdate(messageUpdate("agent_message_chunk", "live output", "message-live")))
-	updated, _ = model.Update(activityMsg{sessionID: "S-1", line: live})
-	model = updated.(Model)
-	if got := len(model.histories["S-1"]); got != 2 {
-		t.Fatalf("history after duplicate + live = %d, want 2", got)
-	}
-	if !strings.Contains(model.View(), "live output") {
-		t.Fatalf("normalized view missing live output:\n%s", model.View())
-	}
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
-	model = updated.(Model)
-	if !model.raw || !strings.Contains(model.View(), `"seq":2`) {
-		t.Fatalf("raw view not enabled:\n%s", model.View())
-	}
-}
-
-func TestSessionConsoleLoadsProviderHistoryAndKeepsLiveACPEventsAcrossReconcile(t *testing.T) {
-	base := newConsoleBackend()
-	snapshot := appservice.ConversationSnapshot{
-		Source:        appservice.ConversationSourceProvider,
-		GatewayCursor: 40,
-		Turns: []appservice.ConversationTurn{
-			{
-				Key:       "provider-first",
-				Committed: true,
-				Activities: []appservice.ConversationActivity{
-					{Display: &presentation.Activity{Type: "user_message", Text: "First ACP prompt"}},
-					{Display: &presentation.Activity{Type: "assistant_chunk", Text: "First answer"}},
-					{Display: &presentation.Activity{Type: "turn_state", State: "complete"}},
-				},
-			},
-			{
-				Key:       "provider-native",
-				Committed: true,
-				Activities: []appservice.ConversationActivity{
-					{Display: &presentation.Activity{Type: "user_message", Text: "Native-only prompt"}},
-					{Kind: "provider_transcript", Display: &presentation.Activity{Type: "thought_chunk", Text: "Native reasoning summary"}},
-					{Kind: "provider_transcript", Display: &presentation.Activity{Type: "assistant_chunk", Text: "Native answer"}},
-					{Display: &presentation.Activity{Type: "turn_state", State: "complete"}},
-				},
-			},
-		},
-	}
-	backend := &conversationFakeBackend{fakeBackend: base, snapshot: snapshot}
-	model, cancel, err := newSessionModel(context.Background(), backend, "S-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cancel()
-
-	if got := model.View(); !strings.Contains(got, "Native-only prompt") || !strings.Contains(got, "Reasoning · saved · 1 line") || !strings.Contains(got, "RESPONSE · GEMINI · saved") || !strings.Contains(got, "Native answer") {
-		t.Fatalf("provider-backed transcript is incomplete:\n%s", got)
-	}
-	nativeTurn := model.projections["S-1"].byID["provider-native"]
-	if nativeTurn == nil || !nativeTurn.reasoningSeen || len(nativeTurn.blocks) < 2 || nativeTurn.blocks[1].kind != blockThought || nativeTurn.blocks[1].text != "Native reasoning summary" {
-		t.Fatalf("provider reasoning projection = %#v", nativeTurn)
-	}
-	if model.cursors["S-1"] != 40 {
-		t.Fatalf("provider snapshot cursor = %d, want 40", model.cursors["S-1"])
-	}
-
-	// An ACP event can arrive while the provider refresh is being read. A
-	// completed snapshot must not erase anything newer than its captured cursor.
-	model.addActivity("S-1", projectionLine(41, "REQ-LIVE", "prompt_submitted", map[string]any{"display_message": "Live follow-up"}), true)
-	model.addActivity("S-1", projectionACPLine(42, "REQ-LIVE", "agent_message_chunk", sessionUpdate(messageUpdate("agent_message_chunk", "Still streaming", "live-message"))), true)
-	updated, _ := model.Update(conversationMsg{sessionID: "S-1", snapshot: snapshot})
-	model = updated.(Model)
-
-	if got := model.View(); !strings.Contains(got, "Native-only prompt") || !strings.Contains(got, "Live follow-up") || !strings.Contains(got, "Still streaming") {
-		t.Fatalf("atomic reconciliation dropped committed or live content:\n%s", got)
-	}
-	if model.cursors["S-1"] != 42 {
-		t.Fatalf("cursor after buffered live events = %d, want 42", model.cursors["S-1"])
-	}
-}
-
-func TestSessionConsolePreservesIncompleteProviderTurnState(t *testing.T) {
-	snapshot := appservice.ConversationSnapshot{Turns: []appservice.ConversationTurn{{
-		Key: "provider-partial", Committed: false,
-		Activities: []appservice.ConversationActivity{
-			{Kind: "provider_transcript", Display: &presentation.Activity{Type: "user_message", Text: "Interrupted native prompt"}},
-			{Kind: "provider_transcript", Display: &presentation.Activity{Type: "assistant_chunk", Text: "Partial provider output"}},
-			{Kind: "provider_turn_incomplete", Display: &presentation.Activity{Type: "turn_state", State: "incomplete", StopReason: "provider_history_incomplete"}},
-		},
-	}}}
-	projection := transcriptFromConversation(snapshot)
-	request := projection.byID["provider-partial"]
-	if request == nil || request.committed || request.state != turnIncomplete {
-		t.Fatalf("incomplete provider request = %#v", request)
-	}
-	if got := renderTurnState(request.state); !strings.Contains(got, "Provider turn incomplete") {
-		t.Fatalf("incomplete state rendering = %q", got)
-	}
-}
-
-func TestProviderTranscriptReconcileLifecycleRefreshesWithoutReplacingLiveTranscript(t *testing.T) {
-	base := newConsoleBackend()
-	snapshot := appservice.ConversationSnapshot{
-		Source: appservice.ConversationSourceProvider, GatewayCursor: 40,
-		Turns: []appservice.ConversationTurn{{
-			Key: "provider-turn", Committed: true,
-			Activities: []appservice.ConversationActivity{
-				{Display: &presentation.Activity{Type: "user_message", Text: "Keep this committed prompt"}},
-				{Display: &presentation.Activity{Type: "assistant_chunk", Text: "Keep this committed answer"}},
-			},
-		}},
-	}
-	backend := &conversationFakeBackend{fakeBackend: base, snapshot: snapshot}
-	model, cancel, err := newSessionModel(context.Background(), backend, "S-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cancel()
-
-	warning := projectionLine(41, "", "provider_transcript_reconcile_warning", map[string]any{"message": "provider store still flushing"})
-	updated, _ := model.Update(activityMsg{sessionID: "S-1", line: warning})
-	model = updated.(Model)
-	if !strings.Contains(model.notice, "reload is delayed") || !strings.Contains(model.View(), "Keep this committed answer") {
-		t.Fatalf("reconcile warning replaced transcript or hid notice: notice=%q\n%s", model.notice, model.View())
-	}
-	if shouldReconcileConversation(warning) {
-		t.Fatal("reconcile warning should preserve the current transcript instead of loading a replacement")
-	}
-
-	reconciled := projectionLine(42, "", "provider_transcript_reconciled", map[string]any{"source": "provider-store", "state": "reconciled"})
-	updated, command := model.Update(activityMsg{sessionID: "S-1", line: reconciled})
-	model = updated.(Model)
-	if command == nil || !shouldReconcileConversation(reconciled) {
-		t.Fatalf("provider transcript reconciliation did not schedule a joined snapshot: command=%v", command)
-	}
-	if !strings.Contains(model.View(), "Keep this committed answer") {
-		t.Fatalf("reconciliation signal replaced transcript before snapshot join:\n%s", model.View())
-	}
-	updated, _ = model.Update(conversationMsg{sessionID: "S-1", snapshot: snapshot})
-	model = updated.(Model)
-	if model.notice != "" {
-		t.Fatalf("successful provider snapshot left stale reconcile warning: %q", model.notice)
-	}
-
-	model.composer.focused = true
-	model.composer.insert([]rune("keep this draft")...)
-	model.scroll = 4
-	model.addActivity("S-1", projectionLine(43, "REQ-REHYDRATE", "prompt_submitted", map[string]any{"display_message": "Provisional ACP prompt"}), true)
-	model.addActivity("S-1", projectionACPLine(44, "REQ-REHYDRATE", "agent_message_chunk", sessionUpdate(messageUpdate("agent_message_chunk", "Provisional ACP answer", "rehydrate-live"))), true)
-	rehydrated := projectionLine(45, "REQ-REHYDRATE", "acp_rehydrated", map[string]any{"state": "refreshed"})
-	updated, command = model.Update(activityMsg{sessionID: "S-1", line: rehydrated})
-	model = updated.(Model)
-	if command == nil || !shouldReconcileConversation(rehydrated) {
-		t.Fatalf("ACP rehydration did not schedule a joined provider snapshot: command=%v", command)
-	}
-	if model.composer.text() != "keep this draft" || !model.composer.focused || model.scroll != 4 || !strings.Contains(model.View(), "Provisional ACP answer") {
-		t.Fatalf("ACP rehydration signal changed disposable viewer state: draft=%q focused=%t scroll=%d\n%s", model.composer.text(), model.composer.focused, model.scroll, model.View())
-	}
-	updated, _ = model.Update(conversationMsg{sessionID: "S-1", snapshot: snapshot})
-	model = updated.(Model)
-	if model.composer.text() != "keep this draft" || !model.composer.focused || model.scroll != 4 || !strings.Contains(model.View(), "Provisional ACP answer") {
-		t.Fatalf("ACP rehydration snapshot dropped draft, scroll, or provisional ACP output: draft=%q focused=%t scroll=%d\n%s", model.composer.text(), model.composer.focused, model.scroll, model.View())
-	}
-}
-
-func TestSessionConsoleAdoptsGatewayFallbackSnapshotBeforeRawHistory(t *testing.T) {
-	base := newConsoleBackend()
-	base.histories["S-1"] = []sessionlog.Line{
-		projectionLine(10, "REQ-RAW-COVERED", "prompt_submitted", map[string]any{"display_message": "covered raw prompt"}),
-		projectionLine(21, "REQ-AFTER-CAPTURE", "prompt_submitted", map[string]any{"display_message": "newer live prompt"}),
-	}
-	snapshot := appservice.ConversationSnapshot{
-		Source: appservice.ConversationSourceGateway, GatewayCursor: 20,
-		Warning: "Provider history is unavailable; showing gateway history.",
-		Turns: []appservice.ConversationTurn{{
-			Key: "REQ-BOUNDED", Committed: false,
-			Activities: []appservice.ConversationActivity{
-				{Position: 10, RequestID: "REQ-BOUNDED", Kind: "prompt_submitted", Display: &presentation.Activity{Type: "user_message", Text: "bounded gateway prompt"}},
-				{Position: 11, RequestID: "REQ-BOUNDED", Kind: "agent_message_chunk", Display: &presentation.Activity{Type: "assistant_chunk", Text: "bounded gateway answer"}},
-			},
-		}},
-	}
-	backend := &conversationFakeBackend{fakeBackend: base, snapshot: snapshot}
-	model, cancel, err := newSessionModel(context.Background(), backend, "S-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cancel()
-
-	view := model.View()
-	for _, want := range []string{"bounded gateway prompt", "bounded gateway answer", "newer live prompt"} {
-		if !strings.Contains(view, want) {
-			t.Fatalf("gateway snapshot view missing %q:\n%s", want, view)
-		}
-	}
-	if strings.Contains(view, "covered raw prompt") {
-		t.Fatalf("snapshot-covered raw activity was independently projected:\n%s", view)
-	}
-	if model.notice != snapshot.Warning || model.snapshotCursors["S-1"] != 20 || model.cursors["S-1"] != 21 {
-		t.Fatalf("fallback state: notice=%q snapshotCursor=%d cursor=%d", model.notice, model.snapshotCursors["S-1"], model.cursors["S-1"])
-	}
-	if got := len(model.histories["S-1"]); got != 1 || model.histories["S-1"][0].Seq != 21 {
-		t.Fatalf("post-snapshot raw history = %#v, want only position 21", model.histories["S-1"])
-	}
-	if _, exists := model.projections["S-1"].byID["REQ-RAW-COVERED"]; exists {
-		t.Fatal("snapshot-covered raw request was re-applied")
-	}
-	base.mu.Lock()
-	historyCalls := append([]historyCall(nil), base.historyCalls...)
-	base.mu.Unlock()
-	if !reflect.DeepEqual(historyCalls, []historyCall{{sessionID: "S-1", cursor: 20}}) {
-		t.Fatalf("History calls = %#v, want captured cursor 20", historyCalls)
-	}
-	model.raw = true
-	if raw := model.View(); strings.Contains(raw, `"seq":10`) || !strings.Contains(raw, `"seq":21`) || !strings.Contains(raw, "Pre-snapshot raw is not retained") || !strings.Contains(raw, "acpctl session logs <id> --raw") {
-		t.Fatalf("bounded raw diagnostics are misleading or incomplete:\n%s", raw)
-	}
-}
-
-func TestConversationSnapshotCursorRejectsLateProjectionButKeepsRawHistory(t *testing.T) {
-	backend := newConsoleBackend()
-	model := baseModel(context.Background(), backend)
-	defer model.manager.cancel()
+	model.width, model.height = 100, 30
 	model.mode = sessionView
-	model.current = session.Session{ID: "S-LATE", ProviderConversationID: "provider-conversation"}
-	model.scroll = 3
-	snapshot := appservice.ConversationSnapshot{
-		Source: appservice.ConversationSourceProvider, GatewayCursor: 40,
-		Turns: []appservice.ConversationTurn{{
-			Key: "provider-committed", Committed: true,
-			Activities: []appservice.ConversationActivity{
-				{Display: &presentation.Activity{Type: "user_message", Text: "committed prompt"}},
-				{Display: &presentation.Activity{Type: "assistant_chunk", Text: "committed answer"}},
-			},
-		}},
-	}
-	updated, command := model.Update(conversationMsg{sessionID: "S-LATE", snapshot: snapshot})
-	model = updated.(Model)
-	if command != nil || model.snapshotCursors["S-LATE"] != 40 {
-		t.Fatalf("snapshot adoption: cursor=%d command=%v", model.snapshotCursors["S-LATE"], command)
-	}
-
-	for _, line := range []sessionlog.Line{
-		projectionLine(39, "REQ-LATE-39", "prompt_submitted", map[string]any{"display_message": "late covered 39"}),
-		projectionLine(40, "REQ-LATE-40", "prompt_submitted", map[string]any{"display_message": "late covered 40"}),
-	} {
-		model.addActivity("S-LATE", line, true)
-	}
-	if got := len(model.histories["S-LATE"]); got != 2 {
-		t.Fatalf("late raw history has %d records, want 2", got)
-	}
-	if len(model.projections["S-LATE"].requests) != 1 || model.projections["S-LATE"].byID["REQ-LATE-39"] != nil || model.projections["S-LATE"].byID["REQ-LATE-40"] != nil {
-		t.Fatalf("snapshot-covered activities were re-applied: requests=%v", model.projections["S-LATE"].byID)
-	}
-	if model.unread != 0 {
-		t.Fatalf("snapshot-covered late delivery incremented unread to %d", model.unread)
-	}
-
-	model.addActivity("S-LATE", projectionLine(41, "REQ-NEW", "prompt_submitted", map[string]any{"display_message": "after snapshot"}), true)
-	if model.projections["S-LATE"].byID["REQ-NEW"] == nil || model.unread != 1 || model.cursors["S-LATE"] != 41 {
-		t.Fatalf("post-snapshot activity was not projected: unread=%d cursor=%d", model.unread, model.cursors["S-LATE"])
-	}
-	model.raw = true
-	if raw := model.View(); !strings.Contains(raw, `"seq":39`) || !strings.Contains(raw, `"seq":40`) || !strings.Contains(raw, `"seq":41`) {
-		t.Fatalf("raw history is incomplete after reconciliation:\n%s", raw)
-	}
-
-	stale := appservice.ConversationSnapshot{
-		Source: appservice.ConversationSourceGateway, GatewayCursor: 39,
-		Turns: []appservice.ConversationTurn{{Key: "stale-snapshot", Activities: []appservice.ConversationActivity{{Display: &presentation.Activity{Type: "user_message", Text: "stale replacement"}}}}},
-	}
-	if model.adoptConversationSnapshot("S-LATE", stale) {
-		t.Fatal("strictly older snapshot replaced the adopted projection")
-	}
-	if model.projections["S-LATE"].byID["stale-snapshot"] != nil || model.snapshotCursors["S-LATE"] != 40 {
-		t.Fatalf("stale snapshot mutated projection: cursor=%d", model.snapshotCursors["S-LATE"])
-	}
-
-	downgrade := appservice.ConversationSnapshot{
-		Source: appservice.ConversationSourceGateway, GatewayCursor: 41,
-		Warning: "Provider history is temporarily unavailable.",
-		Turns: []appservice.ConversationTurn{{
-			Key: "fallback-replacement", Committed: false,
-			Activities: []appservice.ConversationActivity{
-				{Display: &presentation.Activity{Type: "user_message", Text: "fallback replacement"}},
-				{Display: &presentation.Activity{Type: "turn_state", State: "complete"}},
-			},
-		}},
-	}
-	updated, command = model.Update(conversationMsg{sessionID: "S-LATE", snapshot: downgrade})
-	model = updated.(Model)
-	if command == nil || !model.conversationCommitPending["S-LATE"] || !strings.Contains(model.notice, "refresh is delayed") {
-		t.Fatalf("provider downgrade did not retain promotion retry: pending=%v notice=%q command=%v", model.conversationCommitPending["S-LATE"], model.notice, command)
-	}
-	if model.snapshotSources["S-LATE"] != appservice.ConversationSourceProvider || model.snapshotCursors["S-LATE"] != 40 || model.projections["S-LATE"].byID["fallback-replacement"] != nil || model.projections["S-LATE"].byID["REQ-NEW"] == nil {
-		t.Fatalf("gateway fallback replaced provider/live projection: source=%q cursor=%d", model.snapshotSources["S-LATE"], model.snapshotCursors["S-LATE"])
-	}
-}
-
-func TestConversationCommitRetryContinuesUntilProviderSnapshotCommits(t *testing.T) {
-	backend := newConsoleBackend()
-	model := baseModel(context.Background(), backend)
-	defer model.manager.cancel()
-	model.current = session.Session{ID: "S-1", ProviderConversationID: "provider-conversation"}
-	pending := appservice.ConversationSnapshot{
-		Source: appservice.ConversationSourceGateway,
-		Turns: []appservice.ConversationTurn{{
-			Key: "REQ-pending", Committed: false,
-			Activities: []appservice.ConversationActivity{{
-				Kind: "turn_completed", Display: &presentation.Activity{Type: "turn_state", State: "complete"},
-			}},
-		}},
-	}
-	updated, command := model.Update(conversationMsg{sessionID: "S-1", snapshot: pending})
-	model = updated.(Model)
-	if command == nil || !model.conversationCommitPending["S-1"] || model.conversationCommitRetries["S-1"] != 1 {
-		t.Fatalf("pending provider commit did not schedule retry: pending=%v retries=%d command=%v", model.conversationCommitPending["S-1"], model.conversationCommitRetries["S-1"], command)
-	}
-
-	updated, command = model.Update(conversationMsg{sessionID: "S-1", err: fmt.Errorf("provider store still flushing")})
-	model = updated.(Model)
-	if command == nil || model.conversationCommitRetries["S-1"] != 2 || !strings.Contains(model.notice, "live ACP output remains current") {
-		t.Fatalf("transient provider error stopped retrying: retries=%d notice=%q command=%v", model.conversationCommitRetries["S-1"], model.notice, command)
-	}
-
-	committed := pending
-	committed.Turns = append([]appservice.ConversationTurn(nil), pending.Turns...)
-	committed.Turns[0].Committed = true
-	committed.Source = appservice.ConversationSourceProvider
-	updated, command = model.Update(conversationMsg{sessionID: "S-1", snapshot: committed})
-	model = updated.(Model)
-	if command != nil || model.conversationCommitPending["S-1"] || model.conversationCommitRetries["S-1"] != 0 {
-		t.Fatalf("committed provider snapshot left retry state: pending=%v retries=%d command=%v", model.conversationCommitPending["S-1"], model.conversationCommitRetries["S-1"], command)
-	}
-
-	cancelled := pending
-	cancelled.Turns = append([]appservice.ConversationTurn(nil), pending.Turns...)
-	cancelled.Turns[0].Activities = []appservice.ConversationActivity{{
-		Kind: "turn_cancelled", Display: &presentation.Activity{Type: "turn_state", State: "cancelled"},
-	}}
-	if conversationSnapshotNeedsCommit(cancelled) {
-		t.Fatal("cancelled turn incorrectly requested perpetual provider commit polling")
-	}
-	if conversationCommitRetryDelay(0) != 220*time.Millisecond || conversationCommitRetryDelay(6) != 10*time.Second {
-		t.Fatalf("conversation retry delays = %s, %s", conversationCommitRetryDelay(0), conversationCommitRetryDelay(6))
-	}
-
-	for _, test := range []struct {
-		name      string
-		identity  string
-		turnState string
-		wantRetry bool
-	}{
-		{name: "missing canonical identity", turnState: "complete"},
-		{name: "live turn", identity: "provider-conversation", turnState: "working", wantRetry: true},
-		{name: "failed turn", identity: "provider-conversation", turnState: "error", wantRetry: true},
-		{name: "cancelled turn", identity: "provider-conversation", turnState: "cancelled", wantRetry: true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			candidate := baseModel(context.Background(), backend)
-			defer candidate.manager.cancel()
-			candidate.current = session.Session{ID: "S-OTHER", ProviderConversationID: test.identity}
-			snapshot := appservice.ConversationSnapshot{
-				Source: appservice.ConversationSourceGateway,
-				Turns: []appservice.ConversationTurn{{
-					Key: "REQ-other", Committed: false,
-					Activities: []appservice.ConversationActivity{{Display: &presentation.Activity{Type: "turn_state", State: test.turnState}}},
-				}},
-			}
-			updated, retry := candidate.Update(conversationMsg{sessionID: "S-OTHER", snapshot: snapshot})
-			candidate = updated.(Model)
-			if gotRetry := retry != nil && candidate.conversationCommitPending["S-OTHER"]; gotRetry != test.wantRetry {
-				t.Fatalf("fallback authority retry = %v, want %v: pending=%v command=%v", gotRetry, test.wantRetry, candidate.conversationCommitPending["S-OTHER"], retry)
-			}
-		})
-	}
-}
-
-func TestConversationAuthorityRetryRecoversIdleEmptyGatewayFallback(t *testing.T) {
-	backend := newConsoleBackend()
-	model := baseModel(context.Background(), backend)
-	defer model.manager.cancel()
-	model.current = session.Session{ID: "S-IDLE", ProviderConversationID: "provider-conversation"}
-
-	fallback := appservice.ConversationSnapshot{Source: appservice.ConversationSourceGateway}
-	updated, retry := model.Update(conversationMsg{sessionID: "S-IDLE", snapshot: fallback})
-	model = updated.(Model)
-	if retry == nil || !model.conversationCommitPending["S-IDLE"] {
-		t.Fatalf("idle gateway fallback did not schedule provider-authority retry: pending=%v command=%v", model.conversationCommitPending["S-IDLE"], retry)
-	}
-
-	provider := appservice.ConversationSnapshot{Source: appservice.ConversationSourceProvider, Turns: []appservice.ConversationTurn{{
-		Key: "provider-native", Committed: true,
-		Activities: []appservice.ConversationActivity{
-			{Kind: "provider_transcript", Display: &presentation.Activity{Type: "user_message", Text: "Native history"}},
-			{Kind: "provider_transcript", Display: &presentation.Activity{Type: "assistant_chunk", Text: "Loaded later"}},
-			{Kind: "provider_turn_completed", Display: &presentation.Activity{Type: "turn_state", State: "complete"}},
-		},
-	}}}
-	updated, retry = model.Update(conversationMsg{sessionID: "S-IDLE", snapshot: provider})
-	model = updated.(Model)
-	if retry != nil || model.conversationCommitPending["S-IDLE"] || model.snapshotSources["S-IDLE"] != appservice.ConversationSourceProvider {
-		t.Fatalf("provider authority did not clear retry state: pending=%v source=%q command=%v", model.conversationCommitPending["S-IDLE"], model.snapshotSources["S-IDLE"], retry)
-	}
-	if request := model.projections["S-IDLE"].byID["provider-native"]; request == nil || request.state != turnComplete {
-		t.Fatalf("late provider history was not adopted: %#v", request)
-	}
-}
-
-func TestEscapeLeavesComposerWithoutCancellingAndExplicitCancelPreservesDraft(t *testing.T) {
-	backend := newConsoleBackend()
-	current := backend.sessions["S-1"]
-	current.Status = session.StatusWorking
-	backend.sessions["S-1"] = current
-	model, cancel, err := newSessionModel(context.Background(), backend, "S-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cancel()
-
-	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
-	model = updated.(Model)
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("continue differently")})
-	model = updated.(Model)
-	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyEsc})
-	model = updated.(Model)
-	if command != nil {
-		t.Fatal("Esc inside the composer unexpectedly started an action")
-	}
-	backend.mu.Lock()
-	cancelled := append([]string(nil), backend.cancelled...)
-	backend.mu.Unlock()
-	if len(cancelled) != 0 {
-		t.Fatalf("Esc inside the composer cancelled the turn: %v", cancelled)
-	}
-	if model.composer.focused || model.composer.text() != "continue differently" {
-		t.Fatalf("draft was not preserved: mode=%v input=%q", model.composer.focused, model.composer.text())
-	}
-
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
-	model = updated.(Model)
-	if model.confirm == nil || !strings.Contains(model.View(), "CONFIRM") {
-		t.Fatalf("cancel did not require confirmation: %#v", model.confirm)
-	}
-	updated, command = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
-	model = updated.(Model)
-	updated, _ = model.Update(command())
-	model = updated.(Model)
-	backend.mu.Lock()
-	cancelled = append([]string(nil), backend.cancelled...)
-	backend.mu.Unlock()
-	if len(cancelled) != 1 || cancelled[0] != "S-1" {
-		t.Fatalf("explicit cancellation = %v", cancelled)
-	}
-	if model.composer.text() != "continue differently" {
-		t.Fatalf("explicit cancellation discarded draft: %q", model.composer.text())
-	}
-	if !strings.Contains(model.notice, "does not pause") {
-		t.Fatalf("cancellation notice = %q", model.notice)
-	}
-}
-
-func TestAcceptedOrQueuedPromptRemainsCancellableDuringPreparation(t *testing.T) {
-	for _, state := range []turnState{turnReady, turnQueued} {
-		t.Run(string(state), func(t *testing.T) {
-			current := session.Session{Status: session.StatusWaiting}
-			projection := newTranscript()
-			projection.request("REQ-preparing").state = state
-			if !sessionIsActive(current, projection) {
-				t.Fatalf("%s ACP head was not exposed as cancellable", state)
-			}
-		})
-	}
-}
-
-func TestSessionHarnessChoosesExactOfferedPermissionAndHighlightsAlways(t *testing.T) {
-	backend := newConsoleBackend()
-	requestID := "REQ-APPROVAL"
-	backend.histories["S-1"] = []sessionlog.Line{
-		projectionLine(1, requestID, "prompt_submitted", map[string]any{"display_message": "Make a safe change."}),
-		projectionLine(2, requestID, "turn_started", map[string]any{}),
-		projectionACPLine(3, requestID, "session_request_permission", map[string]any{
-			"jsonrpc": "2.0", "id": "permission-7", "method": "session/request_permission", "params": map[string]any{
-				"sessionId": "native", "toolCall": map[string]any{"toolCallId": "tool-write", "title": "Write marker", "kind": "edit"},
-				"options": []any{
-					map[string]any{"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"},
-					map[string]any{"optionId": "allow-always", "name": "Always allow", "kind": "allow_always"},
-					map[string]any{"optionId": "reject-once", "name": "Reject", "kind": "reject_once"},
-				},
-			},
-		}),
-	}
-	model, cancel, err := newSessionModel(context.Background(), backend, "S-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cancel()
+	model.current = backend.sessions["S-1"]
 	view := model.View()
-	if !strings.Contains(view, "APPROVAL REQUIRED") || !strings.Contains(view, "[2] Always allow · PERSISTENT") || !strings.Contains(view, "1-3 choose approval") {
-		t.Fatalf("permission prompt is not actionable:\n%s", view)
+	for _, want := range []string{"SESSION CHANNEL", "YOU", "Hello", "Hi immediately", "Turn complete"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("view missing %q:\n%s", want, view)
+		}
 	}
-
-	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("2")})
-	model = updated.(Model)
-	if command != nil || model.confirm == nil || !strings.Contains(model.View(), "ALLOW ALWAYS") {
-		t.Fatalf("persistent permission did not require explicit confirmation:\n%s", model.View())
-	}
-	updated, command = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
-	model = updated.(Model)
-	if command == nil {
-		t.Fatal("confirmed permission did not produce a command")
-	}
-	updated, _ = model.Update(command())
-	model = updated.(Model)
-	backend.mu.Lock()
-	decisions := append([]permissionCall(nil), backend.permissions...)
-	backend.mu.Unlock()
-	if len(decisions) != 1 || decisions[0].sessionID != "S-1" || decisions[0].permissionID != worker.PermissionConsoleID(requestID, "permission-7") || decisions[0].optionID != "allow-always" || decisions[0].cancelled {
-		t.Fatalf("permission decision = %#v", decisions)
-	}
-	if !strings.Contains(model.notice, "turn continues") {
-		t.Fatalf("permission notice = %q", model.notice)
+	taskCalls, sessionCalls, freshCalls, _ := backend.followCounts()
+	if taskCalls != 1 || sessionCalls != 0 || freshCalls != 0 {
+		t.Fatalf("Task attachment followers = aggregate %d/direct %d/fresh %d", taskCalls, sessionCalls, freshCalls)
 	}
 }
 
-func TestRefreshAddsNewTaskSessionWithoutRestart(t *testing.T) {
-	backend := newConsoleBackend()
-	backend.detail.Sessions = backend.detail.Sessions[:1]
+func TestTaskWatcherDiscoversNewChildThroughOneAggregateFollow(t *testing.T) {
+	backend := newFakeConsoleBackend()
+	backend.history["S-1"] = []sessionlog.Line{
+		testLine(1, "REQ-first", worker.FrameProviderEvent, map[string]any{"type": "text_delta", "text": "first"}),
+	}
 	model, cancel, err := newTaskModel(context.Background(), backend, "T-1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer cancel()
-	if len(model.task.Sessions) != 1 {
-		t.Fatal("fixture did not begin with one Session")
+	select {
+	case message := <-model.manager.events:
+		updated, _ := model.Update(message)
+		model = updated.(Model)
+	case <-time.After(time.Second):
+		t.Fatal("initial aggregate Task activity did not arrive")
 	}
 
-	backend.mu.Lock()
-	backend.detail.Sessions = append(backend.detail.Sessions, backend.sessions["S-2"])
-	backend.mu.Unlock()
+	child := session.Session{ID: "S-child", TaskID: "T-1", Agent: "claude", Provider: "anthropic", Role: "worker", Status: session.StatusWaiting}
+	backend.addTaskSession(child, []sessionlog.Line{
+		testLine(1, "REQ-child", worker.FrameProviderEvent, map[string]any{"type": "text_delta", "text": "child arrived"}),
+	})
+	select {
+	case message := <-model.manager.events:
+		activity, ok := message.(taskActivityMsg)
+		if !ok || activity.activity.SessionID != child.ID {
+			t.Fatalf("new child activity = %#v", message)
+		}
+		updated, _ := model.Update(message)
+		model = updated.(Model)
+	case <-time.After(time.Second):
+		t.Fatal("newly discovered child did not arrive through aggregate Task follow")
+	}
+	if model.cursors[child.ID] != 1 || model.projections[child.ID] == nil {
+		t.Fatalf("new child viewer state = cursor %d projection %v", model.cursors[child.ID], model.projections[child.ID] != nil)
+	}
+	taskCalls, sessionCalls, freshCalls, _ := backend.followCounts()
+	if taskCalls != 1 || sessionCalls != 0 || freshCalls != 0 {
+		t.Fatalf("new child spawned extra followers = aggregate %d/direct %d/fresh %d", taskCalls, sessionCalls, freshCalls)
+	}
+}
+
+func TestTaskWatcherStartsFromDeclaredBoundedReplayWindow(t *testing.T) {
+	backend := newFakeConsoleBackend()
+	history := make([]sessionlog.Line, 0, initialReplayRecords+17)
+	for sequence := 1; sequence <= initialReplayRecords+17; sequence++ {
+		history = append(history, testLine(uint64(sequence), "", worker.FrameConnection, map[string]any{"state": "connected"}))
+	}
+	backend.history["S-1"] = history
+	model, cancel, err := newTaskModel(context.Background(), backend, "T-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	if model.cursors["S-1"] != 17 || !model.historyClipped["S-1"] {
+		t.Fatalf("initial Task replay window = cursor %d, clipped %v", model.cursors["S-1"], model.historyClipped["S-1"])
+	}
+	window := model.replayWindows["S-1"]
+	if window.Cursor != 17 || window.EarliestSequence != 18 || !window.Clipped {
+		t.Fatalf("retained Task replay metadata = %#v", window)
+	}
+	view := model.View()
+	for _, want := range []string{"1 replay window(s) clipped", "earliest_sequence=18", "cursor=17"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("Task replay disclosure missing %q:\n%s", want, view)
+		}
+	}
+	select {
+	case message := <-model.manager.events:
+		activity, ok := message.(taskActivityMsg)
+		if !ok || activity.activity.Line.Seq != 18 {
+			t.Fatalf("first bounded Task activity = %#v", message)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bounded Task replay did not start")
+	}
+}
+
+func TestTaskWatcherStalledUIBoundsFullFrameProducersAcrossSessions(t *testing.T) {
+	backend := newFakeConsoleBackend()
+	backend.detail.Sessions = nil
+	backend.sessions = make(map[string]session.Session)
+	backend.history = make(map[string][]sessionlog.Line)
+	payload := strings.Repeat("x", 256<<10)
+	for index := 0; index < 64; index++ {
+		current := session.Session{ID: fmt.Sprintf("S-stalled-%03d", index), TaskID: "T-1", Agent: "codex", Role: "worker", Status: session.StatusWaiting}
+		backend.detail.Sessions = append(backend.detail.Sessions, current)
+		backend.sessions[current.ID] = current
+		backend.history[current.ID] = []sessionlog.Line{
+			testLine(1, "", worker.FrameProviderEvent, map[string]any{"type": "future", "payload": payload}),
+		}
+	}
+	model, cancel, err := newTaskModel(context.Background(), backend, "T-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		select {
+		case <-backend.taskAttempted:
+		case <-time.After(time.Second):
+			cancel()
+			t.Fatal("aggregate follower did not reach the bounded handoff")
+		}
+	}
+	taskCalls, sessionCalls, freshCalls, attempts := backend.followCounts()
+	if taskCalls != 1 || sessionCalls != 0 || freshCalls != 0 || attempts != 2 || len(model.manager.events) != 1 {
+		cancel()
+		t.Fatalf("stalled Task handoff = aggregate %d/direct %d/fresh %d/attempts %d/queued %d", taskCalls, sessionCalls, freshCalls, attempts, len(model.manager.events))
+	}
+	cancel()
+	waitForTaskWatcherStop(t, model.manager)
+}
+
+func TestDirectSessionWatcherRemainsIndependent(t *testing.T) {
+	backend := newFakeConsoleBackend()
+	backend.history["S-1"] = []sessionlog.Line{
+		testLine(1, "", worker.FrameConnection, map[string]any{"state": "connected"}),
+	}
+	model, cancel, err := newSessionModel(context.Background(), backend, "S-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	select {
+	case message := <-model.manager.events:
+		if _, ok := message.(activityMsg); !ok {
+			t.Fatalf("direct Session activity = %#v", message)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("direct Session replay did not arrive")
+	}
+	taskCalls, sessionCalls, freshCalls, _ := backend.followCounts()
+	if taskCalls != 0 || sessionCalls != 1 || freshCalls != 1 {
+		t.Fatalf("direct attachment followers = aggregate %d/direct %d/fresh %d", taskCalls, sessionCalls, freshCalls)
+	}
+}
+
+func TestDirectSessionWatcherDeclaresBoundedReplayWindow(t *testing.T) {
+	backend := newFakeConsoleBackend()
+	history := make([]sessionlog.Line, 0, initialReplayRecords+17)
+	for sequence := 1; sequence <= initialReplayRecords+17; sequence++ {
+		history = append(history, testLine(uint64(sequence), "", worker.FrameConnection, map[string]any{"state": "connected"}))
+	}
+	backend.history["S-1"] = history
+	model, cancel, err := newSessionModel(context.Background(), backend, "S-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	window := model.replayWindows["S-1"]
+	if model.cursors["S-1"] != 17 || window.Cursor != 17 || window.EarliestSequence != 18 || !window.Clipped {
+		t.Fatalf("direct replay metadata = cursor %d window %#v", model.cursors["S-1"], window)
+	}
+	view := model.View()
+	for _, want := range []string{"REPLAY CLIPPED", "earliest_sequence=18", "cursor=17"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("direct replay disclosure missing %q:\n%s", want, view)
+		}
+	}
+	select {
+	case message := <-model.manager.events:
+		activity, ok := message.(activityMsg)
+		if !ok || activity.line.Seq != 18 {
+			t.Fatalf("first bounded direct activity = %#v", message)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bounded direct replay did not start")
+	}
+}
+
+func TestDirectSessionReattachRestoresPermissionOlderThanReplayTail(t *testing.T) {
+	backend := newFakeConsoleBackend()
+	pending := worker.PendingPermission{
+		ID: "permission-outside-tail-exact", RequestID: "REQ-long-turn", Title: "Approve retained action", Kind: "edit",
+		Options: []worker.PermissionOption{
+			{ID: "allow-outside-tail-exact", Name: "Allow once", Kind: "allow_once"},
+			{ID: "reject-outside-tail-exact", Name: "Reject once", Kind: "reject_once"},
+		},
+	}
+	total := initialReplayRecords + 40
+	history := make([]sessionlog.Line, 0, total)
+	history = append(history,
+		testLine(1, pending.RequestID, worker.FrameClientCommand, map[string]any{"command": "prompt", "text": "long running turn"}),
+		testLine(2, pending.RequestID, worker.FramePermissionRequested, pending),
+	)
+	for sequence := 3; sequence <= total; sequence++ {
+		history = append(history, testLine(uint64(sequence), pending.RequestID, worker.FrameProviderEvent, map[string]any{
+			"type": "future_provider_activity", "index": sequence,
+		}))
+	}
+	backend.history["S-1"] = history
+	backend.permissionState["S-1"] = appservice.PermissionSnapshot{
+		Permissions: []worker.PendingPermission{pending}, Sequence: uint64(total), DecisionsReady: true,
+	}
+
+	model, cancel, err := newSessionModel(context.Background(), backend, "S-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	if model.pendingPermissionSnapshot == nil || model.projections["S-1"] != nil {
+		t.Fatalf("watermarked snapshot before replay = queued %v projection %v", model.pendingPermissionSnapshot != nil, model.projections["S-1"] != nil)
+	}
+	for range initialReplayRecords {
+		select {
+		case message := <-model.manager.events:
+			updated, _ := model.Update(message)
+			model = updated.(Model)
+		case <-time.After(time.Second):
+			t.Fatal("bounded direct replay did not reach the permission snapshot watermark")
+		}
+	}
+	if model.cursors["S-1"] != uint64(total) || model.pendingPermissionSnapshot != nil {
+		t.Fatalf("replay/snapshot convergence = cursor %d queued %v", model.cursors["S-1"], model.pendingPermissionSnapshot != nil)
+	}
+	projection := model.projections["S-1"]
+	_, card := projection.pendingPermission()
+	if card == nil || card.id != pending.ID || len(card.options) != len(pending.Options) {
+		t.Fatalf("reattached permission = %#v", card)
+	}
+	for index, option := range card.options {
+		if option.id != pending.Options[index].ID {
+			t.Fatalf("reattached option %d = %q, want %q", index, option.id, pending.Options[index].ID)
+		}
+	}
+	for _, retained := range model.histories["S-1"] {
+		if retained.line.Type == worker.FramePermissionRequested {
+			t.Fatal("permission snapshot was incorrectly synthesized into exact raw JSONL history")
+		}
+	}
+	model.width, model.height = 100, 30
+	if view := model.View(); !strings.Contains(view, "APPROVAL REQUIRED") || !strings.Contains(view, pending.Title) {
+		t.Fatalf("reattached actionable permission was not rendered:\n%s", view)
+	}
+	if backend.permissionReads["S-1"] != 1 {
+		t.Fatalf("permission status reads = %d, want 1", backend.permissionReads["S-1"])
+	}
+}
+
+func TestPermissionSnapshotIsDiscardedAfterNewerPermissionFrame(t *testing.T) {
+	model := baseModel(context.Background(), newFakeConsoleBackend())
+	model.mode = sessionView
+	model.direct = true
+	model.current = session.Session{ID: "S-1", TaskID: "T-1", Agent: "codex", Role: "worker"}
+	model.cursors["S-1"] = 5
+	model.receivePermissionSnapshot("S-1", appservice.PermissionSnapshot{
+		Permissions: []worker.PendingPermission{{
+			ID: "permission-stale", RequestID: "REQ-stale", Title: "Stale", Kind: "edit",
+			Options: []worker.PermissionOption{{ID: "allow-stale", Name: "Allow", Kind: "allow_once"}},
+		}},
+		Sequence: 8, DecisionsReady: true,
+	})
+	if model.pendingPermissionSnapshot == nil {
+		t.Fatal("snapshot ahead of the local replay cursor was not queued")
+	}
+	model.addActivity("S-1", testLine(9, "REQ-stale", worker.FramePermissionResolved, map[string]any{
+		"permission_id": "permission-stale", "decision": "allow-stale",
+	}), false)
+	if model.pendingPermissionSnapshot != nil {
+		t.Fatal("snapshot older than a permission frame watermark was not discarded")
+	}
+	if projection := model.projections["S-1"]; projection != nil {
+		if _, card := projection.pendingPermission(); card != nil {
+			t.Fatalf("stale snapshot resurrected a resolved permission: %#v", card)
+		}
+	}
+}
+
+func TestPermissionSnapshotRetiresDisappearedWaitingCardAtWatermark(t *testing.T) {
+	model := baseModel(context.Background(), newFakeConsoleBackend())
+	model.mode = sessionView
+	model.direct = true
+	model.current = session.Session{ID: "S-1", TaskID: "T-1", Agent: "codex", Role: "worker"}
+	model.addActivity("S-1", testLine(1, "REQ-current", worker.FramePermissionRequested, worker.PendingPermission{
+		ID: "permission-gone", RequestID: "REQ-current", Title: "Gone", Kind: "edit",
+		Options: []worker.PermissionOption{{ID: "allow-gone", Name: "Allow", Kind: "allow_once"}},
+	}), false)
+	if _, card := model.projections["S-1"].pendingPermission(); card == nil {
+		t.Fatal("test setup did not project the waiting permission")
+	}
+	model.receivePermissionSnapshot("S-1", appservice.PermissionSnapshot{Permissions: []worker.PendingPermission{}, Sequence: 1, DecisionsReady: true})
+	if _, card := model.projections["S-1"].pendingPermission(); card != nil {
+		t.Fatalf("authoritative snapshot did not retire disappeared permission: %#v", card)
+	}
+}
+
+func TestPermissionSnapshotReadinessSuppressesBlockedDecision(t *testing.T) {
+	model := baseModel(context.Background(), newFakeConsoleBackend())
+	model.mode = sessionView
+	model.direct = true
+	model.current = session.Session{ID: "S-1", TaskID: "T-1", Agent: "codex", Role: "worker"}
+	pending := worker.PendingPermission{
+		ID: "permission-blocked-exact", RequestID: "REQ-blocked", Title: "Blocked approval", Kind: "edit",
+		Options: []worker.PermissionOption{{ID: "allow-blocked-exact", Name: "Allow once", Kind: "allow_once"}},
+	}
+	model.projections["S-1"] = newTranscript()
+	model.projections["S-1"].reconcilePendingPermissions([]worker.PendingPermission{pending})
+	model.updateProjectionRetention("S-1")
+	model.receivePermissionSnapshot("S-1", appservice.PermissionSnapshot{
+		Permissions:    []worker.PendingPermission{pending},
+		DecisionsReady: false, BlockedCode: "worker_starting", BlockedMessage: strings.Repeat("not ready ", maxProjectedErrorBytes),
+	})
+	if model.permissionDecisionsReady["S-1"] || len(model.permissionBlockedReason["S-1"]) > maxProjectedErrorBytes {
+		t.Fatalf("bounded permission readiness = ready %v reason bytes %d", model.permissionDecisionsReady["S-1"], len(model.permissionBlockedReason["S-1"]))
+	}
+	updated, command := model.confirmPermission(0)
+	model = updated.(Model)
+	if command != nil || model.confirm != nil || !strings.Contains(model.notice, "Permission decision unavailable") {
+		t.Fatalf("blocked permission dispatch = command %v confirm %#v notice %q", command != nil, model.confirm, model.notice)
+	}
+	model.confirm = &confirmation{
+		kind: "permission", sessionID: "S-1", permissionID: "permission-blocked-exact", optionID: "allow-blocked-exact",
+	}
+	updated, command = model.handleConfirmation("y")
+	model = updated.(Model)
+	if command != nil || model.confirm != nil || !strings.Contains(model.notice, "Permission decision unavailable") {
+		t.Fatalf("readiness changed after confirmation = command %v confirm %#v notice %q", command != nil, model.confirm, model.notice)
+	}
+	model.width, model.height = 100, 30
+	view := model.View()
+	if !strings.Contains(view, "Decision unavailable") || strings.Contains(view, "[1] Allow once") || strings.Contains(view, "choose approval") {
+		t.Fatalf("blocked permission was rendered as actionable:\n%s", view)
+	}
+}
+
+func TestDelayedGenerationlessSnapshotCannotRetireResumedPermission(t *testing.T) {
+	model := baseModel(context.Background(), newFakeConsoleBackend())
+	model.mode = sessionView
+	model.direct = true
+	model.current = session.Session{ID: "S-1", TaskID: "T-1", Agent: "codex", Role: "worker", Status: session.StatusStopped}
+	delayedOffline := appservice.PermissionSnapshot{
+		Permissions: []worker.PendingPermission{}, DecisionsReady: false,
+		BlockedCode: "worker_offline", BlockedMessage: "The previous worker was offline.",
+	}
+	resumed := model.current
+	resumed.Status = session.StatusWorking
+	resumed.WorkerSocket = "/tmp/resumed-worker.sock"
+	updated, _ := model.handleAction(actionMsg{kind: "resume", sessionID: "S-1", current: resumed})
+	model = updated.(Model)
+	pending := worker.PendingPermission{
+		ID: "permission-resumed-exact", RequestID: "REQ-resumed", Title: "Current approval", Kind: "edit",
+		Options: []worker.PermissionOption{{ID: "allow-resumed-exact", Name: "Allow once", Kind: "allow_once"}},
+	}
+	model.addActivity("S-1", testLine(1, pending.RequestID, worker.FramePermissionRequested, pending), false)
+	if !model.permissionDecisionsReady["S-1"] {
+		t.Fatal("current resumed permission frame did not establish decision readiness")
+	}
+	model.receivePermissionSnapshot("S-1", delayedOffline)
+	_, card := model.projections["S-1"].pendingPermission()
+	if card == nil || card.id != pending.ID || !model.permissionDecisionsReady["S-1"] {
+		t.Fatalf("delayed generationless snapshot retired/disabled resumed permission: card %#v ready %v", card, model.permissionDecisionsReady["S-1"])
+	}
+	if model.permissionBlockedReason["S-1"] != "" {
+		t.Fatalf("delayed generationless snapshot replaced current readiness: %q", model.permissionBlockedReason["S-1"])
+	}
+}
+
+func TestPermissionSnapshotRejectsDelayedLowerAuthoritySequence(t *testing.T) {
+	model := baseModel(context.Background(), newFakeConsoleBackend())
+	model.mode = sessionView
+	model.direct = true
+	model.current = session.Session{ID: "S-1", TaskID: "T-1", Agent: "codex", Role: "worker"}
+	model.cursors["S-1"] = 100
+	model.receivePermissionSnapshot("S-1", appservice.PermissionSnapshot{
+		Permissions: []worker.PendingPermission{}, Sequence: 100, DecisionsReady: false,
+		BlockedCode: "channel_failed", BlockedMessage: "The Session channel is unavailable.",
+	})
+	if model.permissionSnapshotCursors["S-1"] != 100 || model.permissionDecisionsReady["S-1"] {
+		t.Fatalf("newer blocked authority = sequence %d ready %v", model.permissionSnapshotCursors["S-1"], model.permissionDecisionsReady["S-1"])
+	}
+	model.receivePermissionSnapshot("S-1", appservice.PermissionSnapshot{
+		Permissions: []worker.PendingPermission{{
+			ID: "permission-from-delayed-read", RequestID: "REQ-delayed", Title: "Stale approval", Kind: "edit",
+			Options: []worker.PermissionOption{{ID: "allow-delayed", Name: "Allow", Kind: "allow_once"}},
+		}},
+		Sequence: 80, DecisionsReady: true,
+	})
+	if model.permissionSnapshotCursors["S-1"] != 100 || model.permissionDecisionsReady["S-1"] {
+		t.Fatalf("delayed authority changed sequence/readiness = %d/%v", model.permissionSnapshotCursors["S-1"], model.permissionDecisionsReady["S-1"])
+	}
+	if model.projections["S-1"] != nil {
+		t.Fatalf("delayed lower-watermark snapshot resurrected projection: %#v", model.projections["S-1"])
+	}
+	if reason := model.permissionBlockedReason["S-1"]; reason != "The Session channel is unavailable." {
+		t.Fatalf("delayed authority replaced bounded blocked reason: %q", reason)
+	}
+}
+
+func TestTaskRefreshReconcilesSelectedSessionPermissionSnapshot(t *testing.T) {
+	backend := newFakeConsoleBackend()
+	second := session.Session{ID: "S-2", TaskID: "T-1", Agent: "claude", Provider: "anthropic", Role: "worker", Status: session.StatusWorking}
+	backend.detail.Sessions = append(backend.detail.Sessions, second)
+	backend.sessions[second.ID] = second
+	backend.permissionState[second.ID] = appservice.PermissionSnapshot{
+		Permissions: []worker.PendingPermission{{
+			ID: "permission-selected-exact", RequestID: "REQ-selected", Title: "Approve selected Session", Kind: "execute",
+			Options: []worker.PermissionOption{{ID: "allow-selected-exact", Name: "Allow once", Kind: "allow_once"}},
+		}},
+		Sequence: 1, DecisionsReady: true,
+	}
+	model, cancel, err := newTaskModel(context.Background(), backend, "T-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	model.moveTaskSelection(1)
+	model.cursors[second.ID] = 1
 	updated, _ := model.Update(model.refreshCmd()())
 	model = updated.(Model)
-	if len(model.task.Sessions) != 2 || !strings.Contains(model.View(), "S-2") || !strings.Contains(model.View(), "CODEX") || !strings.Contains(model.View(), "implementer") {
-		t.Fatalf("new Session did not appear:\n%s", model.View())
+	projection := model.projections[second.ID]
+	_, card := projection.pendingPermission()
+	if card == nil || card.id != "permission-selected-exact" || card.options[0].id != "allow-selected-exact" {
+		t.Fatalf("selected Task Session permission = %#v", card)
+	}
+	if backend.permissionReads[second.ID] != 1 {
+		t.Fatalf("selected Session permission reads = %d, want 1", backend.permissionReads[second.ID])
+	}
+	model.width, model.height = 120, 35
+	if view := model.View(); !strings.Contains(view, "Approve selected Session") || !strings.Contains(view, "● Approval") {
+		t.Fatalf("selected Task preview did not surface the authoritative permission:\n%s", view)
 	}
 }
 
-func TestTaskContinuationReadinessDistinguishesLinkedFromVerified(t *testing.T) {
-	linked := nativeCLICapability{available: true, status: "identity present · safety checked on open"}
-	if got := taskContinuationReadiness(linked); got != "Conversation linked · verified on open" {
-		t.Fatalf("linked readiness = %q", got)
+func waitForTaskWatcherStop(t *testing.T, manager *watchManager) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		manager.mu.Lock()
+		live := manager.taskLive
+		manager.mu.Unlock()
+		if !live {
+			return
+		}
+		time.Sleep(time.Millisecond)
 	}
-	verified := nativeCLICapability{available: true, status: "identity verified · worker checked on open"}
-	if got := taskContinuationReadiness(verified); got != "Exact conversation verified" {
-		t.Fatalf("verified readiness = %q", got)
+	t.Fatal("Task watcher did not stop after cancellation")
+}
+
+func TestLiveFrameAppendsWithoutHydrationOrReplacement(t *testing.T) {
+	backend := newFakeConsoleBackend()
+	model := baseModel(context.Background(), backend)
+	model.mode = sessionView
+	model.current = backend.sessions["S-1"]
+	model.addActivity("S-1", testLine(2, "REQ-live", worker.FrameProviderEvent, map[string]any{
+		"type": "text_delta", "stream": "output", "text": "streamed now",
+	}), true)
+	if model.cursors["S-1"] != 2 || len(model.histories["S-1"]) != 1 {
+		t.Fatalf("live frame state = cursor %d, history %d", model.cursors["S-1"], len(model.histories["S-1"]))
+	}
+	request := model.projections["S-1"].byID["REQ-live"]
+	if request == nil || request.state != turnLive || request.blocks[0].text != "streamed now" {
+		t.Fatalf("live projection = %#v", request)
 	}
 }
 
-func TestTaskConsoleCreatesAndOpensSessionThroughWizard(t *testing.T) {
-	backend := newConsoleBackend()
+func TestModelBoundsRawChannelFrameRetention(t *testing.T) {
+	model := baseModel(context.Background(), newFakeConsoleBackend())
+	for sequence := 1; sequence <= maxRetainedChannelFrames+73; sequence++ {
+		model.addActivity("S-bounded", testLine(uint64(sequence), "", worker.FrameConnection, map[string]any{"state": "connected"}), false)
+	}
+	if got := len(model.histories["S-bounded"]); got != maxRetainedChannelFrames {
+		t.Fatalf("retained raw frames = %d, want %d", got, maxRetainedChannelFrames)
+	}
+	if !model.historyClipped["S-bounded"] || model.cursors["S-bounded"] != maxRetainedChannelFrames+73 {
+		t.Fatalf("bounded raw state = clipped %v cursor %d", model.historyClipped["S-bounded"], model.cursors["S-bounded"])
+	}
+	model.addActivity("S-bounded", testLine(1, "", worker.FrameConnection, map[string]any{"state": "connected"}), false)
+	if len(model.histories["S-bounded"]) != maxRetainedChannelFrames {
+		t.Fatal("old duplicate expanded bounded raw history")
+	}
+
+	large := strings.Repeat("x", 700<<10)
+	for sequence := 1; sequence <= 8; sequence++ {
+		model.addActivity("S-byte-bounded", testLine(uint64(sequence), "", worker.FrameProviderEvent, map[string]any{
+			"type": "future_large_event", "payload": large,
+		}), false)
+	}
+	if model.historyBytes["S-byte-bounded"] > maxRetainedChannelBytes || len(model.histories["S-byte-bounded"]) >= 8 || !model.historyClipped["S-byte-bounded"] {
+		t.Fatalf("byte-bounded raw history = bytes %d frames %d clipped %v", model.historyBytes["S-byte-bounded"], len(model.histories["S-byte-bounded"]), model.historyClipped["S-byte-bounded"])
+	}
+}
+
+func TestModelBoundsRawChannelRetentionAcrossSessions(t *testing.T) {
+	model := baseModel(context.Background(), newFakeConsoleBackend())
+	const sessionCount = 64
+	framesPerSession := maxRetainedChannelTotalFrames/sessionCount + 8
+	for sessionIndex := range sessionCount {
+		sessionID := fmt.Sprintf("S-global-%03d", sessionIndex)
+		for sequence := 1; sequence <= framesPerSession; sequence++ {
+			model.addActivity(sessionID, testLine(uint64(sequence), "", worker.FrameConnection, map[string]any{
+				"state": "connected",
+			}), false)
+		}
+	}
+	if model.retainedHistoryFrames != maxRetainedChannelTotalFrames {
+		t.Fatalf("global retained frames = %d, want %d", model.retainedHistoryFrames, maxRetainedChannelTotalFrames)
+	}
+	if !model.historyClipped["S-global-000"] {
+		t.Fatal("oldest Session did not disclose global frame eviction")
+	}
+	assertRetainedHistoryAccounting(t, &model)
+
+	largePayload := strings.Repeat("z", 512<<10)
+	var lastLine sessionlog.Line
+	for sessionIndex := range sessionCount {
+		sessionID := fmt.Sprintf("S-large-%03d", sessionIndex)
+		lastLine = testLine(1, "", worker.FrameProviderEvent, map[string]any{
+			"type": "future_large_event", "payload": largePayload, "session": sessionID,
+		})
+		model.addActivity(sessionID, lastLine, false)
+	}
+	if model.retainedHistoryBytes > maxRetainedChannelTotalBytes {
+		t.Fatalf("global retained bytes = %d, limit %d", model.retainedHistoryBytes, maxRetainedChannelTotalBytes)
+	}
+	if !model.historyClipped["S-large-000"] {
+		t.Fatal("oldest large Session did not disclose global byte eviction")
+	}
+	latest := model.histories["S-large-063"]
+	if len(latest) != 1 || string(latest[0].line.Data) != string(lastLine.Data) {
+		t.Fatal("newest retained raw JSONL frame was altered")
+	}
+	assertRetainedHistoryAccounting(t, &model)
+}
+
+func TestWatchManagerQueuesAtMostOneFramePayload(t *testing.T) {
+	manager := newWatchManager(context.Background(), newFakeConsoleBackend())
+	defer manager.cancel()
+	if got := cap(manager.events); got != 1 {
+		t.Fatalf("watch event handoff capacity = %d, want 1", got)
+	}
+}
+
+func TestModelBoundsProjectionBytesAcrossTaskSessions(t *testing.T) {
+	model := baseModel(context.Background(), newFakeConsoleBackend())
+	model.mode = taskView
+	model.task.Task = task.Task{ID: "T-projection-bytes", Title: "Bound projection bytes", Status: task.StatusWorking}
+	prompt := strings.Repeat("p", maxProjectedMessageBytes)
+	const sessionCount = 140
+	for index := 0; index < sessionCount; index++ {
+		sessionID := fmt.Sprintf("S-projection-bytes-%03d", index)
+		model.task.Sessions = append(model.task.Sessions, session.Session{ID: sessionID, TaskID: model.task.Task.ID, Agent: "codex", Role: "worker"})
+		model.addActivity(sessionID, testLine(1, "REQ", worker.FrameClientCommand, map[string]any{
+			"command": "prompt", "text": prompt,
+		}), false)
+	}
+	if model.retainedProjectionBytes > maxRetainedProjectionBytes || model.retainedProjectionObjects > maxRetainedProjectionObjects {
+		t.Fatalf("projection totals exceed budget: %d bytes/%d objects", model.retainedProjectionBytes, model.retainedProjectionObjects)
+	}
+	if !model.projectionClipped["S-projection-bytes-000"] || model.projections["S-projection-bytes-000"] != nil {
+		t.Fatal("oldest Task projection was not evicted with clipping disclosure")
+	}
+	latestID := fmt.Sprintf("S-projection-bytes-%03d", sessionCount-1)
+	if model.projections[latestID] == nil || len(model.histories[latestID]) != 1 {
+		t.Fatal("newest projection or independently retained raw frame was lost")
+	}
+	assertProjectionAccounting(t, &model)
+	model.width, model.height = 120, 32
+	view := model.View()
+	for _, want := range []string{"projection(s) clipped", "Projection clipped"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("Task projection disclosure missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestModelBoundsProjectionObjectsAcrossToolHeavySessions(t *testing.T) {
+	model := baseModel(context.Background(), newFakeConsoleBackend())
+	model.mode = taskView
+	const sessionCount = 300
+	for sessionIndex := 0; sessionIndex < sessionCount; sessionIndex++ {
+		sessionID := fmt.Sprintf("S-projection-objects-%03d", sessionIndex)
+		model.addActivity(sessionID, testLine(1, "REQ", worker.FrameClientCommand, map[string]any{
+			"command": "prompt", "text": "inspect",
+		}), false)
+		for toolIndex := 0; toolIndex < 40; toolIndex++ {
+			model.addActivity(sessionID, testLine(uint64(toolIndex+2), "REQ", worker.FrameProviderEvent, map[string]any{
+				"type": "tool_call", "tool_call": map[string]any{
+					"id": fmt.Sprintf("tool-%d", toolIndex), "title": "Inspect", "kind": "read", "status": "completed",
+				},
+			}), false)
+		}
+	}
+	if model.retainedProjectionObjects > maxRetainedProjectionObjects || model.retainedProjectionBytes > maxRetainedProjectionBytes {
+		t.Fatalf("tool-heavy projection totals exceed budget: %d bytes/%d objects", model.retainedProjectionBytes, model.retainedProjectionObjects)
+	}
+	if !model.projectionClipped["S-projection-objects-000"] {
+		t.Fatal("tool-heavy Task did not evict its oldest projection")
+	}
+	assertProjectionAccounting(t, &model)
+}
+
+func TestProjectionEvictionNeverMutatesRawChannelRetention(t *testing.T) {
+	model := baseModel(context.Background(), newFakeConsoleBackend())
+	line := testLine(1, "REQ", worker.FrameClientCommand, map[string]any{"command": "prompt", "text": "exact"})
+	model.addActivity("S-independent-raw", line, false)
+	model.dropProjection("S-independent-raw")
+	history := model.histories["S-independent-raw"]
+	if len(history) != 1 || string(history[0].line.Data) != string(line.Data) {
+		t.Fatal("projection eviction mutated independently retained raw JSONL")
+	}
+	if !model.projectionClipped["S-independent-raw"] {
+		t.Fatal("projection eviction was not disclosed")
+	}
+}
+
+func TestProjectionBudgetPreservesPermissionThatCrossesLimit(t *testing.T) {
+	model := baseModel(context.Background(), newFakeConsoleBackend())
+	model.mode = taskView
+	const sessionID = "S-permission-crossing"
+	sequence := uint64(1)
+	requestIndex := 0
+	requestID := fmt.Sprintf("REQ-%03d", requestIndex)
+	model.addActivity(sessionID, testLine(sequence, requestID, worker.FrameClientCommand, map[string]any{
+		"command": "prompt", "text": "inspect before approval",
+	}), false)
+
+	pending := worker.PendingPermission{
+		ID: "permission-exact", RequestID: requestID, Title: strings.Repeat("A", 512), Kind: "edit",
+		Options: []worker.PermissionOption{
+			{ID: "allow-once-exact", Name: strings.Repeat("n", 512), Kind: "allow_once"},
+			{ID: "allow-always-exact", Name: strings.Repeat("n", 512), Kind: "allow_always"},
+			{ID: "reject-once-exact", Name: strings.Repeat("n", 512), Kind: "reject_once"},
+			{ID: "reject-always-exact", Name: strings.Repeat("n", 512), Kind: "reject_always"},
+		},
+	}
+	permissionIncrement := projectedPermissionIncrement(pending)
+	fullToolIncrement := projectedToolIncrement(maxToolDetailBytes)
+	toolIndex := 0
+	for {
+		remaining := maxRetainedProjectionBytes - model.retainedProjectionBytes
+		if remaining < permissionIncrement {
+			break
+		}
+		if toolIndex == maxProjectedTools {
+			requestIndex++
+			requestID = fmt.Sprintf("REQ-%03d", requestIndex)
+			sequence++
+			model.addActivity(sessionID, testLine(sequence, requestID, worker.FrameClientCommand, map[string]any{
+				"command": "prompt", "text": "continue inspection",
+			}), false)
+			toolIndex = 0
+			continue
+		}
+		contentBytes := maxToolDetailBytes
+		if remaining < fullToolIncrement+permissionIncrement/2 {
+			targetIncrement := remaining - permissionIncrement/2
+			contentBytes = projectedToolContentForIncrement(targetIncrement)
+			if contentBytes <= 0 {
+				break
+			}
+		}
+		sequence++
+		toolID := fmt.Sprintf("tool-%026d", sequence)
+		model.addActivity(sessionID, testLine(sequence, requestID, worker.FrameProviderEvent, map[string]any{
+			"type": "tool_call", "tool_call": map[string]any{
+				"id": toolID, "title": "Inspect", "kind": "read", "status": "completed",
+				"content": strings.Repeat("x", contentBytes),
+			},
+		}), false)
+		toolIndex++
+		if contentBytes < maxToolDetailBytes {
+			break
+		}
+	}
+	if model.projections[sessionID] == nil {
+		t.Fatal("near-budget projection was evicted before the permission frame")
+	}
+	remaining := maxRetainedProjectionBytes - model.retainedProjectionBytes
+	if remaining >= permissionIncrement {
+		t.Fatalf("test setup did not make permission cross budget: remaining %d increment %d", remaining, permissionIncrement)
+	}
+	sequence++
+	pending.RequestID = requestID
+	permissionLine := testLine(sequence, requestID, worker.FramePermissionRequested, pending)
+	model.addActivity(sessionID, permissionLine, false)
+
+	projection := model.projections[sessionID]
+	if projection == nil {
+		t.Fatal("crossing permission evicted its own projection")
+	}
+	_, card := projection.pendingPermission()
+	if card == nil || card.id != pending.ID || len(card.options) != len(pending.Options) {
+		t.Fatalf("preserved permission = %#v", card)
+	}
+	for index, option := range card.options {
+		if option.id != pending.Options[index].ID {
+			t.Fatalf("preserved option %d id = %q, want %q", index, option.id, pending.Options[index].ID)
+		}
+	}
+	if model.retainedProjectionBytes > maxRetainedProjectionBytes || model.retainedProjectionObjects > maxRetainedProjectionObjects {
+		t.Fatalf("permission compaction exceeded projection budget: %d/%d", model.retainedProjectionBytes, model.retainedProjectionObjects)
+	}
+	if !model.projectionClipped[sessionID] || !projection.clipped {
+		t.Fatal("permission-preserving compaction was not disclosed")
+	}
+	history := model.histories[sessionID]
+	if len(history) == 0 || history[len(history)-1].line.Type != worker.FramePermissionRequested ||
+		string(history[len(history)-1].line.Data) != string(permissionLine.Data) {
+		t.Fatal("permission-preserving compaction lost the exact raw permission frame")
+	}
+	assertProjectionAccounting(t, &model)
+}
+
+func TestProjectionBudgetBoundsManyPendingSessionsAndKeepsRetainedIDsExact(t *testing.T) {
+	model := baseModel(context.Background(), newFakeConsoleBackend())
+	model.mode = taskView
+	const sessionCount = 700
+	options := make([]worker.PermissionOption, 0, maxProjectedPermissionOptions)
+	for index := 0; index < maxProjectedPermissionOptions; index++ {
+		options = append(options, worker.PermissionOption{
+			ID: fmt.Sprintf("option-%02d-exact", index), Name: "Choose exact option", Kind: "allow_once",
+		})
+	}
+	for index := 0; index < sessionCount; index++ {
+		sessionID := fmt.Sprintf("S-pending-%03d", index)
+		requestID := fmt.Sprintf("REQ-pending-%03d", index)
+		permissionID := fmt.Sprintf("permission-%03d-exact", index)
+		model.addActivity(sessionID, testLine(1, requestID, worker.FrameClientCommand, map[string]any{
+			"command": "prompt", "text": "await approval",
+		}), false)
+		model.addActivity(sessionID, testLine(2, requestID, worker.FramePermissionRequested, worker.PendingPermission{
+			ID: permissionID, RequestID: requestID, Title: "Approve exact action", Kind: "edit", Options: options,
+		}), false)
+		if index == 511 {
+			if len(model.projections) != 512 || len(model.projectionOverflow) != 0 {
+				t.Fatalf("conforming 512-Session Task retained %d projections with %d overflows", len(model.projections), len(model.projectionOverflow))
+			}
+		}
+	}
+	if model.retainedProjectionBytes > maxRetainedProjectionBytes || model.retainedProjectionObjects > maxRetainedProjectionObjects {
+		t.Fatalf("pending-only projection totals exceed budget: %d/%d", model.retainedProjectionBytes, model.retainedProjectionObjects)
+	}
+	if len(model.projectionOverflow) == 0 {
+		t.Fatal("nonconforming over-512 Task did not enter explicit projection overflow mode")
+	}
+	for sessionID, projection := range model.projections {
+		_, card := projection.pendingPermission()
+		if card == nil {
+			t.Fatalf("retained %s projection lost its pending permission", sessionID)
+		}
+		wantID := "permission-" + strings.TrimPrefix(sessionID, "S-pending-") + "-exact"
+		if card.id != wantID || len(card.options) != len(options) {
+			t.Fatalf("retained %s permission = id %q/options %d, want %q/%d", sessionID, card.id, len(card.options), wantID, len(options))
+		}
+		for index, option := range card.options {
+			if option.id != options[index].ID {
+				t.Fatalf("retained %s option %d = %q, want %q", sessionID, index, option.id, options[index].ID)
+			}
+		}
+	}
+	assertProjectionAccounting(t, &model)
+	for sessionID := range model.projectionOverflow {
+		model.mode = sessionView
+		model.current = session.Session{ID: sessionID, TaskID: "T-overflow", Agent: "codex", Role: "worker"}
+		model.width, model.height = 100, 30
+		if view := model.View(); !strings.Contains(view, "PROJECTION LIMIT") || !strings.Contains(view, "attach this exact") {
+			t.Fatalf("projection overflow was not disclosed for %s:\n%s", sessionID, view)
+		}
+		break
+	}
+}
+
+func projectedPermissionIncrement(pending worker.PendingPermission) int {
+	projection := newTranscript()
+	projection.apply(testLine(1, "REQ", worker.FrameClientCommand, map[string]any{"command": "prompt", "text": "inspect"}))
+	before := projection.retainedUsage().bytes
+	projection.apply(testLine(2, "REQ", worker.FramePermissionRequested, pending))
+	return projection.retainedUsage().bytes - before
+}
+
+func projectedToolIncrement(contentBytes int) int {
+	projection := newTranscript()
+	projection.apply(testLine(1, "REQ", worker.FrameClientCommand, map[string]any{"command": "prompt", "text": "inspect"}))
+	before := projection.retainedUsage().bytes
+	projection.apply(testLine(2, "REQ", worker.FrameProviderEvent, map[string]any{
+		"type": "tool_call", "tool_call": map[string]any{
+			"id": "tool-00000000000000000000000002", "title": "Inspect", "kind": "read", "status": "completed",
+			"content": strings.Repeat("x", contentBytes),
+		},
+	}))
+	return projection.retainedUsage().bytes - before
+}
+
+func projectedToolContentForIncrement(target int) int {
+	largeOverhead := projectedToolIncrement(maxToolPreviewBytes+1) - (maxToolPreviewBytes + 1)
+	if contentBytes := target - largeOverhead; contentBytes > maxToolPreviewBytes {
+		return min(contentBytes, maxToolDetailBytes)
+	}
+	smallOverhead := projectedToolIncrement(1) - 2
+	return max(0, min(maxToolPreviewBytes, (target-smallOverhead)/2))
+}
+
+func assertRetainedHistoryAccounting(t *testing.T, model *Model) {
+	t.Helper()
+	var frames, bytes int
+	for sessionID, history := range model.histories {
+		var sessionBytes int
+		for _, retained := range history {
+			frames++
+			bytes += retained.bytes
+			sessionBytes += retained.bytes
+			if retained.bytes != retainedChannelLineBytes(retained.line) {
+				t.Fatalf("%s retained byte accounting = %d, want %d", sessionID, retained.bytes, retainedChannelLineBytes(retained.line))
+			}
+		}
+		if model.historyBytes[sessionID] != sessionBytes {
+			t.Fatalf("%s history bytes = %d, want %d", sessionID, model.historyBytes[sessionID], sessionBytes)
+		}
+	}
+	if frames != model.retainedHistoryFrames || bytes != model.retainedHistoryBytes {
+		t.Fatalf("global history accounting = %d frames/%d bytes, want %d/%d", model.retainedHistoryFrames, model.retainedHistoryBytes, frames, bytes)
+	}
+	if frames > maxRetainedChannelTotalFrames || bytes > maxRetainedChannelTotalBytes {
+		t.Fatalf("global history exceeds limits: %d frames/%d bytes", frames, bytes)
+	}
+}
+
+func assertProjectionAccounting(t *testing.T, model *Model) {
+	t.Helper()
+	var bytes, objects int
+	for sessionID, projection := range model.projections {
+		usage := projection.retainedUsage()
+		bytes += usage.bytes
+		objects += usage.objects
+		if model.projectionBytes[sessionID] != usage.bytes || model.projectionObjects[sessionID] != usage.objects {
+			t.Fatalf("%s projection accounting = %d/%d, want %d/%d", sessionID,
+				model.projectionBytes[sessionID], model.projectionObjects[sessionID], usage.bytes, usage.objects)
+		}
+	}
+	if bytes != model.retainedProjectionBytes || objects != model.retainedProjectionObjects {
+		t.Fatalf("global projection accounting = %d bytes/%d objects, want %d/%d", model.retainedProjectionBytes, model.retainedProjectionObjects, bytes, objects)
+	}
+}
+
+func TestTaskEnterOpensStructuredSessionChannel(t *testing.T) {
+	backend := newFakeConsoleBackend()
 	model, cancel, err := newTaskModel(context.Background(), backend, "T-1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer cancel()
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if model.mode != sessionView || model.current.ID != "S-1" {
+		t.Fatalf("Enter did not open selected Session: mode=%v current=%q", model.mode, model.current.ID)
+	}
+	if strings.Contains(strings.ToLower(model.View()), "native cli") {
+		t.Fatalf("managed Session view still advertises native attachment:\n%s", model.View())
+	}
+}
 
-	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+func TestBusyPromptRestoresDraftInsteadOfQueueing(t *testing.T) {
+	backend := newFakeConsoleBackend()
+	backend.promptErr = &worker.BusyError{SessionID: "S-1", ActiveRequestID: "REQ-active"}
+	model := baseModel(context.Background(), backend)
+	model.mode = sessionView
+	model.current = backend.sessions["S-1"]
+	model.composer = composerState{focused: true, value: []rune("try this"), cursor: len("try this")}
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated.(Model)
 	if command == nil {
-		t.Fatal("n did not load the new Session wizard")
+		t.Fatal("prompt command was nil")
 	}
 	updated, _ = model.Update(command())
 	model = updated.(Model)
-	if model.wizard == nil || !strings.Contains(model.View(), "NEW SESSION") {
-		t.Fatalf("wizard did not open:\n%s", model.View())
+	if model.composer.text() != "try this" || !model.composer.focused {
+		t.Fatalf("busy prompt lost draft: %#v", model.composer)
 	}
-	// Populate both optional provider controls, then move to the final field and
-	// submit. Defaults still prove isolated worktree + read approval.
-	for model.wizard.field != wizardModel {
-		updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyTab})
-		model = updated.(Model)
+	if !strings.Contains(model.notice, "active provider turn") || strings.Contains(strings.ToLower(model.notice), "queued") {
+		t.Fatalf("busy notice = %q", model.notice)
 	}
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("model-selected")})
-	model = updated.(Model)
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyTab})
-	model = updated.(Model)
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("high")})
-	model = updated.(Model)
-	for model.wizard.field != wizardPrompt {
-		updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyTab})
-		model = updated.(Model)
+}
+
+func TestDetachNeverStopsOrCancelsSession(t *testing.T) {
+	backend := newFakeConsoleBackend()
+	model := baseModel(context.Background(), backend)
+	model.mode = sessionView
+	model.current = backend.sessions["S-1"]
+	_, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	if command == nil {
+		t.Fatal("detach did not return Bubble Tea quit command")
 	}
-	updated, command = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if backend.stopped != 0 || backend.cancelled != 0 {
+		t.Fatalf("detach mutated Session lifecycle: stopped=%d cancelled=%d", backend.stopped, backend.cancelled)
+	}
+}
+
+func TestWizardUsesLiveProviderCatalogThenConfiguresSameSession(t *testing.T) {
+	backend := newFakeConsoleBackend()
+	model := baseModel(context.Background(), backend)
+	model.mode = taskView
+	model.task = backend.detail
+	updated, _ := model.Update(wizardReadyMsg{agents: backend.profiles, defaultRepo: "/repo"})
 	model = updated.(Model)
-	if command == nil || model.wizard == nil || !model.wizard.submitting {
-		t.Fatal("wizard did not submit from its final field")
+	if model.wizard == nil || model.wizard.connectedID != "" {
+		t.Fatalf("initial wizard = %#v", model.wizard)
+	}
+	updated, command := model.submitWizard()
+	model = updated.(Model)
+	if command == nil {
+		t.Fatal("connect command was nil")
 	}
 	updated, command = model.Update(command())
 	model = updated.(Model)
-	if model.wizard != nil || model.mode != sessionView || model.current.ID != "S-3" {
-		t.Fatalf("created Session did not open: wizard=%v mode=%d current=%s", model.wizard != nil, model.mode, model.current.ID)
+	if command == nil || model.wizard.connectedID != "S-2" || model.wizard.providerOptionsReady {
+		t.Fatalf("connecting wizard = %#v", model.wizard)
 	}
-	backend.mu.Lock()
-	starts := append([]appservice.StartSessionParams(nil), backend.starts...)
-	backend.mu.Unlock()
-	if len(starts) != 1 || starts[0].TaskID != "T-1" || starts[0].Agent != "codex" || starts[0].Model != "model-selected" || starts[0].ReasoningEffort != "high" || !starts[0].Worktree || starts[0].ApproveAll {
-		t.Fatalf("wizard start params = %#v", starts)
+	updated, _ = model.Update(command())
+	model = updated.(Model)
+	if model.wizard.connectedID != "S-2" || !model.wizard.providerOptionsReady {
+		t.Fatalf("connected wizard = %#v", model.wizard)
 	}
-}
-
-func TestAttachSessionProgramCanDetachWithoutWorkerMutation(t *testing.T) {
-	backend := newConsoleBackend()
-	var output bytes.Buffer
-	if err := AttachSession(context.Background(), backend, "S-1", strings.NewReader("q"), &output); err != nil {
-		t.Fatal(err)
+	view := model.View()
+	for _, want := range []string{"Provider default (currently provider-model)", "Provider default (currently medium)", "nothing is hard-coded"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("provider catalog view missing %q:\n%s", want, view)
+		}
 	}
-	backend.mu.Lock()
-	defer backend.mu.Unlock()
-	if len(backend.cancelled) != 0 || len(backend.stopped) != 0 {
-		t.Fatalf("terminal detach mutated worker: cancelled=%v stopped=%v", backend.cancelled, backend.stopped)
+	model.wizard.modelIndex = 2
+	model.wizard.effortIndex = 2
+	model.wizard.prompt.value = []rune("Begin")
+	updated, command = model.submitWizard()
+	model = updated.(Model)
+	updated, _ = model.Update(command())
+	model = updated.(Model)
+	if len(backend.configured) != 1 || backend.configured[0].Model != "model-b" || backend.configured[0].ReasoningEffort != "high" {
+		t.Fatalf("configured options = %#v", backend.configured)
 	}
-}
-
-func newConsoleBackend() *fakeBackend {
-	sessions := map[string]session.Session{
-		"S-1": {
-			ID: "S-1", TaskID: "T-1", Role: "researcher", Agent: "gemini", Provider: "google",
-			RepoPath: "/repo/one", Status: session.StatusWorking, WorkerSocket: "/tmp/S-1.sock",
-			MetadataJSON: json.RawMessage(`{"permission":"read-approval"}`),
-		},
-		"S-2": {
-			ID: "S-2", TaskID: "T-1", Role: "implementer", Agent: "codex", Provider: "openai",
-			RepoPath: "/repo/two", WorktreePath: "/worktrees/two", Branch: "agent/S-2",
-			ProviderConversationID: "codex-conversation",
-			Status:                 session.StatusWaiting, WorkerSocket: "/tmp/S-2.sock",
-			MetadataJSON: json.RawMessage(`{"permission":"approve-all"}`),
-		},
+	if len(backend.launches) != 1 || backend.launches[0] != "Begin" || model.current.ID != "S-2" || model.wizard != nil {
+		t.Fatalf("launches/model = %#v / current=%q wizard=%v", backend.launches, model.current.ID, model.wizard != nil)
 	}
-	return &fakeBackend{
-		detail: task.Detail{
-			Task:     task.Task{ID: "T-1", Title: "Investigate gateway", Status: task.StatusWorking},
-			Sessions: []session.Session{sessions["S-1"], sessions["S-2"]},
-		},
-		sessions: sessions,
-		histories: map[string][]sessionlog.Line{
-			"S-1": {logLine(1, "worker_ready", "ready one")},
-			"S-2": {logLine(1, "prompt_queued", "queued two")},
-		},
-		profiles: []agents.Profile{{Name: "claude", Provider: "anthropic", Command: "claude"}, {Name: "codex", Provider: "openai", Command: "codex"}},
-	}
-}
-
-func logLine(sequence uint64, lineType, message string) sessionlog.Line {
-	data, _ := json.Marshal(map[string]string{"message": message})
-	return sessionlog.Line{Seq: sequence, Timestamp: time.Unix(int64(sequence), 0).UTC(), Type: lineType, Data: data}
 }

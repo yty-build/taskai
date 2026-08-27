@@ -2,7 +2,6 @@ package worker
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -10,6 +9,8 @@ import (
 	"github.com/yty-build/acp-gateway/internal/acp"
 	"github.com/yty-build/acp-gateway/internal/agents"
 	"github.com/yty-build/acp-gateway/internal/config"
+	gitrepo "github.com/yty-build/acp-gateway/internal/git"
+	"github.com/yty-build/acp-gateway/internal/session"
 	"github.com/yty-build/acp-gateway/internal/store"
 )
 
@@ -19,8 +20,11 @@ func RunSession(ctx context.Context, home config.Home, repository *store.Store, 
 	if err != nil {
 		return err
 	}
-	if current.ACPSessionID != "" && !usesRuntimeTransport(current.MetadataJSON) {
-		return fmt.Errorf("Session %s was created by the legacy acpx CLI transport; refusing to start a public-runtime bridge while its detached queue owner may still exist. Keep its stored history, or create a fresh Session for the runtime bridge", current.ID)
+	if current.WorkerPID != 0 || current.WorkerSocket != "" {
+		return fmt.Errorf("Session %s retains worker ownership and cannot start another worker; provider-process teardown must be proven before clearing quarantine", current.ID)
+	}
+	if current.Status != session.StatusStarting {
+		return fmt.Errorf("Session %s is %s, not admitted for worker startup", current.ID, current.Status)
 	}
 	registry, err := agents.Load(home.Agents)
 	if err != nil {
@@ -30,17 +34,20 @@ func RunSession(ctx context.Context, home config.Home, repository *store.Store, 
 	if err != nil {
 		return err
 	}
-	binary, err := acp.FindBinary()
-	if err != nil {
-		return err
-	}
-	client := acp.NewRuntimeClient(binary, filepath.Join(home.Root, "acpx-runtime", current.ID))
-	if err := client.Probe(ctx); err != nil {
-		return err
-	}
+	// Binary discovery and compatibility probing are intentionally lazy. The
+	// worker first publishes an addressable `connecting` Session Channel, then
+	// runs bootstrap validation and probes through SessionPort.Probe so viewers
+	// see startup progress/failure.
+	client := acp.NewRuntimeClient("", filepath.Join(home.Root, "acpx-runtime", current.ID))
 	runtime, err := New(Config{
-		Session: current, Profile: profile, Repository: repository, ACP: client,
+		Session: current, Profile: profile, Repository: repository, Port: client,
 		WorkersDirectory: home.Workers, LogsDirectory: home.Logs,
+		Preflight: func(ctx context.Context) error {
+			if err := validateBootstrapProfile(current, profile); err != nil {
+				return err
+			}
+			return validateBootstrapCheckout(ctx, current)
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("initialize Session worker: %w", err)
@@ -48,14 +55,48 @@ func RunSession(ctx context.Context, home config.Home, repository *store.Store, 
 	return runtime.Run(ctx)
 }
 
-func usesRuntimeTransport(metadata json.RawMessage) bool {
-	if len(metadata) == 0 {
-		return false
+// validateBootstrapProfile prevents an opaque provider reference from ever
+// crossing an adapter boundary after a user-owned profile changes. Agent
+// command/version changes within the same provider remain an adapter concern,
+// but changing the provider requires a new Session.
+func validateBootstrapProfile(current session.Session, profile agents.Profile) error {
+	if strings.TrimSpace(current.Provider) == "" {
+		return fmt.Errorf("Session %s has no persisted provider and cannot start a provider Port", current.ID)
 	}
-	var values map[string]any
-	if json.Unmarshal(metadata, &values) != nil {
-		return false
+	if profile.Provider != current.Provider {
+		return fmt.Errorf("Session %s was created for provider %q, but agent profile %q now selects provider %q; create a new Session instead of crossing provider adapters", current.ID, current.Provider, current.Agent, profile.Provider)
 	}
-	transport, _ := values["acp_transport"].(string)
-	return strings.TrimSpace(transport) == acp.RuntimeTransport
+	return nil
+}
+
+// validateBootstrapCheckout closes the validation-to-spawn gap. Persisted
+// paths are immutable Session identity: the worker must neither follow a new
+// symlink target nor accept a deleted/replaced checkout immediately before it
+// opens the one provider Port.
+func validateBootstrapCheckout(ctx context.Context, current session.Session) error {
+	repository, err := gitrepo.ValidateRepository(ctx, current.RepoPath)
+	if err != nil {
+		return fmt.Errorf("validate persisted repository for Session %s: %w", current.ID, err)
+	}
+	if repository != current.RepoPath {
+		return fmt.Errorf("Session %s repository drifted from %q to %q; refusing provider startup", current.ID, current.RepoPath, repository)
+	}
+	if current.WorktreePath == "" {
+		return nil
+	}
+	worktree, err := gitrepo.ValidateRepository(ctx, current.WorktreePath)
+	if err != nil {
+		return fmt.Errorf("validate persisted worktree for Session %s: %w", current.ID, err)
+	}
+	if worktree != current.WorktreePath {
+		return fmt.Errorf("Session %s worktree drifted from %q to %q; refusing provider startup", current.ID, current.WorktreePath, worktree)
+	}
+	same, err := gitrepo.SameRepository(ctx, repository, worktree)
+	if err != nil {
+		return fmt.Errorf("validate persisted worktree repository for Session %s: %w", current.ID, err)
+	}
+	if !same {
+		return fmt.Errorf("Session %s worktree %q no longer belongs to repository %q; refusing provider startup", current.ID, worktree, repository)
+	}
+	return nil
 }

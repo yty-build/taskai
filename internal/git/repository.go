@@ -16,12 +16,9 @@ import (
 	"strings"
 	"syscall"
 	"time"
-	"unicode/utf8"
 )
 
 var idComponent = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
-
-const MaxReviewDiffBytes = 64 << 10
 
 const maxNestedRepositoryEntries = 256
 
@@ -29,14 +26,6 @@ type Worktree struct {
 	Repository string
 	Path       string
 	Branch     string
-}
-
-type ReviewSnapshot struct {
-	Branch       string
-	Status       string
-	StagedDiff   string
-	UnstagedDiff string
-	Truncated    bool
 }
 
 // RepositorySuggestionError reports a single, nearby checkout without
@@ -220,49 +209,6 @@ func CurrentBranch(ctx context.Context, repository string) (string, error) {
 	return strings.TrimSpace(branch), nil
 }
 
-// CaptureReviewSnapshot records the current checkout evidence without changing
-// the index or working tree. Untracked paths appear in Status; reviewers are
-// instructed to inspect their contents directly.
-func CaptureReviewSnapshot(ctx context.Context, checkout string) (ReviewSnapshot, error) {
-	branch, err := CurrentBranch(ctx, checkout)
-	if err != nil {
-		return ReviewSnapshot{}, err
-	}
-	status, err := run(ctx, checkout, "status", "--short", "--untracked-files=all")
-	if err != nil {
-		return ReviewSnapshot{}, fmt.Errorf("capture Git status: %w", err)
-	}
-	staged, err := run(ctx, checkout, "diff", "--cached", "--no-ext-diff", "--no-color", "--")
-	if err != nil {
-		return ReviewSnapshot{}, fmt.Errorf("capture staged Git diff: %w", err)
-	}
-	unstaged, err := run(ctx, checkout, "diff", "--no-ext-diff", "--no-color", "--")
-	if err != nil {
-		return ReviewSnapshot{}, fmt.Errorf("capture unstaged Git diff: %w", err)
-	}
-	remaining := MaxReviewDiffBytes
-	staged, stagedTruncated := truncateBytes(staged, remaining)
-	remaining -= len(staged)
-	unstaged, unstagedTruncated := truncateBytes(unstaged, remaining)
-	return ReviewSnapshot{
-		Branch: branch, Status: strings.TrimSpace(status), StagedDiff: strings.TrimSpace(staged),
-		UnstagedDiff: strings.TrimSpace(unstaged), Truncated: stagedTruncated || unstagedTruncated,
-	}, nil
-}
-
-func truncateBytes(value string, limit int) (string, bool) {
-	if limit < 0 {
-		limit = 0
-	}
-	if len(value) <= limit {
-		return value, false
-	}
-	for limit > 0 && !utf8.ValidString(value[:limit]) {
-		limit--
-	}
-	return value[:limit], true
-}
-
 func PlanWorktree(root, repository, taskID, sessionID string) (Worktree, error) {
 	if strings.TrimSpace(root) == "" {
 		return Worktree{}, fmt.Errorf("worktree root is required")
@@ -357,9 +303,15 @@ func (w Worktree) Create(ctx context.Context) error {
 	return nil
 }
 
-// LockRepository serializes checkout allocation across agent processes. The
-// caller must close the returned file to release the advisory lock.
+// LockRepository serializes checkout allocation across agent processes. Every
+// linked worktree of one repository hashes the same canonical Git common
+// directory, so alternate main/worktree path representations cannot split the
+// exclusion domain. The caller must close the returned file to release it.
 func LockRepository(ctx context.Context, stateRoot, repository string) (*os.File, error) {
+	identity, err := commonDirectory(ctx, repository)
+	if err != nil {
+		return nil, err
+	}
 	locks := filepath.Join(stateRoot, "locks")
 	if err := os.MkdirAll(locks, 0o700); err != nil {
 		return nil, fmt.Errorf("create repository lock directory: %w", err)
@@ -367,7 +319,7 @@ func LockRepository(ctx context.Context, stateRoot, repository string) (*os.File
 	if err := os.Chmod(locks, 0o700); err != nil {
 		return nil, fmt.Errorf("secure repository lock directory: %w", err)
 	}
-	digest := sha256.Sum256([]byte(repository))
+	digest := sha256.Sum256([]byte(identity))
 	path := filepath.Join(locks, fmt.Sprintf("repo-%x.lock", digest[:16]))
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {

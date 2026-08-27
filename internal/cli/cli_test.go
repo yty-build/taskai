@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,6 +40,49 @@ func TestRunVersion(t *testing.T) {
 	}
 }
 
+func TestTerminalSafeWriterRemovesControlAndBidiDataAcrossWrites(t *testing.T) {
+	var output bytes.Buffer
+	writer := newTerminalSafeWriter(&output)
+	if _, err := writer.Write([]byte("safe\x1b[2J\r\u009b31m")); err != nil {
+		t.Fatal(err)
+	}
+	bidi := []byte("\u202e")
+	if _, err := writer.Write(bidi[:1]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write(append(bidi[1:], []byte("text\nnext\tfield")...)); err != nil {
+		t.Fatal(err)
+	}
+	got := output.String()
+	if strings.ContainsAny(got, "\x1b\r") || strings.ContainsRune(got, '\u009b') || strings.ContainsRune(got, '\u202e') {
+		t.Fatalf("terminal-safe writer retained control data: %q", got)
+	}
+	if !strings.HasPrefix(got, "safe") || !strings.Contains(got, "text\nnext\tfield") {
+		t.Fatalf("terminal-safe writer lost printable/layout output: %q", got)
+	}
+}
+
+func TestRunSanitizesDynamicErrorOutput(t *testing.T) {
+	t.Setenv("AGENT_HOME", filepath.Join(t.TempDir(), "state"))
+	code, _, stderr := runForTest(t, "unknown-\x1b[2J-\u202e-command")
+	if code != ExitUsage {
+		t.Fatalf("exit code = %d, stderr = %q", code, stderr)
+	}
+	if strings.ContainsRune(stderr, '\x1b') || strings.ContainsRune(stderr, '\u202e') {
+		t.Fatalf("dynamic stderr retained terminal control data: %q", stderr)
+	}
+}
+
+func TestProviderReferenceDisplayIsQuotedASCII(t *testing.T) {
+	got := displayProviderReference("opaque\n\x1b\u202eref")
+	if got != `"opaque\n\x1b\u202eref"` {
+		t.Fatalf("provider reference display = %q", got)
+	}
+	if displayProviderReference("") != "-" {
+		t.Fatal("empty provider reference did not retain the absent marker")
+	}
+}
+
 func TestRunUnknownCommandHasStableError(t *testing.T) {
 	t.Setenv("AGENT_HOME", filepath.Join(t.TempDir(), "state"))
 	var stdout, stderr bytes.Buffer
@@ -50,30 +92,6 @@ func TestRunUnknownCommandHasStableError(t *testing.T) {
 	}
 	if got, want := stderr.String(), "acpctl: unknown command \"wat\"; run 'acpctl help' for usage\n"; got != want {
 		t.Fatalf("stderr = %q, want %q", got, want)
-	}
-}
-
-func TestHiddenNativeRequiresReservationGeneration(t *testing.T) {
-	err := runHiddenNative(
-		context.Background(),
-		[]string{"--session", "S-EXACT", "--owner-token", "owner"},
-		io.Discard, io.Discard, nil,
-	)
-	if err == nil || !strings.Contains(err.Error(), "--reservation-generation <generation>") {
-		t.Fatalf("hidden native usage error = %v", err)
-	}
-}
-
-func TestNativeRecoveryOutputDoesNotInventRefreshAfterConcurrentRelease(t *testing.T) {
-	var output bytes.Buffer
-	writeNativeRecoveryResult(&output, "S-EXACT", appservice.NativeReservationRecoveryResult{State: "already_released"})
-	if !strings.Contains(output.String(), "already released") || strings.Contains(output.String(), "Wait for native_refreshed") {
-		t.Fatalf("already-released recovery output = %q", output.String())
-	}
-	output.Reset()
-	writeNativeRecoveryResult(&output, "S-EXACT", appservice.NativeReservationRecoveryResult{State: "released"})
-	if !strings.Contains(output.String(), "ACP prompts remain available") || strings.Contains(output.String(), "Wait for native_refreshed") {
-		t.Fatalf("released recovery output = %q", output.String())
 	}
 }
 
@@ -191,18 +209,18 @@ func TestStartCreatesTaskAndSession(t *testing.T) {
 	originalFactory := sessionRuntimeFactory
 	sessionRuntimeFactory = func(config.Home, string) appservice.Runtime { return fakeSessionRuntime{} }
 	t.Cleanup(func() { sessionRuntimeFactory = originalFactory })
-	code, stdout, stderr := runForTest(t, "start", "Fix login", "--agent", "codex", "--repo", repo, "--role", "implementer", "--description", "Production regression", "--model", "gpt-5.6-sol", "--reasoning-effort", "high")
+	code, stdout, stderr := runForTest(t, "start", "Fix login", "--agent", "codex", "--repo", repo, "--role", "implementer", "--description", "Production regression")
 	if code != ExitOK || stderr != "" {
 		t.Fatalf("start: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
 	fields := strings.Fields(stdout)
-	if len(fields) < 7 || fields[0] != "Created" || fields[2] != "Started" || fields[4] != "Initial" {
+	if len(fields) != 5 || fields[0] != "Created" || fields[2] != "Connected" || fields[4] != "(starting)" {
 		t.Fatalf("start output = %q", stdout)
 	}
 	taskID, sessionID := fields[1], fields[3]
 	code, stdout, stderr = runForTest(t, "session", sessionID)
-	if code != ExitOK || stderr != "" || !strings.Contains(stdout, "Requested model: gpt-5.6-sol") || !strings.Contains(stdout, "Requested reasoning effort: high") {
-		t.Fatalf("session provider options: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	if code != ExitOK || stderr != "" || strings.Contains(stdout, "Requested model:") || strings.Contains(stdout, "Requested reasoning effort:") {
+		t.Fatalf("Session persisted disposable provider options: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
 	code, stdout, stderr = runForTest(t, "task", taskID)
 	if code != ExitOK || stderr != "" || !strings.Contains(stdout, sessionID) || !strings.Contains(stdout, "implementer") || !strings.Contains(stdout, "codex") || !strings.Contains(stdout, "starting") {
@@ -249,11 +267,18 @@ func TestStartWorktreeFlagsPersistIsolatedCheckout(t *testing.T) {
 type fakeSessionRuntime struct{}
 
 func (fakeSessionRuntime) Spawn(context.Context, string) (worker.SpawnResult, error) {
-	return worker.SpawnResult{PID: 123, Socket: "fake.sock"}, nil
+	return worker.SpawnResult{PID: 123, Socket: "fake.sock", PortReady: true}, nil
 }
 
 func (fakeSessionRuntime) Send(_ context.Context, _ string, command worker.Command) (worker.Message, error) {
-	return worker.Message{Type: "accepted", RequestID: command.RequestID, State: "ready"}, nil
+	switch command.Type {
+	case "ping":
+		return worker.Message{Type: "pong", SessionID: command.SessionID, ProtocolVersion: worker.ProtocolVersion, Capabilities: []string{worker.CapabilitySessionChannel}}, nil
+	case "configure":
+		return worker.Message{Type: "configured"}, nil
+	default:
+		return worker.Message{Type: "accepted", RequestID: command.RequestID, State: "ready"}, nil
+	}
 }
 
 func (fakeSessionRuntime) Subscribe(context.Context, string, uint64, func(worker.Message) error) error {
@@ -303,6 +328,52 @@ func TestStartRejectsUnknownAgentProfileWithoutCreatingTask(t *testing.T) {
 	code, stdout, stderr := runForTest(t, "tasks")
 	if code != ExitOK || stdout != "No Tasks.\n" || stderr != "" {
 		t.Fatalf("tasks: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
+func TestSessionStartCanNameParentInSameTask(t *testing.T) {
+	t.Setenv("AGENT_HOME", filepath.Join(t.TempDir(), "state"))
+	repo := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(repo, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	initializeCLIRepository(t, repo)
+	originalFactory := sessionRuntimeFactory
+	sessionRuntimeFactory = func(config.Home, string) appservice.Runtime { return fakeSessionRuntime{} }
+	t.Cleanup(func() { sessionRuntimeFactory = originalFactory })
+
+	code, stdout, stderr := runForTest(t, "start", "Parent child", "--agent", "codex", "--repo", repo, "--role", "manager")
+	if code != ExitOK || stderr != "" {
+		t.Fatalf("parent start: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	fields := strings.Fields(stdout)
+	taskID, parentID := fields[1], fields[3]
+	code, stdout, stderr = runForTest(t,
+		"session", "start", taskID, "--agent", "codex", "--repo", repo, "--role", "worker",
+		"--parent-session", parentID, "--allow-shared-checkout",
+	)
+	if code != ExitOK || stderr != "" {
+		t.Fatalf("child start: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	childID := strings.Fields(stdout)[1]
+	code, stdout, stderr = runForTest(t, "session", childID)
+	if code != ExitOK || stderr != "" || !strings.Contains(stdout, "Parent Session: "+parentID) {
+		t.Fatalf("child detail: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
+func TestRemovedManagedNativeAndReviewCommandsAreRejected(t *testing.T) {
+	t.Setenv("AGENT_HOME", filepath.Join(t.TempDir(), "state"))
+	for _, args := range [][]string{
+		{"_native", "--session", "S-1"},
+		{"session", "review", "S-1", "--agent", "codex"},
+		{"session", "recover-native", "S-1"},
+		{"session", "attach", "S-1", "--native"},
+	} {
+		code, _, stderr := runForTest(t, args...)
+		if code != ExitUsage || stderr == "" {
+			t.Fatalf("removed command %v: code=%d stderr=%q", args, code, stderr)
+		}
 	}
 }
 

@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"strings"
 	"time"
 	"unicode"
@@ -13,79 +12,40 @@ import (
 )
 
 const (
-	MetadataModelKey           = "model"
-	MetadataReasoningEffortKey = "reasoning_effort"
+	MetadataAllowSharedKey    = "allow_shared_checkout"
+	MetadataCreateWorktreeKey = "create_worktree"
 )
 
-var (
-	reasoningEffortPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
-)
-
-// ProviderOptions are optional, immutable provider controls stored in a
-// Session's metadata. They are ordinary Session configuration, not another
-// persistent entity. Empty values deliberately preserve the provider's own
-// defaults.
+// ProviderOptions are optional controls selected from the live provider's
+// advertised catalog. Empty values preserve provider defaults.
 type ProviderOptions struct {
 	Model           string
 	ReasoningEffort string
 }
 
 func (o ProviderOptions) Validate() error {
-	if o.Model != "" {
-		if len(o.Model) > 256 || !utf8.ValidString(o.Model) {
-			return fmt.Errorf("Session model must be a valid provider model ID of at most 256 bytes")
-		}
-		if strings.HasPrefix(o.Model, "-") {
-			return fmt.Errorf("Session model must not begin with '-'")
-		}
-		for _, value := range o.Model {
-			if !unicode.IsPrint(value) {
-				return fmt.Errorf("Session model must contain only printable characters")
-			}
-		}
+	if err := validateProviderOption("model", o.Model, 256); err != nil {
+		return err
 	}
-	if o.ReasoningEffort != "" && !reasoningEffortPattern.MatchString(o.ReasoningEffort) {
-		return fmt.Errorf("Session reasoning effort must be a provider value using only letters, numbers, '.', '_', or '-'")
+	return validateProviderOption("reasoning effort", o.ReasoningEffort, 128)
+}
+
+func validateProviderOption(name, value string, limit int) error {
+	if value == "" {
+		return nil
+	}
+	if len(value) > limit || !utf8.ValidString(value) {
+		return fmt.Errorf("Session %s must be a valid provider value of at most %d bytes", name, limit)
+	}
+	for _, item := range value {
+		if !unicode.IsPrint(item) {
+			return fmt.Errorf("Session %s must contain only printable characters", name)
+		}
 	}
 	return nil
 }
 
-// ParseProviderOptions reads the bounded public provider controls without
-// exposing unrelated Session metadata such as permission policy.
-func ParseProviderOptions(metadata json.RawMessage) (ProviderOptions, error) {
-	if len(metadata) == 0 {
-		return ProviderOptions{}, nil
-	}
-	var values map[string]any
-	if err := json.Unmarshal(metadata, &values); err != nil {
-		return ProviderOptions{}, fmt.Errorf("decode Session provider options: %w", err)
-	}
-	read := func(key string) (string, error) {
-		value, exists := values[key]
-		if !exists || value == nil {
-			return "", nil
-		}
-		text, ok := value.(string)
-		if !ok {
-			return "", fmt.Errorf("Session %s metadata must be a string", key)
-		}
-		return strings.TrimSpace(text), nil
-	}
-	model, err := read(MetadataModelKey)
-	if err != nil {
-		return ProviderOptions{}, err
-	}
-	effort, err := read(MetadataReasoningEffortKey)
-	if err != nil {
-		return ProviderOptions{}, err
-	}
-	options := ProviderOptions{Model: model, ReasoningEffort: effort}
-	return options, options.Validate()
-}
-
 type Status string
-
-type ConversationIDSource string
 
 const (
 	StatusStarting  Status = "starting"
@@ -97,14 +57,9 @@ const (
 	StatusStopped   Status = "stopped"
 )
 
-const (
-	ConversationSourceACP           ConversationIDSource = "acp"
-	ConversationSourceNative        ConversationIDSource = "native"
-	ConversationSourceProviderStore ConversationIDSource = "provider-store"
-)
-
 var validStatuses = map[Status]struct{}{
-	StatusStarting: {}, StatusWorking: {}, StatusWaiting: {}, StatusDone: {}, StatusFailed: {}, StatusCancelled: {}, StatusStopped: {},
+	StatusStarting: {}, StatusWorking: {}, StatusWaiting: {}, StatusDone: {},
+	StatusFailed: {}, StatusCancelled: {}, StatusStopped: {},
 }
 
 func (s Status) Validate() error {
@@ -119,60 +74,77 @@ func ParseStatus(value string) (Status, error) {
 	return status, status.Validate()
 }
 
-func (s ConversationIDSource) Validate() error {
-	switch s {
-	case ConversationSourceACP, ConversationSourceNative, ConversationSourceProviderStore:
-		return nil
+// Session is the gateway address for one provider-owned conversation. The
+// provider reference is opaque; the gateway does not parse provider history
+// or model native/ACP evidence as separate identities.
+type Session struct {
+	ID              string
+	TaskID          string
+	ParentSessionID string
+	Role            string
+	Agent           string
+	Provider        string
+	RepoPath        string
+	WorktreePath    string
+	Branch          string
+	RuntimeRef      string
+	ProviderRef     string
+	Status          Status
+	WorkerPID       int
+	WorkerSocket    string
+	LogPath         string
+	MetadataJSON    json.RawMessage
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+	LastActivityAt  *time.Time
+}
+
+// WorkerState is the complete compare-and-swap guard for Session lifecycle
+// ownership. Status alone is not an ownership token: a stopped/failed worker
+// can overlap a newly claimed worker unless every lifecycle write also proves
+// the exact PID and socket it observed.
+type WorkerState struct {
+	Status Status
+	PID    int
+	Socket string
+}
+
+func (s Session) WorkerState() WorkerState {
+	return WorkerState{Status: s.Status, PID: s.WorkerPID, Socket: s.WorkerSocket}
+}
+
+// CanResume is true only for an ownerless terminal Session with an established
+// provider identity. In particular, the ownerless starting window between a
+// lifecycle admission CAS and worker claim is not a second Resume opportunity.
+func (s Session) CanResume() bool {
+	if s.ProviderRef == "" || s.WorkerPID != 0 || s.WorkerSocket != "" {
+		return false
+	}
+	switch s.Status {
+	case StatusStopped, StatusFailed, StatusDone, StatusCancelled:
+		return true
 	default:
-		return fmt.Errorf("invalid conversation ID source %q", s)
+		return false
 	}
 }
 
-type Session struct {
-	ID                       string
-	TaskID                   string
-	Role                     string
-	Agent                    string
-	Provider                 string
-	RepoPath                 string
-	WorktreePath             string
-	Branch                   string
-	ACPXRecordID             string
-	ACPSessionID             string
-	NativeSessionID          string
-	ProviderConversationID   string
-	ConversationIDSource     ConversationIDSource
-	ConversationIDVerifiedAt *time.Time
-	Status                   Status
-	WorkerPID                int
-	WorkerSocket             string
-	LogPath                  string
-	MetadataJSON             json.RawMessage
-	CreatedAt                time.Time
-	UpdatedAt                time.Time
-	LastActivityAt           *time.Time
-}
-
 type CreateParams struct {
-	ID                       string
-	TaskID                   string
-	Role                     string
-	Agent                    string
-	Provider                 string
-	RepoPath                 string
-	WorktreePath             string
-	Branch                   string
-	ACPXRecordID             string
-	ACPSessionID             string
-	NativeSessionID          string
-	ProviderConversationID   string
-	ConversationIDSource     ConversationIDSource
-	ConversationIDVerifiedAt *time.Time
-	Status                   Status
-	WorkerPID                int
-	WorkerSocket             string
-	LogPath                  string
-	MetadataJSON             json.RawMessage
+	ID              string
+	TaskID          string
+	ParentSessionID string
+	Role            string
+	Agent           string
+	Provider        string
+	RepoPath        string
+	WorktreePath    string
+	Branch          string
+	RuntimeRef      string
+	ProviderRef     string
+	Status          Status
+	WorkerPID       int
+	WorkerSocket    string
+	LogPath         string
+	MetadataJSON    json.RawMessage
 }
 
 func (p CreateParams) Validate() error {
@@ -181,6 +153,9 @@ func (p CreateParams) Validate() error {
 	}
 	if strings.TrimSpace(p.Agent) == "" {
 		return fmt.Errorf("Session agent is required")
+	}
+	if p.ParentSessionID != "" && (strings.TrimSpace(p.ParentSessionID) != p.ParentSessionID || p.ParentSessionID == p.ID || strings.ContainsAny(p.ParentSessionID, `/\\`)) {
+		return fmt.Errorf("Session parent ID is invalid")
 	}
 	status := p.Status
 	if status == "" {
@@ -192,24 +167,8 @@ func (p CreateParams) Validate() error {
 	if len(p.MetadataJSON) > 0 && !json.Valid(p.MetadataJSON) {
 		return fmt.Errorf("Session metadata_json is not valid JSON")
 	}
-	if strings.TrimSpace(p.ProviderConversationID) == "" {
-		if p.ConversationIDSource != "" || p.ConversationIDVerifiedAt != nil {
-			return fmt.Errorf("canonical provider conversation ID is required when identity metadata is set")
-		}
-	} else {
-		if err := p.ConversationIDSource.Validate(); err != nil {
-			return err
-		}
-		providerStore := p.ConversationIDSource == ConversationSourceProviderStore
-		if providerStore && p.ConversationIDVerifiedAt == nil {
-			return fmt.Errorf("provider-store conversation identity requires a verification timestamp")
-		}
-		if !providerStore && p.ConversationIDVerifiedAt != nil {
-			return fmt.Errorf("conversation verification timestamp requires provider-store identity source")
-		}
-		if providerStore && strings.TrimSpace(p.NativeSessionID) != "" && strings.TrimSpace(p.NativeSessionID) != strings.TrimSpace(p.ProviderConversationID) {
-			return fmt.Errorf("native adapter ID must match the provider-store verified canonical conversation")
-		}
+	if strings.TrimSpace(p.RuntimeRef) != p.RuntimeRef {
+		return fmt.Errorf("Session runtime reference must not contain surrounding whitespace")
 	}
 	return nil
 }
@@ -218,9 +177,6 @@ type Repository interface {
 	CreateSession(context.Context, CreateParams) (Session, error)
 	GetSession(context.Context, string) (Session, error)
 	ListSessionsByTask(context.Context, string) ([]Session, error)
-	UpdateSessionStatus(context.Context, string, Status) (Session, error)
-	UpdateSessionRuntimeIDs(context.Context, string, string, string, string) (Session, error)
-	UpdateSessionConversation(context.Context, string, string, ConversationIDSource, *time.Time) (Session, error)
-	UpdateSessionWorker(context.Context, string, int, string, string, Status) (Session, error)
-	ClearSessionWorker(context.Context, string, Status) (Session, error)
+	CompareAndSwapSessionWorker(context.Context, string, WorkerState, WorkerState, string) (Session, bool, error)
+	CompareAndSwapSessionProviderRef(context.Context, string, WorkerState, string, string) (Session, bool, error)
 }

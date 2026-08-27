@@ -32,7 +32,7 @@ func (r *webRuntime) Spawn(context.Context, string) (worker.SpawnResult, error) 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.spawns++
-	return worker.SpawnResult{PID: 9001, Socket: "fake.sock"}, nil
+	return worker.SpawnResult{PID: 9001, Socket: "fake.sock", PortReady: true}, nil
 }
 
 func (r *webRuntime) Send(_ context.Context, _ string, command worker.Command) (worker.Message, error) {
@@ -82,11 +82,7 @@ func newWebFixture(t *testing.T) *webFixture {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := repository.UpdateSessionRuntimeIDs(context.Background(), "S-web", "acpx-private", "acp-private", "native-private"); err != nil {
-		t.Fatal(err)
-	}
-	verifiedAt := time.Date(2026, time.August, 15, 12, 0, 0, 0, time.UTC)
-	if _, err := repository.UpdateSessionConversation(context.Background(), "S-web", "native-private", session.ConversationSourceProviderStore, &verifiedAt); err != nil {
+	if _, err := repository.UpdateSessionProviderRef(context.Background(), "S-web", "runtime-private", "provider-private"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := repository.UpdateSessionWorker(
@@ -124,10 +120,13 @@ func TestServerRenderedPagesAndVersionedBrowserBoundary(t *testing.T) {
 
 	taskPage := webRequest(fixture.handler, "/tasks/T-web")
 	assertWebStatus(t, taskPage, http.StatusOK)
-	for _, expected := range []string{"Conversations", "/sessions/S-web", "Start a Session", "structured ACP conversation", "New Session", "Task → Sessions", `name="model" maxlength="256"`, `name="reasoning_effort" maxlength="64"`, "Provider default"} {
+	for _, expected := range []string{"Conversations", "/sessions/S-web", "Connect a Session", "activity as the agent emits it", "New Session", "Task → Sessions", "Connect Session"} {
 		if !strings.Contains(taskPage.Body.String(), expected) {
 			t.Errorf("Task page does not contain %q", expected)
 		}
+	}
+	if strings.Contains(taskPage.Body.String(), `data-provider-option="model"`) || strings.Contains(taskPage.Body.String(), `name="prompt"`) {
+		t.Fatal("Task Session creation still mixes configuration or prompts into identity")
 	}
 	for _, removed := range []string{"Current activity", "Show raw execution", "activity-feed"} {
 		if strings.Contains(taskPage.Body.String(), removed) {
@@ -141,7 +140,7 @@ func TestServerRenderedPagesAndVersionedBrowserBoundary(t *testing.T) {
 
 	sessionPage := webRequest(fixture.handler, "/sessions/S-web")
 	assertWebStatus(t, sessionPage, http.StatusOK)
-	for _, expected := range []string{"Structured ACP", "canonical conversation", "Verified", "Loading history", "Conversation", "Message codex", "Stop response", "Resume", "Stop worker", "Create reviewer Session", "Closing this page only detaches", "Conversation details", "Session diagnostics", "/private/product", "Reasoning effort", "Provider default"} {
+	for _, expected := range []string{"Session activity", "Connecting", "Message codex", "Stop response", "Resume", "Stop worker", "Create child Session", "Closing this page only detaches", "Session details", "Session diagnostics", "/private/product", "Reasoning effort", "Provider controls", "Apply configuration", `id="create-child-session-form"`} {
 		if !strings.Contains(sessionPage.Body.String(), expected) {
 			t.Errorf("Session page does not contain %q", expected)
 		}
@@ -158,10 +157,15 @@ func TestServerRenderedPagesAndVersionedBrowserBoundary(t *testing.T) {
 	if strings.Count(sessionPage.Body.String(), `aria-current="page"`) != 1 || !strings.Contains(sessionPage.Body.String(), `aria-current="location"`) {
 		t.Fatal("Session navigation does not distinguish the current page from its Task ancestor")
 	}
+	for _, removed := range []string{"launch_phase", "prepared", "Resume initial launch", "review-dialog", "review-form", "canonical conversation", "provider-store", "history-summary", "continuity-chip"} {
+		if strings.Contains(sessionPage.Body.String(), removed) {
+			t.Errorf("Session page still contains removed staged/history surface %q", removed)
+		}
+	}
 
 	javascript := webRequest(fixture.handler, "/assets/app.js")
 	assertWebStatus(t, javascript, http.StatusOK)
-	for _, expected := range []string{"new EventSource", "/api/v1/tasks/", "/api/v1/sessions/", "/permissions/decision", "allow_always", "JSON.stringify(activity", "assistant_chunk", "thought_chunk", "tool_upsert", "plan_replace", "makeRollingTextRoom", "completedResponseBlock", "turnHasReasoning", "nearBottom", "patchTurnElement", "patchBlockElement", "blocksPerTurn", "beginFormSubmission", "reasoning_effort"} {
+	for _, expected := range []string{"new EventSource", `addEventListener("frame"`, "/api/v1/tasks/", "/provider-options", "/config", "/children", "/api/v1/sessions/", "/permissions/response", "allow_always", "provider_event", "text_delta", "tool_call", "provider_result", "makeRollingTextRoom", "completedResponseBlock", "turnHasReasoning", "nearBottom", "patchTurnElement", "patchBlockElement", "blocksPerTurn", "beginFormSubmission", "reasoning_effort"} {
 		if !strings.Contains(javascript.Body.String(), expected) {
 			t.Errorf("browser client does not contain %q", expected)
 		}
@@ -169,13 +173,27 @@ func TestServerRenderedPagesAndVersionedBrowserBoundary(t *testing.T) {
 	if strings.Contains(javascript.Body.String(), "React") {
 		t.Fatal("browser client unexpectedly uses React")
 	}
+	for _, removed := range []string{"/conversation", "/sessions/prepare", "/review", "/launch", "provider-options/reconnect", "launch_phase", "prepared", "sessionStorage", "reconcileConversation", "provider-store", "conversationSnapshotSignature", "committed", "surface-native", "surface-acp", "assistant_chunk", "thought_chunk", "tool_upsert", "plan_replace", `addEventListener("activity"`} {
+		if strings.Contains(javascript.Body.String(), removed) {
+			t.Errorf("browser client still contains removed conversation authority %q", removed)
+		}
+	}
+	streamBootstrap := strings.LastIndex(javascript.Body.String(), "attachSessionChannel(`/api/v1/sessions/${encodeURIComponent(sessionID)}/stream`);")
+	permissionBootstrap := strings.LastIndex(javascript.Body.String(), "refreshPermissions().then(scheduleTranscriptRender)")
+	sessionBootstrap := strings.LastIndex(javascript.Body.String(), `if (page === "session")`)
+	if streamBootstrap < 0 || permissionBootstrap < 0 || sessionBootstrap < 0 || streamBootstrap > permissionBootstrap {
+		t.Fatal("Session page does not attach its EventSource before asynchronous option/permission hydration")
+	}
+	if strings.Contains(javascript.Body.String()[sessionBootstrap:], "loadProviderOptions(sessionID).catch") {
+		t.Fatal("Session bootstrap reads provider options before replay ready and provider-connected boundaries")
+	}
 	if strings.Contains(javascript.Body.String(), "cursor=${transcriptState.lastPosition}") {
 		t.Fatal("browser client pins a stale cursor across EventSource reconnects")
 	}
 
 	stylesheet := webRequest(fixture.handler, "/assets/app.css")
 	assertWebStatus(t, stylesheet, http.StatusOK)
-	for _, expected := range []string{"100dvh", "safe-area-inset-bottom", "prefers-reduced-motion", "forced-colors", "@media (max-width: 760px)", ".approval-shelf", ".composer-region", ".mobile-session-actions", ".tool-inline-preview", ".thought-card.provider-history", ".thought-source"} {
+	for _, expected := range []string{"100dvh", "safe-area-inset-bottom", "prefers-reduced-motion", "forced-colors", "@media (max-width: 760px)", ".approval-shelf", ".composer-region", ".mobile-session-actions", ".tool-inline-preview", ".thought-card", ".thought-source", ".provider-status", ".activity-limit-note", ".provider-options", ".nav-session.child-session", ".session-row.child-session", ".parent-session-link"} {
 		if !strings.Contains(stylesheet.Body.String(), expected) {
 			t.Errorf("responsive stylesheet does not contain %q", expected)
 		}
@@ -185,9 +203,6 @@ func TestServerRenderedPagesAndVersionedBrowserBoundary(t *testing.T) {
 	assertWebStatus(t, apiResponse, http.StatusOK)
 	if !strings.Contains(apiResponse.Body.String(), `"id":"S-web"`) {
 		t.Fatalf("versioned API was not mounted: %s", apiResponse.Body.String())
-	}
-	if !strings.Contains(apiResponse.Body.String(), `"conversation_ready":true`) || !strings.Contains(apiResponse.Body.String(), `"conversation_verified":true`) {
-		t.Fatalf("API conversation continuity state missing: %s", apiResponse.Body.String())
 	}
 	assertNoWebRuntimeLeak(t, apiResponse.Body.String(), fixture)
 
@@ -220,6 +235,47 @@ func TestWebRejectsDNSRebindingAndCrossOriginControls(t *testing.T) {
 	}
 	if current.WorkerPID != 4242 || current.Status != session.StatusWaiting {
 		t.Fatalf("rejected control changed Session = %#v", current)
+	}
+}
+
+func TestServerRendersManagerChildRelationships(t *testing.T) {
+	fixture := newWebFixture(t)
+	if _, err := fixture.repository.CreateSession(context.Background(), session.CreateParams{
+		ID: "S-child", TaskID: "T-web", ParentSessionID: "S-web", Role: "reviewer", Agent: "claude", Provider: "claude",
+		RepoPath: "/private/child", Branch: "child", Status: session.StatusWaiting,
+		LogPath: filepath.Join(fixture.home.Logs, "S-child.jsonl"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	taskPage := webRequest(fixture.handler, "/tasks/T-web")
+	assertWebStatus(t, taskPage, http.StatusOK)
+	for _, expected := range []string{
+		`class="nav-session child-session"`,
+		`class="session-row child-session"`,
+		`data-parent-session-id="S-web"`,
+		`Child · reviewer`,
+	} {
+		if !strings.Contains(taskPage.Body.String(), expected) {
+			t.Errorf("Task page does not expose child relationship %q", expected)
+		}
+	}
+
+	childPage := webRequest(fixture.handler, "/sessions/S-child")
+	assertWebStatus(t, childPage, http.StatusOK)
+	for _, expected := range []string{
+		`<dt>Parent Session</dt>`,
+		`class="mono parent-session-link" href="/sessions/S-web">S-web</a>`,
+	} {
+		if !strings.Contains(childPage.Body.String(), expected) {
+			t.Errorf("Child Session details do not contain %q", expected)
+		}
+	}
+
+	managerPage := webRequest(fixture.handler, "/sessions/S-web")
+	assertWebStatus(t, managerPage, http.StatusOK)
+	if strings.Contains(managerPage.Body.String(), `<dt>Parent Session</dt>`) {
+		t.Fatal("root manager Session renders a nonexistent parent relationship")
 	}
 }
 
@@ -296,7 +352,7 @@ func assertWebStatus(t *testing.T, response *httptest.ResponseRecorder, want int
 func assertNoWebRuntimeLeak(t *testing.T, body string, fixture *webFixture) {
 	t.Helper()
 	for _, secret := range []string{
-		"worker_pid", "worker_socket", "log_path", "acpx-private", "acp-private", "native-private",
+		"worker_pid", "worker_socket", "log_path", "runtime_ref", "provider_ref", "runtime-private", "provider-private",
 		filepath.Join(fixture.home.Workers, "S-web.sock"), filepath.Join(fixture.home.Logs, "S-web.jsonl"),
 	} {
 		if strings.Contains(body, secret) {

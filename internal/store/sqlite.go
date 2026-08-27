@@ -23,7 +23,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const currentSchemaVersion = 3
+const currentSchemaVersion = 6
 
 var ErrNotFound = errors.New("not found")
 
@@ -170,18 +170,18 @@ func (s *Store) CreateTask(ctx context.Context, params task.CreateParams) (task.
 }
 
 func (s *Store) GetTask(ctx context.Context, id string) (task.Task, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, title, description, status, external_ref, metadata_json, created_at, updated_at
-		FROM tasks WHERE id = ?`, id)
-	result, err := scanTask(row)
+	result, err := scanTask(s.db.QueryRowContext(ctx, taskSelect+` WHERE id = ?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return task.Task{}, fmt.Errorf("Task %s: %w", id, ErrNotFound)
 	}
-	return result, err
+	if err != nil {
+		return task.Task{}, fmt.Errorf("get Task %s: %w", id, err)
+	}
+	return result, nil
 }
 
 func (s *Store) ListTasks(ctx context.Context) ([]task.Task, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, title, description, status, external_ref, metadata_json, created_at, updated_at
-		FROM tasks ORDER BY created_at DESC, id DESC`)
+	rows, err := s.db.QueryContext(ctx, taskSelect+` ORDER BY created_at DESC, id DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("list Tasks: %w", err)
 	}
@@ -190,7 +190,7 @@ func (s *Store) ListTasks(ctx context.Context) ([]task.Task, error) {
 	for rows.Next() {
 		result, err := scanTask(rows)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("list Tasks: %w", err)
 		}
 		results = append(results, result)
 	}
@@ -204,7 +204,8 @@ func (s *Store) UpdateTaskStatus(ctx context.Context, id string, status task.Sta
 	if err := status.Validate(); err != nil {
 		return task.Task{}, err
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?`, string(status), formatTime(s.now().UTC()), id)
+	result, err := s.db.ExecContext(ctx, `UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?`,
+		string(status), formatTime(s.now().UTC()), id)
 	if err != nil {
 		return task.Task{}, fmt.Errorf("update Task %s: %w", id, err)
 	}
@@ -217,9 +218,17 @@ func (s *Store) UpdateTaskStatus(ctx context.Context, id string, status task.Sta
 }
 
 func (s *Store) CreateSession(ctx context.Context, params session.CreateParams) (session.Session, error) {
-	params = initializeConversationIdentity(params)
 	if err := params.Validate(); err != nil {
 		return session.Session{}, err
+	}
+	if params.ParentSessionID != "" {
+		parent, err := s.GetSession(ctx, params.ParentSessionID)
+		if err != nil {
+			return session.Session{}, fmt.Errorf("load parent Session %s: %w", params.ParentSessionID, err)
+		}
+		if parent.TaskID != params.TaskID {
+			return session.Session{}, fmt.Errorf("parent Session %s belongs to a different Task", params.ParentSessionID)
+		}
 	}
 	if params.Status == "" {
 		params.Status = session.StatusStarting
@@ -233,32 +242,22 @@ func (s *Store) CreateSession(ctx context.Context, params session.CreateParams) 
 	}
 	now := s.now().UTC()
 	result := session.Session{
-		ID: params.ID, TaskID: params.TaskID, Role: params.Role, Agent: strings.TrimSpace(params.Agent), Provider: params.Provider,
+		ID: params.ID, TaskID: params.TaskID, ParentSessionID: params.ParentSessionID,
+		Role: params.Role, Agent: strings.TrimSpace(params.Agent), Provider: params.Provider,
 		RepoPath: params.RepoPath, WorktreePath: params.WorktreePath, Branch: params.Branch,
-		ACPXRecordID: params.ACPXRecordID, ACPSessionID: params.ACPSessionID, NativeSessionID: params.NativeSessionID,
-		ProviderConversationID: params.ProviderConversationID, ConversationIDSource: params.ConversationIDSource,
-		ConversationIDVerifiedAt: cloneTime(params.ConversationIDVerifiedAt), Status: params.Status,
+		RuntimeRef: params.RuntimeRef, ProviderRef: params.ProviderRef, Status: params.Status,
 		WorkerPID: params.WorkerPID, WorkerSocket: params.WorkerSocket, LogPath: params.LogPath,
 		MetadataJSON: cloneJSON(params.MetadataJSON), CreatedAt: now, UpdatedAt: now,
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO sessions
-		(id, task_id, role, agent, provider, repo_path, worktree_path, branch, acpx_record_id, acp_session_id, native_session_id,
-		 provider_conversation_id, conversation_id_source, conversation_id_verified_at,
-		 status, worker_pid, worker_socket, log_path, metadata_json, created_at, updated_at, last_activity_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
-		result.ID, result.TaskID, nullString(result.Role), result.Agent, nullString(result.Provider), nullString(result.RepoPath),
-		nullString(result.WorktreePath), nullString(result.Branch), nullString(result.ACPXRecordID), nullString(result.ACPSessionID), nullString(result.NativeSessionID),
-		nullString(result.ProviderConversationID), nullString(string(result.ConversationIDSource)), nullTime(result.ConversationIDVerifiedAt),
-		string(result.Status), nullInt(result.WorkerPID), nullString(result.WorkerSocket), nullString(result.LogPath), nullJSON(result.MetadataJSON),
-		formatTime(result.CreatedAt), formatTime(result.UpdatedAt))
-	if err != nil {
+	if err := insertSession(ctx, s.db, result); err != nil {
 		return session.Session{}, fmt.Errorf("create Session %s: %w", result.ID, err)
 	}
 	return result, nil
 }
 
-// CreateTaskWithSession atomically persists the convenience one-Session Task
-// without changing the underlying Task -> Session relationship.
+// CreateTaskWithSession atomically persists the convenience one-Session Task.
+// A new Task has no existing Session that its first Session could name as a
+// parent.
 func (s *Store) CreateTaskWithSession(ctx context.Context, taskParams task.CreateParams, sessionParams session.CreateParams) (task.Task, session.Session, error) {
 	if taskParams.ID == "" {
 		id, err := identity.New("T")
@@ -268,7 +267,6 @@ func (s *Store) CreateTaskWithSession(ctx context.Context, taskParams task.Creat
 		taskParams.ID = id
 	}
 	sessionParams.TaskID = taskParams.ID
-	sessionParams = initializeConversationIdentity(sessionParams)
 	if sessionParams.ID == "" {
 		id, err := identity.New("S")
 		if err != nil {
@@ -282,6 +280,9 @@ func (s *Store) CreateTaskWithSession(ctx context.Context, taskParams task.Creat
 	if err := sessionParams.Validate(); err != nil {
 		return task.Task{}, session.Session{}, err
 	}
+	if sessionParams.ParentSessionID != "" {
+		return task.Task{}, session.Session{}, fmt.Errorf("the first Session in a new Task cannot name a parent Session")
+	}
 	if taskParams.Status == "" {
 		taskParams.Status = task.StatusOpen
 	}
@@ -290,15 +291,15 @@ func (s *Store) CreateTaskWithSession(ctx context.Context, taskParams task.Creat
 	}
 	now := s.now().UTC()
 	createdTask := task.Task{
-		ID: taskParams.ID, Title: strings.TrimSpace(taskParams.Title), Description: taskParams.Description, Status: taskParams.Status,
-		ExternalRef: taskParams.ExternalRef, MetadataJSON: cloneJSON(taskParams.MetadataJSON), CreatedAt: now, UpdatedAt: now,
+		ID: taskParams.ID, Title: strings.TrimSpace(taskParams.Title), Description: taskParams.Description,
+		Status: taskParams.Status, ExternalRef: taskParams.ExternalRef,
+		MetadataJSON: cloneJSON(taskParams.MetadataJSON), CreatedAt: now, UpdatedAt: now,
 	}
 	createdSession := session.Session{
-		ID: sessionParams.ID, TaskID: taskParams.ID, Role: sessionParams.Role, Agent: strings.TrimSpace(sessionParams.Agent), Provider: sessionParams.Provider,
+		ID: sessionParams.ID, TaskID: taskParams.ID, Role: sessionParams.Role,
+		Agent: strings.TrimSpace(sessionParams.Agent), Provider: sessionParams.Provider,
 		RepoPath: sessionParams.RepoPath, WorktreePath: sessionParams.WorktreePath, Branch: sessionParams.Branch,
-		ACPXRecordID: sessionParams.ACPXRecordID, ACPSessionID: sessionParams.ACPSessionID, NativeSessionID: sessionParams.NativeSessionID,
-		ProviderConversationID: sessionParams.ProviderConversationID, ConversationIDSource: sessionParams.ConversationIDSource,
-		ConversationIDVerifiedAt: cloneTime(sessionParams.ConversationIDVerifiedAt), Status: sessionParams.Status,
+		RuntimeRef: sessionParams.RuntimeRef, ProviderRef: sessionParams.ProviderRef, Status: sessionParams.Status,
 		WorkerPID: sessionParams.WorkerPID, WorkerSocket: sessionParams.WorkerSocket, LogPath: sessionParams.LogPath,
 		MetadataJSON: cloneJSON(sessionParams.MetadataJSON), CreatedAt: now, UpdatedAt: now,
 	}
@@ -309,20 +310,11 @@ func (s *Store) CreateTaskWithSession(ctx context.Context, taskParams task.Creat
 	defer tx.Rollback()
 	if _, err := tx.ExecContext(ctx, `INSERT INTO tasks
 		(id, title, description, status, external_ref, metadata_json, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, createdTask.ID, createdTask.Title, nullString(createdTask.Description), string(createdTask.Status),
-		nullString(createdTask.ExternalRef), nullJSON(createdTask.MetadataJSON), formatTime(now), formatTime(now)); err != nil {
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, createdTask.ID, createdTask.Title, nullString(createdTask.Description),
+		string(createdTask.Status), nullString(createdTask.ExternalRef), nullJSON(createdTask.MetadataJSON), formatTime(now), formatTime(now)); err != nil {
 		return task.Task{}, session.Session{}, fmt.Errorf("create Task %s: %w", createdTask.ID, err)
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO sessions
-		(id, task_id, role, agent, provider, repo_path, worktree_path, branch, acpx_record_id, acp_session_id, native_session_id,
-		 provider_conversation_id, conversation_id_source, conversation_id_verified_at,
-		 status, worker_pid, worker_socket, log_path, metadata_json, created_at, updated_at, last_activity_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
-		createdSession.ID, createdSession.TaskID, nullString(createdSession.Role), createdSession.Agent, nullString(createdSession.Provider), nullString(createdSession.RepoPath),
-		nullString(createdSession.WorktreePath), nullString(createdSession.Branch), nullString(createdSession.ACPXRecordID), nullString(createdSession.ACPSessionID), nullString(createdSession.NativeSessionID),
-		nullString(createdSession.ProviderConversationID), nullString(string(createdSession.ConversationIDSource)), nullTime(createdSession.ConversationIDVerifiedAt),
-		string(createdSession.Status), nullInt(createdSession.WorkerPID), nullString(createdSession.WorkerSocket), nullString(createdSession.LogPath),
-		nullJSON(createdSession.MetadataJSON), formatTime(now), formatTime(now)); err != nil {
+	if err := insertSession(ctx, tx, createdSession); err != nil {
 		return task.Task{}, session.Session{}, fmt.Errorf("create Session %s: %w", createdSession.ID, err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -332,36 +324,26 @@ func (s *Store) CreateTaskWithSession(ctx context.Context, taskParams task.Creat
 }
 
 func (s *Store) GetSession(ctx context.Context, id string) (session.Session, error) {
-	row := s.db.QueryRowContext(ctx, sessionSelect+` WHERE id = ?`, id)
-	result, err := scanSession(row)
+	result, err := scanSession(s.db.QueryRowContext(ctx, sessionSelect+` WHERE id = ?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return session.Session{}, fmt.Errorf("Session %s: %w", id, ErrNotFound)
 	}
-	return result, err
+	if err != nil {
+		return session.Session{}, fmt.Errorf("get Session %s: %w", id, err)
+	}
+	return result, nil
 }
 
 func (s *Store) ListSessionsByTask(ctx context.Context, taskID string) ([]session.Session, error) {
-	rows, err := s.db.QueryContext(ctx, sessionSelect+` WHERE task_id = ? ORDER BY created_at, id`, taskID)
-	if err != nil {
-		return nil, fmt.Errorf("list Sessions for Task %s: %w", taskID, err)
-	}
-	defer rows.Close()
-	var results []session.Session
-	for rows.Next() {
-		result, err := scanSession(rows)
-		if err != nil {
-			return nil, err
-		}
-		results = append(results, result)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list Sessions for Task %s: %w", taskID, err)
-	}
-	return results, nil
+	return s.listSessions(ctx, sessionSelect+` WHERE task_id = ? ORDER BY created_at, id`, taskID)
 }
 
 func (s *Store) ListSessions(ctx context.Context) ([]session.Session, error) {
-	rows, err := s.db.QueryContext(ctx, sessionSelect+` ORDER BY created_at, id`)
+	return s.listSessions(ctx, sessionSelect+` ORDER BY created_at, id`)
+}
+
+func (s *Store) listSessions(ctx context.Context, query string, args ...any) ([]session.Session, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list Sessions: %w", err)
 	}
@@ -370,7 +352,7 @@ func (s *Store) ListSessions(ctx context.Context) ([]session.Session, error) {
 	for rows.Next() {
 		result, err := scanSession(rows)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("list Sessions: %w", err)
 		}
 		results = append(results, result)
 	}
@@ -385,7 +367,8 @@ func (s *Store) UpdateSessionStatus(ctx context.Context, id string, status sessi
 		return session.Session{}, err
 	}
 	now := s.now().UTC()
-	result, err := s.db.ExecContext(ctx, `UPDATE sessions SET status = ?, updated_at = ?, last_activity_at = ? WHERE id = ?`, string(status), formatTime(now), formatTime(now), id)
+	result, err := s.db.ExecContext(ctx, `UPDATE sessions SET status = ?, updated_at = ?, last_activity_at = ? WHERE id = ?`,
+		string(status), formatTime(now), formatTime(now), id)
 	if err != nil {
 		return session.Session{}, fmt.Errorf("update Session %s: %w", id, err)
 	}
@@ -397,155 +380,120 @@ func (s *Store) UpdateSessionStatus(ctx context.Context, id string, status sessi
 	return s.GetSession(ctx, id)
 }
 
-// UpdateSessionRuntimeIDs persists adapter evidence and initializes the
-// canonical provider conversation identity once. It never silently replaces an
-// identity that has already been established for the Session.
-func (s *Store) UpdateSessionRuntimeIDs(ctx context.Context, id, acpxRecordID, acpSessionID, nativeSessionID string) (session.Session, error) {
-	acpxRecordID = strings.TrimSpace(acpxRecordID)
-	acpSessionID = strings.TrimSpace(acpSessionID)
-	nativeSessionID = strings.TrimSpace(nativeSessionID)
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return session.Session{}, fmt.Errorf("begin Session %s runtime ID update: %w", id, err)
+// CompareAndSwapSessionWorker is the single Session lifecycle mutation
+// primitive. A transition succeeds only while status and both worker locators
+// still exactly match the caller's observation. A blank logPath preserves the
+// existing journal address; claims provide the canonical path explicitly.
+func (s *Store) CompareAndSwapSessionWorker(ctx context.Context, id string, before, after session.WorkerState, logPath string) (session.Session, bool, error) {
+	if err := before.Status.Validate(); err != nil {
+		return session.Session{}, false, err
 	}
-	defer tx.Rollback()
-	current, err := scanSession(tx.QueryRowContext(ctx, sessionSelect+" WHERE id = ?", id))
-	if errors.Is(err, sql.ErrNoRows) {
-		return session.Session{}, fmt.Errorf("Session %s: %w", id, ErrNotFound)
+	if err := after.Status.Validate(); err != nil {
+		return session.Session{}, false, err
 	}
-	if err != nil {
-		return session.Session{}, fmt.Errorf("read Session %s before runtime ID update: %w", id, err)
+	if before.PID < 0 || after.PID < 0 {
+		return session.Session{}, false, fmt.Errorf("worker PID must not be negative")
 	}
-	if err := validateRuntimeEvidence(current, acpSessionID, nativeSessionID); err != nil {
-		return session.Session{}, err
+	if strings.TrimSpace(before.Socket) != before.Socket || strings.TrimSpace(after.Socket) != after.Socket {
+		return session.Session{}, false, fmt.Errorf("worker socket must not contain surrounding whitespace")
 	}
-	conversationID := current.ProviderConversationID
-	source := current.ConversationIDSource
-	if conversationID == "" {
-		conversationID = nativeSessionID
-		if conversationID != "" {
-			source = session.ConversationSourceNative
-		} else if acpSessionID != "" {
-			conversationID = acpSessionID
-			source = session.ConversationSourceACP
-		}
+	if strings.TrimSpace(logPath) != logPath {
+		return session.Session{}, false, fmt.Errorf("worker log path must not contain surrounding whitespace")
 	}
 	now := s.now().UTC()
-	result, err := tx.ExecContext(ctx, `UPDATE sessions
-		SET acpx_record_id = COALESCE(NULLIF(?, ''), acpx_record_id),
-			acp_session_id = COALESCE(NULLIF(?, ''), acp_session_id),
-			native_session_id = COALESCE(NULLIF(?, ''), native_session_id),
-			provider_conversation_id = ?, conversation_id_source = ?,
-			updated_at = ?, last_activity_at = ?
-		WHERE id = ?`, acpxRecordID, acpSessionID, nativeSessionID, nullString(conversationID),
-		nullString(string(source)), formatTime(now), formatTime(now), id)
-	if err != nil {
-		return session.Session{}, fmt.Errorf("update Session %s runtime IDs: %w", id, err)
-	}
-	if count, err := result.RowsAffected(); err != nil {
-		return session.Session{}, fmt.Errorf("update Session %s runtime IDs: %w", id, err)
-	} else if count == 0 {
-		return session.Session{}, fmt.Errorf("Session %s: %w", id, ErrNotFound)
-	}
-	if err := tx.Commit(); err != nil {
-		return session.Session{}, fmt.Errorf("commit Session %s runtime ID update: %w", id, err)
-	}
-	return s.GetSession(ctx, id)
-}
-
-func validateRuntimeEvidence(current session.Session, acpSessionID, nativeSessionID string) error {
-	if current.ACPSessionID != "" && acpSessionID != "" && current.ACPSessionID != acpSessionID {
-		return fmt.Errorf("Session %s already uses ACP Session ID %q; refusing replacement with %q", current.ID, current.ACPSessionID, acpSessionID)
-	}
-	if current.NativeSessionID != "" && nativeSessionID != "" && current.NativeSessionID != nativeSessionID {
-		return fmt.Errorf("Session %s already uses native adapter ID %q; refusing replacement with %q", current.ID, current.NativeSessionID, nativeSessionID)
-	}
-	canonical := strings.TrimSpace(current.ProviderConversationID)
-	if canonical == "" {
-		return nil
-	}
-	effectiveACP := firstNonBlank(acpSessionID, current.ACPSessionID)
-	effectiveNative := firstNonBlank(nativeSessionID, current.NativeSessionID)
-	if current.ConversationIDSource == session.ConversationSourceProviderStore && current.ConversationIDVerifiedAt != nil && effectiveNative != "" && effectiveNative != canonical {
-		return fmt.Errorf("Session %s provider-store verified canonical conversation %q; refusing native adapter ID %q", current.ID, canonical, effectiveNative)
-	}
-	if effectiveACP == canonical || effectiveNative == canonical {
-		return nil
-	}
-	return fmt.Errorf("Session %s runtime evidence does not match canonical provider conversation %q (ACP %q, native %q)", current.ID, canonical, effectiveACP, effectiveNative)
-}
-
-func firstNonBlank(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
-}
-
-// UpdateSessionConversation records or verifies the canonical provider
-// conversation identity. A different existing identity is a hard conflict.
-func (s *Store) UpdateSessionConversation(ctx context.Context, id, conversationID string, source session.ConversationIDSource, verifiedAt *time.Time) (session.Session, error) {
-	conversationID = strings.TrimSpace(conversationID)
-	if conversationID == "" {
-		return session.Session{}, fmt.Errorf("canonical provider conversation ID is required")
-	}
-	if err := source.Validate(); err != nil {
-		return session.Session{}, err
-	}
-	if source == session.ConversationSourceProviderStore && verifiedAt == nil {
-		return session.Session{}, fmt.Errorf("provider-store conversation identity requires a verification timestamp")
-	}
-	if source != session.ConversationSourceProviderStore && verifiedAt != nil {
-		return session.Session{}, fmt.Errorf("conversation verification timestamp requires provider-store identity source")
-	}
-	current, err := s.GetSession(ctx, id)
-	if err != nil {
-		return session.Session{}, err
-	}
-	if providerStoreVerifiedSession(current) && source != session.ConversationSourceProviderStore {
-		return session.Session{}, fmt.Errorf("Session %s provider-store verification is immutable and cannot be downgraded to %q", id, source)
-	}
-	now := s.now().UTC()
-	requireCanonicalNative := source == session.ConversationSourceProviderStore && verifiedAt != nil
-	if requireCanonicalNative && current.NativeSessionID != "" && current.NativeSessionID != conversationID {
-		return session.Session{}, fmt.Errorf("Session %s native adapter ID %q does not match provider-store verified canonical conversation %q", id, current.NativeSessionID, conversationID)
-	}
 	result, err := s.db.ExecContext(ctx, `UPDATE sessions
-		SET provider_conversation_id = ?, conversation_id_source = ?, conversation_id_verified_at = ?, updated_at = ?, last_activity_at = ?
-		WHERE id = ? AND (COALESCE(provider_conversation_id, '') = '' OR provider_conversation_id = ?)
-			AND (? = 0 OR COALESCE(native_session_id, '') = '' OR native_session_id = ?)
-			AND (COALESCE(conversation_id_source, '') != ? OR ? = ?)
-			AND (conversation_id_verified_at IS NULL OR ? IS NOT NULL)`,
-		conversationID, string(source), nullTime(verifiedAt), formatTime(now), formatTime(now), id, conversationID,
-		requireCanonicalNative, conversationID,
-		string(session.ConversationSourceProviderStore), string(source), string(session.ConversationSourceProviderStore), nullTime(verifiedAt))
+		SET worker_pid = NULLIF(?, 0), worker_socket = NULLIF(?, ''),
+			log_path = COALESCE(NULLIF(?, ''), log_path), status = ?,
+			updated_at = ?, last_activity_at = ?
+		WHERE id = ? AND status = ?
+			AND COALESCE(worker_pid, 0) = ? AND COALESCE(worker_socket, '') = ?`,
+		after.PID, after.Socket, logPath, string(after.Status), formatTime(now), formatTime(now),
+		id, string(before.Status), before.PID, before.Socket)
 	if err != nil {
-		return session.Session{}, fmt.Errorf("update Session %s provider conversation: %w", id, err)
+		return session.Session{}, false, fmt.Errorf("transition Session %s worker: %w", id, err)
 	}
 	count, err := result.RowsAffected()
 	if err != nil {
-		return session.Session{}, fmt.Errorf("update Session %s provider conversation: %w", id, err)
+		return session.Session{}, false, fmt.Errorf("transition Session %s worker: %w", id, err)
+	}
+	current, err := s.GetSession(ctx, id)
+	if err != nil {
+		return session.Session{}, false, err
+	}
+	return current, count != 0, nil
+}
+
+// UpdateSessionProviderRef records the opaque reference needed to exactly
+// resume the provider conversation. Once present, ProviderRef is immutable.
+// RuntimeRef identifies the current provider Port record and may advance when
+// that same Session is reconnected. Blank values preserve stored values.
+func (s *Store) UpdateSessionProviderRef(ctx context.Context, id, runtimeRef, providerRef string) (session.Session, error) {
+	if strings.TrimSpace(runtimeRef) != runtimeRef {
+		return session.Session{}, fmt.Errorf("Session runtime reference must not contain surrounding whitespace")
+	}
+	now := s.now().UTC()
+	result, err := s.db.ExecContext(ctx, `UPDATE sessions
+		SET acpx_record_id = COALESCE(NULLIF(?, ''), acpx_record_id),
+			acp_session_id = COALESCE(NULLIF(?, ''), acp_session_id),
+			updated_at = ?, last_activity_at = ?
+		WHERE id = ?
+			AND (COALESCE(acp_session_id, '') = '' OR ? = '' OR acp_session_id = ?)`,
+		runtimeRef, providerRef, formatTime(now), formatTime(now), id, providerRef, providerRef)
+	if err != nil {
+		return session.Session{}, fmt.Errorf("update Session %s provider reference: %w", id, err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return session.Session{}, fmt.Errorf("update Session %s provider reference: %w", id, err)
 	}
 	if count == 0 {
 		current, lookupErr := s.GetSession(ctx, id)
 		if lookupErr != nil {
 			return session.Session{}, lookupErr
 		}
-		if current.ProviderConversationID != "" && current.ProviderConversationID != conversationID {
-			return session.Session{}, fmt.Errorf("Session %s already uses canonical provider conversation %q; refusing replacement with %q", id, current.ProviderConversationID, conversationID)
-		}
-		if requireCanonicalNative && current.NativeSessionID != "" && current.NativeSessionID != conversationID {
-			return session.Session{}, fmt.Errorf("Session %s native adapter ID %q does not match provider-store verified canonical conversation %q", id, current.NativeSessionID, conversationID)
-		}
-		return session.Session{}, fmt.Errorf("Session %s provider conversation could not be updated", id)
+		return session.Session{}, fmt.Errorf("Session %s already uses provider reference %q; refusing replacement with %q", id, current.ProviderRef, providerRef)
 	}
 	return s.GetSession(ctx, id)
 }
 
-func providerStoreVerifiedSession(current session.Session) bool {
-	return current.ConversationIDSource == session.ConversationSourceProviderStore && current.ConversationIDVerifiedAt != nil
+// CompareAndSwapSessionProviderRef applies provider identity only for the
+// exact worker owner and status that opened the Port. ProviderRef remains
+// write-once; a stale owner may neither advance RuntimeRef nor replace it.
+func (s *Store) CompareAndSwapSessionProviderRef(ctx context.Context, id string, owner session.WorkerState, runtimeRef, providerRef string) (session.Session, bool, error) {
+	if err := owner.Status.Validate(); err != nil {
+		return session.Session{}, false, err
+	}
+	if owner.PID <= 0 || strings.TrimSpace(owner.Socket) == "" {
+		return session.Session{}, false, fmt.Errorf("owned provider reference update requires worker PID and socket")
+	}
+	if strings.TrimSpace(owner.Socket) != owner.Socket || strings.TrimSpace(runtimeRef) != runtimeRef {
+		return session.Session{}, false, fmt.Errorf("Session worker socket and runtime reference must not contain surrounding whitespace")
+	}
+	now := s.now().UTC()
+	result, err := s.db.ExecContext(ctx, `UPDATE sessions
+		SET acpx_record_id = COALESCE(NULLIF(?, ''), acpx_record_id),
+			acp_session_id = COALESCE(NULLIF(?, ''), acp_session_id),
+			updated_at = ?, last_activity_at = ?
+		WHERE id = ? AND status = ?
+			AND COALESCE(worker_pid, 0) = ? AND COALESCE(worker_socket, '') = ?
+			AND (COALESCE(acp_session_id, '') = '' OR ? = '' OR acp_session_id = ?)`,
+		runtimeRef, providerRef, formatTime(now), formatTime(now), id, string(owner.Status), owner.PID, owner.Socket,
+		providerRef, providerRef)
+	if err != nil {
+		return session.Session{}, false, fmt.Errorf("update owned Session %s provider reference: %w", id, err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return session.Session{}, false, fmt.Errorf("update owned Session %s provider reference: %w", id, err)
+	}
+	current, err := s.GetSession(ctx, id)
+	if err != nil {
+		return session.Session{}, false, err
+	}
+	if count == 0 && current.WorkerState() == owner && providerRef != "" && current.ProviderRef != "" && current.ProviderRef != providerRef {
+		return session.Session{}, false, fmt.Errorf("Session %s already uses provider reference %q; refusing replacement with %q", id, current.ProviderRef, providerRef)
+	}
+	return current, count != 0, nil
 }
 
 func (s *Store) UpdateSessionWorker(ctx context.Context, id string, pid int, socket, logPath string, status session.Status) (session.Session, error) {
@@ -559,8 +507,9 @@ func (s *Store) UpdateSessionWorker(ctx context.Context, id string, pid int, soc
 		return session.Session{}, err
 	}
 	now := s.now().UTC()
-	result, err := s.db.ExecContext(ctx, `UPDATE sessions SET worker_pid = ?, worker_socket = ?, log_path = ?, status = ?, updated_at = ?, last_activity_at = ? WHERE id = ?`,
-		pid, socket, logPath, string(status), formatTime(now), formatTime(now), id)
+	result, err := s.db.ExecContext(ctx, `UPDATE sessions
+		SET worker_pid = ?, worker_socket = ?, log_path = ?, status = ?, updated_at = ?, last_activity_at = ?
+		WHERE id = ?`, pid, socket, logPath, string(status), formatTime(now), formatTime(now), id)
 	if err != nil {
 		return session.Session{}, fmt.Errorf("update Session %s worker: %w", id, err)
 	}
@@ -577,8 +526,9 @@ func (s *Store) ClearSessionWorker(ctx context.Context, id string, status sessio
 		return session.Session{}, err
 	}
 	now := s.now().UTC()
-	result, err := s.db.ExecContext(ctx, `UPDATE sessions SET worker_pid = NULL, worker_socket = NULL, status = ?, updated_at = ?, last_activity_at = ? WHERE id = ?`,
-		string(status), formatTime(now), formatTime(now), id)
+	result, err := s.db.ExecContext(ctx, `UPDATE sessions
+		SET worker_pid = NULL, worker_socket = NULL, status = ?, updated_at = ?, last_activity_at = ?
+		WHERE id = ?`, string(status), formatTime(now), formatTime(now), id)
 	if err != nil {
 		return session.Session{}, fmt.Errorf("clear Session %s worker: %w", id, err)
 	}
@@ -590,13 +540,35 @@ func (s *Store) ClearSessionWorker(ctx context.Context, id string, status sessio
 	return s.GetSession(ctx, id)
 }
 
-const sessionSelect = `SELECT id, task_id, role, agent, provider, repo_path, worktree_path, branch,
-	acpx_record_id, acp_session_id, native_session_id, provider_conversation_id, conversation_id_source, conversation_id_verified_at,
-	status, worker_pid, worker_socket, log_path, metadata_json,
+const taskSelect = `SELECT id, title, description, status, external_ref, metadata_json, created_at, updated_at FROM tasks`
+
+// Old schemas retain native/provider-history columns for migration
+// compatibility. The application intentionally selects only the two opaque
+// references used by the Session Channel.
+const sessionSelect = `SELECT id, task_id, parent_session_id, role, agent, provider, repo_path, worktree_path, branch,
+	acpx_record_id, acp_session_id, status, worker_pid, worker_socket, log_path, metadata_json,
 	created_at, updated_at, last_activity_at FROM sessions`
 
 type scanner interface {
 	Scan(...any) error
+}
+
+type sqlExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func insertSession(ctx context.Context, executor sqlExecer, value session.Session) error {
+	_, err := executor.ExecContext(ctx, `INSERT INTO sessions
+		(id, task_id, parent_session_id, role, agent, provider, repo_path, worktree_path, branch,
+		 acpx_record_id, acp_session_id, status, worker_pid, worker_socket, log_path, metadata_json,
+		 created_at, updated_at, last_activity_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+		value.ID, value.TaskID, nullString(value.ParentSessionID), nullString(value.Role), value.Agent,
+		nullString(value.Provider), nullString(value.RepoPath), nullString(value.WorktreePath), nullString(value.Branch),
+		nullString(value.RuntimeRef), nullString(value.ProviderRef), string(value.Status), nullInt(value.WorkerPID),
+		nullString(value.WorkerSocket), nullString(value.LogPath), nullJSON(value.MetadataJSON),
+		formatTime(value.CreatedAt), formatTime(value.UpdatedAt))
+	return err
 }
 
 func scanTask(row scanner) (task.Task, error) {
@@ -623,19 +595,27 @@ func scanTask(row scanner) (task.Task, error) {
 
 func scanSession(row scanner) (session.Session, error) {
 	var result session.Session
-	var role, provider, repoPath, worktreePath, branch, acpxRecordID, acpID, nativeID, conversationID, conversationSource, conversationVerifiedAt, socket, logPath, metadata, lastActivity sql.NullString
+	var parentSessionID, role, provider, repoPath, worktreePath, branch sql.NullString
+	var runtimeRef, providerRef, socket, logPath, metadata, lastActivity sql.NullString
 	var workerPID sql.NullInt64
 	var status, createdAt, updatedAt string
-	if err := row.Scan(&result.ID, &result.TaskID, &role, &result.Agent, &provider, &repoPath, &worktreePath, &branch,
-		&acpxRecordID, &acpID, &nativeID, &conversationID, &conversationSource, &conversationVerifiedAt,
-		&status, &workerPID, &socket, &logPath, &metadata, &createdAt, &updatedAt, &lastActivity); err != nil {
+	if err := row.Scan(&result.ID, &result.TaskID, &parentSessionID, &role, &result.Agent, &provider,
+		&repoPath, &worktreePath, &branch, &runtimeRef, &providerRef, &status, &workerPID,
+		&socket, &logPath, &metadata, &createdAt, &updatedAt, &lastActivity); err != nil {
 		return session.Session{}, err
 	}
-	result.Role, result.Provider, result.RepoPath, result.WorktreePath, result.Branch = role.String, provider.String, repoPath.String, worktreePath.String, branch.String
-	result.ACPXRecordID, result.ACPSessionID, result.NativeSessionID, result.WorkerSocket, result.LogPath = acpxRecordID.String, acpID.String, nativeID.String, socket.String, logPath.String
-	result.ProviderConversationID = conversationID.String
-	result.ConversationIDSource = session.ConversationIDSource(conversationSource.String)
-	result.Status, result.WorkerPID = session.Status(status), int(workerPID.Int64)
+	result.ParentSessionID = parentSessionID.String
+	result.Role = role.String
+	result.Provider = provider.String
+	result.RepoPath = repoPath.String
+	result.WorktreePath = worktreePath.String
+	result.Branch = branch.String
+	result.RuntimeRef = runtimeRef.String
+	result.ProviderRef = providerRef.String
+	result.Status = session.Status(status)
+	result.WorkerPID = int(workerPID.Int64)
+	result.WorkerSocket = socket.String
+	result.LogPath = logPath.String
 	if metadata.Valid {
 		result.MetadataJSON = json.RawMessage(metadata.String)
 	}
@@ -653,17 +633,12 @@ func scanSession(row scanner) (session.Session, error) {
 		}
 		result.LastActivityAt = &parsed
 	}
-	if conversationVerifiedAt.Valid {
-		parsed, err := parseTime(conversationVerifiedAt.String)
-		if err != nil {
-			return session.Session{}, err
-		}
-		result.ConversationIDVerifiedAt = &parsed
-	}
 	return result, nil
 }
 
-func formatTime(value time.Time) string { return value.UTC().Format(time.RFC3339Nano) }
+func formatTime(value time.Time) string {
+	return value.UTC().Format(time.RFC3339Nano)
+}
 
 func parseTime(value string) (time.Time, error) {
 	parsed, err := time.Parse(time.RFC3339Nano, value)
@@ -692,35 +667,6 @@ func nullInt(value int) any {
 		return nil
 	}
 	return value
-}
-
-func nullTime(value *time.Time) any {
-	if value == nil {
-		return nil
-	}
-	return formatTime(*value)
-}
-
-func cloneTime(value *time.Time) *time.Time {
-	if value == nil {
-		return nil
-	}
-	cloned := value.UTC()
-	return &cloned
-}
-
-func initializeConversationIdentity(params session.CreateParams) session.CreateParams {
-	if strings.TrimSpace(params.ProviderConversationID) != "" {
-		return params
-	}
-	if value := strings.TrimSpace(params.NativeSessionID); value != "" {
-		params.ProviderConversationID = value
-		params.ConversationIDSource = session.ConversationSourceNative
-	} else if value := strings.TrimSpace(params.ACPSessionID); value != "" {
-		params.ProviderConversationID = value
-		params.ConversationIDSource = session.ConversationSourceACP
-	}
-	return params
 }
 
 func cloneJSON(value json.RawMessage) json.RawMessage {

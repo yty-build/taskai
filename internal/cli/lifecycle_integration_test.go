@@ -1,9 +1,7 @@
 package cli
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -16,7 +14,7 @@ import (
 	"github.com/yty-build/acp-gateway/internal/worker"
 )
 
-func TestSessionLifecycleThroughBuiltCLIAndDetachedWorker(t *testing.T) {
+func TestSessionChannelLifecycleThroughBuiltCLIAndDetachedWorker(t *testing.T) {
 	root, err := os.MkdirTemp("/tmp", "atc-cli-lifecycle-")
 	if err != nil {
 		t.Fatal(err)
@@ -53,203 +51,108 @@ func TestSessionLifecycleThroughBuiltCLIAndDetachedWorker(t *testing.T) {
 		t.Fatalf("task new output = %q", output)
 	}
 	taskID := fields[1]
-	nativeFixture, err := filepath.Abs(filepath.Join("..", "native", "testdata", "fake-native"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	nativeRecord := filepath.Join(root, "native-record")
-	codexHome := filepath.Join(root, "codex-home")
-	profile := fmt.Sprintf("name: codex\nprovider: openai\ncommand: %q\nenvironment:\n  CODEX_HOME: %q\n  FAKE_NATIVE_RECORD: %q\n  FAKE_NATIVE_MARKER: lifecycle\n", nativeFixture, codexHome, nativeRecord)
+	profile := "name: codex\nprovider: openai\ncommand: codex\n"
 	if err := os.WriteFile(filepath.Join(root, "agents", "codex.yaml"), []byte(profile), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	code, output, stderr = runBinary(root, binary, "session", "start", taskID, "--agent", "codex", "--repo", repo, "--role", "researcher", "--prompt", "Check one hour", "--approve-all")
+	code, output, stderr = runBinary(root, binary, "session", "start", taskID, "--agent", "codex", "--repo", repo, "--role", "researcher", "--approve-all")
 	if code != 0 || stderr != "" {
 		t.Fatalf("session start: code=%d output=%q stderr=%q", code, output, stderr)
 	}
 	fields = strings.Fields(output)
-	if len(fields) < 2 || fields[0] != "Started" {
+	if len(fields) != 3 || fields[0] != "Connected" || fields[2] != "(starting)" {
 		t.Fatalf("session start output = %q", output)
 	}
 	sessionID := fields[1]
 	sessionsToStop = append(sessionsToStop, sessionID)
 
 	var detail string
-	waitForCLI(t, 4*time.Second, func() bool {
+	waitForCLI(t, 5*time.Second, func() bool {
 		code, detail, _ = runBinary(root, binary, "session", sessionID)
-		return code == 0 && strings.Contains(detail, "Status: waiting") && strings.Contains(detail, "ACP Session ID: acp-reconnected")
+		return code == 0 && strings.Contains(detail, "Status: waiting") && strings.Contains(detail, `Provider reference: "acp-reconnected"`)
 	})
-	for _, expected := range []string{"Task: " + taskID, "Role: researcher", "Permission: approve-all", "acpx record ID: acpx-record", "Canonical provider conversation: native-reconnected", "Native adapter ID: native-reconnected", "Worker PID:"} {
+	for _, expected := range []string{
+		"Task: " + taskID, "Role: researcher", "Permission: approve-all", `Provider reference: "acp-reconnected"`, "Worker PID:",
+	} {
 		if !strings.Contains(detail, expected) {
 			t.Errorf("Session detail does not contain %q:\n%s", expected, detail)
 		}
 	}
-	workerClient := worker.NewSocketClient(filepath.Join(root, "workers", sessionID+".sock"))
-	waitForCLI(t, 4*time.Second, func() bool {
-		status, statusErr := workerClient.Send(context.Background(), worker.Command{Type: "status"})
-		return statusErr == nil && status.ActiveRequestID == "" && status.Queued == 0 && status.Status == "waiting"
-	})
-
-	conversationPath := filepath.Join(codexHome, "sessions", "2026", "08", "15", "rollout-native-reconnected.jsonl")
-	if err := os.MkdirAll(filepath.Dir(conversationPath), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	conversation := fmt.Sprintf("{\"type\":\"session_meta\",\"payload\":{\"id\":\"native-reconnected\",\"cwd\":%q}}\n", canonicalRepo)
-	if err := os.WriteFile(conversationPath, []byte(conversation), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	code, output, stderr = runBinary(root, binary, "session", "attach", sessionID)
-	if code != 0 || !strings.Contains(output, "fake native attached") || !strings.Contains(stderr, "provider transcript reload requested") {
-		t.Fatalf("native attach: code=%d output=%q stderr=%q", code, output, stderr)
-	}
-	nativeInvocation, err := os.ReadFile(nativeRecord)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, expected := range []string{"cwd=" + canonicalRepo, "arg=resume", "arg=native-reconnected", "marker=lifecycle"} {
-		if !strings.Contains(string(nativeInvocation), expected+"\n") {
-			t.Errorf("native invocation missing %q:\n%s", expected, nativeInvocation)
+	for _, obsolete := range []string{"Canonical provider conversation", "Native adapter ID", "Identity source"} {
+		if strings.Contains(detail, obsolete) {
+			t.Errorf("Session detail contains obsolete %q:\n%s", obsolete, detail)
 		}
 	}
-	code, output, stderr = runBinary(root, binary, "session", "logs", sessionID)
-	if code != 0 || stderr != "" || !strings.Contains(output, "provider_transcript_reconciled") {
-		t.Fatalf("provider transcript history: code=%d output=%q stderr=%q", code, output, stderr)
+
+	workerClient := worker.NewSocketClient(filepath.Join(root, "workers", sessionID+".sock"))
+	waitForCLI(t, 5*time.Second, func() bool {
+		status, statusErr := workerClient.Send(context.Background(), worker.Command{Type: "status"})
+		return statusErr == nil && status.ActiveRequestID == "" && status.Status == "waiting"
+	})
+
+	code, output, stderr = runBinary(root, binary, "session", "prompt", sessionID, "Check one hour")
+	if code != 0 || stderr != "" || !strings.Contains(output, "Accepted REQ-") {
+		t.Fatalf("initial explicit prompt: code=%d output=%q stderr=%q", code, output, stderr)
 	}
+	waitForCLI(t, 5*time.Second, func() bool {
+		status, statusErr := workerClient.Send(context.Background(), worker.Command{Type: "status"})
+		return statusErr == nil && status.ActiveRequestID == "" && status.Status == "waiting"
+	})
 
 	argsLog, err := os.ReadFile(filepath.Join(root, "acpx-args.log"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{"Task " + taskID + ": Investigate BTC edge", "Description: Compare horizons", "Role: researcher", "Repository: " + canonicalRepo, "Check one hour"} {
-		if !strings.Contains(string(argsLog), expected) {
-			t.Errorf("acpx argv log does not contain %q", expected)
+	if !strings.Contains(string(argsLog), "Check one hour") {
+		t.Fatalf("provider prompt did not contain the requested instructions:\n%s", argsLog)
+	}
+	for _, injected := range []string{"Task " + taskID, "Description: Compare horizons", "Role: researcher", "Repository: " + canonicalRepo} {
+		if strings.Contains(string(argsLog), injected) {
+			t.Errorf("provider prompt contains gateway-injected %q:\n%s", injected, argsLog)
 		}
 	}
 
-	followContext, stopFollowing := context.WithCancel(context.Background())
-	followCommand := exec.CommandContext(followContext, binary, "session", "logs", sessionID, "--follow")
-	followCommand.Env = binaryEnvironment(root)
-	followStdout, err := followCommand.StdoutPipe()
-	if err != nil {
-		t.Fatal(err)
+	waitForCLI(t, 5*time.Second, func() bool {
+		code, output, _ = runBinary(root, binary, "session", "logs", sessionID, "--raw")
+		return code == 0 && strings.Contains(output, `"type":"client_command"`) &&
+			strings.Contains(output, `"type":"provider_event"`) && strings.Contains(output, `"type":"provider_result"`)
+	})
+	if !strings.Contains(output, `"text":"ok"`) {
+		t.Fatalf("initial channel replay did not contain streamed provider output: %s", output)
 	}
-	if err := followCommand.Start(); err != nil {
-		t.Fatal(err)
-	}
-	followLines := make(chan string, 100)
-	go func() {
-		scanner := bufio.NewScanner(followStdout)
-		for scanner.Scan() {
-			followLines <- scanner.Text()
-		}
-	}()
-	waitForCLI(t, 2*time.Second, func() bool { return len(followLines) > 0 })
 
 	code, output, stderr = runBinary(root, binary, "session", "prompt", sessionID, "Follow up")
-	if code != 0 || stderr != "" || !strings.Contains(output, "Accepted REQ-") {
+	if code != 0 || stderr != "" || !strings.Contains(output, "Accepted REQ-") || strings.Contains(strings.ToLower(output), "queued") {
 		t.Fatalf("session prompt: code=%d output=%q stderr=%q", code, output, stderr)
 	}
-	waitForCLI(t, 4*time.Second, func() bool {
-		code, output, _ = runBinary(root, binary, "session", "logs", sessionID)
-		return code == 0 && strings.Contains(output, "turn completed") && strings.Contains(output, "ok")
+	waitForCLI(t, 5*time.Second, func() bool {
+		code, output, _ = runBinary(root, binary, "session", "logs", sessionID, "--raw")
+		return code == 0 && strings.Count(output, `"type":"provider_result"`) >= 2
 	})
-	waitForCLI(t, 2*time.Second, func() bool {
-		for len(followLines) > 0 {
-			if strings.Contains(<-followLines, "ok") {
-				return true
-			}
-		}
-		return false
-	})
-	stopFollowing()
-	_ = followCommand.Wait()
-	if !strings.Contains(output, "ok") {
-		t.Fatalf("normalized logs do not contain agent output: %s", output)
-	}
 
-	code, rawOutput, stderr := runBinary(root, binary, "session", "logs", sessionID, "--raw", "--from", "0")
-	if code != 0 || stderr != "" {
-		t.Fatalf("raw logs: code=%d stderr=%q", code, stderr)
-	}
-	var rawLines int
-	for _, line := range strings.Split(strings.TrimSpace(rawOutput), "\n") {
-		if !json.Valid([]byte(line)) {
-			t.Fatalf("invalid raw JSONL output: %q", line)
-		}
-		rawLines++
-	}
-	if rawLines < 8 || !strings.Contains(rawOutput, `"request_id":"REQ-`) {
-		t.Fatalf("raw logs missing correlated history (%d lines): %s", rawLines, rawOutput)
-	}
-
-	code, output, stderr = runBinary(root, binary, "task", "logs", taskID)
-	if code != 0 || stderr != "" || !strings.Contains(output, sessionID) || !strings.Contains(output, "turn completed") {
-		t.Fatalf("task logs: code=%d output=%q stderr=%q", code, output, stderr)
+	code, taskOutput, stderr := runBinary(root, binary, "task", "logs", taskID, "--raw")
+	if code != 0 || stderr != "" || !strings.Contains(taskOutput, sessionID) || !strings.Contains(taskOutput, `"type":"provider_result"`) {
+		t.Fatalf("task logs: code=%d output=%q stderr=%q", code, taskOutput, stderr)
 	}
 
 	code, output, stderr = runBinary(root, binary, "session", "stop", sessionID)
 	if code != 0 || stderr != "" || output != "Stopped "+sessionID+"\n" {
 		t.Fatalf("session stop: code=%d output=%q stderr=%q", code, output, stderr)
 	}
-	code, fallback, stderr := runBinary(root, binary, "session", "logs", sessionID, "--raw")
-	if code != 0 || stderr != "" || !strings.HasPrefix(fallback, rawOutput) || !strings.Contains(fallback, `"type":"worker_stopping"`) {
-		t.Fatalf("stopped JSONL fallback is incomplete: code=%d stderr=%q\nprior=%q\ngot=%q", code, stderr, rawOutput, fallback)
-	}
-
-	code, output, stderr = runBinary(root, binary, "session", "review", sessionID, "--agent", "claude")
-	if code != 0 || stderr != "" {
-		t.Fatalf("session review: code=%d output=%q stderr=%q", code, output, stderr)
-	}
-	fields = strings.Fields(output)
-	if len(fields) < 6 || fields[0] != "Started" || fields[1] != "reviewer" || fields[3] != "for" || fields[4] != sessionID {
-		t.Fatalf("review output = %q", output)
-	}
-	reviewerID := fields[2]
-	sessionsToStop = append(sessionsToStop, reviewerID)
-	reviewerWorker := worker.NewSocketClient(filepath.Join(root, "workers", reviewerID+".sock"))
-	waitForCLI(t, 4*time.Second, func() bool {
-		code, detail, _ = runBinary(root, binary, "session", reviewerID)
-		status, statusErr := reviewerWorker.Send(context.Background(), worker.Command{Type: "status"})
-		return code == 0 && strings.Contains(detail, "Role: reviewer") && strings.Contains(detail, "Status: waiting") &&
-			statusErr == nil && status.ActiveRequestID == "" && status.Queued == 0
+	waitForCLI(t, 5*time.Second, func() bool {
+		code, output, _ = runBinary(root, binary, "session", "logs", sessionID, "--raw")
+		return code == 0 && strings.Contains(output, `"type":"connection"`) && strings.Contains(output, `"state":"stopped"`)
 	})
-	if !strings.Contains(detail, "Task: "+taskID) || !strings.Contains(detail, "Repo: "+canonicalRepo) {
-		t.Fatalf("reviewer detail = %q", detail)
-	}
-	argsLog, err = os.ReadFile(filepath.Join(root, "acpx-args.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, expected := range []string{
-		"Producer Session ID: " + sessionID, "Producer JSONL log (read-only evidence): " + filepath.Join(root, "logs", sessionID+".jsonl"),
-		"independent, skeptical review", "ignored test failures", "selective tests presented as complete tests", "security regressions",
-	} {
-		if !strings.Contains(string(argsLog), expected) {
-			t.Errorf("review prompt argv missing %q", expected)
-		}
-	}
-	code, output, stderr = runBinary(root, binary, "task", taskID)
-	if code != 0 || stderr != "" || !strings.Contains(output, reviewerID) || !strings.Contains(output, "reviewer") {
-		t.Fatalf("Task reviewer aggregate: code=%d output=%q stderr=%q", code, output, stderr)
-	}
-	code, _, stderr = runBinary(root, binary, "session", "stop", reviewerID)
-	if code != 0 || stderr != "" {
-		t.Fatalf("stop reviewer: code=%d stderr=%q", code, stderr)
-	}
 
 	code, output, stderr = runBinary(root, binary, "session", "resume", sessionID)
 	if code != 0 || stderr != "" || output != "Resumed "+sessionID+"\n" {
 		t.Fatalf("session resume: code=%d output=%q stderr=%q", code, output, stderr)
 	}
-	argsLog, err = os.ReadFile(filepath.Join(root, "acpx-args.log"))
-	if err != nil || !strings.Contains(string(argsLog), "--resume-session\nacp-reconnected") {
-		t.Fatalf("resume did not target prior ACP Session: err=%v\n%s", err, argsLog)
-	}
-	code, _, stderr = runBinary(root, binary, "session", "stop", sessionID)
-	if code != 0 || stderr != "" {
-		t.Fatalf("final stop: code=%d stderr=%q", code, stderr)
-	}
+	waitForCLI(t, 5*time.Second, func() bool {
+		argsLog, err = os.ReadFile(filepath.Join(root, "acpx-args.log"))
+		return err == nil && strings.Contains(string(argsLog), "--resume-session\nacp-reconnected")
+	})
 }
 
 func runBinary(root, binary string, args ...string) (int, string, string) {

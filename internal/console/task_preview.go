@@ -10,9 +10,6 @@ import (
 )
 
 const (
-	taskPreviewProvider = "provider"
-	taskPreviewLive     = "live"
-
 	taskPreviewRequestLimit = 32
 	taskPreviewBlockLimit   = 64
 	taskPreviewEntryLimit   = 192
@@ -20,36 +17,50 @@ const (
 )
 
 type taskPreviewEntry struct {
-	kind       string
-	label      string
-	text       string
-	provenance string
+	kind  string
+	label string
+	text  string
 }
 
 func (m Model) renderCompactTaskPreview(current session.Session, width, height int) []string {
-	capability := nativeCapability(current)
-	nativeLine := "Enter " + capability.label
-	if !capability.available {
-		nativeLine = "Native unavailable"
-	}
 	content := []string{
 		fitLine(m.sessionAttention(current), width),
-		fitWithRight(taskCheckoutLabel(current), taskContinuationReadiness(capability), width),
-		fitLine(nativeLine+" · a Structured view", width),
+		fitWithRight(taskCheckoutLabel(current), taskChannelReadiness(current), width),
+		fitLine("Enter Open · p Message", width),
 	}
+	content = append(m.taskReplayWindowLines(current.ID, width), content...)
+	content = append(m.taskProjectionClipLines(current.ID, width), content...)
 	return padLines(content, height, width)
 }
 
 func (m Model) renderTaskPreviewOverview(current session.Session, width int) []string {
-	capability := nativeCapability(current)
-	action := "Enter " + capability.label + " · a Structured view · p Message"
-	if !capability.available {
-		action = "Native unavailable · a Structured view · p Message"
+	content := []string{
+		fitLine(m.sessionAttention(current), width),
+		fitWithRight(taskCheckoutLabel(current), taskChannelReadiness(current), width),
+		fitLine("Enter Open Session · p Message", width),
+	}
+	content = append(m.taskReplayWindowLines(current.ID, width), content...)
+	return append(m.taskProjectionClipLines(current.ID, width), content...)
+}
+
+func (m Model) taskProjectionClipLines(sessionID string, width int) []string {
+	if !m.projectionClipped[sessionID] {
+		return nil
+	}
+	if m.projectionOverflow[sessionID] {
+		return []string{fitLine("Projection limit · attach this exact Session directly", width)}
+	}
+	return []string{fitLine("Projection clipped · open raw channel frames or on-disk JSONL", width)}
+}
+
+func (m Model) taskReplayWindowLines(sessionID string, width int) []string {
+	window, clipped := m.effectiveReplayWindow(sessionID)
+	if !clipped {
+		return nil
 	}
 	return []string{
-		fitLine(m.sessionAttention(current), width),
-		fitWithRight(taskCheckoutLabel(current), taskContinuationReadiness(capability), width),
-		fitLine(action, width),
+		fitLine(fmt.Sprintf("Replay clipped · earliest_sequence=%d", window.EarliestSequence), width),
+		fitLine(fmt.Sprintf("Replay cursor=%d · raw JSONL is authoritative", window.Cursor), width),
 	}
 }
 
@@ -83,13 +94,13 @@ func taskPreviewEntries(projection *transcript, agent string) []taskPreviewEntry
 		return nil
 	}
 	var entries []taskPreviewEntry
-	appendEntry := func(kind, label, text, provenance string) {
+	appendEntry := func(kind, label, text string) {
 		text, _ = truncateUTF8(text, taskPreviewTextLimit)
 		text = strings.TrimSpace(safeText(text))
 		if text == "" {
 			return
 		}
-		entries = append(entries, taskPreviewEntry{kind: kind, label: label, text: text, provenance: provenance})
+		entries = append(entries, taskPreviewEntry{kind: kind, label: label, text: text})
 	}
 	requests := projection.requests
 	if len(requests) > taskPreviewRequestLimit {
@@ -106,36 +117,30 @@ func taskPreviewEntries(projection *transcript, agent string) []taskPreviewEntry
 			}
 		}
 		for _, block := range blocks {
-			provenance := taskPreviewProvenance(block.source)
 			switch block.kind {
 			case blockUser:
-				if request.committed {
-					provenance = taskPreviewProvider
-				}
-				appendEntry("user", "You", block.text, provenance)
+				appendEntry("user", "You", block.text)
 			case blockThought:
-				appendEntry("reasoning", "Reasoning", block.text, provenance)
+				appendEntry("reasoning", "Reasoning", block.text)
 			case blockAssistant:
-				appendEntry("assistant", agent, block.text, provenance)
+				appendEntry("assistant", agent, block.text)
 			case blockTool:
 				if block.tool == nil {
 					continue
 				}
-				appendEntry("tool", "Tool · "+toolDisplayTitle(block.tool), taskPreviewToolSummary(block.tool), provenance)
-			case blockPlan:
-				appendEntry("plan", "Plan", taskPreviewPlanSummary(block.plan), provenance)
+				appendEntry("tool", "Tool · "+toolDisplayTitle(block.tool), taskPreviewToolSummary(block.tool))
 			case blockPermission:
 				if block.permission == nil {
 					continue
 				}
 				state := valueOr(block.permission.state, "pending")
-				appendEntry("approval", "Approval", valueOr(block.permission.title, "Tool permission")+" · "+state, provenance)
+				appendEntry("approval", "Approval", valueOr(block.permission.title, "Tool permission")+" · "+state)
 			case blockError:
-				appendEntry("error", "Error", block.text, provenance)
+				appendEntry("error", "Error", block.text)
 			}
 		}
 		if text := taskPreviewStateText(request.state); text != "" {
-			appendEntry("status", "Status", text, taskPreviewRequestProvenance(request))
+			appendEntry("status", "Status", text)
 		}
 		if len(entries) > taskPreviewEntryLimit {
 			entries = append([]taskPreviewEntry(nil), entries[len(entries)-taskPreviewEntryLimit:]...)
@@ -154,14 +159,6 @@ func selectTaskPreviewEntries(entries []taskPreviewEntry, limit int) []taskPrevi
 	selected := make(map[int]struct{}, limit)
 	for _, kind := range []string{"user", "reasoning", "tool", "assistant", "status"} {
 		if index := latestTaskPreviewEntry(entries, func(entry taskPreviewEntry) bool { return entry.kind == kind }); index >= 0 {
-			selected[index] = struct{}{}
-		}
-	}
-	for _, provenance := range []string{taskPreviewProvider, taskPreviewLive} {
-		if len(selected) >= limit {
-			break
-		}
-		if index := latestTaskPreviewEntry(entries, func(entry taskPreviewEntry) bool { return entry.provenance == provenance }); index >= 0 {
 			selected[index] = struct{}{}
 		}
 	}
@@ -213,21 +210,14 @@ func taskPreviewEntryHeading(entry taskPreviewEntry) string {
 }
 
 func taskProviderName(current session.Session) string {
-	label := nativeCapability(current).label
-	if provider := strings.TrimSpace(strings.TrimSuffix(label, " CLI")); provider != "" && provider != "Native" {
-		return provider
-	}
 	return providerDisplayName(strings.ToLower(strings.TrimSpace(current.Agent)))
 }
 
-func taskContinuationReadiness(capability nativeCLICapability) string {
-	if !capability.available {
-		return "Native unavailable"
+func taskChannelReadiness(current session.Session) string {
+	if strings.TrimSpace(current.WorkerSocket) == "" {
+		return "Channel stopped"
 	}
-	if strings.HasPrefix(capability.status, "identity verified") {
-		return "Exact conversation verified"
-	}
-	return "Conversation linked · verified on open"
+	return "Channel connected"
 }
 
 func taskCheckoutLabel(current session.Session) string {
@@ -255,7 +245,7 @@ func taskPreviewStateGlyph(text string) string {
 		return "×"
 	case "Provider turn incomplete":
 		return "◇"
-	case "Message queued", "Cancellation requested":
+	case "Cancellation requested":
 		return "○"
 	default:
 		return "●"
@@ -264,29 +254,6 @@ func taskPreviewStateGlyph(text string) string {
 
 func taskPreviewSnippet(value string) string {
 	return strings.Join(strings.Fields(safeText(value)), " ")
-}
-
-func taskPreviewProvenance(source string) string {
-	if source == "provider" {
-		return taskPreviewProvider
-	}
-	return taskPreviewLive
-}
-
-func taskPreviewRequestProvenance(request *transcriptRequest) string {
-	if len(request.blocks) > 0 && request.blocks[0].source == "provider" {
-		return taskPreviewProvider
-	}
-	blocks := request.blocks
-	if len(blocks) > taskPreviewBlockLimit {
-		blocks = blocks[len(blocks)-taskPreviewBlockLimit:]
-	}
-	for _, block := range blocks {
-		if block.source == "provider" {
-			return taskPreviewProvider
-		}
-	}
-	return taskPreviewLive
 }
 
 func taskPreviewToolSummary(tool *toolCard) string {
@@ -311,20 +278,10 @@ func taskPreviewToolSummary(tool *toolCard) string {
 	return strings.Join(parts, " · ")
 }
 
-func taskPreviewPlanSummary(entries []planEntry) string {
-	if len(entries) == 0 {
-		return ""
-	}
-	latest := entries[len(entries)-1]
-	return valueOr(latest.content, "Plan updated") + statusSuffix(latest.status)
-}
-
 func taskPreviewStateText(state turnState) string {
 	switch state {
 	case turnReady:
 		return "Message accepted"
-	case turnQueued:
-		return "Message queued"
 	case turnLive:
 		return "Agent is working"
 	case turnCancelling:

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/yty-build/acp-gateway/internal/agents"
+	gitrepo "github.com/yty-build/acp-gateway/internal/git"
 )
 
 //go:embed runtime_bridge.mjs
@@ -27,8 +28,11 @@ var runtimeBridgeSource []byte
 const (
 	runtimeBridgeStartupTimeout = 15 * time.Second
 	maxBridgeCommandFrame       = 4 << 20
-	bridgeMessageQueue          = 4096
-	maxBridgeStderrBytes        = 16 << 10
+	maxRuntimeRefBytes          = 512
+	// The Node stdout pipe provides backpressure. Keep only a small decoded
+	// burst per command and block the reader when its consumer falls behind.
+	bridgeMessageQueue   = 4
+	maxBridgeStderrBytes = 16 << 10
 )
 
 type runtimeBridge struct {
@@ -38,12 +42,17 @@ type runtimeBridge struct {
 
 	writeMu sync.Mutex
 	mu      sync.Mutex
-	pending map[string]chan bridgeMessage
+	pending map[string]*bridgePending
 	closed  chan struct{}
 	exited  chan struct{}
 	err     error
 	stderr  string
 	nextID  atomic.Uint64
+}
+
+type bridgePending struct {
+	messages chan bridgeMessage
+	done     chan struct{}
 }
 
 type bridgeMessage struct {
@@ -96,8 +105,9 @@ type bridgeCommand struct {
 }
 
 type bridgeSession struct {
-	Handle bridgeHandle `json:"handle"`
-	Status bridgeStatus `json:"status"`
+	Handle          bridgeHandle          `json:"handle"`
+	Status          bridgeStatus          `json:"status"`
+	ProviderOptions ProviderOptionCatalog `json:"providerOptions"`
 }
 
 type bridgeHandle struct {
@@ -105,7 +115,6 @@ type bridgeHandle struct {
 	RuntimeSessionName string `json:"runtimeSessionName"`
 	ACPXRecordID       string `json:"acpxRecordId"`
 	BackendSessionID   string `json:"backendSessionId"`
-	AgentSessionID     string `json:"agentSessionId"`
 	CWD                string `json:"cwd"`
 }
 
@@ -113,7 +122,6 @@ type bridgeStatus struct {
 	Summary          string `json:"summary"`
 	ACPXRecordID     string `json:"acpxRecordId"`
 	BackendSessionID string `json:"backendSessionId"`
-	AgentSessionID   string `json:"agentSessionId"`
 }
 
 func startRuntimeBridge(ctx context.Context, binary, stateDirectory string) (*runtimeBridge, error) {
@@ -180,7 +188,7 @@ func startRuntimeBridge(ctx context.Context, binary, stateDirectory string) (*ru
 	_ = controlRead.Close()
 	bridge := &runtimeBridge{
 		command: command, stdin: controlWrite, promptInput: promptInput,
-		pending: make(map[string]chan bridgeMessage), closed: make(chan struct{}), exited: make(chan struct{}),
+		pending: make(map[string]*bridgePending), closed: make(chan struct{}), exited: make(chan struct{}),
 	}
 	ready := make(chan error, 1)
 	go bridge.read(stdout, ready)
@@ -301,17 +309,16 @@ func (b *runtimeBridge) read(reader io.Reader, ready chan<- error) {
 			continue
 		}
 		b.mu.Lock()
-		channel := b.pending[message.CommandID]
+		pending := b.pending[message.CommandID]
 		b.mu.Unlock()
-		if channel == nil {
+		if pending == nil {
 			continue
 		}
 		select {
-		case channel <- message:
+		case pending.messages <- message:
+		case <-pending.done:
+			continue
 		case <-b.closed:
-			return
-		default:
-			b.fail(fmt.Errorf("acpx runtime bridge consumer overflow for command %s", message.CommandID))
 			return
 		}
 	}
@@ -383,7 +390,7 @@ func (b *runtimeBridge) start(command bridgeCommand) (<-chan bridgeMessage, func
 	if len(encoded) > maxBridgeCommandFrame {
 		return nil, nil, fmt.Errorf("acpx runtime bridge command exceeds %d bytes", maxBridgeCommandFrame)
 	}
-	channel := make(chan bridgeMessage, bridgeMessageQueue)
+	pending := &bridgePending{messages: make(chan bridgeMessage, bridgeMessageQueue), done: make(chan struct{})}
 	b.mu.Lock()
 	select {
 	case <-b.closed:
@@ -392,7 +399,7 @@ func (b *runtimeBridge) start(command bridgeCommand) (<-chan bridgeMessage, func
 		return nil, nil, fmt.Errorf("acpx runtime bridge is closed: %w", err)
 	default:
 	}
-	b.pending[command.CommandID] = channel
+	b.pending[command.CommandID] = pending
 	b.mu.Unlock()
 	b.writeMu.Lock()
 	_, err = b.stdin.Write(append(encoded, '\n'))
@@ -402,12 +409,16 @@ func (b *runtimeBridge) start(command bridgeCommand) (<-chan bridgeMessage, func
 		return nil, nil, fmt.Errorf("send acpx runtime bridge command: %w", err)
 	}
 	cleanup := func() { b.remove(command.CommandID) }
-	return channel, cleanup, nil
+	return pending.messages, cleanup, nil
 }
 
 func (b *runtimeBridge) remove(commandID string) {
 	b.mu.Lock()
+	pending := b.pending[commandID]
 	delete(b.pending, commandID)
+	if pending != nil {
+		close(pending.done)
+	}
 	b.mu.Unlock()
 }
 
@@ -459,7 +470,7 @@ func (b *runtimeBridge) stderrDetail() string {
 }
 
 func (b *runtimeBridge) closeProcess() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	err := b.call(ctx, bridgeCommand{Type: "shutdown"}, nil)
 	_ = b.stdin.Close()
@@ -467,15 +478,23 @@ func (b *runtimeBridge) closeProcess() error {
 	if err == nil {
 		select {
 		case <-b.exited:
-			return nil
+			// The bridge leader exiting is not proof that provider descendants
+			// in its dedicated process group exited. Fall through to the same
+			// group-wide kill-and-verify barrier used after graceful failure.
 		case <-ctx.Done():
 			err = ctx.Err()
 		}
 	}
-	if terminateErr := b.terminateProcess(); err == nil {
-		err = terminateErr
+	if terminateErr := b.terminateProcess(); terminateErr != nil {
+		if err != nil {
+			return fmt.Errorf("graceful runtime shutdown failed (%v); forced teardown also failed: %w", err, terminateErr)
+		}
+		return terminateErr
 	}
-	return err
+	// Once the entire process group is proven terminated and the leader has
+	// been reaped, an earlier graceful-shutdown protocol error is no longer an
+	// unsafe ownership condition.
+	return nil
 }
 
 func (b *runtimeBridge) terminateProcess() error {
@@ -488,17 +507,40 @@ func (b *runtimeBridge) terminateProcess() error {
 	// startRuntimeBridge establishes PGID=PID. Signal that group even when the
 	// Node leader has already exited: surviving provider descendants retain the
 	// group and remain addressable as -PID after Getpgid(PID) returns ESRCH.
-	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return fmt.Errorf("terminate acpx runtime process group %d: %w", pid, err)
+	groupGone := false
+	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			groupGone = true
+		} else {
+			return fmt.Errorf("terminate acpx runtime process group %d: %w", pid, err)
+		}
 	}
-	timer := time.NewTimer(3 * time.Second)
+	timer := time.NewTimer(2 * time.Second)
 	defer timer.Stop()
-	select {
-	case <-b.exited:
-		return nil
-	case <-timer.C:
-		return fmt.Errorf("acpx runtime process group %d did not exit within 3s", pid)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	leaderExited := false
+	exited := b.exited
+	for !leaderExited || !groupGone {
+		select {
+		case <-exited:
+			leaderExited = true
+			exited = nil
+		case <-ticker.C:
+			err := syscall.Kill(-pid, 0)
+			switch {
+			case errors.Is(err, syscall.ESRCH):
+				groupGone = true
+			case err == nil, errors.Is(err, syscall.EPERM):
+				// A leader or descendant still owns the process group.
+			default:
+				return fmt.Errorf("verify acpx runtime process group %d teardown: %w", pid, err)
+			}
+		case <-timer.C:
+			return fmt.Errorf("acpx runtime process group %d did not terminate and reap within 2s", pid)
+		}
 	}
+	return nil
 }
 
 func bridgeRemoteError(message bridgeMessage) error {
@@ -514,28 +556,71 @@ func bridgeRemoteError(message bridgeMessage) error {
 }
 
 func bridgeSessionInfo(target Target, payload bridgeSession) (SessionInfo, error) {
-	acpxRecordID := firstNonEmptyString(payload.Status.ACPXRecordID, payload.Handle.ACPXRecordID)
-	acpSessionID := firstNonEmptyString(payload.Status.BackendSessionID, payload.Handle.BackendSessionID)
-	nativeSessionID := firstNonEmptyString(payload.Status.AgentSessionID, payload.Handle.AgentSessionID)
-	if acpxRecordID == "" {
-		return SessionInfo{}, &ProtocolError{Operation: "runtime session metadata", Message: "missing acpxRecordId"}
+	// The ensured handle is the live Port identity. Status is observational;
+	// when it repeats an identity it must agree literally rather than silently
+	// overriding or normalizing the handle.
+	if target.ConsoleSessionID == "" {
+		return SessionInfo{}, &ProtocolError{Operation: "runtime session metadata", Message: "missing target Session key"}
+	}
+	if payload.Handle.SessionKey == "" {
+		return SessionInfo{}, &ProtocolError{Operation: "runtime session metadata", Message: "missing handle Session key"}
+	}
+	if payload.Handle.SessionKey != target.ConsoleSessionID {
+		return SessionInfo{}, &ProtocolError{Operation: "runtime session metadata", Message: "handle Session key does not match the target Session"}
+	}
+	if strings.TrimSpace(target.WorkingDirectory) == "" {
+		return SessionInfo{}, &ProtocolError{Operation: "runtime session metadata", Message: "missing target working directory"}
+	}
+	if strings.TrimSpace(payload.Handle.CWD) == "" {
+		return SessionInfo{}, &ProtocolError{Operation: "runtime session metadata", Message: "missing handle working directory"}
+	}
+	targetCWD, err := gitrepo.CanonicalPath(target.WorkingDirectory)
+	if err != nil {
+		return SessionInfo{}, &ProtocolError{Operation: "runtime session metadata", Message: "target working directory cannot be canonicalized"}
+	}
+	handleCWD, err := gitrepo.CanonicalPath(payload.Handle.CWD)
+	if err != nil {
+		return SessionInfo{}, &ProtocolError{Operation: "runtime session metadata", Message: "handle working directory cannot be canonicalized"}
+	}
+	if handleCWD != targetCWD {
+		return SessionInfo{}, &ProtocolError{Operation: "runtime session metadata", Message: "handle working directory does not match the target working directory"}
+	}
+	runtimeRef := payload.Handle.ACPXRecordID
+	providerRef := payload.Handle.BackendSessionID
+	if issue := runtimeRefValidationIssue(runtimeRef); issue != "" {
+		return SessionInfo{}, &ProtocolError{Operation: "runtime session metadata", Message: issue}
+	}
+	if payload.Status.ACPXRecordID != "" && payload.Status.ACPXRecordID != runtimeRef {
+		return SessionInfo{}, &ProtocolError{Operation: "runtime session metadata", Message: "status acpxRecordId does not match the live handle"}
+	}
+	if payload.Status.BackendSessionID != "" && payload.Status.BackendSessionID != providerRef {
+		return SessionInfo{}, &ProtocolError{Operation: "runtime session metadata", Message: "status provider reference does not match the live handle"}
+	}
+	if issue := providerRefValidationIssue(providerRef); issue != "" {
+		return SessionInfo{}, &ProtocolError{Operation: "runtime session metadata", Message: issue}
 	}
 	raw, _ := json.Marshal(payload)
 	return SessionInfo{
-		ConsoleSessionID: target.ConsoleSessionID, ACPXRecordID: acpxRecordID,
-		ACPSessionID: acpSessionID, NativeSessionID: nativeSessionID, Raw: raw,
+		ConsoleSessionID: target.ConsoleSessionID, RuntimeRef: runtimeRef,
+		ProviderRef: providerRef, Raw: raw,
 	}, nil
+}
+
+func runtimeRefValidationIssue(value string) string {
+	switch {
+	case value == "":
+		return "missing acpxRecordId"
+	case len(value) > maxRuntimeRefBytes:
+		return fmt.Sprintf("acpxRecordId exceeds %d bytes", maxRuntimeRefBytes)
+	case strings.TrimSpace(value) != value:
+		return "acpxRecordId contains surrounding whitespace"
+	case !boundedPrintable(value, maxRuntimeRefBytes):
+		return "acpxRecordId is not a valid protocol token"
+	default:
+		return ""
+	}
 }
 
 func bridgeAgentArgv(profile agents.Profile) []string {
 	return append([]string(nil), profile.Argv()...)
-}
-
-func firstNonEmptyString(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return value
-		}
-	}
-	return ""
 }

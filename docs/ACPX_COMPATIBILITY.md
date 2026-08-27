@@ -1,83 +1,116 @@
 # acpx 0.13.0 compatibility contract
 
-Agent Task Console V1 pins `acpx` 0.13.0. All adapter behavior lives in `internal/acp`; no worker, service, CLI, TUI, API, or web package invokes `acpx` directly.
+Agent Task Console V1 pins `acpx` 0.13.0. All adapter behavior stays in `internal/acp`; worker, service, CLI, terminal, API, and web packages do not invoke `acpx` directly.
 
 ## Runtime integration
 
-Every new Session worker owns one long-lived Node child using the public `acpx/runtime` export:
+Each active Session worker owns one long-lived private bridge using the public `acpx/runtime` export. The bridge resolves the runtime from the package associated with the configured `acpx` binary and verifies the exact supported version before provider startup.
 
-- `createAgentRegistry`
-- `createRuntimeStore`
-- `createAcpRuntime`
-- `ensureSession`
-- `startTurn` with separate event/result streams
-- `getStatus`, `cancel`, and `close`
-- `onPermissionRequest`
+Runtime and bridge files live under private `$AGENT_HOME/acpx-runtime` directories with user-only permissions. Provider authentication remains provider-managed. Environment values are used only to launch the adapter and are not persisted in Session metadata or channel logs.
 
-The configured `acpx` executable is resolved through symlinks, its ancestor `package.json` must identify exact version `0.13.0` and export `./runtime`, and Node must be at least 22.13. The bridge resolves the runtime with `createRequire(package.json).resolve("acpx/runtime")`; a plain package import from the repository is not assumed to work for a user-global npm installation.
+Go and Node exchange bounded structured frames over a private control pipe. Child stdin is reserved for any pinned runtime host-operation response that requires it. Malformed, oversized, or unexpected control traffic fails closed.
 
-The bridge source is embedded in the Go binary and materialized `0600` under a per-Session `0700` directory in `$AGENT_HOME/acpx-runtime`. It sets umask `077`. Friendly built-in profile commands are resolved by the pinned public agent registry; custom profile argv is installed as a literal registry override. Gemini is deliberately an override using `gemini --experimental-acp`, because the installed Gemini 0.25 CLI rejects the pinned runtime registry's `--acp` spelling. Adapter downloads use a shared `0700` npm cache under the private runtime root, avoiding dependence on a global npm cache with incompatible ownership. Provider command/environment configuration crosses the private worker-to-bridge pipe before runtime creation; environment values are not placed in persisted `sessionOptions`, SQLite, or JSONL.
+## One Port per Session
 
-Go and Node exchange bounded NDJSON frames over a private control pipe on file descriptor 3, leaving the bridge child's stdin reserved for acpx host-operation answers. Commands cover ensure, turn, inspect, exact refresh, cancel, permission decision, and shutdown. Events cover normalized runtime activity, pending permission requests, terminal turn results, and errors. Go serializes writes and demultiplexes responses by command ID; bridge exit, overflow, malformed messages, and consumer failure fail closed and cancel the active turn.
+The bridge implements the Session provider Port:
 
-## Why V1 does not use a PTY
+- Start a new provider conversation when the Session has no provider reference.
+- Persist the returned opaque reference before the Session becomes ready.
+- Exact-resume that saved reference once when a worker/provider transport starts again.
+- Keep the connection alive across turns.
+- Send prompt, cancel, permission response, and configure commands through that connection.
+- Emit normalized runtime event objects immediately.
 
-`acpx prompt` submits persistent work to a detached `__queue-owner` process whose stdin/stdout are not connected to the foreground command. A PTY around the foreground process therefore cannot answer that owner's permission prompt. The queue protocol also has no pending-permission reply operation. The public runtime bridge instead owns the live ACP client in-process. For its two known host prompts, it observes structured `client_operation` activity and supplies a private one-shot y/N answer through reserved stdin; it never parses mixed provider terminal output.
+Stopping a Session worker closes the Port as lifecycle cleanup. The bridge does not expose a separate channel close command or HTTP close endpoint.
+
+The bridge does not Refresh or Resume before each prompt. It does not reset `acpx` records to manufacture a new retained connection for every turn. A healthy Port is reused.
+
+Pinned `acpx` 0.13.0 normally falls back to creating a new client from inside
+`startTurn` and idle control calls when its pending persistent client is lost.
+That fallback is incompatible with the Session Port contract because it would
+hide an exact Resume inside Prompt, provider-options, or configure. The bridge
+therefore shape-checks the pinned manager's `createClient` and
+`readPendingPersistentClient` hooks before the one allowed Start/Resume,
+disables subsequent client creation on that manager instance, and proves the
+same retained client immediately before and after every provider-dependent
+operation. Loss at either boundary fails and closes the Port. Only an explicit
+Session Resume may create a fresh bridge and reconnect the saved provider
+reference. This compatibility shim is intentionally contained in
+`internal/acp` and must be re-audited before changing the pinned acpx version.
+
+If exact Resume fails, the bridge closes and reports `provider_resume_failed`. It never falls back to Start under the same Task Console Session.
+
+## Configuration discovery
+
+Model and reasoning controls come from the connected provider Session. An observational provider-options call returns a bounded catalog containing sanitized labels and exact opaque values; it does not append a journal frame.
+
+The gateway never embeds a cross-provider model catalog. Blank in a `configure` field means leave the current live value unchanged; on a fresh Port that value is the provider default. Every nonblank value must exactly match a current advertisement. Configure completes synchronously after the Port applies it or returns an error. The gateway does not persist or reapply model/effort selections, and it emits no `config_changed` journal frame. After Resume, the Port's advertised current values are authoritative.
+
+There is no prepared Session, provider-options reconnect, launch phase, or initial-prompt outbox. The ordinary flow is attach after `connection.data.state == "connecting"`, wait for `connection.data.state == "connected"`, observe options, configure, and prompt. The channel is addressable before the bridge completes its one Start or exact Resume.
+
+## Turn behavior
+
+The public runtime supports one active turn per provider Session. Agent Task Console mirrors that constraint: when a turn is active, another prompt is rejected as busy. The bridge does not maintain a prompt FIFO.
+
+Provider activity is forwarded while the turn runs as `provider_event` records. The terminal outcome becomes `provider_result`; it is not the first time clients receive content.
+
+Cancellation targets the active request. It does not cancel the gateway's Prompt context first: the bridge sends the provider cancellation, drains the provider's terminal turn result, and proves the same retained Port remains reusable. Only then does the worker report a healthy cancelled turn. A cancellation error, timeout, or failed retained-Port proof fails and closes the channel, requiring explicit exact Resume. The gateway does not claim cancellation paused an exact token or tool position.
 
 ## Permission behavior
 
-For `approve-all`, the pinned runtime resolves permission requests using its normal policy. For `read-approval`, inferred read/search/fetch/thought requests may resolve automatically; write/execute/unknown `session/request_permission` calls remain pending in the bridge.
+The gateway passes its coarse permission policy to the ACP runtime but does not select provider-specific modes, rewrite provider configuration, or infer policy from a provider name.
 
-Provider/user defaults can allow workspace writes without a permission request. For every read-approval Session, the bridge therefore selects Codex's provider-native `read-only` mode and Claude's provider-native `default` (manual) mode; that makes file-change and command escalation cross `session/request_permission`. OpenCode receives an inline runtime override that preserves its other configuration while forcing `edit` and `bash` from permissive defaults to `ask` and retaining stricter deny rules. Approve-all OpenCode Sessions explicitly receive `permission: "allow"`; other approve-all providers retain their normal mode and the runtime approves their requests.
+For the typed `session/request_permission` callback, the bridge emits the exact provider-offered choices. The worker validates opaque IDs and uses first-valid-decision-wins. Detaching a viewer leaves the callback pending. Cancel, stop, bridge EOF, or Port close abandons it safely.
 
-For `session/request_permission`, the bridge emits the exact options offered by the provider. The worker validates Session, active request, permission ID, option ID, and unique semantic option kinds. Multiple viewers use first-valid-decision-wins semantics. Detach does nothing to the pending callback. Cancel, stop, bridge EOF, or process shutdown resolves it as cancel and records the abandonment.
+If an adapter exposes a separate human terminal prompt instead of the typed callback, the managed noninteractive Port fails closed. The gateway does not parse status text, synthesize permission cards, or push invented yes/no answers into provider stdin.
 
-`allow_always` and `reject_always` are shown as persistent choices and are usable only if offered. A malformed request with duplicate semantic kinds fails closed rather than guessing which provider option to select.
+## Frame fidelity
 
-The public runtime does not expose callbacks for client-side `fs/write_text_file` or `terminal/create`. In read-approval mode the pinned bridge converts their structured running events into gateway-owned `Allow Once`/`Reject` cards, keeps acpx's private y/N prompt pending, and returns the viewer's answer to that exact operation. It does not invent an always-allow scope that acpx did not offer. Unknown host-operation prompts remain fail-closed. Prompt text, write previews, commands, and inline configuration are not copied into bridge diagnostics.
+`acpx/runtime` exposes normalized event objects for text, reasoning, tools, plans, status, usage, configuration, permissions, and extensions. The worker places each object verbatim in `provider_event.data`, including unknown event types and fields.
 
-## Event fidelity
+The result is not guaranteed to be an exact ACP JSON-RPC packet capture. The adapter bounds the normalized object, but the gateway does not project it into invented semantic outer frame types. The outer journal type remains `provider_event`.
 
-The public runtime provides rich normalized output/thought text, tool calls and
-updates, status, usage, and permission data. It does not expose the exact
-underlying JSON-RPC packet stream. This ACP output is provisional until the
-provider-owned conversation store commits it. Session JSONL and the advanced
-raw/debug view preserve the complete gateway envelope and normalized payload
-available to this integration as lifecycle/audit, overlay, recovery, and
-fallback data; neither is the committed provider transcript or a wire packet
-capture.
+The other journal types are exactly `connection`, `client_command`, `provider_result`, `permission_requested`, `permission_resolved`, `permission_abandoned`, and `worker_error`.
 
-The legacy CLI adapter remains covered by focused compatibility tests, but new Session workers use the public runtime bridge.
+Session JSONL records the frames that crossed this integration. It supports replay and audit only. It is not a provider transcript and is never replayed into provider memory.
 
-## Identity, auth, and migration
+## What the adapter must not do
 
-Task Console Session ID, acpx record ID, ACP/backend Session ID, and native adapter ID remain distinct evidence. The first exact provider identity becomes the immutable canonical provider conversation ID; later observations may verify it but may not replace it implicitly. ACP resume must return the exact requested ACP ID or fail closed. Cached/provider-managed login state is inherited; Agent Task Console never modifies or copies provider auth files.
+- read Codex, Claude, Grok, Gemini, or OpenCode private transcript stores;
+- select a conversation by recency;
+- merge provider history with Session JSONL;
+- infer committed/provisional state;
+- launch a provider-native CLI as a second writer;
+- Refresh before prompt;
+- queue prompts;
+- replace a failed exact Resume with Start.
 
-Do not run a new runtime bridge concurrently with an old CLI queue owner for the same provider conversation. For demonstrations and provider acceptance, create fresh runtime-backed Sessions. A legacy Session may be resumed only after the prior worker/queue owner is known to be gone and exact identity can be proven.
+## Custom agents
 
-Provider-native mappings, exact local-store verification, and read-only
-provider transcript adapters remain isolated in `internal/native`: Codex uses
-`resume <id>`, Claude uses `--resume <id>`, Grok's ACP-friendly `grok-build`
-profile maps to `grok --resume <id>`, and OpenCode reuses the same pinned npm
-CLI without its `acp` subcommand and adds `--session <id>`. Unknown profiles,
-missing identities, ambiguous records, and checkout mismatches fail closed.
-Committed-history readers use the exact provider stores: Codex, Claude, and
-Grok JSONL, and OpenCode SQLite. Gateway Session JSONL is not an input to these
-provider resume commands.
+Friendly built-in profiles may use the pinned runtime registry. Custom profiles install literal command/argument overrides without shell parsing. Gemini-specific ACP flags or similar compatibility details stay inside `internal/acp` fixtures.
 
-Provider-write callers first negotiate worker protocol v3 plus
-`exclusive-native-owner-v2`; older responsive workers fail closed before
-sending input or spawning a provider. The public runtime supports one active
-ACP turn per Session, so the worker keeps an ACP-to-ACP FIFO. A provider-native
-owner or pre-launch reservation is not part of that FIFO: an ACP submission is
-rejected before admission and must be retried after the provider exits and
-exact ownership releases. Conversely,
-starting or activating a native generation while ACP is accepted, queued,
-preparing, or active is rejected rather than queued and never cancels ACP.
-Before every accepted ACP dispatch at the FIFO head, the worker Refreshes the
-exact persisted ACP Session, with exact-Resume fallback and identity validation;
-success emits correlated `acp_rehydrated` before `turn_started`. Native
-exit/stop starts exact provider-snapshot reconciliation, and a fresh native
-generation later uses `BuildResume` on the same canonical ID. Viewer detach
-changes neither provider-process lifetime nor exclusive ownership. See
-[CODEX_NATIVE_SMOKE.md](CODEX_NATIVE_SMOKE.md).
+Unknown profiles may still function through a custom ACP command if they satisfy the Port contract. Unsupported model/effort controls remain disabled and unchanged.
+
+## Upgrade behavior
+
+Worker protocol changes require a version bump. A responsive old worker receives no provider write from a new client. Stop it cleanly, confirm its provider process is gone, and resume the Session with the new worker.
+
+Do not delete legacy `acpx` state, Session logs, native-owner markers, or launch files while an older worker/provider process may be alive. New code may ignore obsolete files after safe shutdown, but it must not reinterpret them as current channel state.
+
+## Required compatibility tests
+
+- exact package/version resolution;
+- private runtime permissions;
+- literal profile argv and redacted environment;
+- Start once for an empty reference;
+- Resume once for a saved reference;
+- two turns reuse one Port;
+- retained-client loss before or during prompt, provider-options, or configure
+  fails the Port and performs no hidden client creation;
+- Resume failure never calls Start;
+- immediate frame delivery before turn completion;
+- busy rejection without queueing;
+- observational live configuration advertisements and synchronous configure completion;
+- permission detach/decision/cancel behavior;
+- malformed/oversized bridge frame failure;
+- bridge/process-group shutdown without leaked provider children.

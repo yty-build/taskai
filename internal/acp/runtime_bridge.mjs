@@ -2,7 +2,6 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
-import { Writable } from "node:stream";
 import { pathToFileURL } from "node:url";
 
 process.umask(0o077);
@@ -13,34 +12,14 @@ if (!packageRoot || !stateDir) {
   throw new Error("acpx runtime bridge requires package root and state directory");
 }
 
-// Bridge commands use fd 3, leaving stdin exclusively for acpx's built-in
-// host-operation prompts. acpx only offers those prompts when stdin/stderr are
-// TTY-like; the synthetic input stays private and its prompt output is redacted.
+// Bridge commands use fd 3. The gateway relies only on acpx's typed
+// onPermissionRequest callback; it never parses human terminal prompts or
+// pretends a provider status string is a permission protocol.
 const commandInput = fs.createReadStream(null, { fd: 3, autoClose: false });
-const diagnosticStderr = process.stderr;
-let permissionPromptOutput = false;
-const promptStderr = new Writable({
-  write(chunk, encoding, callback) {
-    const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
-    if (text.includes("[permission]")) {
-      permissionPromptOutput = true;
-    }
-    if (!permissionPromptOutput) {
-      diagnosticStderr.write(chunk, encoding);
-    }
-    callback();
-  },
-});
-Object.defineProperties(promptStderr, {
-  isTTY: { value: true },
-  columns: { value: 80 },
-  rows: { value: 24 },
-});
-Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
-Object.defineProperty(process, "stderr", { value: promptStderr, configurable: true });
 
 const maxCommandFrameBytes = 4 * 1024 * 1024;
-const maxOutputFrameBytes = 8 * 1024 * 1024;
+const maxOutputFrameBytes = 1 * 1024 * 1024;
+const maxQueuedOutputBytes = 4 * 1024 * 1024;
 const maxPendingPermissions = 128;
 const permissionKinds = new Set([
   "allow_once",
@@ -49,10 +28,6 @@ const permissionKinds = new Set([
   "reject_always",
 ]);
 const automaticallyResolvedReadKinds = new Set(["read", "search", "fetch", "think"]);
-const readApprovalProviderModes = new Map([
-  ["codex", "read-only"],
-  ["claude", "default"],
-]);
 
 const require = createRequire(path.join(packageRoot, "package.json"));
 const runtimeURL = pathToFileURL(require.resolve("acpx/runtime")).href;
@@ -67,16 +42,71 @@ fs.chmodSync(npmCacheDir, 0o700);
 process.env.npm_config_cache = npmCacheDir;
 
 let runtime;
+let runtimeStore;
 let handle;
 let configuredPermissionMode = "approve-reads";
 let activeTurn;
+let activatingTurn;
 let activeTurnCommandId = "";
 let activeRequestId = "";
 let shuttingDown = false;
+let retainedPortManager;
 const pendingPermissions = new Map();
+const outputQueue = [];
+let queuedOutputBytes = 0;
+let outputBlocked = false;
+let outputExitCode;
+let outputOverflowed = false;
+
+const strictRetainedPortMarker = Symbol("acpGatewayStrictRetainedPort");
+
+function retainedPortUnavailable(operation) {
+  const error = new Error(`the retained provider Port is unavailable during ${operation}; explicitly resume the Session before sending provider commands`);
+  error.code = "retained_port_unavailable";
+  error.retryable = false;
+  return error;
+}
 
 function encode(message) {
   return JSON.stringify(message);
+}
+
+function requestBridgeExit(code) {
+  outputExitCode = code;
+  flushOutputQueue();
+}
+
+function failOutputBackpressure() {
+  if (outputOverflowed) return;
+  outputOverflowed = true;
+  process.stderr.write("acpx runtime bridge output exceeded its bounded backpressure queue\n");
+  for (const permissionId of [...pendingPermissions.keys()]) {
+    settlePermission(permissionId, { outcome: "cancel" });
+  }
+  void activeTurn?.cancel({ reason: "bridge output backpressure exceeded" }).catch(() => {});
+  commandInput.destroy();
+  setTimeout(() => process.exit(1), 0);
+}
+
+function flushOutputQueue() {
+  if (outputBlocked || outputOverflowed) return;
+  while (outputQueue.length > 0) {
+    const next = outputQueue.shift();
+    queuedOutputBytes -= next.bytes;
+    if (!process.stdout.write(next.line)) {
+      outputBlocked = true;
+      process.stdout.once("drain", () => {
+        outputBlocked = false;
+        flushOutputQueue();
+      });
+      return;
+    }
+  }
+  if (outputExitCode !== undefined) {
+    const code = outputExitCode;
+    outputExitCode = undefined;
+    process.stdout.write("", () => process.exit(code));
+  }
 }
 
 function emit(message) {
@@ -90,7 +120,16 @@ function emit(message) {
       message: "acpx runtime event exceeded the gateway bridge frame limit",
     });
   }
-  process.stdout.write(`${line}\n`);
+  const framed = `${line}\n`;
+  const bytes = Buffer.byteLength(framed, "utf8");
+  if (queuedOutputBytes + process.stdout.writableLength + bytes > maxQueuedOutputBytes) {
+    failOutputBackpressure();
+    return false;
+  }
+  outputQueue.push({ line: framed, bytes });
+  queuedOutputBytes += bytes;
+  flushOutputQueue();
+  return true;
 }
 
 function failure(commandId, error, requestId = "") {
@@ -121,13 +160,6 @@ function settlePermission(permissionId, decision) {
   return true;
 }
 
-function answerHostPrompt(approved) {
-  permissionPromptOutput = false;
-  if (!process.stdin.destroyed && !process.stdin.readableEnded) {
-    process.stdin.push(approved ? "y\n" : "n\n");
-  }
-}
-
 function cancelPendingPermissions(reason = "cancelled") {
   for (const permissionId of [...pendingPermissions.keys()]) {
     const pending = pendingPermissions.get(permissionId);
@@ -140,19 +172,7 @@ function cancelPendingPermissions(reason = "cancelled") {
         reason,
       });
     }
-    if (pending?.source === "host") {
-      pendingPermissions.delete(permissionId);
-      pending.cleanup();
-      answerHostPrompt(false);
-    } else {
-      settlePermission(permissionId, { outcome: "cancel" });
-    }
-  }
-  // An unrecognized pinned-runtime host operation deliberately has no
-  // approval card. If acpx nevertheless opened its private prompt, answer no
-  // during cancellation so the turn cannot strand the worker.
-  if (permissionPromptOutput) {
-    answerHostPrompt(false);
+	settlePermission(permissionId, { outcome: "cancel" });
   }
 }
 
@@ -252,71 +272,6 @@ function permissionRequest(request, context) {
   return waitForPermissionDecision(validated, inferredKind, context.signal, activeTurnCommandId, activeRequestId);
 }
 
-function hostPermissionForRuntimeEvent(event) {
-  if (
-    configuredPermissionMode !== "approve-reads" ||
-    !activeTurnCommandId ||
-    !activeRequestId ||
-    event?.type !== "status" ||
-    typeof event.text !== "string"
-  ) {
-    return;
-  }
-  let method;
-  let kind;
-  let title;
-  if (event.text.startsWith("fs/write_text_file running ")) {
-    method = "fs/write_text_file";
-    kind = "edit";
-    title = "Write file";
-  } else if (event.text.startsWith("terminal/create running ")) {
-    method = "terminal/create";
-    kind = "execute";
-    title = "Run terminal command";
-  } else {
-    return;
-  }
-  // The structured running event precedes acpx's human-readable y/N prompt.
-  // Suppress that prompt before it is written so paths, commands, and file
-  // previews never enter the bounded diagnostic stderr capture.
-  permissionPromptOutput = true;
-  if (pendingPermissions.size >= maxPendingPermissions) {
-    answerHostPrompt(false);
-    return;
-  }
-  for (const pending of pendingPermissions.values()) {
-    if (pending.source === "host") {
-      throw new Error("multiple concurrent acpx host permission prompts are unsupported");
-    }
-  }
-  const permissionId = `permission-${crypto.randomUUID()}`;
-  const toolCallId = `host-${crypto.randomUUID()}`;
-  const raw = {
-    sessionId: handle?.backendSessionId || handle?.sessionKey || "",
-    toolCall: { toolCallId, title, kind, status: "pending" },
-    options: [
-      { optionId: "host-allow-once", name: "Allow Once", kind: "allow_once" },
-      { optionId: "host-reject-once", name: "Reject", kind: "reject_once" },
-    ],
-    _meta: { gateway: { hostMethod: method } },
-  };
-  pendingPermissions.set(permissionId, {
-    source: "host",
-    options: new Map(raw.options.map((option) => [option.optionId, option])),
-    requestId: activeRequestId,
-    turnCommandId: activeTurnCommandId,
-    cleanup: () => {},
-  });
-  emit({
-    type: "permission_request",
-    commandId: activeTurnCommandId,
-    requestId: activeRequestId,
-    permissionId,
-    inferredKind: kind,
-    request: raw,
-  });
-}
-
 function applyEnvironment(environment) {
   if (!environment) {
     return;
@@ -329,73 +284,92 @@ function applyEnvironment(environment) {
   }
 }
 
-function restrictiveOpenCodeAction(value) {
-  if (value === "deny") {
-    return "deny";
-  }
-  if (value && typeof value === "object" && !Array.isArray(value)) {
-    const result = { "*": "ask" };
-    for (const [pattern, action] of Object.entries(value)) {
-      if (action === "deny") {
-        result[pattern] = "deny";
-      }
-    }
-    return result;
-  }
-  return "ask";
-}
-
-function configureOpenCodePermissions(command) {
-  if (command.agent !== "opencode") {
-    return;
-  }
-  let config = {};
-  const inline = process.env.OPENCODE_CONFIG_CONTENT;
-  if (inline) {
-    try {
-      const parsed = JSON.parse(inline);
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-        throw new Error("inline config must be a JSON object");
-      }
-      config = parsed;
-    } catch {
-      throw new Error("OPENCODE_CONFIG_CONTENT must contain a valid JSON object");
-    }
-  }
-  if (configuredPermissionMode === "approve-all") {
-    config.permission = "allow";
-  } else if (config.permission !== "deny" && config.permission !== "ask") {
-    const permission =
-      config.permission && typeof config.permission === "object" && !Array.isArray(config.permission)
-        ? { ...config.permission }
-        : config.permission === "allow"
-          ? { "*": "allow" }
-          : {};
-    permission.edit = restrictiveOpenCodeAction(permission.edit);
-    permission.bash = restrictiveOpenCodeAction(permission.bash);
-    config.permission = permission;
-  }
-  process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify(config);
-}
-
 function configure(command) {
   if (runtime) {
     return;
   }
   applyEnvironment(command.environment);
   configuredPermissionMode = command.permissionMode === "approve-all" ? "approve-all" : "approve-reads";
-  configureOpenCodePermissions(command);
   const agentRegistry = command.useBuiltin
     ? createAgentRegistry()
     : createAgentRegistry({ overrides: { [command.agent]: command.argv } });
+  runtimeStore = createRuntimeStore({ stateDir });
   runtime = createAcpRuntime({
     cwd: command.cwd,
-    sessionStore: createRuntimeStore({ stateDir }),
+    sessionStore: runtimeStore,
     agentRegistry,
     permissionMode: configuredPermissionMode,
     nonInteractivePermissions: "fail",
     onPermissionRequest: permissionRequest,
   });
+}
+
+async function prepareStrictRetainedPortMode() {
+  if (retainedPortManager) return retainedPortManager;
+  if (!runtime || typeof runtime.getManager !== "function") {
+    throw new Error("pinned acpx runtime does not expose its retained-Port manager");
+  }
+  const manager = await runtime.getManager();
+  if (
+    !manager || typeof manager.createClient !== "function" ||
+    typeof manager.readPendingPersistentClient !== "function"
+  ) {
+    throw new Error("pinned acpx runtime retained-Port manager shape is incompatible");
+  }
+  retainedPortManager = manager;
+  return manager;
+}
+
+function activateStrictRetainedPortMode(manager) {
+  if (manager[strictRetainedPortMarker] === true) return;
+  // acpx 0.13 normally reconnects from Prompt/configure when its pending
+  // persistent client disappears. That is useful for acpx as a standalone
+  // runtime but violates this gateway's one-Port contract: only an explicit
+  // worker Resume may reconnect. All hidden fallback paths create a client
+  // through this pinned manager method, so disabling it after the one allowed
+  // ensure makes transport loss fail closed.
+  manager.createClient = () => {
+    throw retainedPortUnavailable("provider command");
+  };
+  manager[strictRetainedPortMarker] = true;
+}
+
+async function requireRetainedPort(operation) {
+  if (!runtime || !runtimeStore || !handle) {
+    throw retainedPortUnavailable(operation);
+  }
+  const manager = await prepareStrictRetainedPortMode();
+  const record = await runtimeStore.load(handle.acpxRecordId);
+  if (
+    !record || record.acpxRecordId !== handle.acpxRecordId ||
+    record.acpSessionId !== handle.backendSessionId
+  ) {
+    throw retainedPortUnavailable(operation);
+  }
+  const client = await manager.readPendingPersistentClient(record, { consume: false });
+  if (!client) throw retainedPortUnavailable(operation);
+}
+
+async function requireExactResumeConnection(command) {
+  if (!command.resumeSessionId) return;
+  if (!runtimeStore) {
+    throw new Error("acpx runtime store is unavailable for exact resume activation");
+  }
+  const record = await runtimeStore.load(command.sessionKey);
+  if (!record) return;
+  if (record.acpSessionId !== command.resumeSessionId) {
+    throw new Error("persisted acpx record does not match the requested exact ACP conversation");
+  }
+  // acpx 0.13's public ensureSession reuses an existing persistent record
+  // without reconnecting it. Its public idle control methods then each open
+  // and close a separate exact-resume connection, so interdependent provider
+  // controls cannot be applied and verified as one tuple. The public session
+  // store exposes the pinned record's reset_on_next_ensure lifecycle flag.
+  // Setting it makes ensureSession resume this same ACP ID on one retained
+  // persistent connection; it does not close or replace the canonical
+  // provider conversation, alter gateway JSONL, or permit a new identity.
+  record.acpx = { ...record.acpx, reset_on_next_ensure: true };
+  await runtimeStore.save(record);
 }
 
 function advertisedConfigOptions(status) {
@@ -409,69 +383,200 @@ function advertisedSelectValues(option) {
   }
   const values = [];
   for (const candidate of option.options) {
-    if (typeof candidate?.value === "string" && candidate.value.trim()) {
-      values.push(candidate.value.trim());
+    if (typeof candidate?.value === "string" && candidate.value !== "") {
+      values.push(candidate.value);
       continue;
     }
     if (Array.isArray(candidate?.options)) {
       for (const nested of candidate.options) {
-        if (typeof nested?.value === "string" && nested.value.trim()) values.push(nested.value.trim());
+        if (typeof nested?.value === "string" && nested.value !== "") values.push(nested.value);
       }
     }
   }
   return values;
 }
 
-function uniqueConfigOption(status, category, fallbackIds, label) {
+const maxProviderCatalogChoices = 128;
+
+function boundedProviderValue(value, limit) {
+  if (typeof value !== "string") return "";
+  if (value === "" || Buffer.byteLength(value, "utf8") > limit || /[\p{C}]/u.test(value)) return "";
+  return value;
+}
+
+function boundedProviderDisplay(value, limit, fallback = "") {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value !== "string") return null;
+  const clean = value.trim();
+  if (!clean) return fallback;
+  if (Buffer.byteLength(clean, "utf8") > limit || /[\p{C}]/u.test(clean)) return null;
+  return clean;
+}
+
+function catalogForConfigOption(status, category, fallbackIds, reasoningEffort) {
+  let option;
+  try {
+    option = uniqueConfigOption(status, category, fallbackIds, reasoningEffort ? "reasoning effort" : "model");
+  } catch {
+    return { supported: false, unavailable_reason: "ambiguous_or_invalid", choices: [] };
+  }
+  if (!option || option.type !== "select" || !Array.isArray(option.options)) {
+    return { supported: false, unavailable_reason: "not_advertised", choices: [] };
+  }
+  const choices = [];
+  const seen = new Set();
+  let invalid = false;
+  let overflow = false;
+  const addChoice = (candidate, group) => {
+    if (choices.length >= maxProviderCatalogChoices) {
+      overflow = true;
+      return;
+    }
+    const value = boundedProviderValue(candidate?.value, reasoningEffort ? 128 : 256);
+    if (!value || seen.has(value)) {
+      invalid = true;
+      return;
+    }
+    const label = boundedProviderDisplay(candidate?.name, 256, value);
+    if (label === null) {
+      invalid = true;
+      return;
+    }
+    seen.add(value);
+    choices.push({
+      value,
+      label,
+      ...(group ? { group } : {}),
+    });
+  };
+  for (const candidate of option.options) {
+    if (Array.isArray(candidate?.options)) {
+      const group = boundedProviderDisplay(candidate?.name ?? candidate?.group, 128);
+      if (group === null) {
+        invalid = true;
+        continue;
+      }
+      for (const nested of candidate.options) addChoice(nested, group);
+    } else {
+      addChoice(candidate, "");
+    }
+  }
+  if (invalid || overflow || choices.length === 0) {
+    return { supported: false, unavailable_reason: "ambiguous_or_invalid", choices: [] };
+  }
+  const currentValue = boundedProviderValue(option.currentValue, reasoningEffort ? 128 : 256);
+  if (option.currentValue !== undefined && option.currentValue !== null && option.currentValue !== "" && !currentValue) {
+    return { supported: false, unavailable_reason: "ambiguous_or_invalid", choices: [] };
+  }
+  return { supported: true, ...(currentValue ? { current_value: currentValue } : {}), choices };
+}
+
+function providerOptionCatalog(status) {
+  try {
+    validateProviderConfigSemantics(status);
+  } catch {
+    const unavailable = { supported: false, unavailable_reason: "ambiguous_or_invalid", choices: [] };
+    return { model: unavailable, reasoning_effort: unavailable };
+  }
+  return {
+    model: catalogForConfigOption(status, "model", ["model"], false),
+    reasoning_effort: catalogForConfigOption(
+      status,
+      "thought_level",
+      ["reasoning_effort", "effort", "thinking", "thought_level"],
+      true,
+    ),
+  };
+}
+
+const recognizedProviderConfigCategories = new Set(["model", "thought_level"]);
+
+function matchingConfigOptions(status, category, fallbackIds) {
   const options = advertisedConfigOptions(status);
   const ids = new Set(fallbackIds);
-  const matches = options.filter(
-    (option) => option && typeof option.id === "string" && option.id.trim().length > 0 &&
-      (option.category === category || ids.has(option.id.trim())),
+  const matches = [];
+  for (const option of options) {
+    if (!option || typeof option.id !== "string" || option.id.trim().length === 0) continue;
+    const id = option.id.trim();
+    const optionCategory = typeof option.category === "string" ? option.category.trim() : "";
+    const fallbackMatch = ids.has(id);
+    if (fallbackMatch && recognizedProviderConfigCategories.has(optionCategory) && optionCategory !== category) {
+      throw new Error("the provider advertised contradictory model and reasoning option semantics");
+    }
+    if (optionCategory === category || fallbackMatch) matches.push(option);
+  }
+  return matches;
+}
+
+function validateProviderConfigSemantics(status) {
+  const modelOptions = matchingConfigOptions(status, "model", ["model"]);
+  const effortOptions = matchingConfigOptions(
+    status,
+    "thought_level",
+    ["reasoning_effort", "effort", "thinking", "thought_level"],
   );
+  const effortSet = new Set(effortOptions);
+  if (modelOptions.some((option) => effortSet.has(option))) {
+    throw new Error("the provider advertised one control as both model and reasoning effort");
+  }
+}
+
+function uniqueConfigOption(status, category, fallbackIds, label) {
+  validateProviderConfigSemantics(status);
+  const matches = matchingConfigOptions(status, category, fallbackIds);
   if (matches.length === 1) return matches[0];
   throw new Error(
     `the provider did not advertise exactly one ${label} option; leave ${label} on Provider default or update the provider adapter`,
   );
 }
 
-function modelSelectionMatches(requested, effective) {
-  if (!requested) return true;
-  if (!effective) return false;
-  return effective === requested || effective.startsWith(`${requested}[`);
+function validateRequestedProviderCatalog(status, requestedModel, requestedEffort) {
+  const catalog = providerOptionCatalog(status);
+  const includes = (selector, requested) =>
+    selector?.supported === true && Array.isArray(selector.choices) &&
+    selector.choices.some((choice) => choice?.value === requested);
+  if (requestedModel && !includes(catalog.model, requestedModel)) {
+    throw new Error("the provider's current model catalog does not contain the requested selection");
+  }
+  if (requestedEffort && !includes(catalog.reasoning_effort, requestedEffort)) {
+    throw new Error("the provider's current reasoning catalog does not contain the requested selection");
+  }
+  return catalog;
 }
 
 async function applyRequestedProviderOptions(command) {
   let status = await runtime.getStatus({ handle });
-  const requestedModel = typeof command.model === "string" ? command.model.trim() : "";
+  const requestedModel = typeof command.model === "string" ? command.model : "";
+  const requestedEffort = typeof command.reasoningEffort === "string" ? command.reasoningEffort : "";
+  validateRequestedProviderCatalog(status, requestedModel, requestedEffort);
   if (requestedModel) {
     const modelOption = uniqueConfigOption(status, "model", ["model"], "model");
     if (!advertisedSelectValues(modelOption).includes(requestedModel)) {
       throw new Error(`the provider did not advertise requested model ${JSON.stringify(requestedModel)}; choose Provider default or another advertised model`);
     }
-    // Always set explicitly, even when the provider currently reports this
-    // value. acpx persists the requested control only through setConfigOption,
-    // and that durable intent is needed for its own reconnect path.
+    // Apply the exact advertised token explicitly. Configuration belongs to
+    // this live provider Port; the gateway does not invent aliases or rewrite
+    // provider-owned values.
     await runtime.setConfigOption({ handle, key: modelOption.id, value: requestedModel });
     status = await runtime.getStatus({ handle });
+    validateRequestedProviderCatalog(status, requestedModel, requestedEffort);
     const appliedModelOption = uniqueConfigOption(status, "model", ["model"], "model");
     const appliedByOption = appliedModelOption.currentValue === requestedModel;
-    const appliedByStatus = modelSelectionMatches(requestedModel, status?.models?.currentModelId);
+    const appliedByStatus = status?.models?.currentModelId === requestedModel;
     if (!appliedByOption && !appliedByStatus) {
       throw new Error(`the provider did not apply requested model ${JSON.stringify(requestedModel)}`);
     }
   }
 
-  const requestedEffort = typeof command.reasoningEffort === "string" ? command.reasoningEffort.trim() : "";
   if (requestedEffort) {
     const effortOption = uniqueConfigOption(status, "thought_level", ["reasoning_effort", "effort", "thinking", "thought_level"], "reasoning effort");
     if (!advertisedSelectValues(effortOption).includes(requestedEffort)) {
       throw new Error(`the provider did not advertise requested reasoning effort ${JSON.stringify(requestedEffort)}; choose Provider default or another advertised effort`);
     }
-    // See the model branch above: setting an already-effective value is still
-    // required so acpx records the explicit desired option for reconnects.
+    // See the model branch above: pass the provider-owned token unchanged.
     await runtime.setConfigOption({ handle, key: effortOption.id, value: requestedEffort });
     status = await runtime.getStatus({ handle });
+    validateRequestedProviderCatalog(status, requestedModel, requestedEffort);
     const applied = uniqueConfigOption(status, "thought_level", ["reasoning_effort", "effort", "thinking", "thought_level"], "reasoning effort");
     if (applied.currentValue !== requestedEffort) {
       throw new Error(`the provider did not apply requested reasoning effort ${JSON.stringify(requestedEffort)}`);
@@ -482,10 +587,11 @@ async function applyRequestedProviderOptions(command) {
   // the model (or vice versa). Verify the complete requested tuple only after
   // every mutation, immediately before the worker is allowed to send a turn.
   status = await runtime.getStatus({ handle });
+  validateRequestedProviderCatalog(status, requestedModel, requestedEffort);
   if (requestedModel) {
     const finalModelOption = uniqueConfigOption(status, "model", ["model"], "model");
     const finalModelByOption = finalModelOption.currentValue === requestedModel;
-    const finalModelByStatus = modelSelectionMatches(requestedModel, status?.models?.currentModelId);
+    const finalModelByStatus = status?.models?.currentModelId === requestedModel;
     if (!finalModelByOption && !finalModelByStatus) {
       throw new Error(`the provider did not retain requested model ${JSON.stringify(requestedModel)}`);
     }
@@ -508,7 +614,16 @@ async function ensure(command) {
     if (!sameSession) {
       throw new Error("runtime bridge is already bound to a different Task Console Session");
     }
+    if (command.resumeSessionId && handle.backendSessionId !== command.resumeSessionId) {
+      throw new Error("runtime bridge is already bound to a different ACP conversation");
+    }
+    await requireRetainedPort("Session reuse");
+    const status = await runtime.getStatus({ handle });
+    emit({ type: "response", commandId: command.commandId, data: { handle, status } });
+    return;
   }
+  const manager = await prepareStrictRetainedPortMode();
+  await requireExactResumeConnection(command);
   handle = await runtime.ensureSession({
     sessionKey: command.sessionKey,
     agent: command.agent,
@@ -516,12 +631,8 @@ async function ensure(command) {
     cwd: command.cwd,
     resumeSessionId: command.resumeSessionId || undefined,
   });
-  // Provider/user defaults can silently allow edits. Select each adapter's
-  // restrictive mode so writes and commands cross session/request_permission.
-  const readApprovalMode = command.useBuiltin ? readApprovalProviderModes.get(command.agent) : undefined;
-  if (configuredPermissionMode === "approve-reads" && readApprovalMode) {
-    await runtime.setMode({ handle, mode: readApprovalMode });
-  }
+  activateStrictRetainedPortMode(manager);
+  await requireRetainedPort("Session startup");
   const status = await runtime.getStatus({ handle });
   emit({ type: "response", commandId: command.commandId, data: { handle, status } });
 }
@@ -533,43 +644,63 @@ async function configureProviderOptions(command) {
   if (activeTurn) {
     throw new Error("cannot configure provider options while an acpx runtime turn is active");
   }
+  await requireRetainedPort("provider configuration");
   const status = await applyRequestedProviderOptions(command);
+  await requireRetainedPort("provider configuration completion");
   emit({ type: "response", commandId: command.commandId, data: { handle, status } });
 }
 
-async function refresh(command) {
+async function providerOptions(command) {
   if (!runtime || !handle) {
     throw new Error("acpx runtime Session is not ensured");
   }
   if (activeTurn) {
-    throw new Error("cannot refresh while an acpx runtime turn is active");
+    throw new Error("cannot inspect provider options while an acpx runtime turn is active");
   }
-  cancelPendingPermissions("Session refreshed after native activity");
-  await runtime.close({ handle, reason: "refresh after provider-native activity" });
-  handle = undefined;
-  await ensure(command);
+  await requireRetainedPort("provider option discovery");
+  const status = await runtime.getStatus({ handle });
+  await requireRetainedPort("provider option discovery completion");
+  emit({
+    type: "response",
+    commandId: command.commandId,
+    data: { handle, status, providerOptions: providerOptionCatalog(status) },
+  });
 }
 
 async function runTurn(command) {
   if (!runtime || !handle) {
     throw new Error("acpx runtime Session is not ensured");
   }
-  if (activeTurn) {
+  if (activeTurn || activatingTurn) {
     throw new Error("an acpx runtime turn is already active");
   }
+  // Reserve the turn synchronously before the first asynchronous preflight.
+  // Command lines are handled concurrently so Cancel can otherwise observe no
+  // active turn, acknowledge a no-op, and let this prompt start afterward.
+  const activation = { cancelled: false, reason: "" };
+  activatingTurn = activation;
   activeTurnCommandId = command.commandId;
   activeRequestId = command.requestId;
-  const turn = runtime.startTurn({
-    handle,
-    text: command.text,
-    mode: "prompt",
-    requestId: command.requestId,
-  });
-  activeTurn = turn;
-  emit({ type: "turn_started", commandId: command.commandId, requestId: command.requestId });
   try {
+    await requireRetainedPort("prompt dispatch");
+    if (activation.cancelled) {
+      emit({
+        type: "turn_result",
+        commandId: command.commandId,
+        requestId: command.requestId,
+        result: { status: "cancelled", stopReason: "cancelled" },
+      });
+      return;
+    }
+    const turn = runtime.startTurn({
+      handle,
+      text: command.text,
+      mode: "prompt",
+      requestId: command.requestId,
+    });
+    activeTurn = turn;
+    emit({ type: "turn_started", commandId: command.commandId, requestId: command.requestId });
     for await (const event of turn.events) {
-      hostPermissionForRuntimeEvent(event);
       emit({
         type: "runtime_event",
         commandId: command.commandId,
@@ -578,6 +709,7 @@ async function runTurn(command) {
       });
     }
     const result = await turn.result;
+    await requireRetainedPort("prompt completion");
     emit({
       type: "turn_result",
       commandId: command.commandId,
@@ -586,6 +718,7 @@ async function runTurn(command) {
     });
   } finally {
     cancelPendingPermissions("turn ended");
+    if (activatingTurn === activation) activatingTurn = undefined;
     activeTurn = undefined;
     activeTurnCommandId = "";
     activeRequestId = "";
@@ -605,17 +738,6 @@ async function respondPermission(command) {
     }
     decision = { outcome: option.kind };
   }
-  if (pending.source === "host") {
-    pendingPermissions.delete(command.permissionId);
-    pending.cleanup();
-    answerHostPrompt(decision.outcome === "allow_once" || decision.outcome === "allow_always");
-    emit({
-      type: "response",
-      commandId: command.commandId,
-      data: { accepted: true, permissionId: command.permissionId, optionId: command.optionId || "", outcome: decision.outcome },
-    });
-    return;
-  }
   if (!settlePermission(command.permissionId, decision)) {
     throw new Error(`permission ${command.permissionId} is no longer pending`);
   }
@@ -630,18 +752,13 @@ async function cancelTurn(command) {
   cancelPendingPermissions(command.reason || "turn cancelled");
   if (activeTurn) {
     await activeTurn.cancel({ reason: command.reason || "cancelled by user" });
+  } else if (activatingTurn) {
+    activatingTurn.cancelled = true;
+    activatingTurn.reason = command.reason || "cancelled by user";
   } else if (runtime && handle) {
     await runtime.cancel({ handle, reason: command.reason || "cancelled by user" });
   }
   emit({ type: "response", commandId: command.commandId, data: { cancelled: true } });
-}
-
-async function inspect(command) {
-  if (!runtime || !handle) {
-    throw new Error("acpx runtime Session is not ensured");
-  }
-  const status = await runtime.getStatus({ handle });
-  emit({ type: "response", commandId: command.commandId, data: { handle, status } });
 }
 
 async function shutdown(command) {
@@ -652,12 +769,15 @@ async function shutdown(command) {
   cancelPendingPermissions("Session worker stopped");
   if (activeTurn) {
     await activeTurn.cancel({ reason: "Session worker stopped" });
+  } else if (activatingTurn) {
+    activatingTurn.cancelled = true;
+    activatingTurn.reason = "Session worker stopped";
   }
   if (runtime && handle) {
     await runtime.close({ handle, reason: "Session worker stopped" });
   }
   emit({ type: "response", commandId: command.commandId, data: { closed: true } });
-  setTimeout(() => process.exit(0), 0);
+  requestBridgeExit(0);
 }
 
 async function handleCommand(command) {
@@ -669,11 +789,11 @@ async function handleCommand(command) {
       case "ensure":
         await ensure(command);
         break;
-      case "refresh":
-        await refresh(command);
-        break;
       case "configure":
         await configureProviderOptions(command);
+        break;
+      case "provider_options":
+        await providerOptions(command);
         break;
       case "turn":
         await runTurn(command);
@@ -683,9 +803,6 @@ async function handleCommand(command) {
         break;
       case "cancel":
         await cancelTurn(command);
-        break;
-      case "inspect":
-        await inspect(command);
         break;
       case "shutdown":
         await shutdown(command);

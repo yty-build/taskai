@@ -1,6 +1,6 @@
 // Package web provides the disposable loopback-only browser UI. Pages render
 // shared Task/Session service data and browser interactions use the versioned
-// API; no worker transport or ACP wire data is exposed here.
+// API, including the mechanical Session frame stream.
 package web
 
 import (
@@ -15,7 +15,6 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/yty-build/acp-gateway/internal/agents"
 	"github.com/yty-build/acp-gateway/internal/api"
@@ -37,25 +36,19 @@ type Server struct {
 }
 
 type sessionView struct {
-	ID                       string
-	TaskID                   string
-	Role                     string
-	Agent                    string
-	Provider                 string
-	RequestedModel           string
-	RequestedReasoningEffort string
-	RepoPath                 string
-	WorktreePath             string
-	CheckoutLabel            string
-	Branch                   string
-	Status                   string
-	Permission               string
-	WorkerRunning            bool
-	ConversationReady        bool
-	ConversationVerified     bool
-	ConversationVerifiedAt   *time.Time
-	UpdatedAt                time.Time
-	LastActivityAt           *time.Time
+	ID              string
+	TaskID          string
+	ParentSessionID string
+	Role            string
+	Agent           string
+	RepoPath        string
+	WorktreePath    string
+	CheckoutLabel   string
+	Branch          string
+	Status          string
+	Permission      string
+	Resumable       bool
+	HasProviderRef  bool
 }
 
 type navigationTask struct {
@@ -104,12 +97,6 @@ func New(tasks *task.Service, sessions *appservice.SessionService, registry *age
 				return "A"
 			}
 			return strings.ToUpper(string([]rune(value)[0]))
-		},
-		"formatTime": func(value time.Time) string {
-			if value.IsZero() {
-				return ""
-			}
-			return value.Local().Format("2006-01-02 15:04:05")
 		},
 	}).ParseFS(content, "templates/*.html")
 	if err != nil {
@@ -227,14 +214,13 @@ func (s *Server) navigation(ctx context.Context, currentTaskID string) ([]naviga
 func (s *Server) execute(writer http.ResponseWriter, name string, data any) {
 	writer.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := s.templates.ExecuteTemplate(writer, name, data); err != nil {
-		// Headers may already be committed. The error is intentionally not sent
+		// Headers may already have been written. The error is intentionally not sent
 		// to the browser because template internals are not a client contract.
 		return
 	}
 }
 
 func makeSessionView(current session.Session) sessionView {
-	providerOptions, _ := session.ParseProviderOptions(current.MetadataJSON)
 	label := filepath.Base(current.RepoPath)
 	if label == "." || label == string(filepath.Separator) || strings.TrimSpace(label) == "" {
 		label = current.RepoPath
@@ -243,13 +229,10 @@ func makeSessionView(current session.Session) sessionView {
 		label += " · isolated worktree"
 	}
 	return sessionView{
-		ID: current.ID, TaskID: current.TaskID, Role: current.Role, Agent: current.Agent, Provider: current.Provider,
-		RequestedModel: providerOptions.Model, RequestedReasoningEffort: providerOptions.ReasoningEffort,
+		ID: current.ID, TaskID: current.TaskID, ParentSessionID: current.ParentSessionID, Role: current.Role, Agent: current.Agent,
 		RepoPath: current.RepoPath, WorktreePath: current.WorktreePath, CheckoutLabel: label, Branch: current.Branch,
-		Status: string(current.Status), Permission: appservice.PermissionLabel(current), WorkerRunning: current.WorkerSocket != "",
-		ConversationReady: current.ProviderConversationID != "", ConversationVerified: current.ConversationIDVerifiedAt != nil,
-		ConversationVerifiedAt: current.ConversationIDVerifiedAt,
-		UpdatedAt:              current.UpdatedAt, LastActivityAt: current.LastActivityAt,
+		Status: string(current.Status), Permission: appservice.PermissionLabel(current),
+		Resumable: current.CanResume(), HasProviderRef: current.ProviderRef != "",
 	}
 }
 

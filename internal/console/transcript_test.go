@@ -5,365 +5,333 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/yty-build/acp-gateway/internal/acp"
 	"github.com/yty-build/acp-gateway/internal/sessionlog"
 	"github.com/yty-build/acp-gateway/internal/worker"
 )
 
-func TestTranscriptProjectsTurnsAndCoalescesRealShapedACP(t *testing.T) {
+func TestTranscriptProjectsV6SessionChannelFramesImmediately(t *testing.T) {
 	projection := newTranscript()
-	requestID := "REQ-1"
 	lines := []sessionlog.Line{
-		projectionLine(1, requestID, "prompt_submitted", map[string]any{"display_message": "First paragraph.\n\nSecond paragraph."}),
-		projectionLine(2, requestID, "prompt_ready", map[string]any{"state": "ready"}),
-		projectionLine(3, requestID, "turn_started", map[string]any{"request_id": requestID}),
-		projectionACPLine(4, requestID, "initialize", map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
-		projectionACPLine(5, requestID, "usage_update", sessionUpdate(map[string]any{"sessionUpdate": "usage_update", "used": 15})),
-		projectionACPLine(6, requestID, "agent_thought_chunk", sessionUpdate(messageUpdate("agent_thought_chunk", "check ", "thought-1"))),
-		projectionACPLine(7, requestID, "agent_thought_chunk", sessionUpdate(messageUpdate("agent_thought_chunk", "constraints", "thought-1"))),
-		projectionACPLine(8, requestID, "agent_message_chunk", sessionUpdate(messageUpdate("agent_message_chunk", "Hello, ", "message-1"))),
-		projectionACPLine(9, requestID, "agent_message_chunk", sessionUpdate(messageUpdate("agent_message_chunk", "world.\n\nNext paragraph.", "message-1"))),
-		projectionLine(10, requestID, "turn_completed", map[string]any{"stopReason": "end_turn"}),
+		testLine(1, "REQ-1", worker.FrameClientCommand, map[string]any{"command": "prompt", "text": "Where am I?"}),
+		testLine(2, "REQ-1", worker.FrameProviderEvent, map[string]any{"type": "text_delta", "stream": "reasoning", "text": "Checking the working directory."}),
+		testLine(3, "REQ-1", worker.FrameProviderEvent, map[string]any{"type": "text_delta", "stream": "output", "text": "You are in "}),
+		testLine(4, "REQ-1", worker.FrameProviderEvent, map[string]any{"type": "text_delta", "stream": "output", "text": "/repo."}),
+		testLine(5, "REQ-1", worker.FrameProviderResult, map[string]any{"status": "completed", "stop_reason": "end_turn"}),
 	}
 	for _, line := range lines {
 		if !projection.apply(line) {
-			t.Fatalf("line %d was not applied", line.Seq)
+			t.Fatalf("frame %d was not applied", line.Seq)
 		}
-	}
-	if projection.apply(lines[8]) {
-		t.Fatal("duplicate stream position was applied twice")
 	}
 	if len(projection.requests) != 1 {
-		t.Fatalf("requests = %d, want 1", len(projection.requests))
+		t.Fatalf("requests = %d", len(projection.requests))
 	}
 	request := projection.requests[0]
-	if request.state != turnComplete {
-		t.Fatalf("state = %q, want complete", request.state)
+	if request.state != turnComplete || request.stop != "end_turn" {
+		t.Fatalf("terminal state = %q, stop = %q", request.state, request.stop)
 	}
 	if len(request.blocks) != 3 {
-		t.Fatalf("blocks = %#v, want user/thought/assistant", request.blocks)
+		t.Fatalf("blocks = %#v", request.blocks)
 	}
-	if got := request.blocks[0].text; got != "First paragraph.\n\nSecond paragraph." {
-		t.Fatalf("user message = %q", got)
+	if request.blocks[0].kind != blockUser || request.blocks[0].text != "Where am I?" {
+		t.Fatalf("user block = %#v", request.blocks[0])
 	}
-	if got := request.blocks[1].text; got != "check constraints" {
-		t.Fatalf("thought = %q", got)
+	if request.blocks[1].kind != blockThought || request.blocks[1].text != "Checking the working directory." {
+		t.Fatalf("thought block = %#v", request.blocks[1])
 	}
-	if got := request.blocks[2].text; got != "Hello, world.\n\nNext paragraph." {
-		t.Fatalf("assistant = %q", got)
-	}
-	if projection.metadata.usage != "15" {
-		t.Fatalf("usage metadata = %q", projection.metadata.usage)
+	if request.blocks[2].kind != blockAssistant || request.blocks[2].text != "You are in /repo." {
+		t.Fatalf("assistant block = %#v", request.blocks[2])
 	}
 }
 
-func TestTranscriptPreservesInterleavedReasoningChronology(t *testing.T) {
+func TestTranscriptProjectsToolAndPermissionFrames(t *testing.T) {
 	projection := newTranscript()
-	requestID := "REQ-ORDER"
-	lines := []sessionlog.Line{
-		projectionLine(1, requestID, "prompt_submitted", map[string]any{"display_message": "Investigate."}),
-		projectionLine(2, requestID, "turn_started", map[string]any{}),
-		projectionACPLine(3, requestID, "agent_thought_chunk", sessionUpdate(messageUpdate("agent_thought_chunk", "reason one", "thought-1"))),
-		projectionACPLine(4, requestID, "agent_message_chunk", sessionUpdate(messageUpdate("agent_message_chunk", "update one", "message-1"))),
-		projectionACPLine(5, requestID, "tool_call", sessionUpdate(map[string]any{"sessionUpdate": "tool_call", "toolCallId": "tool-1", "title": "Inspect", "status": "completed"})),
-		projectionACPLine(6, requestID, "agent_thought_chunk", sessionUpdate(messageUpdate("agent_thought_chunk", "reason two", "thought-2"))),
-		projectionACPLine(7, requestID, "agent_message_chunk", sessionUpdate(messageUpdate("agent_message_chunk", "final response", "message-2"))),
-		projectionLine(8, requestID, "turn_completed", map[string]any{"stopReason": "end_turn"}),
-	}
-	for _, line := range lines {
-		projection.apply(line)
-	}
-	request := projection.requests[0]
-	wantKinds := []blockKind{blockUser, blockThought, blockAssistant, blockTool, blockThought, blockAssistant}
-	if len(request.blocks) != len(wantKinds) {
-		t.Fatalf("blocks = %d, want %d: %#v", len(request.blocks), len(wantKinds), request.blocks)
-	}
-	for index, want := range wantKinds {
-		if request.blocks[index].kind != want {
-			t.Fatalf("block %d kind = %d, want %d", index, request.blocks[index].kind, want)
-		}
-	}
-	if request.blocks[1].text != "reason one" || request.blocks[4].text != "reason two" {
-		t.Fatalf("reasoning segments merged out of order: %#v", request.blocks)
-	}
-	if got := request.completedResponse(); got == nil || got.text != "final response" {
-		t.Fatalf("completed response = %#v", got)
-	}
-}
-
-func TestTranscriptRetainsRecentAssistantAndReasoningTails(t *testing.T) {
-	projection := newTranscript()
-	requestID := "REQ-TAIL"
-	projection.apply(projectionLine(1, requestID, "prompt_submitted", map[string]any{"display_message": "Stream a lot."}))
-	projection.apply(projectionACPLine(2, requestID, "agent_message_chunk", sessionUpdate(messageUpdate("agent_message_chunk", strings.Repeat("a", maxProjectedMessageBytes), "message"))))
-	projection.apply(projectionACPLine(3, requestID, "agent_message_chunk", sessionUpdate(messageUpdate("agent_message_chunk", "FINAL-MARKER", "message"))))
-	projection.apply(projectionACPLine(4, requestID, "agent_thought_chunk", sessionUpdate(messageUpdate("agent_thought_chunk", strings.Repeat("r", maxProjectedThoughtBytes), "thought"))))
-	projection.apply(projectionACPLine(5, requestID, "agent_thought_chunk", sessionUpdate(messageUpdate("agent_thought_chunk", "REASONING-TAIL", "thought"))))
-
-	request := projection.requests[0]
-	if request.assistantBytes > maxProjectedMessageBytes || request.thoughtBytes > maxProjectedThoughtBytes {
-		t.Fatalf("retention exceeded limits: assistant=%d thought=%d", request.assistantBytes, request.thoughtBytes)
-	}
-	if !request.contentClipped || !request.assistantSeen || !request.reasoningSeen {
-		t.Fatalf("retention provenance was lost: clipped=%v assistant=%v reasoning=%v", request.contentClipped, request.assistantSeen, request.reasoningSeen)
-	}
-	var assistant, thought *transcriptBlock
-	for _, block := range request.blocks {
-		switch block.kind {
-		case blockAssistant:
-			assistant = block
-		case blockThought:
-			thought = block
-		}
-	}
-	if assistant == nil || !strings.HasSuffix(assistant.text, "FINAL-MARKER") || !assistant.truncated {
-		t.Fatalf("assistant tail was not retained: %#v", assistant)
-	}
-	if thought == nil || !strings.HasSuffix(thought.text, "REASONING-TAIL") || !thought.truncated {
-		t.Fatalf("reasoning tail was not retained: %#v", thought)
-	}
-}
-
-func TestTranscriptPresentsReadyPromptAsAcceptedNotQueued(t *testing.T) {
-	projection := newTranscript()
-	projection.apply(projectionLine(1, "REQ-READY", "prompt_submitted", map[string]any{"display_message": "Continue while native is open"}))
-	projection.apply(projectionLine(2, "REQ-READY", "prompt_ready", map[string]any{"state": "ready"}))
-	request := projection.requests[0]
-	if request.state != turnReady {
-		t.Fatalf("ready prompt state = %q", request.state)
-	}
-	if got := renderTurnState(request.state); !strings.Contains(got, "Message accepted") || strings.Contains(strings.ToLower(got), "queued") {
-		t.Fatalf("ready prompt rendering = %q", got)
-	}
-}
-
-func TestTranscriptProjectsLegacySessionPromptWithoutTransportScaffolding(t *testing.T) {
-	projection := newTranscript()
-	prompt := "Task T-1: Claude review\nDescription: (none)\nSession: S-1\nRole: reviewer\nRepository: /repo\nWorktree: /worktree\nBranch: agent/review\nWork in the repository context at /worktree. This is one Session under the Task; preserve the Task/Session boundary.\n\nSession-specific instructions:\nReview the implementation and report any problems."
-	projection.apply(projectionLine(1, "REQ-LEGACY", "prompt_queued", map[string]any{"state": "ready"}))
-	projection.apply(projectionACPLine(2, "REQ-LEGACY", "session_prompt", map[string]any{
-		"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": map[string]any{
-			"sessionId": "native", "prompt": []any{map[string]any{"type": "text", "text": prompt}},
-		},
-	}))
-	request := projection.requests[0]
-	if len(request.blocks) != 1 || request.blocks[0].kind != blockUser {
-		t.Fatalf("legacy prompt blocks = %#v", request.blocks)
-	}
-	want := "Start work on \"Claude review\" as reviewer.\n\nReview the implementation and report any problems."
-	if got := request.blocks[0].text; got != want {
-		t.Fatalf("legacy display message = %q, want %q", got, want)
-	}
-	if strings.Contains(request.blocks[0].text, "Repository:") || strings.Contains(request.blocks[0].text, "Worktree:") {
-		t.Fatalf("legacy prompt leaked transport scaffolding: %q", request.blocks[0].text)
-	}
-
-	// A newer truthful prompt_submitted record replaces the legacy fallback.
-	projection.apply(projectionLine(3, "REQ-LEGACY", "prompt_submitted", map[string]any{"display_message": "Exact user-facing message."}))
-	if got := request.blocks[0].text; got != "Exact user-facing message." || request.blocks[0].legacy {
-		t.Fatalf("truthful prompt did not replace fallback: %#v", request.blocks[0])
-	}
-}
-
-func TestTranscriptMergesToolLifecycleAndBoundsLargeBodies(t *testing.T) {
-	const sentinel = "SENTINEL-MUST-NOT-APPEAR-IN-DEFAULT-VIEW"
-	line := strings.Repeat("package example // long source line\n", 760)
-	body := line + sentinel
-	projection := newTranscript()
-	requestID := "REQ-TOOL"
-	updates := []sessionlog.Line{
-		projectionLine(1, requestID, "prompt_submitted", map[string]any{"display_message": "Review the implementation."}),
-		projectionACPLine(2, requestID, "tool_call", sessionUpdate(map[string]any{
-			"sessionUpdate": "tool_call", "toolCallId": "tool-1", "title": "Read", "kind": "read", "status": "pending",
-		})),
-		projectionACPLine(3, requestID, "tool_call_update", sessionUpdate(map[string]any{
-			"sessionUpdate": "tool_call_update", "toolCallId": "tool-1", "rawInput": map[string]any{"path": "/repo/internal/console/model.go"},
-		})),
-		projectionACPLine(4, requestID, "tool_call_update", sessionUpdate(map[string]any{
-			"sessionUpdate": "tool_call_update", "toolCallId": "tool-1",
-			"_meta": map[string]any{"claudeCode": map[string]any{"toolResponse": map[string]any{
-				"type": "text", "file": map[string]any{"filePath": "/repo/internal/console/model.go", "content": body, "numLines": 761},
-			}}},
-		})),
-		projectionACPLine(5, requestID, "tool_call_update", sessionUpdate(map[string]any{
-			"sessionUpdate": "tool_call_update", "toolCallId": "tool-1", "status": "completed",
-			"content":   []any{map[string]any{"type": "content", "content": map[string]any{"type": "text", "text": body}}},
-			"rawOutput": body,
-		})),
-	}
-	for _, item := range updates {
-		projection.apply(item)
-	}
-	tools := projection.tools()
-	if len(tools) != 1 {
-		t.Fatalf("logical tools = %d, want 1", len(tools))
-	}
-	tool := tools[0]
-	if tool.status != "completed" || tool.kind != "read" || tool.metadata != "model.go" {
-		t.Fatalf("merged tool = %#v", tool)
-	}
-	if tool.outputBytes < 25_000 || tool.outputLines < 760 {
-		t.Fatalf("tool size = %d bytes / %d lines", tool.outputBytes, tool.outputLines)
-	}
-	if tool.preview != "" || strings.Contains(tool.preview, sentinel) {
-		t.Fatalf("large source leaked through preview: %q", tool.preview)
-	}
-	if !strings.Contains(tool.detail, sentinel) {
-		t.Fatal("explicit bounded detail lost forensic content")
-	}
-	if len(tool.detail) > maxToolDetailBytes {
-		t.Fatalf("detail is unbounded: %d bytes", len(tool.detail))
-	}
-	encoded, err := json.Marshal(updates[len(updates)-1])
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(encoded), sentinel) {
-		t.Fatal("raw history no longer exposes complete forensic data")
-	}
-}
-
-func TestTranscriptUpdatesPlanPermissionErrorsAndCancellation(t *testing.T) {
-	projection := newTranscript()
-	requestID := "REQ-STATE"
-	permissionID := worker.PermissionConsoleID(requestID, "8")
-	lines := []sessionlog.Line{
-		projectionLine(1, requestID, "prompt_submitted", map[string]any{"display_message": "Make a safe change."}),
-		projectionLine(2, requestID, "turn_started", map[string]any{}),
-		projectionACPLine(3, requestID, "plan", sessionUpdate(map[string]any{"sessionUpdate": "plan", "entries": []any{
-			map[string]any{"content": "Inspect", "status": "in_progress"},
-		}})),
-		projectionACPLine(4, requestID, "plan_update", sessionUpdate(map[string]any{"sessionUpdate": "plan_update", "entries": []any{
-			map[string]any{"content": "Inspect", "status": "completed"}, map[string]any{"content": "Edit", "status": "in_progress"},
-		}})),
-		projectionACPLine(5, requestID, "session_request_permission", map[string]any{
-			"jsonrpc": "2.0", "id": 8, "method": "session/request_permission", "params": map[string]any{
-				"sessionId": "provider-session", "toolCall": map[string]any{"toolCallId": "tool-write", "title": "Write config", "kind": "edit"},
-				"options": []any{map[string]any{"optionId": "allow", "name": "Allow once", "kind": "allow_once"}, map[string]any{"optionId": "reject", "name": "Deny", "kind": "reject_once"}},
+	for _, line := range []sessionlog.Line{
+		testLine(1, "REQ-2", worker.FrameClientCommand, map[string]any{"command": "prompt", "text": "Edit it"}),
+		testLine(2, "REQ-2", worker.FrameProviderEvent, map[string]any{
+			"type": "tool_call", "tool_call": map[string]any{
+				"id": "tool-1", "title": "Read file", "kind": "read", "status": "completed",
+				"content": []any{map[string]any{"type": "content", "content": map[string]any{"text": "safe preview"}}},
 			},
 		}),
-		projectionLine(6, requestID, "permission_resolved", map[string]any{"permission_id": permissionID, "decision": "deny"}),
-		projectionLine(7, requestID, "cancel_requested", map[string]any{}),
-		projectionACPLine(8, requestID, "prompt_result", map[string]any{"jsonrpc": "2.0", "id": 3, "result": map[string]any{"stopReason": "cancelled"}}),
-		projectionLine(9, requestID, "turn_completed", map[string]any{"stopReason": "cancelled"}),
-	}
-	for _, line := range lines {
+		testLine(3, "REQ-2", worker.FramePermissionRequested, worker.PendingPermission{
+			ID: "permission-1", RequestID: "REQ-2", Title: "Write file", Kind: "edit",
+			Options: []worker.PermissionOption{{ID: "allow", Name: "Allow once", Kind: "allow_once"}},
+		}),
+	} {
 		projection.apply(line)
 	}
 	request := projection.requests[0]
-	if request.state != turnCancelled {
-		t.Fatalf("state = %q", request.state)
+	if tool := request.tools["tool-1"]; tool == nil || tool.title != "Read file" || tool.preview != "safe preview" {
+		t.Fatalf("tool = %#v", tool)
 	}
-	if request.plan == nil || len(request.plan.plan) != 2 || request.plan.plan[1].content != "Edit" {
-		t.Fatalf("plan was not updated in place: %#v", request.plan)
+	_, permission := projection.pendingPermission()
+	if permission == nil || permission.id != "permission-1" || len(permission.options) != 1 {
+		t.Fatalf("permission = %#v", permission)
 	}
-	if len(request.permission) != 1 {
-		t.Fatalf("permissions = %#v", request.permission)
-	}
-	card := request.permission[permissionID]
-	if card == nil || card.state != "resolved" || card.decision != "deny" {
-		t.Fatalf("permission = %#v", card)
-	}
+	projection.apply(testLine(4, "REQ-2", worker.FramePermissionResolved, map[string]any{
+		"permission_id": "permission-1", "decision": "allow",
+	}))
 	if _, pending := projection.pendingPermission(); pending != nil {
 		t.Fatalf("resolved permission remained pending: %#v", pending)
 	}
 }
 
-func TestTranscriptRestoresWorkerPermissionBeforeACPEventAndAbandonsIt(t *testing.T) {
+func TestTranscriptPermissionCompactionKeepsEveryWaitingCardActionable(t *testing.T) {
 	projection := newTranscript()
-	permissionID := worker.PermissionConsoleID("REQ-PENDING", "permission-2")
-	projection.apply(projectionLine(1, "REQ-PENDING", "prompt_submitted", map[string]any{"display_message": "Write safely."}))
-	projection.apply(projectionLine(2, "REQ-PENDING", "permission_requested", map[string]any{
-		"id": permissionID, "request_id": "REQ-PENDING",
-		"title": "Write marker", "kind": "edit", "options": []any{
-			map[string]any{"id": "allow", "name": "Allow once", "kind": "allow_once"},
-			map[string]any{"id": "reject", "name": "Reject", "kind": "reject_once"},
+	projection.apply(testLine(1, "REQ-pending", worker.FrameClientCommand, map[string]any{
+		"command": "prompt", "text": strings.Repeat("history", 4096),
+	}))
+	projection.apply(testLine(2, "REQ-pending", worker.FrameProviderEvent, map[string]any{
+		"type": "tool_call", "tool_call": map[string]any{
+			"id": "tool-history", "title": "Large history", "kind": "read", "status": "completed",
+			"content": strings.Repeat("x", maxToolDetailBytes),
 		},
 	}))
-	_, pending := projection.pendingPermission()
-	if pending == nil || pending.id != permissionID || len(pending.options) != 2 {
-		t.Fatalf("worker permission was not restored: %#v", pending)
+	want := []worker.PendingPermission{
+		{
+			ID: "permission-one  exact", RequestID: "REQ-pending", Title: "First", Kind: "edit",
+			Options: []worker.PermissionOption{
+				{ID: "allow-one  exact", Name: "Allow once", Kind: "allow_once"},
+				{ID: "reject-one-exact", Name: "Reject once", Kind: "reject_once"},
+			},
+		},
+		{
+			ID: "permission-two-exact", RequestID: "REQ-pending", Title: "Second", Kind: "execute",
+			Options: []worker.PermissionOption{
+				{ID: "allow-two-exact", Name: "Allow once", Kind: "allow_once"},
+				{ID: "reject-two-exact", Name: "Reject once", Kind: "reject_once"},
+			},
+		},
+		{
+			ID: "permission-three-exact", RequestID: "REQ-pending", Title: "Third", Kind: "network",
+			Options: []worker.PermissionOption{
+				{ID: "allow-three-exact", Name: "Allow once", Kind: "allow_once"},
+				{ID: "reject-three-exact", Name: "Reject once", Kind: "reject_once"},
+			},
+		},
 	}
-	projection.apply(projectionLine(3, "REQ-PENDING", "permission_abandoned", map[string]any{
-		"permission_id": permissionID, "message": "worker stopped",
-	}))
-	if _, stillPending := projection.pendingPermission(); stillPending != nil {
-		t.Fatalf("abandoned permission remained actionable: %#v", stillPending)
+	sequence := uint64(3)
+	for _, pending := range want {
+		projection.apply(testLine(sequence, pending.RequestID, worker.FramePermissionRequested, pending))
+		sequence++
 	}
-	if pending.state != "resolved" || !strings.Contains(pending.decision, "worker stopped") {
-		t.Fatalf("abandoned permission state = %#v", pending)
-	}
-}
-
-func TestTranscriptSanitizesHostileTerminalSequences(t *testing.T) {
-	projection := newTranscript()
-	projection.apply(projectionLine(1, "REQ", "prompt_submitted", map[string]any{
-		"display_message": "alpha\x1b]52;c;SECRET\a\x1b[31m red\x1b[0m\n\tindented\x00",
-	}))
-	got := projection.requests[0].blocks[0].text
-	if strings.Contains(got, "\x1b") || strings.Contains(got, "SECRET") || strings.ContainsRune(got, '\x00') {
-		t.Fatalf("hostile control sequence survived: %q", got)
-	}
-	if !strings.Contains(got, "\n\tindented") {
-		t.Fatalf("newlines/tabs were not preserved: %q", got)
-	}
-}
-
-func TestTranscriptAppliesTenThousandEventsWithinBudget(t *testing.T) {
-	projection := newTranscript()
-	started := time.Now()
-	projection.apply(projectionLine(1, "REQ-PERF", "prompt_submitted", map[string]any{"display_message": "Stream a response."}))
-	for sequence := uint64(2); sequence <= 10_001; sequence++ {
-		projection.apply(projectionACPLine(sequence, "REQ-PERF", "agent_message_chunk", sessionUpdate(messageUpdate("agent_message_chunk", "x", "message-perf"))))
-	}
-	elapsed := time.Since(started)
-	// Acceptance also runs this guard with race instrumentation while the other
-	// packages execute concurrently. Keep this as a generous runaway bound;
-	// steady-state performance remains exercised by the projection benchmark.
-	const budget = 5 * time.Second
-	if elapsed > budget {
-		t.Fatalf("10k event projection took %s, budget is %s", elapsed, budget)
+	if !projection.compactToPendingPermissions() {
+		t.Fatal("permission-bearing transcript was not compacted")
 	}
 	request := projection.requests[0]
-	if len(request.blocks) != 2 || len(request.blocks[1].text) != 10_000 {
-		t.Fatalf("stream did not coalesce: blocks=%d bytes=%d", len(request.blocks), len(request.blocks[1].text))
+	if len(projection.requests) != 1 || len(request.blocks) != len(want) || len(request.permission) != len(want) || len(request.tools) != 0 {
+		t.Fatalf("compacted transcript retained requests=%d blocks=%d permissions=%d tools=%d", len(projection.requests), len(request.blocks), len(request.permission), len(request.tools))
+	}
+	for index := len(want) - 1; index >= 0; index-- {
+		pendingRequest, card := projection.pendingPermission()
+		if pendingRequest != request || card == nil || card.id != want[index].ID || len(card.options) != len(want[index].Options) {
+			t.Fatalf("pending card %d = request %#v card %#v", index, pendingRequest, card)
+		}
+		for optionIndex, option := range card.options {
+			if option.id != want[index].Options[optionIndex].ID {
+				t.Fatalf("pending card %d option %d = %q, want %q", index, optionIndex, option.id, want[index].Options[optionIndex].ID)
+			}
+		}
+		request.resolvePermission(card.id, "allow_once")
+	}
+	if _, card := projection.pendingPermission(); card != nil {
+		t.Fatalf("resolved compacted permissions still reported pending: %#v", card)
+	}
+	if projection.retainedUsage().bytes >= maxToolDetailBytes {
+		t.Fatalf("compaction retained large non-permission history: %d bytes", projection.retainedUsage().bytes)
 	}
 }
 
-func projectionLine(sequence uint64, requestID, lineType string, data any) sessionlog.Line {
-	raw, _ := json.Marshal(data)
-	return sessionlog.Line{Seq: sequence, Timestamp: time.Unix(int64(sequence), 0).UTC(), RequestID: requestID, Type: lineType, Data: raw}
-}
-
-func projectionACPLine(sequence uint64, requestID, eventType string, rawPayload map[string]any) sessionlog.Line {
-	raw, _ := json.Marshal(rawPayload)
-	event, _ := json.Marshal(acp.Event{EventVersion: 1, RequestID: requestID, Seq: sequence, Stream: "prompt", Type: eventType, Raw: raw})
-	return sessionlog.Line{Seq: sequence, Timestamp: time.Unix(int64(sequence), 0).UTC(), RequestID: requestID, Type: "acp", Data: event}
-}
-
-func sessionUpdate(update map[string]any) map[string]any {
-	return map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{"sessionId": "provider-session", "update": update}}
-}
-
-func messageUpdate(kind, text, messageID string) map[string]any {
-	return map[string]any{
-		"sessionUpdate": kind, "messageId": messageID,
-		"content": map[string]any{"type": "text", "text": text},
+func TestTranscriptProviderFailureIsTerminalAndBounded(t *testing.T) {
+	projection := newTranscript()
+	projection.apply(testLine(1, "REQ-3", worker.FrameClientCommand, map[string]any{"command": "prompt", "text": "go"}))
+	projection.apply(testLine(2, "REQ-3", worker.FrameProviderResult, map[string]any{
+		"status": "failed", "code": "rate_limited", "message": "Try again shortly.\x1b[31m",
+	}))
+	request := projection.requests[0]
+	if request.state != turnFailed || len(request.blocks) != 2 {
+		t.Fatalf("failed request = %#v", request)
+	}
+	if strings.Contains(request.errorText, "\x1b") || request.errorText != "Try again shortly." {
+		t.Fatalf("sanitized error = %q", request.errorText)
 	}
 }
 
-func BenchmarkTranscriptApplyTenThousandEvents(b *testing.B) {
-	lines := make([]sessionlog.Line, 10_000)
-	for index := range lines {
-		lines[index] = projectionACPLine(uint64(index+1), "REQ-BENCH", "agent_message_chunk", sessionUpdate(messageUpdate("agent_message_chunk", fmt.Sprintf("%d", index%10), "message")))
+func TestTranscriptDeduplicatesChannelSequenceAndBoundsRollingOutput(t *testing.T) {
+	projection := newTranscript()
+	projection.apply(testLine(1, "REQ-4", worker.FrameClientCommand, map[string]any{"command": "prompt", "text": "stream"}))
+	chunk := strings.Repeat("x", maxProjectedMessageBytes/2+100)
+	line := testLine(2, "REQ-4", worker.FrameProviderEvent, map[string]any{"type": "text_delta", "stream": "output", "text": chunk})
+	if !projection.apply(line) || projection.apply(line) {
+		t.Fatal("channel sequence was not applied exactly once")
 	}
-	b.ResetTimer()
-	for iteration := 0; iteration < b.N; iteration++ {
-		projection := newTranscript()
-		for _, line := range lines {
-			projection.apply(line)
+	projection.apply(testLine(3, "REQ-4", worker.FrameProviderEvent, map[string]any{"type": "text_delta", "stream": "output", "text": chunk}))
+	request := projection.requests[0]
+	if request.assistantBytes > maxProjectedMessageBytes || !request.contentClipped {
+		t.Fatalf("retained assistant bytes = %d, clipped = %v", request.assistantBytes, request.contentClipped)
+	}
+}
+
+func TestTranscriptBoundsRequestAndSequenceState(t *testing.T) {
+	projection := newTranscript()
+	for sequence := 1; sequence <= maxProjectedRequests+37; sequence++ {
+		requestID := fmt.Sprintf("REQ-%03d", sequence)
+		projection.apply(testLine(uint64(sequence), requestID, worker.FrameClientCommand, map[string]any{"command": "prompt", "text": "bounded"}))
+	}
+	if len(projection.requests) != maxProjectedRequests || len(projection.byID) != maxProjectedRequests || !projection.clipped {
+		t.Fatalf("bounded projection = requests %d index %d clipped %v", len(projection.requests), len(projection.byID), projection.clipped)
+	}
+	if projection.apply(testLine(1, "REQ-old", worker.FrameConnection, map[string]any{"state": "connected"})) {
+		t.Fatal("old duplicate frame was reapplied")
+	}
+}
+
+func TestTranscriptBoundsProviderControlledMetadataPromptAndErrors(t *testing.T) {
+	projection := newTranscript()
+	requestID := strings.Repeat("r", maxProjectedIdentifierBytes+73)
+	prompt := strings.Repeat("p", maxProjectedMessageBytes+73)
+	promptLine := testLine(1, requestID, worker.FrameClientCommand, map[string]any{"command": "prompt", "text": prompt})
+	originalPromptJSON := append([]byte(nil), promptLine.Data...)
+	projection.apply(promptLine)
+
+	toolID := strings.Repeat("t", maxProjectedIdentifierBytes+73)
+	projection.apply(testLine(2, requestID, worker.FrameProviderEvent, map[string]any{
+		"type": "tool_call", "tool_call": map[string]any{
+			"id": toolID, "title": strings.Repeat("T", maxProjectedTitleBytes+73),
+			"kind": strings.Repeat("k", maxProjectedKindBytes+73), "status": strings.Repeat("s", maxProjectedStatusBytes+73),
+			"rawInput": map[string]any{"query": strings.Repeat("m", maxProjectedMetadataBytes+73)},
+			"content":  strings.Repeat("d", maxToolDetailBytes+73),
+		},
+	}))
+
+	permissionID := strings.Repeat("a", maxProjectedPermissionIDBytes+73)
+	options := make([]worker.PermissionOption, 0, maxProjectedPermissionOptions+7)
+	for index := 0; index < maxProjectedPermissionOptions+7; index++ {
+		options = append(options, worker.PermissionOption{
+			ID:   strings.Repeat("o", maxProjectedIdentifierBytes+73) + fmt.Sprint(index),
+			Name: strings.Repeat("n", maxProjectedTitleBytes+73),
+			Kind: strings.Repeat("q", maxProjectedKindBytes+73),
+		})
+	}
+	projection.apply(testLine(3, requestID, worker.FramePermissionRequested, worker.PendingPermission{
+		ID: permissionID, Title: strings.Repeat("A", maxProjectedTitleBytes+73),
+		Kind: strings.Repeat("e", maxProjectedKindBytes+73), Options: options,
+	}))
+	projection.apply(testLine(4, requestID, worker.FramePermissionResolved, map[string]any{
+		"permission_id": permissionID, "decision": strings.Repeat("c", maxProjectedDecisionBytes+73),
+	}))
+
+	sequence := uint64(5)
+	for range maxProjectedErrorBlocks + 7 {
+		projection.apply(testLine(sequence, requestID, worker.FrameProviderEvent, map[string]any{
+			"type": "error", "message": strings.Repeat("E", maxProjectedErrorBytes+73),
+		}))
+		sequence++
+	}
+	projection.apply(testLine(sequence, requestID, worker.FrameProviderResult, map[string]any{
+		"status": "failed", "stop_reason": strings.Repeat("z", maxProjectedStopBytes+73),
+		"message": strings.Repeat("F", maxProjectedErrorBytes+73),
+	}))
+
+	if string(promptLine.Data) != string(originalPromptJSON) {
+		t.Fatal("projection mutated the exact raw JSONL payload")
+	}
+	if len(projection.requests) != 1 || !projection.clipped {
+		t.Fatalf("request projection = %d requests, clipped %v", len(projection.requests), projection.clipped)
+	}
+	request := projection.requests[0]
+	if len(request.id) > maxProjectedIdentifierBytes || !request.contentClipped {
+		t.Fatalf("request id/content bounds = %d bytes, clipped %v", len(request.id), request.contentClipped)
+	}
+	if len(request.stop) > maxProjectedStopBytes || len(request.errorText) > maxProjectedErrorBytes {
+		t.Fatalf("terminal metadata = stop %d/error %d bytes", len(request.stop), len(request.errorText))
+	}
+	if len(request.blocks) > maxProjectedBlocks {
+		t.Fatalf("retained blocks = %d, limit %d", len(request.blocks), maxProjectedBlocks)
+	}
+	var user *transcriptBlock
+	errorBlocks := 0
+	for _, block := range request.blocks {
+		switch block.kind {
+		case blockUser:
+			user = block
+		case blockError:
+			errorBlocks++
+			if len(block.text) > maxProjectedErrorBytes {
+				t.Fatalf("error block retained %d bytes", len(block.text))
+			}
 		}
 	}
+	if user == nil || len(user.text) > maxProjectedMessageBytes || !user.truncated {
+		t.Fatalf("bounded user block = %#v", user)
+	}
+	if errorBlocks != maxProjectedErrorBlocks {
+		t.Fatalf("error blocks = %d, want capped %d", errorBlocks, maxProjectedErrorBlocks)
+	}
+
+	tool := request.tools[strings.Repeat("t", maxProjectedIdentifierBytes)]
+	if tool == nil {
+		t.Fatalf("bounded tool keys = %#v", request.tools)
+	}
+	if len(tool.id) > maxProjectedIdentifierBytes || len(tool.title) > maxProjectedTitleBytes ||
+		len(tool.kind) > maxProjectedKindBytes || len(tool.status) > maxProjectedStatusBytes ||
+		len(tool.metadata) > maxProjectedMetadataBytes || len(tool.detail) > maxToolDetailBytes || !tool.detailClipped {
+		t.Fatalf("bounded tool = %#v", tool)
+	}
+
+	permission := request.permission[strings.Repeat("a", maxProjectedPermissionIDBytes)]
+	if permission == nil {
+		t.Fatalf("bounded permission keys = %#v", request.permission)
+	}
+	if permission.state != "resolved" || len(permission.id) > maxProjectedPermissionIDBytes ||
+		len(permission.title) > maxProjectedTitleBytes || len(permission.kind) > maxProjectedKindBytes ||
+		len(permission.decision) > maxProjectedDecisionBytes || len(permission.options) != maxProjectedPermissionOptions {
+		t.Fatalf("bounded permission = %#v", permission)
+	}
+	for _, option := range permission.options {
+		if len(option.id) > maxProjectedIdentifierBytes || len(option.name) > maxProjectedTitleBytes || len(option.kind) > maxProjectedKindBytes {
+			t.Fatalf("unbounded permission option = %#v", option)
+		}
+	}
+}
+
+func TestTranscriptBoundsAlternatingProviderBlocks(t *testing.T) {
+	projection := newTranscript()
+	projection.apply(testLine(1, "REQ-blocks", worker.FrameClientCommand, map[string]any{"command": "prompt", "text": "stream"}))
+	for index := 0; index < maxProjectedBlocks+73; index++ {
+		projection.apply(testLine(uint64(index+2), "REQ-blocks", worker.FrameProviderEvent, map[string]any{
+			"type": "text_delta", "stream": "output", "text": "x", "message_id": fmt.Sprintf("message-%d", index),
+		}))
+	}
+	request := projection.requests[0]
+	if len(request.blocks) != maxProjectedBlocks || !request.contentClipped {
+		t.Fatalf("alternating blocks = %d, clipped %v", len(request.blocks), request.contentClipped)
+	}
+}
+
+func TestConsoleSanitizersRemoveUnicodeFormatAndTerminalControls(t *testing.T) {
+	input := "safe\x1b[2J\u009b31m\u202e\u2066\u200btext\r\nnext\tfield"
+	display := sanitizeDisplay(input)
+	for _, forbidden := range []rune{'\x1b', '\u009b', '\u202e', '\u2066', '\u200b', '\r'} {
+		if strings.ContainsRune(display, forbidden) {
+			t.Fatalf("sanitizeDisplay retained %U in %q", forbidden, display)
+		}
+	}
+	if !strings.Contains(display, "safe") || !strings.Contains(display, "text\nnext\tfield") {
+		t.Fatalf("sanitizeDisplay lost printable or layout text: %q", display)
+	}
+	inline := safeText(input)
+	if strings.ContainsAny(inline, "\r\n\t\x1b") || strings.ContainsRune(inline, '\u202e') || strings.ContainsRune(inline, '\u200b') {
+		t.Fatalf("safeText retained terminal/layout controls: %q", inline)
+	}
+}
+
+func testLine(sequence uint64, requestID, lineType string, data any) sessionlog.Line {
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		panic(err)
+	}
+	return sessionlog.Line{Seq: sequence, RequestID: requestID, Type: lineType, Data: encoded}
 }

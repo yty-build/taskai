@@ -1,453 +1,218 @@
-# Agent Task Console V1 — Developer Execution Plan
+# Agent Task Console — ordered development plan
 
-This plan is executed directly by the primary Codex implementation session. It does not depend on a tmux developer or tester handoff.
-
-Read `agent_task_console_spec.md` completely before editing. The specification is authoritative. Implement the full V1 locally in Go, preserve the Task → Sessions model, and do not add Run, Event, Artifact, workflow, broker, or daemon abstractions.
+This plan replaces the provider-history reconciliation and cross-surface continuity design with one provider Port and one Session Channel per Session.
 
 ## Execution rules
 
-1. Work through D01–D14 in order.
-2. Add feature tests in the same commit as each feature.
-3. Run the relevant tests before every commit.
-4. Keep every commit focused and buildable; do not squash or amend completed milestones.
-5. Push every green commit to the already-verified private `origin`.
-6. Never commit credentials, provider auth state, databases, sockets, logs, binaries, coverage, or live worktrees.
-7. Preserve unrelated work and never use destructive Git commands.
-8. Do not start web work until the CLI and interactive attachment flow are pleasant and green.
-9. After implementation, run a separate evidence-driven verification pass against the test plan before declaring completion.
-10. If a dependency or adapter behavior differs from the specification, investigate it, preserve the product contract behind an internal adapter, document the decision, and continue when safely possible.
-11. Treat the provider store as committed conversation history, ACP as the live
-    provisional stream, and Session JSONL as lifecycle/audit/overlay/fallback.
-    V1 reads Codex/Claude/Grok provider JSONL and OpenCode provider SQLite. No
-    transport may silently promote gateway JSONL into the canonical provider
-    transcript.
-12. Keep exactly Task and Session as persistent product entities. Provider
-    snapshots, ACP overlays, native-harness lifecycle, reconciliation
-    boundaries, and projection revisions remain operational/in-memory state.
+- Keep exactly Task and Session as persistent entities.
+- Make each milestone leave the tree buildable.
+- Prefer deletion over compatibility layers that revive the old architecture.
+- Preserve existing user databases, logs, worktrees, and provider state during migration.
+- Never edit or renumber a migration that may already have been applied; add a new migration.
+- Stop old workers before switching worker protocol. Never delete native-owner or launch files while an old provider process may still exist.
+- Keep `acpx` behind `internal/acp`.
+- Run focused tests during each milestone and the complete gates at the end.
 
-## Ordered conversation-continuity and UX work
+## M01 — Contract and vocabulary
 
-The D01–D14 milestone order remains authoritative. Within it, implement the
-approved source and seamless-view contract in this dependency order:
+- Replace the product specification, architecture, API, operations, test, and acceptance documents.
+- Define Task, Session, optional parent Session, provider Port, the four channel commands, and the eight mechanical journal frame types.
+- Remove committed/provisional, provider-store, history merge, per-prompt refresh, prepared launch, outbox, FIFO, native owner, and review-workflow requirements.
+- State that HTTP commands plus SSE are the current logical channel and WebSocket is optional.
 
-1. **D05 — ACP live contract:** normalize request-correlated ACP activity as a
-   provisional stream and keep every `acpx` assumption inside `internal/acp`.
-   Do not treat ACP replay as the provider's committed transcript.
-2. **D06 — journal and ACP transport FIFO:** make Session JSONL the monotonic
-   lifecycle/audit/overlay/fallback journal and serialize only ACP-to-ACP turns
-   required by the public runtime. Native ownership is a separate exclusive
-   admission state: reject the second cross-surface activation instead of
-   placing it in that FIFO.
-3. **D08 — source-agnostic cockpit:** build the Go/Bubble Tea Task cockpit and
-   Structured ACP console against a semantic conversation projection. Exercise
-   provider-snapshot and JSONL-fallback fixtures even before live provider-store
-   adapters arrive.
-4. **D10 — committed history and reconciliation:** add verified read-only
-   provider-store adapters for Codex, Claude, Grok, and OpenCode; load the exact
-   canonical conversation; join it with the gateway overlay; and reconcile
-   after ACP and native turns without visible replacement. Native exit must
-   release exact ownership before a cross-surface retry is admitted.
-   Before every ACP dispatch at the head of the FIFO, Refresh the exact ACP
-   Session with exact-Resume fallback; a fresh native generation uses exact
-   provider-store verification plus `BuildResume`.
-5. **D12 — shared projection service:** make CLI, TUI, API, and web consume the
-   same initial snapshot, fallback state, live cursor, and atomic replacement
-   contract. Clients never open provider files or merge JSONL themselves.
-6. **D13 — seamless browser/mobile projection:** apply live provisional frames
-   and background replacements with stable keys while preserving reader and
-   composer state.
-7. **D14 — cross-provider acceptance:** run the full source/fallback,
-   ACP-FIFO/exclusive-surface, reconciliation, state-preservation,
-   terminal-compatibility, and no-flicker matrix before declaring the build
-   complete.
+Exit criteria:
 
-## D01 — Private Go project bootstrap
+- documentation contains one coherent architecture;
+- no normative document instructs the gateway to parse provider transcripts;
+- no normative document requires native/ACP same-Session handoff.
 
-- Verify `origin` is `yty-build/acp-gateway` and is private.
-- Install Go with Homebrew if it is unavailable.
-- Install `acpx@0.13.0` beneath `~/.local` without `sudo` if it is unavailable. Use a user-owned npm cache if the default cache has ownership problems.
-- Create the Go module `github.com/yty-build/acp-gateway`.
-- Add `.gitignore`, `AGENTS.md`, a README scaffold, and build/test/format/vet/race targets.
-- Add `cmd/acpctl` with version, help, stable error output, and exit-code handling.
-- Add `AGENT_HOME`, defaulting to `~/.agent`, and create state directories with user-only permissions.
-- Prefer standard-library CLI dispatch and avoid an unnecessary command framework.
+## M02 — Safe Session migration
 
-Commit: `chore: bootstrap the private Go project`
+- Add nullable `parent_session_id` with an index and same-Task service validation.
+- Add or designate one opaque `provider_ref` used by the selected adapter.
+- Preserve Tasks and Sessions during upgrade.
+- Leave old physical columns in place if removing them would require an unsafe table rewrite; stop reading them in new code.
+- Treat every nonempty legacy provider conversation field as audit evidence only and clear its physical ProviderRef, regardless of its old source or verification timestamp.
+- Preserve a ProviderRef only for Session Channel rows that have no legacy provider conversation field; never guess from ACP/native evidence fields.
+- Move ownerless legacy rows in `starting`, `waiting`, or `working` to `stopped`, and never replay their old prepared prompt or outbox.
 
-## D02 — Task and Session persistence
+Tests:
 
-- Use a pure-Go SQLite driver and embedded transactional migrations.
-- Implement exactly the `tasks` and `sessions` tables from the spec.
-- Enable foreign keys, busy timeout, and safe local concurrency.
-- Implement repositories, UTC timestamps, status validation, metadata JSON validation, and readable collision-resistant Task/Session IDs.
-- Cover fresh database, reopening, idempotent migration, foreign key, invalid state, and concurrent creation behavior.
+- fresh database still has only Task and Session tables;
+- version upgrade preserves rows;
+- same-Task parent succeeds;
+- cross-Task parent, self-parent, and cycles fail atomically;
+- every legacy provider identity is retained only as audit evidence and cannot drive Resume;
+- a fresh Session Channel ProviderRef survives migration.
 
-Commit: `feat: add task and session persistence`
+## M03 — Provider Port interface
 
-## D03 — Task management
+- Define Start, exact Resume, Send, event stream, and lifecycle Close semantics.
+- Adapt `acpx/runtime` behind `internal/acp`.
+- Start only when `provider_ref` is empty.
+- Resume only on worker/provider transport startup.
+- Keep one healthy Port across turns.
+- Remove Refresh from prompt dispatch and delete provider-store verification.
+- Put every bounded normalized runtime event object verbatim in `provider_event.data`, preserving unknown provider extensions without inventing outer frame types.
+- Expose live model/reasoning controls without a hard-coded catalog.
+- Keep model/effort selection as disposable live-Port state; do not persist or reapply it.
 
-- Implement `acpctl task new`, `acpctl tasks`, `acpctl task <id>`, and `acpctl task status`.
-- Implement `acpctl start` as atomic convenience for creating a Task and its first Session without changing the persisted relationship.
-- Include descriptions, external references, Session summaries, useful errors, and stable human-readable output.
-- Add isolated CLI integration and output tests.
+Tests:
 
-Commit: `feat: add task management commands`
+- Start returns and persists one reference;
+- Resume receives the exact saved reference once;
+- two turns reuse one Port;
+- Resume failure never calls Start;
+- provider options come from the Port;
+- malformed/oversized normalized runtime event objects fail safely.
 
-## D04 — Declarative agent registry
+## M04 — Simplified worker and replay
 
-- Load embedded default YAML profiles and overlay `~/.agent/agents/*.yaml`.
-- Support only name, provider, command, args, and environment in V1.
-- Provide profiles for Codex, Claude, Gemini, Grok (`grok`, with `grok-build` compatibility), and OpenCode.
-- Support raw custom ACP-compatible commands.
-- Validate names and commands and never use shell interpolation.
-- Provide a small list/diagnostic command.
+- Reduce the worker to one Session, one Port, one active turn, commands, permission callbacks, ordered log append, and fan-out.
+- Replace the prompt FIFO with a typed busy response.
+- Remove fresh-handle eligibility, `acp_rehydrated`, per-prompt identity checks, provider transcript reconciliation, native ownership generations, and launch outbox recovery.
+- Store private per-Session JSONL lines as `seq`, optional `request_id`, `timestamp`, `type`, and `data`; bind identity through the canonical `channel-v1` path and validated Session resource. Public API envelopes add that resource's `session_id`.
+- Limit `type` to `connection`, `client_command`, `provider_event`, `provider_result`, `permission_requested`, `permission_resolved`, `permission_abandoned`, and `worker_error`.
+- Preserve raw legacy logs without treating them as current frames.
+- Keep V1 replay corruption checks focused on JSONL framing and sequence continuity; semantic revalidation of manually modified, syntactically valid private lines is post-V1 hardening.
+- Keep stale PID/socket detection as retained-ownership quarantine and keep duplicate-worker protection; never clear ownership without proven provider-tree teardown.
+- Open the socket/journal, emit `connection` with `data.state == "connecting"`, and accept subscribers before the one provider Start or exact Resume.
+- Bound provider startup to 30 seconds; keep Stop available to cancel it and reject provider-dependent commands with typed `session_starting` until `connection.data.state == "connected"`.
 
-Commit: `feat: add declarative agent registry`
+Tests:
 
-## D05 — ACP adapter
+- prompt streams before completion;
+- second prompt is busy and not recorded as accepted;
+- cancel targets the active request;
+- pending permission survives viewer detach;
+- first valid permission response wins;
+- a slow subscriber does not block provider work;
+- replay plus live fan-out is gap-free and ordered;
+- worker restart calls Resume and never replays an uncertain prompt.
 
-- Put every `acpx` invocation and output assumption in `internal/acp`.
-- Pin and probe `acpx@0.13.0` compatibility.
-- Run one long-lived Node bridge per Session worker through the public `acpx/runtime` export; do not use the detached `acpx prompt` queue owner or a PTY.
-- Implement session create/ensure, prompt, status, cancel, reconnect/resume, metadata inspection, and interactive `session/request_permission` decisions.
-- Stream normalized runtime events and preserve the complete gateway event payload. Document that the public runtime does not expose an exact raw JSON-RPC packet stream.
-- Mark ACP conversation activity as the live provisional source in the internal
-  projection contract. It may render immediately but is not the canonical
-  committed transcript once an equivalent provider-store turn exists.
-- Persist Task Console and acpx record IDs distinctly from one canonical provider conversation ID. Retain ACP/native source IDs only as adapter evidence and migration compatibility.
-- Assign a request ID to every prompt and preserve it through streamed output.
-- Keep runtime state/bridge source private, keep provider auth out of persisted options, bound bridge frames and diagnostics, and fail closed on malformed permission options.
-- Build a deterministic fake-`acpx/runtime` fixture for success, cancellation,
-  exact resume, permissions, duplicate option kinds, reconnection, live chunks
-  that precede provider commit, post-turn identity inspection, and display
-  reconciliation signals. Retain
-  CLI-adapter fixtures for the legacy compatibility unit tests.
-- Support optional Session model/reasoning controls without a new model
-  abstraction: persist exact requested values only after profile-level
-  ACP/native parity validation, persist provider identity before applying
-  them, jointly verify them before prompting, and reapply them after exact
-  Refresh/Resume. Configuration failure must preserve the failed Session and
-  redact provider detail.
-- Run a focused live compatibility spike before locking the subprocess/queue behavior.
+## M05 — Shared Session Channel services
 
-Commit: `feat: add the acpx execution adapter`
+- Expose create/open/configure/prompt/cancel/permission/resume/stop through `SessionService`; stop closes the Port as lifecycle cleanup.
+- Remove prepare, reconnect-options, launch, merged conversation, native attach, native recovery, and privileged review flows.
+- Make a reviewer role an ordinary Session; no server-generated review workflow.
+- Keep repository validation and checkout exclusion shared by CLI/API/web.
+- Record provider startup failures on the already-created Session and its channel.
+- Return Create/Resume once the channel is addressable, with Session status `starting` and no provider options.
 
-## D06 — Durable Session workers
+Tests:
 
-- Implement hidden `acpctl _worker --session <id>`.
-- Detach it so it survives the parent CLI.
-- Enforce one worker per active Session.
-- Implement the NDJSON Unix socket protocol from the spec with user-only permissions.
-- Support multiple simultaneous subscribers.
-- Permit one active ACP turn and a serialized ACP-to-ACP prompt queue.
-- Broadcast request-correlated activity to all viewers.
-- Append monotonically positioned JSONL lifecycle/audit history and retain the
-  complete ACP material needed for provisional overlay, missed-stream recovery,
-  and explicit provider-history fallback.
-- Handle signals, stale PID/socket state, duplicate workers, and crash recovery.
-- Keep work independent of disposable viewers. Serialize ACP-to-ACP prompts as
-  required by the one-active-turn runtime. Reject ACP admission while a native
-  owner or pre-launch reservation exists; cross-surface work never joins the
-  ACP FIFO.
-- Persist enough native-harness lifecycle metadata to prevent a second native
-  process without introducing a new product entity or table. A tmux viewer
-  detach must not falsely permit replacement native creation, and that marker
-  must also exclude ACP admission until exact native release.
-- Reject creation/activation of a new native generation while an ACP request is
-  accepted, queued, preparing, or running. The rejection is not a queue, starts
-  no provider process, and never cancels ACP.
-- Test ACP FIFO order, native reattach, stale pre-launch reservation recovery,
-  fail-closed duplicate-native crash preservation, exclusive surface
-  admission, and exact release/rehydration ordering. Missing tmux must never
-  clear an active native harness.
+- every transport calls the same service methods;
+- no failed startup creates a duplicate Session;
+- subscribe/replay works while provider startup is blocked, and early provider commands reach neither provider nor accepted-command journal;
+- busy, stopped, failed, and permission errors are typed and bounded;
+- repo suggestions never retarget or mutate;
+- shared checkout remains explicit.
 
-Commit: `feat: add durable session workers`
+## M06 — API transport
 
-## D07 — Session lifecycle controls
+- Keep Task and Session metadata endpoints.
+- Make Session SSE the ordered mechanical journal stream.
+- Add config, prompt, permission response, cancel, resume, and stop operations over HTTP; do not add a separate close endpoint.
+- Remove `/conversation`, prepare, provider-options reconnect, launch, native, and review-prepare routes.
+- Support replay after numeric Session sequence.
+- Keep Task activity as a computed merge of child Session frames.
+- Preserve loopback, Host, origin, size, and output-sanitization controls.
+- Optionally add a WebSocket later using the same commands and frames.
 
-- Implement `acpctl session start`, detail, prompt, cancel, resume, stop, and logs.
-- Implement `acpctl task logs` aggregation.
-- Starting a Session must send an initial prompt containing Task title, description, role, and repo/worktree context; `--prompt` appends Session-specific instructions.
-- Expose the same optional `--model` and `--reasoning-effort` controls through
-  CLI, API, Web, reviewer creation, and the terminal wizard. Blank means
-  Provider default; unsupported profile combinations fail before creation.
-- Default to read approval. Require an explicit choice such as `--approve-all` for unattended writes and persist it in `metadata_json`.
-- `logs --follow` must support normalized and `--raw` gateway output and fall
-  back to Session JSONL when the worker is unavailable. Label this as gateway
-  lifecycle/audit history rather than the canonical provider transcript.
-- Every normal CLI invocation must reconcile stale workers.
+Tests:
 
-Commit: `feat: add session lifecycle controls`
+- attach stream before prompt and observe the first delta immediately;
+- replay cursor has no gap/duplicate within retention;
+- HTTP busy maps to conflict without provider dispatch;
+- browser DTOs omit provider references and runtime secrets;
+- stopping the API server leaves workers untouched.
 
-## D08 — Interactive Task and Session attachment
+## M07 — Structured terminal and web
 
-- Implement `acpctl task attach <task-id>` and `acpctl session attach <session-id>`.
-- Keep the terminal implementation in Go with Bubble Tea and centralize
-  ANSI-aware layout, semantic styles, pointer geometry, help, and composer
-  behavior. Do not combine a Go baseline or Bubble Tea major-version migration
-  with this redesign.
-- Build visual-contract fixtures at 40x16, 60x16, 80x24, and 120x40. Assert
-  ANSI-aware width, keyboard-only operation, and no click-through overlays.
-- Make Task attachment a polished developer cockpit. At normal widths use one
-  cohesive two-pane surface with a scannable Session navigator, single shared
-  seam, larger selected-Session preview, slim Task status/title header, and
-  contextual status/footer. Use a high-contrast focus marker and semantic
-  status glyph+word; prioritize Task title, agent/role, latest activity,
-  checkout, and canonical-conversation readiness over opaque IDs.
-- Use a stacked navigator/preview on narrow terminals and keep the Session
-  navigator plus core actions at the supported 40x16 minimum. Smaller terminals
-  receive an actionable warning while Session work continues. Mouse is optional
-  convenience, never the only path. Do not require truecolor or Nerd Fonts.
-- Keep one action registry for direct keys, footer, help, filtering, and a
-  searchable substring command palette. Label unavailable native continuation
-  and return an actionable notice for an invalid current action. `Enter` opens
-  the exact real provider-native harness; `a` opens the structured conversation
-  view; `p` targets an ACP message. Keep normal labels human-facing and move
-  protocol provenance into details/raw views rather than a third context rail.
-- Make Structured ACP conversation-first: compact identity/status line,
-  transcript on the terminal background, distinct user/agent gutters, inline
-  reasoning/tools, compact tool status/previews with `d` detail disclosure,
-  latest-plan replacement without duplicate updates, prominent permission
-  shelf, and a wrapping two-line composer. Do not imitate provider-native
-  harness features.
-- New Sessions must appear without restarting the console.
-- The New Session wizard must display and submit the optional requested model
-  and reasoning effort, and Session detail must disclose requested values or
-  Provider default without claiming an inferred effective value.
-- Keyboard and mouse selection drill into a Session and allow return to the
-  Task view with selection/filter/scroll state restored after native handoff.
-- Consume a semantic Session projection: provider snapshot as committed base,
-  gateway lifecycle/uncommitted ACP as overlay, then live provisional ACP from
-  a captured cursor. Before D10 adapters exist, use deterministic provider-base
-  fixtures and explicit JSONL fallback rather than hard-wiring the UI to log
-  files.
-- Follow live output only while at the bottom. Scrolling away freezes the
-  viewport and shows `N new`/return-to-live status instead of moving content
-  under the reader. Coalesce chunk redraws without delaying meaningful state.
-- Render messages, tools, commands, results, diffs, permissions, errors, and provider-exposed reasoning in event order; identify the completed response without claiming a protocol-level final-answer channel, and provide a raw toggle.
-- Number exact provider-offered permission choices, distinguish persistent decisions, and keep a permission actionable across detach/reattach.
-- A prompt submitted while another ACP turn is active is visibly queued in the
-  ACP-to-ACP FIFO. Native ownership never creates that queue: reject the ACP
-  submission before admission with exit-and-retry guidance.
-- `Esc` requests cancellation of the current turn only in the specified
-  non-composer focus; it is not true suspension. Composer/overlay Escape keeps
-  its contextual dismiss/back behavior.
-- Detach closes only the viewer and never affects the worker or turn.
-- Reconnect from the last stream position and recover missed correlated output.
-  Provider reconciliation must preserve selected Session/tool, scroll anchor
-  and live-follow state, focus, composer draft/cursor, selection, pending
-  approval focus, and expanded reasoning/tool state.
-- Multiple viewers must work safely.
+- Render one channel replay plus live frames; remove provider snapshot replacement and source badges.
+- Coalesce adjacent deltas only as local presentation.
+- Populate model and effort selectors from the observational provider-options response.
+- Connect before enabling Send.
+- Preserve scroll/follow, focus, draft/cursor, text selection, selected Session, and expanded tool/reasoning state.
+- Keep permissions pinned and actionable.
+- Make structured terminal the managed Session attachment.
+- Remove managed provider-native handoff. Document direct provider CLI use as unmanaged.
+- Retain responsive desktop/mobile layouts and accessible semantics.
 
-Commit: `feat: add interactive task and session consoles`
+Tests:
 
-## D09 — Git and worktree isolation
+- no initial history fetch delays the stream;
+- streamed text appears before terminal result;
+- config choices are never hard-coded;
+- detach does not mutate the worker;
+- live updates preserve viewer state;
+- terminal and browser reducers consume the same frame contract.
 
-- Validate Git repositories.
-- Implement optional `--worktree` using `~/.agent/worktrees/<task>-<session>` and `agent/<task>/<session>` naming.
-- Reject accidental concurrent writers in the same checkout unless explicitly requested.
-- Persist repo/worktree/branch and never automatically delete user worktrees or branches.
-- Test with disposable Git repositories.
+## M08 — Manager and child composition
 
-Commit: `feat: add isolated git worktrees`
+- Implement nullable parent Session creation through the shared service.
+- Expose human/operator API, web, and terminal controls to create and list direct children and to prompt or cancel an exact child.
+- Require exact same-Task child IDs.
+- Keep each child's frames on its own Session Channel; do not add parent wait or result routing.
+- Keep provider-facing manager tools, wait/result mapping, peer messaging, and offline mail as explicit post-V1 integrations.
 
-## D10 — Canonical provider-native attachment
+Tests:
 
-- Make `acpctl session attach <id>` open the real provider-native harness by default; use `--acp` for the structured gateway console and keep `--native` only as a compatibility alias.
-- Resolve the exact canonical provider conversation ID from the Session. Never select a conversation by recency or create a replacement conversation as an attach fallback.
-- Implement read-only provider-store adapters and deterministic fixtures for
-  Codex, Claude, Grok, and OpenCode. Verify the exact canonical ID and
-  repo/worktree before reading or launching; treat each format as
-  provider-specific (Codex/Claude/Grok JSONL, OpenCode SQLite) and project only
-  allowlisted user-visible history.
-- Define the shared conversation reducer: normalized provider snapshot is the
-  committed base; gateway-only lifecycle/permission/audit state and ACP
-  activity not yet represented in that snapshot form a keyed overlay. Never
-  expose provider auth, hidden internal state, unrelated conversations, store
-  paths, or canonical provider IDs through the browser projection.
-- Implement initial load as one consistency boundary: load/validate a bounded
-  provider snapshot, derive the JSONL overlay and returned gateway cursor,
-  reduce off-screen, publish once, then follow from that cursor without gaps or
-  duplicates.
-- Implement explicit nonfatal source states: live ACP before provider commit
-  and bounded gateway-history fallback when provider snapshot is unavailable.
-  On transient refresh failure, an already-open viewer keeps its current
-  in-memory presentation and shows a delayed-refresh warning. A Session with no
-  conversation activity uses a specific empty state. Gemini and custom ACP
-  commands use disclosed gateway fallback until they have a verified
-  provider-store adapter; never guess a store path or reuse another provider's
-  parser.
-- Launch the documented provider resume command in the correct repo/worktree, preferably in a tmux-backed native harness so a terminal detach does not end the provider process.
-- Negotiate worker protocol v3 plus `exclusive-native-owner-v2`, then reserve
-  one stable native harness to prevent duplicate native processes and exclude
-  ACP admission. New native creation/activation while ACP is accepted, queued,
-  preparing, or running is rejected with wait-then-open guidance, not queued,
-  and never cancels the ACP request.
-- Before every ACP prompt after it reaches the FIFO head, perform exact ACP
-  Refresh with exact-Resume fallback and identity validation. Emit correlated
-  `acp_rehydrated` before `turn_started`; on failure send no prompt.
-- After every settled ACP turn and after native process exit/stop, load a fresh
-  provider snapshot in the background, merge still-uncommitted/gateway-only
-  overlay records, validate the complete candidate, and atomically publish it.
-  Native exit releases exact ownership and schedules that reconciliation. A
-  cross-surface retry may then proceed through exact ACP rehydration; a transient
-  presentation refresh failure keeps the last validated view and never permits
-  another native writer.
-- Preserve exclusive ownership when a native viewer detaches. An ACP prompt
-  must be rejected before admission until the operator exits the provider
-  normally and exact release completes. After release, ACP uses exact
-  Refresh/fallback Resume; a later native generation uses fresh `BuildResume`
-  on the updated canonical conversation. Do not auto-kill the provider.
-- Never remove a live ACP item until its equivalent provider item exists in the
-  candidate snapshot. On malformed/partial/wrong-conversation/wrong-checkout
-  input, leave an already-open viewer's current projection plus live overlay in
-  place and surface a bounded delayed-refresh diagnostic; never blank or
-  partially swap the view.
-- Test exact provider argv and store verification; provider snapshot + overlay
-  deduplication; turn/tool/reasoning ordering; first-turn-before-commit;
-  malformed/partial stores; fallback disclosures; native detach/reattach,
-  recoverable pre-launch collision reservations, and fail-closed
-  duplicate-native protection; ACP → native → rejected ACP → normal native
-  release → retried ACP → fresh native continuity; and atomic no-blank/no-duplicate
-  replacement for Codex, Claude, Grok, and OpenCode.
+- operator creates and lists multiple children under a parent in the same Task;
+- operator child routes cannot address a Session from another Task;
+- prompt and cancel use exact child IDs;
+- parallel children stream independently;
+- no provider manager tool or implicit child wait/result route exists;
+- schema still contains only Task and Session tables.
 
-Commit: `feat: make native harness the default session attachment`
+## M09 — Legacy code removal
 
-## D11 — Independent review Sessions
+Delete or retire:
 
-- Implement `acpctl session review <producer> --agent <reviewer>`.
-- Create a new reviewer Session under the same Task.
-- Include original Task, producer ID, JSONL path as read-only gateway audit
-  evidence, repo/worktree, branch/diff, and independent verification
-  instructions. Do not describe JSONL as the provider's committed transcript.
-- Include the suspicious-behavior checklist from the spec.
-- Do not import the producer conversation into the reviewer conversation.
-- Do not begin against an actively changing producer checkout without an explicit safe state.
+- provider transcript readers and verifiers;
+- semantic conversation merge/projection services;
+- committed/provisional and surface inference;
+- provider-store reconciliation events and retry loops;
+- per-prompt Refresh/Resume and identity drift machinery;
+- staged prepare/launch metadata, endpoints, outboxes, and recovery;
+- gateway ACP FIFO;
+- managed native attach, tmux ownership generations, and recovery;
+- privileged review preparation and evidence injection.
 
-Commit: `feat: add independent agent review sessions`
+Do not delete user provider stores, auth, Session logs, worktrees, branches, or live processes.
 
-## D12 — Shared service and versioned API boundary
+## M10 — Hardening and release
 
-- Define shared TaskService, SessionService, and SessionStream behavior used by CLI, TUI, and HTTP.
-- Add one shared Session conversation-projection read contract returning the
-  validated provider snapshot + derived gateway overlay, source/fallback state,
-  stable presentation keys, captured live cursor, and opaque projection
-  revision. Projection revisions are transport metadata, not persistent Events.
-- Keep provider-file parsing, JSONL joining, deduplication, and reconciliation
-  below the service boundary. CLI, TUI, HTTP, web, and future mobile clients
-  must not independently merge sources.
-- Implement all `/api/v1` routes and `/healthz` from the spec.
-- Use stable API DTOs rather than SQLite rows.
-- Prompt submission returns a request ID.
-- Task streams aggregate every Session.
-- Session and Task SSE support cursor/`Last-Event-ID` replay.
-- Stream provisional ACP activity and publish successful reconciliation as one
-  atomic semantic replacement or stable-keyed equivalent. A failed refresh
-  leaves an already-open viewer's current in-memory presentation intact and
-  updates its bounded warning state.
-- Keep raw ACP and Unix socket details below the boundary.
-- Bind only to loopback in V1 and reject unsupported public exposure.
+- Bound frame data, replay, Task aggregation, browser state, and subscriber buffers.
+- Verify private permissions on state, logs, sockets, and bridge files.
+- Verify literal argv and environment redaction.
+- Exercise worker crash, provider disconnect, replay gap, permission abandonment, and repo drift.
+- Update README and operations examples to match implemented commands.
+- Confirm no obsolete vocabulary remains in normative docs or production UI.
 
-Commit: `feat: expose the versioned task and session API`
+Run:
 
-## D13 — Local web UI
+```bash
+make fmt-check
+make test
+make race
+make vet
+make build
+make security-check
+make acceptance
+```
 
-- Implement `acpctl serve` with Go `net/http`, server-rendered HTML, minimal JavaScript, and SSE.
-- Add Tasks, Task detail, clickable Session detail, reconciled provider-history
-  snapshot + gateway overlay/fallback + live provisional ACP conversation,
-  prompt/cancel/resume/stop, review, and bounded sanitized diagnostics.
-- Make desktop and mobile layouts responsive structured ACP views of the same canonical provider conversation: persistent navigation on desktop; an accessible drawer, sticky composer, pinned approvals, and retained response controls on mobile.
-- Coalesce streamed assistant output, merge tool updates, and key semantic
-  blocks independently of array position. Apply a validated background
-  reconciliation without clearing/reloading the page or duplicating a turn.
-- Preserve stable-block scroll anchor and live-follow mode, navigation and tool
-  selection, keyboard focus, composer draft/cursor, DOM text selection,
-  pending-approval focus, and expanded reasoning/tool state across live frames
-  and atomic projection replacement.
-- Show concise `live before provider commit`, `gateway history fallback`, and
-  `provider history refresh delayed` disclosures while leaving the transcript usable.
-  Enforce cumulative browser-state limits for provider and gateway sources.
-- Expose only safe linked/verified continuity indicators; never send provider conversation identifiers to the browser.
-- Use `/api/v1` and shared services; do not duplicate business logic.
-- Prove stopping the web server does not affect workers.
+## Definition of complete
 
-Commit: `feat: add the local task console web UI`
+A release candidate is complete when:
 
-## D14 — Hardening and documentation
-
-- Complete README, installation, agent profiles, architecture, API, security, permissions, troubleshooting, and public-service boundary documentation.
-- Document the three conversation sources, ACP-to-ACP FIFO, exact surface
-  activation, exclusive cross-surface conflicts, fallback disclosures,
-  generation-scoped native ownership/release, and the difference between
-  provider committed history, live provisional ACP, and raw gateway JSONL.
-- Use `acpctl` as the only executable/usage name; never install or overwrite a global `agent` command.
-- Add deterministic end-to-end acceptance automation and map it to the spec checklist.
-- Run the mandatory projection/UX matrix below with fixtures first and fresh
-  authenticated provider Sessions second. Capture source counts, conversation
-  IDs only in private test evidence, screen/API assertions, and terminal/web
-  state-preservation evidence without committing live stores or logs.
-- Add build/version metadata and secret/runtime-file checks.
-- Run `make fmt-check`, `make test`, `make race`, `make vet`, `make build`,
-  `make security-check`, and `make acceptance`.
-- Ensure `git status --short` is empty, push the final commit, and report all SHAs, test output, and limitations.
-
-Commit: `docs: complete V1 operations and acceptance guide`
-
-## Mandatory projection and terminal test matrix
-
-Run these in milestone order and repeat the cross-surface cases during D14:
-
-1. **Reducer unit tests:** provider-only history; ACP-only first turn; provider
-   base + nonoverlapping overlay; the same turn in both sources; gateway-only
-   permission/lifecycle facts; reasoning → assistant → tool → reasoning →
-   assistant ordering; and large bounded histories whose recent/final tail is
-   retained.
-2. **Provider adapter fixtures:** exact canonical ID and checkout for Codex,
-   Claude, Grok, and OpenCode; reject newest/wrong conversation, wrong checkout,
-   truncated/partially-written file, unknown record shapes, and hidden/auth
-   fields. A failed refresh leaves an already-open viewer's current in-memory
-   presentation intact.
-3. **Load-boundary tests:** inject an ACP record between provider/JSONL reads
-   and subscription; assert captured-cursor replay yields neither gap nor
-   duplicate. Assert source/fallback labels for pre-commit, provider unavailable,
-   delayed refresh, and an empty new Session.
-4. **ACP FIFO and surface-activation tests:** active ACP serializes only later
-   ACP prompts; native owner/reservation rejects ACP before admission; pre-prompt
-   exact rehydration precedes dispatch after release; new native start during
-   accepted/queued/preparing/active ACP is rejected without queueing or
-   cancellation; normal native exit preserves ownership until exact release;
-   fresh `BuildResume` restores the same conversation; crash recovery cannot
-   create two native harnesses.
-5. **Atomic reconciliation tests:** show live ACP chunks, commit the equivalent
-   provider turn, refresh in the background, and assert one continuous visible
-   turn with no intermediate empty frame, duplicate block, lost final response,
-   or reordered tool/reasoning content.
-6. **Viewer-state tests:** during live update and reconciliation preserve Task
-   Session selection/filter, transcript stable-block anchor, follow/not-follow
-   mode, selected tool/row, focus, composer draft/cursor, text selection,
-   pending approval focus, and each reasoning/tool disclosure state in terminal
-   and browser.
-7. **Terminal cockpit visual contracts:** empty, many Sessions,
-   active/waiting/error, pending approval, long transcript, fallback, and the
-   searchable action palette at 40x16, 60x16, 80x24, and 120x40; ANSI-aware
-   width, keyboard-only operation, and mouse selection paths.
-8. **Compatibility smoke:** Terminal.app, iTerm2, VS Code terminal, tmux, and an
-   SSH session; resize, paste/multiline input, native handoff/return, copy/search
-   escape hatch, viewer detach, and no worker/turn loss.
-9. **Fresh live continuity:** for each authenticated Codex, Claude, Grok, and
-   OpenCode Session, prove ACP prompt/stream → provider-store commit → seamless
-   structured reload → fresh native continuation → native-store advance →
-   immediate ACP rejection while native remains open → normal native exit and
-   exact release with asynchronous transcript reconciliation → retried ACP
-   rehydration/dispatch → fresh native `BuildResume` with latest context, always
-   on the exact canonical conversation.
-
-## Post-V1 terminal refinements
-
-These are useful follow-ups, not V1 release claims or acceptance gates:
-
-- explicit `NO_COLOR`, 16-color, truecolor, and ASCII-fallback golden suites;
-- fuzzy-ranked command search and state-filtered palette contents;
-- a compact list/detail toggle below the current 40x16 minimum;
-- transcript export to native scrollback or a configured pager/editor; and
-- a direct reviewer-creation action inside the Task cockpit.
+1. A user creates a Task and Session in an existing repository.
+2. The Session connects one provider Port and exposes its advertised controls through an observational read.
+3. Web attaches before prompt and renders provider output immediately.
+4. A second prompt receives busy rather than entering a queue.
+5. Closing every viewer leaves work running.
+6. Reconnecting replays ordered channel frames and resumes live output.
+7. Restarting the worker exactly resumes the saved provider reference once.
+8. A human/operator can create and list child Sessions, then prompt or cancel an exact same-Task child.
+9. No provider transcript parser, merge layer, staged launch, per-prompt refresh, or managed native handoff remains.
+10. SQLite has only Task and Session product tables and all verification gates pass.

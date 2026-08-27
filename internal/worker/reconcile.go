@@ -3,8 +3,6 @@ package worker
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/yty-build/acp-gateway/internal/config"
@@ -13,13 +11,15 @@ import (
 
 type ReconcileRepository interface {
 	ListSessions(context.Context) ([]session.Session, error)
-	ClearSessionWorker(context.Context, string, session.Status) (session.Session, error)
+	CompareAndSwapSessionWorker(context.Context, string, session.WorkerState, session.WorkerState, string) (session.Session, bool, error)
 }
 
-// ReconcileStale marks database rows stopped when their detached process and
-// private socket no longer describe a responsive worker. It never restarts a
-// Session automatically.
-func ReconcileStale(ctx context.Context, home config.Home, repository ReconcileRepository) ([]string, error) {
+// ReconcileStale quarantines unresponsive worker ownership. A dead worker PID
+// does not prove that the separately-grouped provider process tree exited, so
+// this recovery path must never clear the locator or make an exact Resume/new
+// checkout writer possible. Verified/manual provider teardown is a separate
+// operational action.
+func ReconcileStale(ctx context.Context, _ config.Home, repository ReconcileRepository) ([]string, error) {
 	sessions, err := repository.ListSessions(ctx)
 	if err != nil {
 		return nil, err
@@ -32,19 +32,25 @@ func ReconcileStale(ctx context.Context, home config.Home, repository ReconcileR
 		responsive := false
 		if current.WorkerPID > 0 && current.WorkerSocket != "" && IsProcessAlive(current.WorkerPID) {
 			pingContext, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
-			responsive = NewSocketClient(current.WorkerSocket).Ping(pingContext) == nil
+			responsive = NewSocketClient(current.WorkerSocket).Ping(pingContext, current.ID) == nil
 			cancel()
 		}
 		if responsive {
 			continue
 		}
-		if _, err := repository.ClearSessionWorker(ctx, current.ID, session.StatusStopped); err != nil {
+		// Failed + retained ownership is already the durable quarantine marker.
+		if current.Status == session.StatusFailed {
+			continue
+		}
+		failed := current.WorkerState()
+		failed.Status = session.StatusFailed
+		if _, swapped, err := repository.CompareAndSwapSessionWorker(ctx, current.ID, current.WorkerState(), failed, ""); err != nil {
 			return reconciled, fmt.Errorf("reconcile stale Session %s: %w", current.ID, err)
+		} else if !swapped {
+			// Ownership or status changed after the failed liveness probe. The
+			// newer state wins; never quarantine it using stale evidence.
+			continue
 		}
-		if current.WorkerSocket != "" {
-			_ = os.Remove(current.WorkerSocket)
-		}
-		_ = os.Remove(filepath.Join(home.Workers, current.ID+".json"))
 		reconciled = append(reconciled, current.ID)
 	}
 	return reconciled, nil

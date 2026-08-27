@@ -10,18 +10,19 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	agentregistry "github.com/yty-build/acp-gateway/internal/agents"
 	"github.com/yty-build/acp-gateway/internal/api"
 	"github.com/yty-build/acp-gateway/internal/buildinfo"
 	"github.com/yty-build/acp-gateway/internal/config"
 	"github.com/yty-build/acp-gateway/internal/console"
-	"github.com/yty-build/acp-gateway/internal/native"
 	"github.com/yty-build/acp-gateway/internal/render"
 	appservice "github.com/yty-build/acp-gateway/internal/service"
-	"github.com/yty-build/acp-gateway/internal/session"
 	"github.com/yty-build/acp-gateway/internal/sessionlog"
 	"github.com/yty-build/acp-gateway/internal/store"
 	"github.com/yty-build/acp-gateway/internal/task"
@@ -56,10 +57,16 @@ Commands:
 
 Environment:
   AGENT_HOME  State directory (default: ~/.agent)
+
+Provider-native terminals are invoked directly and remain outside managed Sessions.
 `
 
 // Run executes the command-line application and returns a process exit code.
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer, info buildinfo.Info) int {
+	stderr = newTerminalSafeWriter(stderr)
+	if !stdoutCarriesRawOrInteractiveTerminal(args) {
+		stdout = newTerminalSafeWriter(stdout)
+	}
 	if len(args) == 0 || args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
 		fmt.Fprint(stdout, usage)
 		return ExitOK
@@ -93,14 +100,6 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, info buil
 	switch args[0] {
 	case "_worker":
 		err = runHiddenWorker(ctx, args[1:], home, database)
-	case "_native":
-		registry, loadErr := agentregistry.Load(home.Agents)
-		if loadErr != nil {
-			err = loadErr
-			break
-		}
-		sessionService := appservice.NewSessionService(database, registry, home, runtime)
-		err = runHiddenNative(ctx, args[1:], stdout, stderr, sessionService)
 	case "tasks":
 		err = runTasks(ctx, args[1:], stdout, taskService)
 	case "task":
@@ -123,14 +122,14 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, info buil
 		err = runStart(ctx, args[1:], stdout, sessionService)
 	case "session":
 		var registry *agentregistry.Registry
-		if len(args) > 1 && (args[1] == "start" || args[1] == "review" || args[1] == "attach") {
+		if len(args) > 1 && (args[1] == "start" || args[1] == "attach") {
 			registry, err = agentregistry.Load(home.Agents)
 			if err != nil {
 				break
 			}
 		}
 		sessionService := appservice.NewSessionService(database, registry, home, runtime)
-		err = runSession(ctx, args[1:], stdout, stderr, sessionService)
+		err = runSession(ctx, args[1:], stdout, sessionService)
 	case "agents":
 		registry, loadErr := agentregistry.Load(home.Agents)
 		if loadErr != nil {
@@ -157,6 +156,78 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, info buil
 		return fail(stderr, ExitUsage, usageErr)
 	}
 	return fail(stderr, ExitFailure, err)
+}
+
+// terminalSafeWriter is the non-raw CLI output boundary. It preserves the
+// CLI's own line/tab layout while preventing dynamic values from emitting
+// terminal controls, including Unicode format and bidi characters. Raw JSONL
+// and the interactive console have their own explicit rendering contracts.
+type terminalSafeWriter struct {
+	mu          sync.Mutex
+	destination io.Writer
+	pending     []byte
+}
+
+func newTerminalSafeWriter(destination io.Writer) io.Writer {
+	return &terminalSafeWriter{destination: destination}
+}
+
+func (writer *terminalSafeWriter) Write(value []byte) (int, error) {
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+
+	originalLength := len(value)
+	input := append([]byte(nil), writer.pending...)
+	input = append(input, value...)
+	writer.pending = writer.pending[:0]
+	var safe strings.Builder
+	for len(input) > 0 {
+		if !utf8.FullRune(input) {
+			writer.pending = append(writer.pending, input...)
+			break
+		}
+		r, size := utf8.DecodeRune(input)
+		input = input[size:]
+		if r == utf8.RuneError && size == 1 {
+			continue
+		}
+		switch r {
+		case '\n', '\t':
+			safe.WriteRune(r)
+		case '\r':
+			safe.WriteByte(' ')
+		default:
+			if unicode.IsPrint(r) {
+				safe.WriteRune(r)
+			}
+		}
+	}
+	if safe.Len() == 0 {
+		return originalLength, nil
+	}
+	written, err := io.WriteString(writer.destination, safe.String())
+	if err != nil {
+		return 0, err
+	}
+	if written != safe.Len() {
+		return 0, io.ErrShortWrite
+	}
+	return originalLength, nil
+}
+
+func stdoutCarriesRawOrInteractiveTerminal(args []string) bool {
+	if len(args) >= 2 && ((args[0] == "session" && args[1] == "attach") || (args[0] == "task" && args[1] == "attach")) {
+		return true
+	}
+	if len(args) < 2 || !((args[0] == "session" || args[0] == "task") && args[1] == "logs") {
+		return false
+	}
+	for _, argument := range args[2:] {
+		if argument == "--raw" {
+			return true
+		}
+	}
+	return false
 }
 
 func runServe(ctx context.Context, args []string, stdout io.Writer, tasks *task.Service, sessions *appservice.SessionService, registry *agentregistry.Registry) error {
@@ -189,19 +260,6 @@ func runHiddenWorker(ctx context.Context, args []string, home config.Home, datab
 		return usagef("usage: acpctl _worker --session <session-id>")
 	}
 	return worker.RunSession(ctx, home, database, options.values["--session"])
-}
-
-func runHiddenNative(ctx context.Context, args []string, stdout, stderr io.Writer, service *appservice.SessionService) error {
-	options, err := parseOptions(args, map[string]optionKind{
-		"--session": stringOption, "--owner-token": stringOption, "--reservation-generation": stringOption,
-	})
-	if err != nil || len(options.positionals) != 0 || options.values["--session"] == "" || options.values["--owner-token"] == "" || options.values["--reservation-generation"] == "" {
-		return usagef("usage: acpctl _native --session <session-id> --owner-token <token> --reservation-generation <generation>")
-	}
-	return service.AttachNative(ctx, options.values["--session"], appservice.NativeAttachOptions{
-		Runner: &native.ExecRunner{}, OwnerToken: options.values["--owner-token"], ReservationGeneration: options.values["--reservation-generation"],
-		Input: os.Stdin, Output: stdout, ErrorOutput: stderr,
-	})
 }
 
 func fail(stderr io.Writer, code int, err error) int {
@@ -323,37 +381,35 @@ func showTask(ctx context.Context, id string, stdout io.Writer, service *task.Se
 func runStart(ctx context.Context, args []string, stdout io.Writer, sessions *appservice.SessionService) error {
 	options, err := parseOptions(args, map[string]optionKind{
 		"--agent": stringOption, "--repo": stringOption, "--role": stringOption, "--description": stringOption,
-		"--external-ref": stringOption, "--metadata-json": stringOption, "--prompt": stringOption, "--approve-all": boolOption,
-		"--model": stringOption, "--reasoning-effort": stringOption,
+		"--external-ref": stringOption, "--metadata-json": stringOption, "--approve-all": boolOption,
 		"--worktree": boolOption, "--allow-shared-checkout": boolOption,
 	})
 	if err != nil {
 		return usagef("acpctl start: %s", err)
 	}
 	if len(options.positionals) != 1 || strings.TrimSpace(options.values["--agent"]) == "" || strings.TrimSpace(options.values["--repo"]) == "" {
-		return usagef("usage: acpctl start <title> --agent <name> --repo <path> [--role <role>] [--model <id>] [--reasoning-effort <value>] [--worktree] [--allow-shared-checkout]")
+		return usagef("usage: acpctl start <title> --agent <name> --repo <path> [--role <role>] [--worktree] [--allow-shared-checkout]")
 	}
-	started, err := sessions.StartTask(ctx,
+	connected, err := sessions.ConnectTask(ctx,
 		task.CreateParams{Title: options.positionals[0], Description: options.values["--description"], ExternalRef: options.values["--external-ref"], MetadataJSON: rawJSON(options.values["--metadata-json"]), Status: task.StatusWorking},
 		appservice.StartSessionParams{
-			Agent: options.values["--agent"], RepoPath: options.values["--repo"], Role: options.values["--role"], Prompt: options.values["--prompt"],
-			Model: options.values["--model"], ReasoningEffort: options.values["--reasoning-effort"],
+			Agent: options.values["--agent"], RepoPath: options.values["--repo"], Role: options.values["--role"],
 			ApproveAll: options.booleans["--approve-all"], Worktree: options.booleans["--worktree"], AllowSharedCheckout: options.booleans["--allow-shared-checkout"],
 		},
 	)
 	if err != nil {
-		if started.Task.ID != "" && started.Session.ID != "" {
-			return fmt.Errorf("created Task %s and Session %s with status %s, but the Session did not start; inspect it with `acpctl session %s` before trying again", started.Task.ID, started.Session.ID, started.Session.Status, started.Session.ID)
+		if connected.Task.ID != "" && connected.Session.ID != "" {
+			return fmt.Errorf("created Task %s and Session %s with status %s, but its Session Channel is unavailable; inspect it with `acpctl session %s`", connected.Task.ID, connected.Session.ID, connected.Session.Status, connected.Session.ID)
 		}
 		return err
 	}
-	fmt.Fprintf(stdout, "Created %s\nStarted %s\nInitial request %s (%s)\n", started.Task.ID, started.Session.ID, started.RequestID, started.State)
+	fmt.Fprintf(stdout, "Created %s\nConnected %s (%s)\n", connected.Task.ID, connected.Session.ID, connected.Session.Status)
 	return nil
 }
 
-func runSession(ctx context.Context, args []string, stdout, stderr io.Writer, service *appservice.SessionService) error {
+func runSession(ctx context.Context, args []string, stdout io.Writer, service *appservice.SessionService) error {
 	if len(args) == 0 {
-		return usagef("usage: acpctl session start|review|attach|prompt|cancel|resume|stop|recover-native|logs|<session-id>")
+		return usagef("usage: acpctl session start|attach|prompt|cancel|resume|stop|logs|<session-id>")
 	}
 	switch args[0] {
 	case "start":
@@ -397,50 +453,13 @@ func runSession(ctx context.Context, args []string, stdout, stderr io.Writer, se
 		}
 		fmt.Fprintf(stdout, "Stopped %s\n", args[1])
 		return nil
-	case "recover-native":
-		if len(args) != 2 {
-			return usagef("usage: acpctl session recover-native <session-id>")
-		}
-		recovered, err := service.RecoverNativeReservation(ctx, args[1], appservice.NativeReservationRecoveryOptions{})
-		if err != nil {
-			return err
-		}
-		writeNativeRecoveryResult(stdout, args[1], recovered)
-		return nil
 	case "logs":
 		return runSessionLogs(ctx, args[1:], stdout, service)
-	case "review":
-		options, err := parseOptions(args[1:], map[string]optionKind{
-			"--agent": stringOption, "--model": stringOption, "--reasoning-effort": stringOption,
-			"--allow-active-producer": boolOption,
-		})
-		if err != nil || len(options.positionals) != 1 || strings.TrimSpace(options.values["--agent"]) == "" {
-			return usagef("usage: acpctl session review <producer-session-id> --agent <reviewer> [--model <id>] [--reasoning-effort <value>] [--allow-active-producer]")
-		}
-		launched, err := service.Review(ctx, appservice.ReviewSessionParams{
-			ProducerID: options.positionals[0], Agent: options.values["--agent"], Model: options.values["--model"],
-			ReasoningEffort: options.values["--reasoning-effort"], AllowActiveProducer: options.booleans["--allow-active-producer"],
-		})
-		if err != nil {
-			if launched.Session.ID != "" {
-				return partialSessionStartError(launched)
-			}
-			return err
-		}
-		fmt.Fprintf(stdout, "Started reviewer %s for %s\nInitial request %s (%s)\n", launched.Session.ID, options.positionals[0], launched.RequestID, launched.State)
-		return nil
 	case "attach":
-		options, err := parseOptions(args[1:], map[string]optionKind{"--acp": boolOption, "--native": boolOption})
-		if err != nil || len(options.positionals) != 1 {
-			return usagef("usage: acpctl session attach <session-id> [--acp]")
+		if len(args) != 2 {
+			return usagef("usage: acpctl session attach <session-id>")
 		}
-		if options.booleans["--acp"] && options.booleans["--native"] {
-			return usagef("acpctl session attach: --acp and --native cannot be combined")
-		}
-		if options.booleans["--acp"] {
-			return console.AttachSession(ctx, console.Services{Sessions: service}, options.positionals[0], os.Stdin, stdout)
-		}
-		return service.AttachNative(ctx, options.positionals[0], appservice.NativeAttachOptions{Input: os.Stdin, Output: stdout, ErrorOutput: stderr})
+		return console.AttachSession(ctx, console.Services{Sessions: service}, args[1], os.Stdin, stdout)
 	default:
 		if len(args) != 1 {
 			return usagef("usage: acpctl session <session-id>")
@@ -449,50 +468,32 @@ func runSession(ctx context.Context, args []string, stdout, stderr io.Writer, se
 	}
 }
 
-func writeNativeRecoveryResult(stdout io.Writer, sessionID string, recovered appservice.NativeReservationRecoveryResult) {
-	switch recovered.State {
-	case "released":
-		fmt.Fprintf(stdout, "Recovered orphaned native reservation for %s; provider transcript reload was requested and ACP prompts remain available. Retry acpctl session attach %s when ready.\n", sessionID, sessionID)
-	case "refresh_scheduled":
-		fmt.Fprintf(stdout, "Recovered legacy native reservation state for %s; reconciliation is in progress and ACP prompts remain available. Retry acpctl session attach %s when ready.\n", sessionID, sessionID)
-	default:
-		fmt.Fprintf(stdout, "Native reservation for %s was already released. Inspect Session status, then retry acpctl session attach %s when ready.\n", sessionID, sessionID)
-	}
-}
-
 func runSessionStart(ctx context.Context, args []string, stdout io.Writer, service *appservice.SessionService) error {
 	options, err := parseOptions(args, map[string]optionKind{
 		"--agent": stringOption, "--repo": stringOption, "--role": stringOption,
-		"--model": stringOption, "--reasoning-effort": stringOption,
-		"--prompt": stringOption, "--approve-all": boolOption, "--worktree": boolOption, "--allow-shared-checkout": boolOption,
+		"--parent-session": stringOption,
+		"--approve-all":    boolOption, "--worktree": boolOption, "--allow-shared-checkout": boolOption,
 	})
 	if err != nil {
 		return usagef("acpctl session start: %s", err)
 	}
 	if len(options.positionals) != 1 || options.values["--agent"] == "" || options.values["--repo"] == "" {
-		return usagef("usage: acpctl session start <task-id> --agent <name> --repo <path> --role <role> [--model <id>] [--reasoning-effort <value>] [--worktree] [--allow-shared-checkout] [--prompt <text>] [--approve-all]")
+		return usagef("usage: acpctl session start <task-id> --agent <name> --repo <path> --role <role> [--parent-session <session-id>] [--worktree] [--allow-shared-checkout] [--approve-all]")
 	}
-	launched, err := service.Start(ctx, appservice.StartSessionParams{
+	connected, err := service.ConnectSession(ctx, appservice.StartSessionParams{
 		TaskID: options.positionals[0], Agent: options.values["--agent"], RepoPath: options.values["--repo"],
-		Role: options.values["--role"], Model: options.values["--model"], ReasoningEffort: options.values["--reasoning-effort"],
-		Prompt: options.values["--prompt"], ApproveAll: options.booleans["--approve-all"],
+		ParentSessionID: options.values["--parent-session"],
+		Role:            options.values["--role"], ApproveAll: options.booleans["--approve-all"],
 		Worktree: options.booleans["--worktree"], AllowSharedCheckout: options.booleans["--allow-shared-checkout"],
 	})
 	if err != nil {
-		if launched.Session.ID != "" {
-			return partialSessionStartError(launched)
+		if connected.Session.ID != "" {
+			return fmt.Errorf("Session %s was created with status %s, but its Session Channel is unavailable; inspect it with `acpctl session %s`", connected.Session.ID, connected.Session.Status, connected.Session.ID)
 		}
 		return err
 	}
-	fmt.Fprintf(stdout, "Started %s\nInitial request %s (%s)\n", launched.Session.ID, launched.RequestID, launched.State)
+	fmt.Fprintf(stdout, "Connected %s (%s)\n", connected.Session.ID, connected.Session.Status)
 	return nil
-}
-
-func partialSessionStartError(launched appservice.LaunchResult) error {
-	if launched.Started {
-		return fmt.Errorf("Session %s started, but its Task status update did not complete; inspect it with `acpctl session %s`", launched.Session.ID, launched.Session.ID)
-	}
-	return fmt.Errorf("Session %s was created with status %s but did not start; inspect it with `acpctl session %s` before trying again", launched.Session.ID, launched.Session.Status, launched.Session.ID)
 }
 
 func showSession(ctx context.Context, id string, stdout io.Writer, service *appservice.SessionService) error {
@@ -501,16 +502,17 @@ func showSession(ctx context.Context, id string, stdout io.Writer, service *apps
 		return err
 	}
 	fmt.Fprintf(stdout, "%s\nTask: %s\nRole: %s\nAgent: %s\nProvider: %s\nStatus: %s\n", current.ID, current.TaskID, valueOrDash(current.Role), current.Agent, valueOrDash(current.Provider), current.Status)
+	if current.ParentSessionID != "" {
+		fmt.Fprintf(stdout, "Parent Session: %s\n", current.ParentSessionID)
+	}
 	fmt.Fprintf(stdout, "Permission: %s\nRepo: %s\n", appservice.PermissionLabel(current), valueOrDash(current.RepoPath))
-	providerOptions, _ := session.ParseProviderOptions(current.MetadataJSON)
-	fmt.Fprintf(stdout, "Requested model: %s\nRequested reasoning effort: %s\n", valueOrProviderDefault(providerOptions.Model), valueOrProviderDefault(providerOptions.ReasoningEffort))
 	if current.WorktreePath != "" {
 		fmt.Fprintf(stdout, "Worktree: %s\n", current.WorktreePath)
 	}
 	if current.Branch != "" {
 		fmt.Fprintf(stdout, "Branch: %s\n", current.Branch)
 	}
-	fmt.Fprintf(stdout, "Task Console ID: %s\nCanonical provider conversation: %s\nIdentity source: %s\nacpx record ID: %s\nACP Session ID: %s\nNative adapter ID: %s\n", current.ID, valueOrDash(current.ProviderConversationID), valueOrDash(string(current.ConversationIDSource)), valueOrDash(current.ACPXRecordID), valueOrDash(current.ACPSessionID), valueOrDash(current.NativeSessionID))
+	fmt.Fprintf(stdout, "Provider reference: %s\n", displayProviderReference(current.ProviderRef))
 	fmt.Fprintf(stdout, "Worker PID: %s\nWorker socket: %s\nLog: %s\n", intOrDash(current.WorkerPID), valueOrDash(current.WorkerSocket), valueOrDash(current.LogPath))
 	fmt.Fprintf(stdout, "Created: %s\nUpdated: %s\n", displayTime(current.CreatedAt), displayTime(current.UpdatedAt))
 	return nil
@@ -533,22 +535,22 @@ func runSessionLogs(ctx context.Context, args []string, stdout io.Writer, servic
 		return nil
 	}
 	if options.booleans["--follow"] {
+		if cursor == 0 {
+			var clipped bool
+			cursor, clipped, err = service.FreshReplayCursor(ctx, options.positionals[0], 256)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(stdout, "Replay window: cursor=%d earliest_sequence=%d clipped=%t\n", cursor, replayEarliest(cursor), clipped)
+		}
 		err := service.Follow(ctx, options.positionals[0], cursor, printLine)
 		if errors.Is(err, context.Canceled) {
 			return nil
 		}
 		return err
 	}
-	lines, err := service.History(ctx, options.positionals[0], cursor)
-	if err != nil {
-		return err
-	}
-	for _, line := range lines {
-		if err := printLine(line); err != nil {
-			return err
-		}
-	}
-	return nil
+	_, err = service.Replay(ctx, options.positionals[0], cursor, printLine)
+	return err
 }
 
 func runTaskLogs(ctx context.Context, args []string, stdout io.Writer, service *appservice.SessionService) error {
@@ -565,7 +567,20 @@ func runTaskLogs(ctx context.Context, args []string, stdout io.Writer, service *
 		return nil
 	}
 	if options.booleans["--follow"] {
-		err = service.FollowTask(ctx, taskID, nil, printActivity)
+		cursors, windows, windowErr := service.TaskReplayWindows(ctx, taskID, nil, 256)
+		if windowErr != nil {
+			return windowErr
+		}
+		sessionIDs := make([]string, 0, len(windows))
+		for sessionID := range windows {
+			sessionIDs = append(sessionIDs, sessionID)
+		}
+		sort.Strings(sessionIDs)
+		for _, sessionID := range sessionIDs {
+			window := windows[sessionID]
+			fmt.Fprintf(stdout, "%s  Replay window: cursor=%d earliest_sequence=%d clipped=%t\n", sessionID, window.Cursor, window.EarliestSequence, window.Clipped)
+		}
+		err = service.FollowTask(ctx, taskID, cursors, printActivity)
 		if errors.Is(err, context.Canceled) {
 			return nil
 		}
@@ -583,6 +598,13 @@ func parseCursor(value string) (uint64, error) {
 		return 0, fmt.Errorf("invalid stream position %q", value)
 	}
 	return cursor, nil
+}
+
+func replayEarliest(cursor uint64) uint64 {
+	if cursor == ^uint64(0) {
+		return cursor
+	}
+	return cursor + 1
 }
 
 func intOrDash(value int) string {
@@ -636,6 +658,13 @@ func valueOrDash(value string) string {
 		return "-"
 	}
 	return value
+}
+
+func displayProviderReference(value string) string {
+	if value == "" {
+		return "-"
+	}
+	return strconv.QuoteToASCII(value)
 }
 
 func valueOrProviderDefault(value string) string {

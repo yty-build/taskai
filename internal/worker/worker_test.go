@@ -1,15 +1,12 @@
 package worker
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -19,299 +16,125 @@ import (
 
 	"github.com/yty-build/acp-gateway/internal/acp"
 	"github.com/yty-build/acp-gateway/internal/agents"
-	"github.com/yty-build/acp-gateway/internal/config"
-	"github.com/yty-build/acp-gateway/internal/native"
 	"github.com/yty-build/acp-gateway/internal/session"
 	"github.com/yty-build/acp-gateway/internal/sessionlog"
-	"github.com/yty-build/acp-gateway/internal/store"
-	"github.com/yty-build/acp-gateway/internal/task"
 )
 
-type fakeACP struct {
-	mu               sync.Mutex
-	active           map[string]chan struct{}
-	cancelled        map[string]bool
-	cancelCount      int
-	cancelGate       <-chan struct{}
-	cancelInFlight   int
-	trackClose       bool
-	closed           bool
-	closeWhileCancel bool
-	started          chan string
-	concurrent       int
-	maxConcurrent    int
-	startCount       int
-	resumeCount      int
-	resumeErr        error
-	resumeHook       func()
-	resumeNativeID   string
-	inspectACP       string
-	inspectNative    string
-	promptErr        error
-	promptReturnGate <-chan struct{}
-	promptReturning  chan string
-	refreshCount     int
-	refreshWait      bool
-	refreshErr       error
-	refreshNativeID  string
-	refreshGate      <-chan struct{}
-	refreshStarted   chan int
-	configureCount   int
-	configureErr     error
-	configureHook    func(acp.StartSpec)
-	configureSpecs   []acp.StartSpec
-	calls            []string
+type workerTestRepository struct {
+	mu              sync.Mutex
+	current         session.Session
+	beforeWorkerCAS func(session.WorkerState, session.WorkerState)
 }
 
-func newFakeACP() *fakeACP {
-	return &fakeACP{active: make(map[string]chan struct{}), cancelled: make(map[string]bool), started: make(chan string, 20)}
-}
-
-func (f *fakeACP) Start(context.Context, acp.StartSpec) (acp.SessionInfo, error) {
-	f.mu.Lock()
-	f.startCount++
-	f.calls = append(f.calls, "start")
-	f.mu.Unlock()
-	return acp.SessionInfo{ACPXRecordID: "acpx-start", ACPSessionID: "acp-start", NativeSessionID: "native-start"}, nil
-}
-
-func (f *fakeACP) Resume(_ context.Context, spec acp.StartSpec) (acp.SessionInfo, error) {
-	f.mu.Lock()
-	f.resumeCount++
-	f.calls = append(f.calls, "resume")
-	resumeErr := f.resumeErr
-	resumeHook := f.resumeHook
-	nativeID := f.resumeNativeID
-	f.mu.Unlock()
-	if resumeHook != nil {
-		resumeHook()
-	}
-	if resumeErr != nil {
-		return acp.SessionInfo{}, resumeErr
-	}
-	if nativeID == "" {
-		nativeID = "native-start"
-	}
-	return acp.SessionInfo{ACPXRecordID: "acpx-resumed", ACPSessionID: spec.ResumeACPSessionID, NativeSessionID: nativeID}, nil
-}
-
-func (f *fakeACP) Refresh(ctx context.Context, spec acp.StartSpec) (acp.SessionInfo, error) {
-	f.mu.Lock()
-	f.refreshCount++
-	f.calls = append(f.calls, "refresh")
-	refreshWait := f.refreshWait
-	refreshErr := f.refreshErr
-	refreshGate := f.refreshGate
-	refreshStarted := f.refreshStarted
-	refreshCount := f.refreshCount
-	nativeID := f.refreshNativeID
-	f.mu.Unlock()
-	if refreshStarted != nil {
-		refreshStarted <- refreshCount
-	}
-	if refreshGate != nil {
-		select {
-		case <-refreshGate:
-		case <-ctx.Done():
-			return acp.SessionInfo{}, ctx.Err()
-		}
-	}
-	if refreshWait {
-		<-ctx.Done()
-		return acp.SessionInfo{}, ctx.Err()
-	}
-	if refreshErr != nil {
-		return acp.SessionInfo{}, refreshErr
-	}
-	if nativeID == "" {
-		nativeID = "native-start"
-	}
-	return acp.SessionInfo{ACPXRecordID: "acpx-refreshed", ACPSessionID: spec.ResumeACPSessionID, NativeSessionID: nativeID}, nil
-}
-
-func (f *fakeACP) Configure(_ context.Context, spec acp.StartSpec) (acp.SessionInfo, error) {
-	f.mu.Lock()
-	f.configureCount++
-	f.calls = append(f.calls, "configure")
-	f.configureSpecs = append(f.configureSpecs, spec)
-	configureErr := f.configureErr
-	configureHook := f.configureHook
-	f.mu.Unlock()
-	if configureHook != nil {
-		configureHook(spec)
-	}
-	if configureErr != nil {
-		return acp.SessionInfo{}, configureErr
-	}
-	nativeID := spec.ExpectedNativeSessionID
-	if nativeID == "" {
-		nativeID = "native-start"
-	}
-	return acp.SessionInfo{
-		ACPXRecordID: "acpx-configured", ACPSessionID: spec.ResumeACPSessionID, NativeSessionID: nativeID,
-	}, nil
-}
-
-func (f *fakeACP) Prompt(ctx context.Context, spec acp.PromptSpec, emit func(acp.Event) error) (acp.PromptReceipt, error) {
-	release := make(chan struct{})
-	f.mu.Lock()
-	f.active[spec.RequestID] = release
-	f.calls = append(f.calls, "prompt:"+spec.RequestID)
-	f.concurrent++
-	if f.concurrent > f.maxConcurrent {
-		f.maxConcurrent = f.concurrent
-	}
-	f.mu.Unlock()
-	f.started <- spec.RequestID
-	if err := emit(acp.Event{EventVersion: 1, SessionID: "acp-start", RequestID: spec.RequestID, Seq: 1, Stream: "prompt", Type: "agent_message_chunk", Raw: json.RawMessage(`{"text":"working"}`)}); err != nil {
-		return acp.PromptReceipt{}, err
-	}
-	select {
-	case <-ctx.Done():
-		f.finish(spec.RequestID)
-		return acp.PromptReceipt{RequestID: spec.RequestID, LastSeq: 1}, ctx.Err()
-	case <-release:
-	}
-	f.mu.Lock()
-	cancelled := f.cancelled[spec.RequestID]
-	promptErr := f.promptErr
-	promptReturnGate := f.promptReturnGate
-	promptReturning := f.promptReturning
-	f.mu.Unlock()
-	if promptReturning != nil {
-		promptReturning <- spec.RequestID
-	}
-	if promptReturnGate != nil {
-		select {
-		case <-promptReturnGate:
-		case <-ctx.Done():
-			f.finish(spec.RequestID)
-			return acp.PromptReceipt{RequestID: spec.RequestID, LastSeq: 1}, ctx.Err()
-		}
-	}
-	f.finish(spec.RequestID)
-	if promptErr != nil {
-		return acp.PromptReceipt{RequestID: spec.RequestID, LastSeq: 1}, promptErr
-	}
-	reason := "end_turn"
-	if cancelled {
-		reason = "cancelled"
-	}
-	return acp.PromptReceipt{RequestID: spec.RequestID, LastSeq: 1, StopReason: reason}, nil
-}
-
-func (f *fakeACP) finish(requestID string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	delete(f.active, requestID)
-	f.concurrent--
-}
-
-func (f *fakeACP) Cancel(context.Context, acp.Target) error {
-	f.mu.Lock()
-	f.cancelInFlight++
-	gate := f.cancelGate
-	f.mu.Unlock()
-	if gate != nil {
-		<-gate
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.cancelInFlight--
-	f.cancelCount++
-	for requestID, release := range f.active {
-		if !f.cancelled[requestID] {
-			f.cancelled[requestID] = true
-			close(release)
-		}
-	}
-	return nil
-}
-
-func (f *fakeACP) Close() error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if !f.trackClose {
-		return nil
-	}
-	f.closed = true
-	f.closeWhileCancel = f.cancelInFlight > 0
-	return nil
-}
-
-func (f *fakeACP) Inspect(context.Context, acp.Target) (acp.SessionInfo, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	acpID := f.inspectACP
-	if acpID == "" {
-		acpID = "acp-start"
-	}
-	nativeID := f.inspectNative
-	if nativeID == "" {
-		nativeID = "native-start"
-	}
-	return acp.SessionInfo{ACPXRecordID: "acpx-inspected", ACPSessionID: acpID, NativeSessionID: nativeID}, nil
-}
-
-func (f *fakeACP) Complete(requestID string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if release, ok := f.active[requestID]; ok && !f.cancelled[requestID] {
-		f.cancelled[requestID] = true
-		close(release)
-	}
-}
-
-func (f *fakeACP) maximumConcurrency() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.maxConcurrent
-}
-
-type workerHarness struct {
-	root       string
-	repository *store.Store
-	runtime    *Worker
-	client     *SocketClient
-	acp        *fakeACP
-	reconcile  *fakeTranscriptReconciler
-	cancel     context.CancelFunc
-	done       chan error
-}
-
-type fakeTranscriptReconciler struct {
-	mu             sync.Mutex
-	calls          int
-	conversationID string
-	workingDir     string
-	wait           <-chan struct{}
-	err            error
-	started        chan struct{}
-}
-
-func newFakeTranscriptReconciler() *fakeTranscriptReconciler {
-	return &fakeTranscriptReconciler{started: make(chan struct{}, 8)}
-}
-
-func (r *fakeTranscriptReconciler) Reconcile(ctx context.Context, _ agents.Profile, conversationID, workingDirectory string) error {
+func (r *workerTestRepository) GetSession(_ context.Context, id string) (session.Session, error) {
 	r.mu.Lock()
-	r.calls++
-	r.conversationID = conversationID
-	r.workingDir = workingDirectory
-	wait, err := r.wait, r.err
+	defer r.mu.Unlock()
+	if id != r.current.ID {
+		return session.Session{}, fmt.Errorf("unknown Session %q", id)
+	}
+	return cloneWorkerTestSession(r.current), nil
+}
+
+func (r *workerTestRepository) UpdateSessionStatus(_ context.Context, id string, status session.Status) (session.Session, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if id != r.current.ID {
+		return session.Session{}, fmt.Errorf("unknown Session %q", id)
+	}
+	r.current.Status = status
+	return cloneWorkerTestSession(r.current), nil
+}
+
+func (r *workerTestRepository) UpdateSessionProviderRef(_ context.Context, id, runtimeRef, providerRef string) (session.Session, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if id != r.current.ID {
+		return session.Session{}, fmt.Errorf("unknown Session %q", id)
+	}
+	if runtimeRef != "" {
+		r.current.RuntimeRef = runtimeRef
+	}
+	if providerRef != "" {
+		r.current.ProviderRef = providerRef
+	}
+	return cloneWorkerTestSession(r.current), nil
+}
+
+func (r *workerTestRepository) UpdateSessionWorker(_ context.Context, id string, pid int, socket, logPath string, status session.Status) (session.Session, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if id != r.current.ID {
+		return session.Session{}, fmt.Errorf("unknown Session %q", id)
+	}
+	r.current.WorkerPID = pid
+	r.current.WorkerSocket = socket
+	r.current.LogPath = logPath
+	r.current.Status = status
+	return cloneWorkerTestSession(r.current), nil
+}
+
+func (r *workerTestRepository) ClearSessionWorker(_ context.Context, id string, status session.Status) (session.Session, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if id != r.current.ID {
+		return session.Session{}, fmt.Errorf("unknown Session %q", id)
+	}
+	r.current.WorkerPID = 0
+	r.current.WorkerSocket = ""
+	r.current.Status = status
+	return cloneWorkerTestSession(r.current), nil
+}
+
+func (r *workerTestRepository) CompareAndSwapSessionWorker(_ context.Context, id string, before, after session.WorkerState, logPath string) (session.Session, bool, error) {
+	r.mu.Lock()
+	if id != r.current.ID {
+		r.mu.Unlock()
+		return session.Session{}, false, fmt.Errorf("unknown Session %q", id)
+	}
+	hook := r.beforeWorkerCAS
+	r.beforeWorkerCAS = nil
 	r.mu.Unlock()
-	select {
-	case r.started <- struct{}{}:
-	default:
+	if hook != nil {
+		hook(before, after)
 	}
-	if wait != nil {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-wait:
-		}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.current.WorkerState() != before {
+		return cloneWorkerTestSession(r.current), false, nil
 	}
-	return err
+	r.current.Status = after.Status
+	r.current.WorkerPID = after.PID
+	r.current.WorkerSocket = after.Socket
+	if logPath != "" {
+		r.current.LogPath = logPath
+	}
+	return cloneWorkerTestSession(r.current), true, nil
+}
+
+func (r *workerTestRepository) CompareAndSwapSessionProviderRef(_ context.Context, id string, owner session.WorkerState, runtimeRef, providerRef string) (session.Session, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if id != r.current.ID {
+		return session.Session{}, false, fmt.Errorf("unknown Session %q", id)
+	}
+	if r.current.WorkerState() != owner {
+		return cloneWorkerTestSession(r.current), false, nil
+	}
+	if providerRef != "" && r.current.ProviderRef != "" && r.current.ProviderRef != providerRef {
+		return session.Session{}, false, fmt.Errorf("refusing provider reference replacement")
+	}
+	if runtimeRef != "" {
+		r.current.RuntimeRef = runtimeRef
+	}
+	if providerRef != "" {
+		r.current.ProviderRef = providerRef
+	}
+	return cloneWorkerTestSession(r.current), true, nil
+}
+
+func cloneWorkerTestSession(value session.Session) session.Session {
+	value.MetadataJSON = append(json.RawMessage(nil), value.MetadataJSON...)
+	return value
 }
 
 type permissionDecision struct {
@@ -320,2586 +143,2358 @@ type permissionDecision struct {
 	cancelled    bool
 }
 
-type permissionACP struct {
-	mu         sync.Mutex
-	emitted    chan struct{}
-	decisions  chan permissionDecision
-	recorded   []permissionDecision
-	cancelled  chan struct{}
-	promptDone chan struct{}
-	cancelOnce sync.Once
+type workerTestPort struct {
+	mu sync.Mutex
+
+	info               acp.SessionInfo
+	exactInfo          bool
+	preflight          func(context.Context) error
+	probeCalls         int
+	probeGate          <-chan struct{}
+	probeEntered       chan<- struct{}
+	probeErr           error
+	startGate          <-chan struct{}
+	startEntered       chan<- struct{}
+	startErr           error
+	startIgnoresCancel bool
+	startupTimeout     time.Duration
+	shutdownTimeout    time.Duration
+	resumeGate         <-chan struct{}
+	resumeEntered      chan<- struct{}
+	resumeErr          error
+	optionErr          error
+	configureErr       error
+	effortResetsModel  bool
+	permissionErrors   []error
+	catalog            acp.ProviderOptionCatalog
+	startSpecs         []acp.StartSpec
+	resumeSpecs        []acp.StartSpec
+	promptSpecs        []acp.PromptSpec
+	optionSpecs        []acp.StartSpec
+	configureSpecs     []acp.StartSpec
+	cancelCalls        int
+	cancel             func(context.Context, acp.Target) error
+	closeCalls         int
+	closeGate          <-chan struct{}
+	closeEntered       chan<- struct{}
+	closeSignal        chan struct{}
+	closeErr           error
+	permissionCalls    []permissionDecision
+	prompt             func(context.Context, acp.PromptSpec, func(acp.Event) error) (acp.PromptReceipt, error)
+	permissionDecided  chan permissionDecision
 }
 
-func newPermissionACP() *permissionACP {
-	return &permissionACP{
-		emitted: make(chan struct{}), decisions: make(chan permissionDecision, 2),
-		cancelled: make(chan struct{}), promptDone: make(chan struct{}),
-	}
-}
-
-func (f *permissionACP) Start(context.Context, acp.StartSpec) (acp.SessionInfo, error) {
-	return acp.SessionInfo{ACPXRecordID: "acpx-permission", ACPSessionID: "acp-permission", NativeSessionID: "native-permission"}, nil
-}
-
-func (f *permissionACP) Resume(context.Context, acp.StartSpec) (acp.SessionInfo, error) {
-	return f.Start(context.Background(), acp.StartSpec{})
-}
-
-func (f *permissionACP) Refresh(context.Context, acp.StartSpec) (acp.SessionInfo, error) {
-	return acp.SessionInfo{ACPXRecordID: "acpx-permission-refreshed", ACPSessionID: "acp-permission", NativeSessionID: "native-permission"}, nil
-}
-
-func (f *permissionACP) Prompt(ctx context.Context, spec acp.PromptSpec, emit func(acp.Event) error) (acp.PromptReceipt, error) {
-	defer close(f.promptDone)
-	raw := json.RawMessage(`{"jsonrpc":"2.0","id":"bridge-permission","method":"session/request_permission","params":{"sessionId":"acp-permission","toolCall":{"toolCallId":"tool-write","title":"Write marker","kind":"edit"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"},{"optionId":"allow-always","name":"Always allow","kind":"allow_always"},{"optionId":"reject-once","name":"Reject once","kind":"reject_once"}]}}`)
-	if err := emit(acp.Event{
-		EventVersion: 1, SessionID: spec.ConsoleSessionID, RequestID: spec.RequestID,
-		Seq: 1, Stream: "prompt", Type: "session_request_permission", Raw: raw,
-	}); err != nil {
-		return acp.PromptReceipt{}, err
-	}
-	close(f.emitted)
-	select {
-	case <-ctx.Done():
-		return acp.PromptReceipt{RequestID: spec.RequestID, LastSeq: 1}, ctx.Err()
-	case <-f.cancelled:
-		return acp.PromptReceipt{RequestID: spec.RequestID, LastSeq: 1, StopReason: "cancelled"}, nil
-	case decision := <-f.decisions:
-		if decision.cancelled {
-			return acp.PromptReceipt{RequestID: spec.RequestID, LastSeq: 1, StopReason: "cancelled"}, nil
+func (p *workerTestPort) Probe(ctx context.Context) error {
+	p.mu.Lock()
+	p.probeCalls++
+	gate, entered, probeErr := p.probeGate, p.probeEntered, p.probeErr
+	p.mu.Unlock()
+	if entered != nil {
+		select {
+		case entered <- struct{}{}:
+		default:
 		}
-		return acp.PromptReceipt{RequestID: spec.RequestID, LastSeq: 1, StopReason: "end_turn"}, nil
 	}
-}
-
-func (f *permissionACP) DecidePermission(ctx context.Context, permissionID, optionID string, cancelled bool) error {
-	decision := permissionDecision{permissionID: permissionID, optionID: optionID, cancelled: cancelled}
-	f.mu.Lock()
-	f.recorded = append(f.recorded, decision)
-	f.mu.Unlock()
-	select {
-	case f.decisions <- decision:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+	if gate != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-gate:
+		}
 	}
+	return probeErr
 }
 
-func (f *permissionACP) recordedDecisions() []permissionDecision {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]permissionDecision(nil), f.recorded...)
+func (p *workerTestPort) Start(ctx context.Context, spec acp.StartSpec) (acp.SessionInfo, error) {
+	p.mu.Lock()
+	p.startSpecs = append(p.startSpecs, spec)
+	gate, entered, startErr, ignoresCancel := p.startGate, p.startEntered, p.startErr, p.startIgnoresCancel
+	info := p.sessionInfo(spec)
+	p.mu.Unlock()
+	if entered != nil {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+	}
+	if gate != nil {
+		if ignoresCancel {
+			<-gate
+		} else {
+			select {
+			case <-ctx.Done():
+				return acp.SessionInfo{}, ctx.Err()
+			case <-gate:
+			}
+		}
+	}
+	return info, startErr
 }
 
-func (f *permissionACP) Cancel(context.Context, acp.Target) error {
-	f.cancelOnce.Do(func() { close(f.cancelled) })
+func (p *workerTestPort) Resume(ctx context.Context, spec acp.StartSpec) (acp.SessionInfo, error) {
+	p.mu.Lock()
+	p.resumeSpecs = append(p.resumeSpecs, spec)
+	gate, entered, resumeErr := p.resumeGate, p.resumeEntered, p.resumeErr
+	info := p.sessionInfo(spec)
+	p.mu.Unlock()
+	if entered != nil {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+	}
+	if gate != nil {
+		select {
+		case <-ctx.Done():
+			return acp.SessionInfo{}, ctx.Err()
+		case <-gate:
+		}
+	}
+	return info, resumeErr
+}
+
+func (p *workerTestPort) sessionInfo(spec acp.StartSpec) acp.SessionInfo {
+	info := p.info
+	if p.exactInfo {
+		return info
+	}
+	if info.ConsoleSessionID == "" {
+		info.ConsoleSessionID = spec.ConsoleSessionID
+	}
+	if info.RuntimeRef == "" {
+		info.RuntimeRef = "record-1"
+	}
+	if info.ProviderRef == "" {
+		info.ProviderRef = "acp-1"
+	}
+	return info
+}
+
+func (p *workerTestPort) Prompt(ctx context.Context, spec acp.PromptSpec, emit func(acp.Event) error) (acp.PromptReceipt, error) {
+	p.mu.Lock()
+	p.promptSpecs = append(p.promptSpecs, spec)
+	prompt := p.prompt
+	p.mu.Unlock()
+	if prompt != nil {
+		return prompt(ctx, spec, emit)
+	}
+	raw := json.RawMessage(`{"type":"text_delta","stream":"output","text":"ok","provider":"fixture"}`)
+	if err := emit(acp.Event{Type: "text_delta", Raw: raw}); err != nil {
+		return acp.PromptReceipt{RequestID: spec.RequestID}, err
+	}
+	return acp.PromptReceipt{RequestID: spec.RequestID, LastSeq: 1, StopReason: "end_turn"}, nil
+}
+
+func (p *workerTestPort) Cancel(ctx context.Context, target acp.Target) error {
+	p.mu.Lock()
+	p.cancelCalls++
+	cancel := p.cancel
+	p.mu.Unlock()
+	if cancel != nil {
+		return cancel(ctx, target)
+	}
 	return nil
 }
 
-func (f *permissionACP) Inspect(context.Context, acp.Target) (acp.SessionInfo, error) {
-	return acp.SessionInfo{ACPXRecordID: "acpx-permission", ACPSessionID: "acp-permission", NativeSessionID: "native-permission"}, nil
+func (p *workerTestPort) ProviderOptions(_ context.Context, spec acp.StartSpec) (acp.ProviderOptionCatalog, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.optionSpecs = append(p.optionSpecs, spec)
+	return cloneWorkerTestCatalog(p.catalog), p.optionErr
 }
 
-type permissionWorkerHarness struct {
-	runtime *Worker
-	client  *SocketClient
-	acp     *permissionACP
-	cancel  context.CancelFunc
-	done    chan error
+func (p *workerTestPort) Configure(_ context.Context, spec acp.StartSpec) (acp.SessionInfo, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.configureSpecs = append(p.configureSpecs, spec)
+	if p.configureErr != nil {
+		return acp.SessionInfo{}, p.configureErr
+	}
+	if spec.Model != "" {
+		p.catalog.Model.CurrentValue = spec.Model
+	}
+	if spec.ReasoningEffort != "" {
+		p.catalog.ReasoningEffort.CurrentValue = spec.ReasoningEffort
+		if p.effortResetsModel {
+			p.catalog.Model.CurrentValue = "provider-default"
+		}
+	}
+	return p.sessionInfo(spec), nil
 }
 
-func startPermissionWorkerHarness(t *testing.T) *permissionWorkerHarness {
-	t.Helper()
-	root, err := os.MkdirTemp("/tmp", "atc-permission-worker-")
-	if err != nil {
-		t.Fatal(err)
+func (p *workerTestPort) DecidePermission(_ context.Context, permissionID, optionID string, cancelled bool) error {
+	decision := permissionDecision{permissionID: permissionID, optionID: optionID, cancelled: cancelled}
+	p.mu.Lock()
+	p.permissionCalls = append(p.permissionCalls, decision)
+	decided := p.permissionDecided
+	var decisionErr error
+	if len(p.permissionErrors) > 0 {
+		decisionErr = p.permissionErrors[0]
+		p.permissionErrors = p.permissionErrors[1:]
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
-	repo := filepath.Join(root, "repo")
-	if err := os.MkdirAll(repo, 0o700); err != nil {
-		t.Fatal(err)
+	p.mu.Unlock()
+	if decisionErr == nil && decided != nil {
+		decided <- decision
 	}
-	repository, err := store.Open(context.Background(), filepath.Join(root, "agent.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = repository.Close() })
-	createdTask, err := repository.CreateTask(context.Background(), task.CreateParams{ID: "T-permission", Title: "Permission test"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	createdSession, err := repository.CreateSession(context.Background(), session.CreateParams{
-		ID: "S-permission", TaskID: createdTask.ID, Agent: "codex", Provider: "openai", RepoPath: repo,
-		Status: session.StatusStarting, MetadataJSON: json.RawMessage(`{"permission":"read-approval"}`),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	fake := newPermissionACP()
-	runtime, err := New(Config{
-		Session: createdSession, Profile: agents.Profile{Name: "codex", Provider: "openai", Command: "codex"},
-		Repository: repository, ACP: fake, WorkersDirectory: filepath.Join(root, "workers"), LogsDirectory: filepath.Join(root, "logs"),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- runtime.Run(ctx) }()
-	client := NewSocketClient(runtime.SocketPath())
-	waitFor(t, 3*time.Second, func() bool {
-		probe, stop := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer stop()
-		return client.Ping(probe) == nil
-	})
-	harness := &permissionWorkerHarness{runtime: runtime, client: client, acp: fake, cancel: cancel, done: done}
-	t.Cleanup(func() {
-		cancel()
+	return decisionErr
+}
+
+func (p *workerTestPort) Close() error {
+	p.mu.Lock()
+	p.closeCalls++
+	gate, entered, signal, closeErr := p.closeGate, p.closeEntered, p.closeSignal, p.closeErr
+	p.mu.Unlock()
+	if entered != nil {
 		select {
-		case err := <-done:
-			if err != nil {
-				t.Errorf("Worker.Run() error = %v", err)
-			}
-		case <-time.After(3 * time.Second):
-			t.Error("permission worker did not stop")
+		case entered <- struct{}{}:
+		default:
 		}
-	})
-	return harness
+	}
+	if gate != nil {
+		<-gate
+	}
+	if signal != nil {
+		close(signal)
+	}
+	return closeErr
 }
 
-func startWorkerHarness(t *testing.T) *workerHarness {
+func cloneWorkerTestCatalog(value acp.ProviderOptionCatalog) acp.ProviderOptionCatalog {
+	value.Model.Choices = append([]acp.ProviderOptionChoice(nil), value.Model.Choices...)
+	value.ReasoningEffort.Choices = append([]acp.ProviderOptionChoice(nil), value.ReasoningEffort.Choices...)
+	return value
+}
+
+func advertisedWorkerTestCatalog() acp.ProviderOptionCatalog {
+	return acp.ProviderOptionCatalog{
+		Model: acp.ProviderSelectCatalog{
+			Supported: true, CurrentValue: "provider-default",
+			Choices: []acp.ProviderOptionChoice{{Value: "provider-default", Label: "Provider default"}, {Value: "model-selected", Label: "Selected model"}},
+		},
+		ReasoningEffort: acp.ProviderSelectCatalog{
+			Supported: true, CurrentValue: "medium",
+			Choices: []acp.ProviderOptionChoice{{Value: "medium", Label: "Medium"}, {Value: "high", Label: "High"}},
+		},
+	}
+}
+
+type runningWorkerTest struct {
+	worker        *Worker
+	client        *SocketClient
+	port          *workerTestPort
+	repo          *workerTestRepository
+	done          chan struct{}
+	cancel        context.CancelFunc
+	allowRunError bool
+	errMu         sync.Mutex
+	err           error
+}
+
+func startRunningWorkerTest(t *testing.T, current session.Session, port *workerTestPort) *runningWorkerTest {
+	return startWorkerTest(t, current, port, true)
+}
+
+func startAddressableWorkerTest(t *testing.T, current session.Session, port *workerTestPort) *runningWorkerTest {
+	return startWorkerTest(t, current, port, false)
+}
+
+func startWorkerTest(t *testing.T, current session.Session, port *workerTestPort, waitForProvider bool) *runningWorkerTest {
 	t.Helper()
-	root, err := os.MkdirTemp("/tmp", "atc-worker-test-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
-	repo := filepath.Join(root, "repo")
-	if err := os.MkdirAll(repo, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	repository, err := store.Open(context.Background(), filepath.Join(root, "agent.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { repository.Close() })
-	createdTask, err := repository.CreateTask(context.Background(), task.CreateParams{ID: "T-worker", Title: "Worker test"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	createdSession, err := repository.CreateSession(context.Background(), session.CreateParams{
-		ID: "S-worker", TaskID: createdTask.ID, Agent: "codex", Provider: "openai", RepoPath: repo,
-		Status: session.StatusStarting, MetadataJSON: json.RawMessage(`{"permission":"read-approval"}`),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	fake := newFakeACP()
-	reconciler := newFakeTranscriptReconciler()
-	runtime, err := New(Config{
-		Session: createdSession, Profile: agents.Profile{Name: "codex", Provider: "openai", Command: "codex"},
-		Repository: repository, ACP: fake, WorkersDirectory: filepath.Join(root, "workers"), LogsDirectory: filepath.Join(root, "logs"),
-		RefreshTimeout: 250 * time.Millisecond, ReconcileProviderTranscript: reconciler.Reconcile,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- runtime.Run(ctx) }()
-	client := NewSocketClient(runtime.SocketPath())
-	waitFor(t, 3*time.Second, func() bool {
-		pingContext, stop := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer stop()
-		return client.Ping(pingContext) == nil
-	})
-	harness := &workerHarness{root: root, repository: repository, runtime: runtime, client: client, acp: fake, reconcile: reconciler, cancel: cancel, done: done}
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Errorf("Worker.Run() error = %v", err)
-			}
-		case <-time.After(3 * time.Second):
-			t.Error("worker did not stop")
-		}
-	})
-	return harness
-}
-
-func newProviderOptionsWorker(t *testing.T) (*Worker, *fakeACP, *store.Store) {
-	t.Helper()
-	root, err := os.MkdirTemp("/tmp", "atc-provider-options-worker-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
-	for _, directory := range []string{filepath.Join(root, "repo"), filepath.Join(root, "workers"), filepath.Join(root, "logs")} {
-		if err := os.MkdirAll(directory, 0o700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	repository, err := store.Open(context.Background(), filepath.Join(root, "agent.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = repository.Close() })
-	createdTask, err := repository.CreateTask(context.Background(), task.CreateParams{ID: "T-provider-options", Title: "Provider options"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	createdSession, err := repository.CreateSession(context.Background(), session.CreateParams{
-		ID: "S-provider-options", TaskID: createdTask.ID, Agent: "codex", Provider: "openai",
-		RepoPath: filepath.Join(root, "repo"), Status: session.StatusStarting,
-		MetadataJSON: json.RawMessage(`{"permission":"read-approval","model":"model-selected","reasoning_effort":"high"}`),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	fake := newFakeACP()
-	runtime, err := New(Config{
-		Session: createdSession, Profile: agents.Profile{Name: "codex", Provider: "openai", Command: "codex"},
-		Repository: repository, ACP: fake, WorkersDirectory: filepath.Join(root, "workers"), LogsDirectory: filepath.Join(root, "logs"),
-		RefreshTimeout: 250 * time.Millisecond,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return runtime, fake, repository
-}
-
-func TestWorkerPersistsIdentityBeforeProviderConfigurationFailure(t *testing.T) {
-	runtime, fake, repository := newProviderOptionsWorker(t)
-	observed := make(chan session.Session, 1)
-	fake.mu.Lock()
-	fake.configureErr = &acp.ProviderConfigurationError{}
-	fake.configureHook = func(acp.StartSpec) {
-		current, _ := repository.GetSession(context.Background(), "S-provider-options")
-		observed <- current
-	}
-	fake.mu.Unlock()
-	err := runtime.Run(context.Background())
-	var configurationError *acp.ProviderConfigurationError
-	if !errors.As(err, &configurationError) {
-		t.Fatalf("Worker.Run() error = %T %v", err, err)
-	}
-	persistedBeforeFailure := <-observed
-	if persistedBeforeFailure.ACPSessionID != "acp-start" || persistedBeforeFailure.NativeSessionID != "native-start" || persistedBeforeFailure.ACPXRecordID != "acpx-start" {
-		t.Fatalf("identity before Configure = %#v", persistedBeforeFailure)
-	}
-	current, err := repository.GetSession(context.Background(), "S-provider-options")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if current.Status != session.StatusFailed || current.ACPSessionID != "acp-start" || current.NativeSessionID != "native-start" || current.ProviderConversationID == "" {
-		t.Fatalf("failed Session lost canonical identity = %#v", current)
-	}
-	fake.mu.Lock()
-	calls := append([]string(nil), fake.calls...)
-	fake.mu.Unlock()
-	if !reflect.DeepEqual(calls, []string{"start", "configure"}) {
-		t.Fatalf("provider calls = %v, want identity then configuration and no prompt", calls)
-	}
-	lines, err := sessionlog.ReadFile(runtime.LogPath(), 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var safeFailure bool
-	for _, line := range lines {
-		if line.Type != "worker_error" {
-			continue
-		}
-		var failure map[string]string
-		if json.Unmarshal(line.Data, &failure) == nil && failure["source"] == "provider" && failure["code"] == "configuration_failed" && !strings.Contains(failure["message"], "SECRET") {
-			safeFailure = true
-		}
-	}
-	if !safeFailure {
-		t.Fatalf("worker log did not retain a safe structured configuration failure: %#v", lines)
-	}
-}
-
-func TestWorkerAppliesProviderOptionsAfterIdentityAndEveryRefreshBeforePrompt(t *testing.T) {
-	runtime, fake, repository := newProviderOptionsWorker(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- runtime.Run(ctx) }()
-	client := NewSocketClient(runtime.SocketPath())
-	waitFor(t, 3*time.Second, func() bool {
-		probe, stop := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer stop()
-		return client.Ping(probe) == nil
-	})
-	accepted, err := client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-provider-options", Message: "verify"})
-	if err != nil || accepted.State != "ready" {
-		t.Fatalf("prompt = %#v, %v", accepted, err)
-	}
-	waitStarted(t, fake.started, "req-provider-options")
-	fake.mu.Lock()
-	calls := append([]string(nil), fake.calls...)
-	specs := append([]acp.StartSpec(nil), fake.configureSpecs...)
-	fake.mu.Unlock()
-	want := []string{"start", "configure", "refresh", "configure", "prompt:req-provider-options"}
-	if !reflect.DeepEqual(calls, want) {
-		t.Fatalf("provider option order = %v, want %v", calls, want)
-	}
-	if len(specs) != 2 {
-		t.Fatalf("Configure specs = %#v", specs)
-	}
-	for _, spec := range specs {
-		if spec.ResumeACPSessionID != "acp-start" || spec.ExpectedNativeSessionID != "native-start" || spec.Model != "model-selected" || spec.ReasoningEffort != "high" {
-			t.Fatalf("Configure spec = %#v", spec)
-		}
-	}
-	current, err := repository.GetSession(context.Background(), "S-provider-options")
-	if err != nil || current.ACPSessionID != "acp-start" || current.NativeSessionID != "native-start" {
-		t.Fatalf("configured Session = %#v, %v", current, err)
-	}
-	fake.Complete("req-provider-options")
-	cancel()
-	select {
-	case err := <-done:
+	// Darwin caps Unix-domain socket paths at roughly 104 bytes. testing.T's
+	// descriptive temp path can exceed that before the Session suffix is added.
+	var root string
+	if current.ID != "" && filepath.Base(current.LogPath) == current.ID+".channel-v1.jsonl" {
+		root = filepath.Dir(filepath.Dir(current.LogPath))
+	} else {
+		var err error
+		root, err = os.MkdirTemp("", "acpw-")
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("provider options worker did not stop")
+		t.Cleanup(func() { _ = os.RemoveAll(root) })
 	}
-}
-
-func TestWorkerReappliesProviderOptionsAfterRefreshFallsBackToExactResume(t *testing.T) {
-	runtime, fake, _ := newProviderOptionsWorker(t)
-	fake.mu.Lock()
-	fake.refreshErr = errors.New("refresh unavailable")
-	fake.mu.Unlock()
+	if current.ID == "" {
+		current.ID = "S-test"
+	}
+	if current.RepoPath == "" {
+		current.RepoPath = root
+	}
+	if current.Status == "" {
+		current.Status = session.StatusStarting
+	}
+	if current.LogPath == "" {
+		current.LogPath = filepath.Join(root, "logs", current.ID+".channel-v1.jsonl")
+	}
+	repository := &workerTestRepository{current: current}
+	runtime, err := New(Config{
+		Session:          current,
+		Profile:          agents.Profile{Name: "fixture", Provider: "test", Command: "fixture-agent"},
+		Repository:       repository,
+		Port:             port,
+		Preflight:        port.preflight,
+		WorkersDirectory: filepath.Join(root, "workers"),
+		LogsDirectory:    filepath.Join(root, "logs"),
+		PID:              4242,
+		StartupTimeout:   port.startupTimeout,
+		ShutdownTimeout:  port.shutdownTimeout,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- runtime.Run(ctx) }()
-	client := NewSocketClient(runtime.SocketPath())
-	waitFor(t, 3*time.Second, func() bool {
-		probe, stop := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer stop()
-		return client.Ping(probe) == nil
-	})
-	if _, err := client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-resume-options", Message: "verify fallback"}); err != nil {
-		t.Fatal(err)
-	}
-	waitStarted(t, fake.started, "req-resume-options")
-	fake.mu.Lock()
-	calls := append([]string(nil), fake.calls...)
-	specs := append([]acp.StartSpec(nil), fake.configureSpecs...)
-	fake.mu.Unlock()
-	want := []string{"start", "configure", "refresh", "resume", "configure", "prompt:req-resume-options"}
-	if !reflect.DeepEqual(calls, want) {
-		t.Fatalf("fallback provider option order = %v, want %v", calls, want)
-	}
-	if len(specs) != 2 || specs[1].ResumeACPSessionID != "acp-start" || specs[1].ExpectedNativeSessionID != "native-start" || specs[1].Model != "model-selected" || specs[1].ReasoningEffort != "high" {
-		t.Fatalf("fallback Configure specs = %#v", specs)
-	}
-	fake.Complete("req-resume-options")
-	cancel()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("fallback provider options worker did not stop")
-	}
-}
-
-func TestWorkerSerializesPromptsBroadcastsAndReplays(t *testing.T) {
-	harness := startWorkerHarness(t)
-
-	subscriberContexts := make([]context.CancelFunc, 2)
-	subscriberLines := make([]chan Message, 2)
-	for index := range subscriberLines {
-		ctx, cancel := context.WithCancel(context.Background())
-		subscriberContexts[index] = cancel
-		subscriberLines[index] = make(chan Message, 100)
-		go func(index int) {
-			_ = harness.client.Subscribe(ctx, 0, func(message Message) error {
-				subscriberLines[index] <- message
-				return nil
-			})
-		}(index)
-	}
-	defer subscriberContexts[0]()
-	defer subscriberContexts[1]()
-	for _, lines := range subscriberLines {
-		waitFor(t, time.Second, func() bool { return len(lines) > 0 })
-	}
-
-	first, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-1", Message: "first"})
-	if err != nil || first.Type != "accepted" || first.State != "ready" {
-		t.Fatalf("first prompt = %#v, %v", first, err)
-	}
-	waitStarted(t, harness.acp.started, "req-1")
-	second, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-2", Message: "second"})
-	if err != nil || second.State != "queued" {
-		t.Fatalf("second prompt = %#v, %v", second, err)
-	}
-	status, err := harness.client.Send(context.Background(), Command{Type: "status"})
-	if err != nil || status.ActiveRequestID != "req-1" || status.Queued != 1 || status.Status != "working" {
-		t.Fatalf("status = %#v, %v", status, err)
-	}
-	if nativeOwner, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: "owner-active", NativeOwnerRole: NativeOwnerRoleDirect}); err == nil || !strings.Contains(err.Error(), "wait for the current ACP turn to settle") {
-		t.Fatalf("native acquire during accepted ACP work = %#v, %v", nativeOwner, err)
-	}
-	if _, err := harness.client.Send(context.Background(), Command{Type: "cancel", RequestID: "req-1"}); err != nil {
-		t.Fatal(err)
-	}
-	waitStarted(t, harness.acp.started, "req-2")
-	// Detaching one viewer must not affect the active turn.
-	subscriberContexts[0]()
-	if err := harness.client.Ping(context.Background()); err != nil {
-		t.Fatalf("Ping after detach: %v", err)
-	}
-	pong, err := harness.client.Send(context.Background(), Command{Type: "ping"})
-	if err != nil || pong.Type != "pong" || pong.ProtocolVersion != ProtocolVersion || !reflect.DeepEqual(pong.Capabilities, []string{CapabilityExclusiveNativeOwner}) {
-		t.Fatalf("worker capability pong = %#v, %v", pong, err)
-	}
-	harness.acp.Complete("req-2")
-	waitFor(t, 2*time.Second, func() bool {
-		current, err := harness.client.Send(context.Background(), Command{Type: "status"})
-		return err == nil && current.ActiveRequestID == "" && current.Queued == 0 && current.Status == "waiting"
-	})
-	if got := harness.acp.maximumConcurrency(); got != 1 {
-		t.Fatalf("maximum ACP concurrency = %d, want 1", got)
-	}
-	harness.acp.mu.Lock()
-	providerCalls := append([]string(nil), harness.acp.calls...)
-	harness.acp.mu.Unlock()
-	wantProviderCalls := []string{"start", "refresh", "prompt:req-1", "refresh", "prompt:req-2"}
-	if !reflect.DeepEqual(providerCalls, wantProviderCalls) {
-		t.Fatalf("ACP-only FIFO did not rehydrate every prompt: calls=%v want=%v", providerCalls, wantProviderCalls)
-	}
-
-	var replay []Message
-	if err := harness.client.Tail(context.Background(), 0, func(message Message) error {
-		replay = append(replay, message)
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if len(replay) < 8 {
-		t.Fatalf("replay has only %d lines", len(replay))
-	}
-	seenRequests := map[string]bool{}
-	for index, line := range replay {
-		if line.Type != "line" || (index > 0 && line.Seq <= replay[index-1].Seq) {
-			t.Fatalf("non-monotonic replay at %d: %#v", index, line)
-		}
-		seenRequests[line.RequestID] = true
-	}
-	if !seenRequests["req-1"] || !seenRequests["req-2"] {
-		t.Fatalf("correlated request IDs missing from replay: %v", seenRequests)
-	}
-
-	for _, lines := range subscriberLines {
-		waitFor(t, 2*time.Second, func() bool {
-			for _, count := range requestCounts(lines) {
-				if count > 0 {
-					return true
-				}
-			}
-			return false
-		})
-	}
-}
-
-func TestCancelInterruptsPredispatchRehydrationAndNextQueuedPromptProceeds(t *testing.T) {
-	harness := startWorkerHarness(t)
-	refreshGate := make(chan struct{})
-	refreshStarted := make(chan int, 3)
-	harness.acp.mu.Lock()
-	harness.acp.refreshGate = refreshGate
-	harness.acp.refreshStarted = refreshStarted
-	harness.acp.mu.Unlock()
-	accepted, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-cancel-rehydration", Message: "do not dispatch"})
-	if err != nil || accepted.State != "ready" {
-		t.Fatalf("prompt receipt = %#v, %v", accepted, err)
-	}
-	select {
-	case <-refreshStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("pre-dispatch refresh did not start")
-	}
-	queued, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-cancelled-rehydration", Message: "continue next"})
-	if err != nil || queued.State != "queued" {
-		t.Fatalf("queued prompt = %#v, %v", queued, err)
-	}
-	if _, err := harness.client.Send(context.Background(), Command{Type: "cancel", RequestID: "req-cancel-rehydration"}); err != nil {
-		t.Fatal(err)
-	}
-	close(refreshGate)
-	waitStarted(t, harness.acp.started, "req-after-cancelled-rehydration")
-	harness.acp.Complete("req-after-cancelled-rehydration")
-	waitFor(t, 2*time.Second, func() bool {
-		status, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
-		return statusErr == nil && status.ActiveRequestID == "" && status.Status == string(session.StatusWaiting)
-	})
-	harness.acp.mu.Lock()
-	cancelCount, refreshCount := harness.acp.cancelCount, harness.acp.refreshCount
-	harness.acp.mu.Unlock()
-	if cancelCount != 0 || refreshCount != 2 {
-		t.Fatalf("pre-dispatch cancel runtime calls: cancel=%d refresh=%d, want 0/2", cancelCount, refreshCount)
-	}
-	lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var cancelled, startedCancelled bool
-	var cancelRequestedAt, cancelledAt uint64
-	for _, line := range lines {
-		if line.RequestID != "req-cancel-rehydration" {
-			continue
-		}
-		startedCancelled = startedCancelled || line.Type == "turn_started"
-		if line.Type == "cancel_requested" {
-			cancelRequestedAt = line.Seq
-		}
-		if line.Type == "turn_completed" {
-			var receipt acp.PromptReceipt
-			cancelled = json.Unmarshal(line.Data, &receipt) == nil && receipt.StopReason == "cancelled"
-			cancelledAt = line.Seq
-		}
-	}
-	if !cancelled || startedCancelled || cancelRequestedAt == 0 || cancelRequestedAt >= cancelledAt {
-		t.Fatalf("pre-dispatch cancellation history cancelled=%t turnStarted=%t requested/completed=%d/%d: %#v", cancelled, startedCancelled, cancelRequestedAt, cancelledAt, lines)
-	}
-}
-
-func TestCancelTerminalizesAcceptedFIFOHeadBeforeDispatch(t *testing.T) {
-	harness := startWorkerHarness(t)
-	const requestID = "req-ready-cancel"
-	harness.runtime.mu.Lock()
-	harness.runtime.queue = append(harness.runtime.queue, queuedPrompt{RequestID: requestID, Message: "never dispatch", DisplayMessage: "never dispatch"})
-	harness.runtime.seenRequestIDs[requestID] = struct{}{}
-	harness.runtime.mu.Unlock()
-
-	if err := harness.runtime.cancel(context.Background(), requestID); err != nil {
-		t.Fatal(err)
-	}
-	harness.runtime.mu.Lock()
-	queued := len(harness.runtime.queue)
-	_, seen := harness.runtime.seenRequestIDs[requestID]
-	harness.runtime.mu.Unlock()
-	if queued != 0 || seen {
-		t.Fatalf("cancelled accepted head remained runnable: queued=%d seen=%t", queued, seen)
-	}
-	select {
-	case started := <-harness.acp.started:
-		t.Fatalf("cancelled accepted head reached provider: %s", started)
-	default:
-	}
-	lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var requestedAt, completedAt uint64
-	for _, line := range lines {
-		if line.RequestID != requestID {
-			continue
-		}
-		if line.Type == "cancel_requested" {
-			requestedAt = line.Seq
-		}
-		if line.Type == "turn_completed" {
-			completedAt = line.Seq
-			var receipt acp.PromptReceipt
-			if json.Unmarshal(line.Data, &receipt) != nil || receipt.StopReason != "cancelled" {
-				t.Fatalf("accepted-head terminal = %s", line.Data)
-			}
-		}
-	}
-	if requestedAt != 0 || completedAt == 0 {
-		t.Fatalf("never-started cancellation should be one terminal record, requested/completed=%d/%d: %#v", requestedAt, completedAt, lines)
-	}
-}
-
-func TestCancelClaimsTerminalBeforeProviderCompletionCanPublish(t *testing.T) {
-	harness := startWorkerHarness(t)
-	returnGate := make(chan struct{})
-	returning := make(chan string, 1)
-	harness.acp.mu.Lock()
-	harness.acp.promptReturnGate = returnGate
-	harness.acp.promptReturning = returning
-	harness.acp.mu.Unlock()
-
-	if _, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-terminal-race", Message: "race completion"}); err != nil {
-		t.Fatal(err)
-	}
-	waitStarted(t, harness.acp.started, "req-terminal-race")
-	harness.acp.Complete("req-terminal-race")
-	select {
-	case requestID := <-returning:
-		if requestID != "req-terminal-race" {
-			t.Fatalf("provider returning request = %q", requestID)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("provider did not reach its completion boundary")
-	}
-	if _, err := harness.client.Send(context.Background(), Command{Type: "cancel", RequestID: "req-terminal-race"}); err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, 2*time.Second, func() bool {
-		status, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
-		return statusErr == nil && status.ActiveRequestID == ""
-	})
-	lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var requestedAt, terminalAt uint64
-	terminalCount := 0
-	for _, line := range lines {
-		if line.RequestID != "req-terminal-race" {
-			continue
-		}
-		if line.Type == "cancel_requested" {
-			requestedAt = line.Seq
-		}
-		if line.Type == "turn_completed" || line.Type == "turn_error" {
-			terminalCount++
-			terminalAt = line.Seq
-			if line.Type != "turn_completed" || !bytes.Contains(line.Data, []byte(`"stopReason":"cancelled"`)) {
-				t.Fatalf("completion raced past cancellation claim: %#v", line)
-			}
-		}
-	}
-	if terminalCount != 1 || requestedAt == 0 || terminalAt <= requestedAt {
-		t.Fatalf("terminal claim history terminals=%d requested/completed=%d/%d: %#v", terminalCount, requestedAt, terminalAt, lines)
-	}
-}
-
-func TestEnqueueJournalFailureLeavesNoRunnablePrompt(t *testing.T) {
-	harness := startWorkerHarness(t)
-	if err := harness.runtime.log.Close(); err != nil {
-		t.Fatal(err)
-	}
-	state, err := harness.runtime.enqueue("req-journal-failure", "must not run", "must not run")
-	if err == nil || state != "" {
-		t.Fatalf("enqueue with closed journal = state %q, error %v", state, err)
-	}
-	harness.runtime.mu.Lock()
-	queued := len(harness.runtime.queue)
-	_, seen := harness.runtime.seenRequestIDs["req-journal-failure"]
-	harness.runtime.mu.Unlock()
-	if queued != 0 || seen {
-		t.Fatalf("journal-rejected prompt remained runnable: queued=%d seen=%t", queued, seen)
-	}
-	harness.runtime.signalWake()
-	select {
-	case requestID := <-harness.acp.started:
-		t.Fatalf("journal-rejected prompt reached provider: %s", requestID)
-	case <-time.After(100 * time.Millisecond):
-	}
-}
-
-func TestWorkerShutdownJoinsAcceptLoopAndClosesBlockedConnections(t *testing.T) {
-	harness := startWorkerHarness(t)
-	connection, err := net.Dial("unix", harness.runtime.SocketPath())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer connection.Close()
-	if _, err := connection.Write([]byte(`{"type":"status"`)); err != nil {
-		t.Fatal(err)
-	}
-	// A successful second request proves the accept loop moved past the first
-	// connection and its handler is blocked in Scanner waiting for a newline.
-	if _, err := harness.client.Send(context.Background(), Command{Type: "status"}); err != nil {
-		t.Fatal(err)
-	}
-
-	harness.cancel()
-	waitFor(t, 3*time.Second, func() bool {
-		current, loadErr := harness.repository.GetSession(context.Background(), harness.runtime.config.Session.ID)
-		return loadErr == nil && current.WorkerPID == 0 && current.WorkerSocket == ""
-	})
-}
-
-func TestWorkerShutdownJoinsCancelHandlerBeforeClosingACP(t *testing.T) {
-	harness := startWorkerHarness(t)
-	cancelGate := make(chan struct{})
-	harness.acp.mu.Lock()
-	harness.acp.trackClose = true
-	harness.acp.cancelGate = cancelGate
-	harness.acp.mu.Unlock()
-	if _, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "REQ-stop-cancel-race", Message: "continue"}); err != nil {
-		t.Fatal(err)
-	}
-	waitStarted(t, harness.acp.started, "REQ-stop-cancel-race")
-	cancelDone := make(chan error, 1)
+	harness := &runningWorkerTest{worker: runtime, client: NewSocketClient(runtime.SocketPath()), port: port, repo: repository, done: make(chan struct{}), cancel: cancel}
 	go func() {
-		_, err := harness.client.Send(context.Background(), Command{Type: "cancel", RequestID: "REQ-stop-cancel-race"})
-		cancelDone <- err
+		err := runtime.Run(ctx)
+		harness.errMu.Lock()
+		harness.err = err
+		harness.errMu.Unlock()
+		close(harness.done)
 	}()
-	waitFor(t, time.Second, func() bool {
-		harness.acp.mu.Lock()
-		defer harness.acp.mu.Unlock()
-		return harness.acp.cancelInFlight == 1
-	})
-	stopDone := make(chan error, 1)
-	go func() {
-		_, err := harness.client.Send(context.Background(), Command{Type: "stop"})
-		stopDone <- err
-	}()
-	time.Sleep(50 * time.Millisecond)
-	harness.acp.mu.Lock()
-	closedEarly := harness.acp.closed
-	harness.acp.mu.Unlock()
-	if closedEarly {
-		t.Fatal("ACP closed while cancel handler was still using it")
-	}
-	close(cancelGate)
-	if err := <-cancelDone; err != nil && !strings.Contains(err.Error(), "EOF") {
-		t.Fatal(err)
-	}
-	if err := <-stopDone; err != nil && !strings.Contains(err.Error(), "EOF") {
-		t.Fatal(err)
-	}
-	waitFor(t, 3*time.Second, func() bool {
-		harness.acp.mu.Lock()
-		defer harness.acp.mu.Unlock()
-		return harness.acp.closed
-	})
-	harness.acp.mu.Lock()
-	closeWhileCancel := harness.acp.closeWhileCancel
-	harness.acp.mu.Unlock()
-	if closeWhileCancel {
-		t.Fatal("ACP Close overlapped an in-flight cancel handler")
-	}
-}
 
-func TestQueuedCancellationJournalFailureStopsBeforePromptCanRun(t *testing.T) {
-	runtime, fake := disconnectedIdentityWorker(t, "acp-canonical", "native-canonical")
-	history, err := sessionlog.Open(runtime.LogPath())
-	if err != nil {
-		t.Fatal(err)
-	}
-	runtime.log = history
-	runtime.hub = newHub(history.LastSequence())
-	runtime.queue = []queuedPrompt{{RequestID: "REQ-cancel-journal", Message: "must not run"}}
-	runtime.seenRequestIDs["REQ-cancel-journal"] = struct{}{}
-	stopContext, stop := context.WithCancel(context.Background())
-	runtime.stop = stop
-	if err := history.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := runtime.cancel(context.Background(), "REQ-cancel-journal"); err == nil || !strings.Contains(err.Error(), "Session log is closed") {
-		t.Fatalf("queued cancel journal error = %v", err)
-	}
-	runtime.mu.Lock()
-	queued, transportError := len(runtime.queue), runtime.transportError
-	runtime.mu.Unlock()
-	if queued != 0 || !strings.Contains(transportError, "persist cancellation") {
-		t.Fatalf("failed cancellation queue=%d transportError=%q", queued, transportError)
-	}
-	select {
-	case <-stopContext.Done():
-	default:
-		t.Fatal("journal-uncertain cancellation did not stop the worker")
-	}
-	runtime.signalWake()
-	select {
-	case requestID := <-fake.started:
-		t.Fatalf("journal-uncertain cancelled prompt reached provider: %s", requestID)
-	case <-time.After(50 * time.Millisecond):
-	}
-}
-
-func TestPermissionSurvivesDetachAndConcurrentViewerDecisionIsFirstWins(t *testing.T) {
-	harness := startPermissionWorkerHarness(t)
-	viewerContext, detachViewer := context.WithCancel(context.Background())
-	viewerLines := make(chan Message, 32)
-	go func() {
-		_ = harness.client.Subscribe(viewerContext, 0, func(message Message) error {
-			viewerLines <- message
-			return nil
-		})
-	}()
-	waitFor(t, time.Second, func() bool { return len(viewerLines) > 0 })
-
-	accepted, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "REQ-permission", Message: "write marker"})
-	if err != nil || accepted.State != "ready" {
-		t.Fatalf("prompt = %#v, %v", accepted, err)
-	}
-	select {
-	case <-harness.acp.emitted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("permission was not emitted")
-	}
-	waitFor(t, time.Second, func() bool {
-		status, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
-		return statusErr == nil && len(status.Permissions) == 1
-	})
-	status, err := harness.client.Send(context.Background(), Command{Type: "status"})
-	if err != nil || len(status.Permissions) != 1 {
-		t.Fatalf("pending status = %#v, %v", status, err)
-	}
-	pending := status.Permissions[0]
-	if pending.ID != PermissionConsoleID("REQ-permission", "bridge-permission") || strings.Contains(pending.ID, "tool-write") || pending.RequestID != "REQ-permission" || len(pending.Options) != 3 {
-		t.Fatalf("pending permission = %#v", pending)
-	}
-
-	// A disposable viewer disconnect is not a turn or permission lifecycle
-	// action. A later viewer can still inspect and resolve the same request.
-	detachViewer()
-	time.Sleep(50 * time.Millisecond)
-	status, err = harness.client.Send(context.Background(), Command{Type: "status"})
-	if err != nil || status.ActiveRequestID != "REQ-permission" || len(status.Permissions) != 1 {
-		t.Fatalf("status after detach = %#v, %v", status, err)
-	}
-	if _, err := harness.client.Send(context.Background(), Command{
-		Type: "permission_decision", PermissionID: pending.ID, OptionID: "not-offered",
-	}); err == nil || !strings.Contains(err.Error(), "was not offered") {
-		t.Fatalf("invalid option error = %v", err)
-	}
-	status, err = harness.client.Send(context.Background(), Command{Type: "status"})
-	if err != nil || len(status.Permissions) != 1 {
-		t.Fatalf("invalid option consumed pending request: %#v, %v", status, err)
-	}
-
-	start := make(chan struct{})
-	results := make(chan error, 2)
-	for _, optionID := range []string{"allow-once", "reject-once"} {
-		optionID := optionID
-		go func() {
-			<-start
-			_, decisionErr := harness.client.Send(context.Background(), Command{
-				Type: "permission_decision", PermissionID: pending.ID, OptionID: optionID,
-			})
-			results <- decisionErr
-		}()
-	}
-	close(start)
-	var successes, conflicts int
-	for range 2 {
-		decisionErr := <-results
-		if decisionErr == nil {
-			successes++
-		} else if strings.Contains(decisionErr.Error(), "no longer pending") {
-			conflicts++
+	deadline := time.Now().Add(3 * time.Second)
+	admitted := false
+	for {
+		probe, probeCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		var message Message
+		var pingErr error
+		if admitted {
+			message, pingErr = harness.client.Send(probe, Command{Type: "ping", SessionID: harness.worker.config.Session.ID})
 		} else {
-			t.Fatalf("unexpected viewer race result: %v", decisionErr)
+			message, pingErr = harness.client.Admit(probe, harness.worker.config.Session.ID)
+			if pingErr == nil {
+				admitted = true
+			}
 		}
-	}
-	if successes != 1 || conflicts != 1 {
-		t.Fatalf("viewer race = %d success, %d conflict", successes, conflicts)
-	}
-	select {
-	case <-harness.acp.promptDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("turn did not continue after permission decision")
-	}
-	decisions := harness.acp.recordedDecisions()
-	if len(decisions) != 1 || decisions[0].permissionID != "bridge-permission" || (decisions[0].optionID != "allow-once" && decisions[0].optionID != "reject-once") {
-		t.Fatalf("provider decisions = %#v", decisions)
-	}
-	waitFor(t, time.Second, func() bool {
-		current, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
-		return statusErr == nil && current.ActiveRequestID == "" && len(current.Permissions) == 0
-	})
-
-	var types []string
-	if err := harness.client.Tail(context.Background(), 0, func(message Message) error {
-		types = append(types, message.LineType)
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	for _, required := range []string{"permission_requested", "acp", "permission_resolved", "turn_completed"} {
-		if !containsString(types, required) {
-			t.Errorf("durable replay is missing %s: %v", required, types)
-		}
-	}
-}
-
-func TestCancelAndStopAbandonPendingPermission(t *testing.T) {
-	t.Run("cancel turn", func(t *testing.T) {
-		harness := startPermissionWorkerHarness(t)
-		if _, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "REQ-cancel-permission", Message: "write"}); err != nil {
-			t.Fatal(err)
+		probeCancel()
+		if pingErr == nil {
+			if message.SessionID != harness.worker.config.Session.ID || message.ProtocolVersion != ProtocolVersion || !reflect.DeepEqual(message.Capabilities, []string{CapabilitySessionChannel}) {
+				t.Fatalf("ping = %#v", message)
+			}
+			if !waitForProvider || message.State != string(session.StatusStarting) {
+				break
+			}
 		}
 		select {
-		case <-harness.acp.emitted:
-		case <-time.After(2 * time.Second):
-			t.Fatal("permission was not emitted")
+		case <-harness.done:
+			t.Fatalf("worker exited during startup: %v", harness.runError())
+		default:
 		}
-		if _, err := harness.client.Send(context.Background(), Command{Type: "cancel", RequestID: "REQ-cancel-permission"}); err != nil {
-			t.Fatal(err)
-		}
-		select {
-		case <-harness.acp.promptDone:
-		case <-time.After(2 * time.Second):
-			t.Fatal("cancel did not release pending prompt")
-		}
-		waitFor(t, time.Second, func() bool {
-			status, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
-			return statusErr == nil && len(status.Permissions) == 0
-		})
-		var abandoned bool
-		if err := harness.client.Tail(context.Background(), 0, func(message Message) error {
-			abandoned = abandoned || message.LineType == "permission_abandoned"
-			return nil
-		}); err != nil || !abandoned {
-			t.Fatalf("permission abandonment was not durable: %v", err)
-		}
-	})
-
-	t.Run("stop worker", func(t *testing.T) {
-		harness := startPermissionWorkerHarness(t)
-		if _, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "REQ-stop-permission", Message: "write"}); err != nil {
-			t.Fatal(err)
-		}
-		select {
-		case <-harness.acp.emitted:
-		case <-time.After(2 * time.Second):
-			t.Fatal("permission was not emitted")
-		}
-		if _, err := harness.client.Send(context.Background(), Command{Type: "stop"}); err != nil {
-			t.Fatal(err)
-		}
-		select {
-		case <-harness.acp.promptDone:
-		case <-time.After(2 * time.Second):
-			t.Fatal("stop did not release pending prompt")
-		}
-		waitFor(t, 2*time.Second, func() bool {
-			current, loadErr := harness.runtime.config.Repository.GetSession(context.Background(), harness.runtime.config.Session.ID)
-			return loadErr == nil && current.WorkerPID == 0 && current.Status == session.StatusStopped
-		})
-		lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var abandoned bool
-		for _, line := range lines {
-			abandoned = abandoned || line.Type == "permission_abandoned"
-		}
-		if !abandoned {
-			t.Fatalf("stop history lacks permission_abandoned: %#v", lines)
-		}
-	})
-}
-
-func TestPendingPermissionLimitFailsClosed(t *testing.T) {
-	runtime := &Worker{
-		active:      &queuedPrompt{RequestID: "REQ-permission-cap"},
-		permissions: make(map[string]*pendingPermission),
-	}
-	for index := 0; index < maxPendingPermissions; index++ {
-		pending := &pendingPermission{PendingPermission: PendingPermission{
-			ID: fmt.Sprintf("permission-%03d", index), RequestID: "REQ-permission-cap",
-		}}
-		if err := runtime.registerPermission(pending); err != nil {
-			t.Fatalf("register permission %d: %v", index, err)
-		}
-	}
-	overflow := &pendingPermission{PendingPermission: PendingPermission{
-		ID: "permission-overflow", RequestID: "REQ-permission-cap",
-	}}
-	if err := runtime.registerPermission(overflow); !errors.Is(err, errPendingPermissionCap) {
-		t.Fatalf("overflow error = %v", err)
-	}
-	if len(runtime.permissions) != maxPendingPermissions || runtime.permissions[overflow.ID] != nil {
-		t.Fatalf("permission cap did not fail closed: count=%d overflow=%#v", len(runtime.permissions), runtime.permissions[overflow.ID])
-	}
-}
-
-func containsString(values []string, wanted string) bool {
-	for _, value := range values {
-		if value == wanted {
-			return true
-		}
-	}
-	return false
-}
-
-func TestNativeOwnershipRejectsACPThenReleaseRehydratesBeforePrompt(t *testing.T) {
-	harness := startWorkerHarness(t)
-	const ownerToken = "owner-native-barrier"
-	reconcileRelease := make(chan struct{})
-	harness.reconcile.mu.Lock()
-	harness.reconcile.wait = reconcileRelease
-	harness.reconcile.mu.Unlock()
-	acquired, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleDirect})
-	if err != nil || acquired.Type != "native_acquired" || acquired.State != "acquired" {
-		t.Fatalf("native acquire = %#v, %v", acquired, err)
-	}
-	if duplicate, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleDirect}); err != nil || duplicate.State != "already_acquired" || duplicate.NativeGeneration != acquired.NativeGeneration {
-		t.Fatalf("idempotent native acquire = %#v, %v", duplicate, err)
-	}
-	if _, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: "another-owner", NativeOwnerRole: NativeOwnerRoleDirect}); err == nil || !strings.Contains(err.Error(), "another native provider process") {
-		t.Fatalf("competing native acquire error = %v", err)
-	}
-	marker, err := os.Stat(harness.runtime.NativeOwnerPath())
-	if err != nil || marker.Mode().Perm() != 0o600 {
-		t.Fatalf("native ownership marker = %#v, %v", marker, err)
-	}
-	if _, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-during-native", Message: "continue"}); err == nil || !strings.Contains(err.Error(), "native harness is running") || !strings.Contains(err.Error(), "prompt was not accepted") {
-		t.Fatalf("prompt while native owns error = %v", err)
-	}
-	if duplicate, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleDirect}); err != nil || duplicate.State != "already_acquired" {
-		t.Fatalf("exclusive native reuse = %#v, %v", duplicate, err)
-	}
-	status, err := harness.client.Send(context.Background(), Command{Type: "status"})
-	if err != nil || !status.NativeOwned || status.Queued != 0 || status.ActiveRequestID != "" {
-		t.Fatalf("native-owned status = %#v, %v", status, err)
-	}
-	if _, err := harness.client.Send(context.Background(), Command{Type: "stop"}); err == nil || !strings.Contains(err.Error(), "exit the native provider") {
-		t.Fatalf("stop while native owns error = %v", err)
-	}
-	released, err := harness.client.Send(context.Background(), Command{Type: "native_release", OwnerToken: ownerToken, NativeGeneration: acquired.NativeGeneration, NativeActivity: true})
-	if err != nil || released.State != "released" {
-		t.Fatalf("native release = %#v, %v", released, err)
-	}
-	releaseMarker, err := os.ReadFile(harness.runtime.NativeOwnerPath())
-	if err != nil || !bytes.Contains(releaseMarker, []byte(`"state": "refresh_pending"`)) {
-		t.Fatalf("native release freshness marker = %q, %v", releaseMarker, err)
-	}
-	accepted, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-native", Message: "continue again"})
-	if err != nil || accepted.State != "ready" {
-		t.Fatalf("post-release ACP prompt = %#v, %v", accepted, err)
-	}
-	select {
-	case <-harness.reconcile.started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("provider transcript reconciliation did not start after native release")
-	}
-	waitStarted(t, harness.acp.started, "req-after-native")
-	if _, err := os.Stat(harness.runtime.NativeOwnerPath()); !os.IsNotExist(err) {
-		t.Fatalf("native release freshness marker remains after exact ACP rehydration: %v", err)
-	}
-	close(reconcileRelease)
-	waitFor(t, 2*time.Second, func() bool {
-		lines, readErr := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
-		if readErr != nil {
-			return false
-		}
-		for _, line := range lines {
-			if line.Type == "provider_transcript_reconciled" {
-				return true
-			}
-		}
-		return false
-	})
-	harness.acp.mu.Lock()
-	refreshCount, resumeCount := harness.acp.refreshCount, harness.acp.resumeCount
-	harness.acp.mu.Unlock()
-	if refreshCount != 1 || resumeCount != 0 {
-		t.Fatalf("exact ACP rehydration after native release: refresh=%d resume=%d, want 1/0", refreshCount, resumeCount)
-	}
-	wantCalls := []string{"start", "refresh", "prompt:req-after-native"}
-	harness.acp.mu.Lock()
-	calls := append([]string(nil), harness.acp.calls...)
-	harness.acp.mu.Unlock()
-	if !reflect.DeepEqual(calls, wantCalls) {
-		t.Fatalf("provider activation order = %v, want %v", calls, wantCalls)
-	}
-	lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var reconciledAt, dispatchedAt uint64
-	var readyRecorded, falselyQueued bool
-	for _, line := range lines {
-		switch {
-		case line.RequestID == "req-after-native" && line.Type == "prompt_ready":
-			readyRecorded = true
-		case line.RequestID == "req-after-native" && line.Type == "prompt_queued":
-			falselyQueued = true
-		case line.Type == "provider_transcript_reconciled":
-			reconciledAt = line.Seq
-			var payload map[string]string
-			if json.Unmarshal(line.Data, &payload) != nil || len(payload) != 2 || payload["source"] != "provider-store" || payload["state"] != "reconciled" {
-				t.Fatalf("provider transcript reconciliation payload = %s", line.Data)
-			}
-		case line.Type == "turn_started" && line.RequestID == "req-after-native":
-			dispatchedAt = line.Seq
-		}
-	}
-	for _, line := range lines {
-		if line.RequestID == "req-during-native" {
-			t.Fatalf("rejected native-open prompt mutated log: %#v", line)
-		}
-	}
-	if !readyRecorded || falselyQueued {
-		t.Fatalf("ready ACP request provenance ready=%t falselyQueued=%t", readyRecorded, falselyQueued)
-	}
-	if reconciledAt == 0 || dispatchedAt == 0 || dispatchedAt >= reconciledAt {
-		t.Fatalf("provider transcript reconcile/dispatch ordering = %d/%d", reconciledAt, dispatchedAt)
-	}
-	harness.reconcile.mu.Lock()
-	if harness.reconcile.calls != 1 || harness.reconcile.conversationID != "native-start" || harness.reconcile.workingDir == "" {
-		t.Fatalf("provider transcript reconcile = calls %d, conversation %q, directory %q", harness.reconcile.calls, harness.reconcile.conversationID, harness.reconcile.workingDir)
-	}
-	harness.reconcile.mu.Unlock()
-	harness.acp.Complete("req-after-native")
-}
-
-func TestReleasedNativeGenerationRehydratesBeforeEveryACPPrompt(t *testing.T) {
-	harness := startWorkerHarness(t)
-	const ownerToken = "owner-alternating-surfaces"
-	acquired, err := harness.client.Send(context.Background(), Command{
-		Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleDirect,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := harness.client.Send(context.Background(), Command{
-		Type: "native_release", OwnerToken: ownerToken, NativeGeneration: acquired.NativeGeneration, NativeActivity: true,
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	for _, requestID := range []string{"req-after-native-one", "req-after-native-two"} {
-		accepted, promptErr := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: requestID, Message: "continue exact conversation"})
-		if promptErr != nil || accepted.State != "ready" {
-			t.Fatalf("%s accepted = %#v, %v", requestID, accepted, promptErr)
-		}
-		waitStarted(t, harness.acp.started, requestID)
-		harness.acp.Complete(requestID)
-		waitFor(t, 2*time.Second, func() bool {
-			status, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
-			return statusErr == nil && status.ActiveRequestID == "" && status.Status == string(session.StatusWaiting)
-		})
-	}
-
-	harness.acp.mu.Lock()
-	calls := append([]string(nil), harness.acp.calls...)
-	harness.acp.mu.Unlock()
-	want := []string{"start", "refresh", "prompt:req-after-native-one", "refresh", "prompt:req-after-native-two"}
-	if !reflect.DeepEqual(calls, want) {
-		t.Fatalf("alternating provider calls = %v, want %v", calls, want)
-	}
-}
-
-func TestNativeActivationDuringACPRehydrationIsRejectedBeforeProviderStart(t *testing.T) {
-	harness := startWorkerHarness(t)
-	acquired, err := harness.client.Send(context.Background(), Command{
-		Type: "native_acquire", OwnerToken: "owner-release-during-refresh", NativeOwnerRole: NativeOwnerRoleDirect,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := harness.client.Send(context.Background(), Command{
-		Type: "native_release", OwnerToken: "owner-release-during-refresh", NativeGeneration: acquired.NativeGeneration, NativeActivity: true,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	refreshGate := make(chan struct{})
-	refreshStarted := make(chan int, 4)
-	harness.acp.mu.Lock()
-	harness.acp.refreshGate = refreshGate
-	harness.acp.refreshStarted = refreshStarted
-	harness.acp.mu.Unlock()
-	accepted, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-release-during-refresh", Message: "continue exactly"})
-	if err != nil || accepted.State != "ready" {
-		t.Fatalf("prompt receipt = %#v, %v", accepted, err)
-	}
-	select {
-	case attempt := <-refreshStarted:
-		if attempt != 1 {
-			t.Fatalf("first refresh attempt = %d", attempt)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("first ACP refresh did not start")
-	}
-	if _, err := harness.client.Send(context.Background(), Command{
-		Type: "native_acquire", OwnerToken: "new-owner-during-refresh", NativeOwnerRole: NativeOwnerRoleDirect,
-	}); err == nil || !strings.Contains(err.Error(), "wait for the current ACP turn to settle") {
-		t.Fatalf("native activation during ACP rehydration error = %v", err)
-	}
-	close(refreshGate)
-	waitStarted(t, harness.acp.started, "req-release-during-refresh")
-	if _, err := os.Stat(harness.runtime.NativeOwnerPath()); !os.IsNotExist(err) {
-		t.Fatalf("release freshness marker remains before provider prompt: %v", err)
-	}
-	harness.acp.mu.Lock()
-	calls := append([]string(nil), harness.acp.calls...)
-	harness.acp.mu.Unlock()
-	want := []string{"start", "refresh", "prompt:req-release-during-refresh"}
-	if !reflect.DeepEqual(calls, want) {
-		t.Fatalf("release/refresh provider order = %v, want %v", calls, want)
-	}
-	harness.acp.Complete("req-release-during-refresh")
-}
-
-func TestNativeActivationBetweenRehydrationAndDispatchIsRejected(t *testing.T) {
-	harness := startWorkerHarness(t)
-	harness.runtime.mu.Lock()
-	harness.runtime.active = &queuedPrompt{RequestID: "req-release-before-dispatch"}
-	harness.runtime.mu.Unlock()
-	epoch, err := harness.runtime.rehydrateACPForPrompt(context.Background(), "req-release-before-dispatch")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := harness.client.Send(context.Background(), Command{
-		Type: "native_acquire", OwnerToken: "owner-between-rehydrate-dispatch", NativeOwnerRole: NativeOwnerRoleDirect,
-	}); err == nil || !strings.Contains(err.Error(), "wait for the current ACP turn to settle") {
-		t.Fatalf("native activation between rehydration and dispatch error = %v", err)
-	}
-	if err := harness.runtime.publishACPDispatch("req-release-before-dispatch", epoch); err != nil {
-		t.Fatalf("exclusive ACP dispatch boundary = %v", err)
-	}
-	lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, line := range lines {
-		if line.Type == "native_acquired" {
-			t.Fatal("rejected native activation published ownership")
-		}
-	}
-	harness.acp.mu.Lock()
-	refreshCount := harness.acp.refreshCount
-	harness.acp.mu.Unlock()
-	if refreshCount != 1 {
-		t.Fatalf("refreshes at exclusive dispatch boundary = %d, want 1", refreshCount)
-	}
-	if _, err := os.Stat(harness.runtime.NativeOwnerPath()); !os.IsNotExist(err) {
-		t.Fatalf("rejected native activation created ownership marker: %v", err)
-	}
-}
-
-func TestCancelBetweenRehydrationAndDispatchPreventsTurnStart(t *testing.T) {
-	harness := startWorkerHarness(t)
-	promptContext, cancelPrompt := context.WithCancel(context.Background())
-	harness.runtime.mu.Lock()
-	harness.runtime.active = &queuedPrompt{RequestID: "req-cancel-before-dispatch"}
-	harness.runtime.activeCancel = cancelPrompt
-	harness.runtime.seenRequestIDs["req-cancel-before-dispatch"] = struct{}{}
-	harness.runtime.mu.Unlock()
-	epoch, err := harness.runtime.rehydrateACPForPrompt(promptContext, "req-cancel-before-dispatch")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := harness.runtime.cancel(context.Background(), "req-cancel-before-dispatch"); err != nil {
-		t.Fatal(err)
-	}
-	if err := harness.runtime.publishACPDispatch("req-cancel-before-dispatch", epoch); !errors.Is(err, context.Canceled) {
-		t.Fatalf("dispatch after cancellation = %v", err)
-	}
-	cancelled, claimed := harness.runtime.claimPromptTerminal("req-cancel-before-dispatch", true)
-	if !claimed || !cancelled {
-		t.Fatalf("cancelled terminal claim = cancelled %t claimed %t", cancelled, claimed)
-	}
-	harness.runtime.finishClaimedCancelledPrompt("req-cancel-before-dispatch")
-
-	lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var requestedAt, completedAt uint64
-	for _, line := range lines {
-		if line.RequestID != "req-cancel-before-dispatch" {
-			continue
-		}
-		if line.Type == "turn_started" {
-			t.Fatal("cancelled freshness boundary emitted turn_started")
-		}
-		if line.Type == "cancel_requested" {
-			requestedAt = line.Seq
-		}
-		if line.Type == "turn_completed" {
-			completedAt = line.Seq
-		}
-	}
-	if requestedAt == 0 || completedAt <= requestedAt {
-		t.Fatalf("boundary cancellation order = %d/%d: %#v", requestedAt, completedAt, lines)
-	}
-	select {
-	case requestID := <-harness.acp.started:
-		t.Fatalf("cancelled boundary reached provider Prompt: %s", requestID)
-	default:
-	}
-}
-
-func TestNewNativeActivationRejectsAcceptedACPWorkWithoutQueuingOrCancellingIt(t *testing.T) {
-	for _, test := range []struct {
-		name  string
-		setup func(*Worker)
-	}{
-		{name: "active", setup: func(runtime *Worker) { runtime.active = &queuedPrompt{RequestID: "req-active"} }},
-		{name: "queued", setup: func(runtime *Worker) { runtime.queue = []queuedPrompt{{RequestID: "req-queued"}} }},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			runtime, _ := disconnectedIdentityWorker(t, "acp-canonical", "native-canonical")
-			if err := os.MkdirAll(runtime.config.WorkersDirectory, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			runtime.mu.Lock()
-			test.setup(runtime)
-			runtime.mu.Unlock()
-			_, _, err := runtime.acquireNative("new-native-owner", NativeOwnerRoleDirect, "")
-			if err == nil || !strings.Contains(err.Error(), "wait for the current ACP turn to settle") || !strings.Contains(err.Error(), "open Native CLI again") {
-				t.Fatalf("native activation error = %v", err)
-			}
-			if _, markerErr := os.Stat(runtime.NativeOwnerPath()); !os.IsNotExist(markerErr) {
-				t.Fatalf("rejected native activation created ownership marker: %v", markerErr)
-			}
-		})
-	}
-}
-
-func TestNativeReservationRejectsACPBeforeProviderActivation(t *testing.T) {
-	harness := startWorkerHarness(t)
-	reserved, err := harness.client.Send(context.Background(), Command{
-		Type: "native_acquire", OwnerToken: "owner-provider-activation", NativeOwnerRole: NativeOwnerRoleReservation,
-	})
-	if err != nil || reserved.State != "reserved" {
-		t.Fatalf("native reservation = %#v, %v", reserved, err)
-	}
-	if _, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-before-native-activation", Message: "continue"}); err == nil || !strings.Contains(err.Error(), "active launch reservation") {
-		t.Fatalf("ACP prompt during native reservation error = %v", err)
-	}
-	status, err := harness.client.Send(context.Background(), Command{
-		Type: "native_reservation_status", OwnerToken: "owner-provider-activation",
-	})
-	if err != nil || status.State != "reserved" || status.NativeGeneration != reserved.NativeGeneration {
-		t.Fatalf("reservation after rejected activation = %#v, %v", status, err)
-	}
-	activated, err := harness.client.Send(context.Background(), Command{
-		Type: "native_acquire", OwnerToken: "owner-provider-activation", NativeOwnerRole: NativeOwnerRoleProvider, NativeGeneration: reserved.NativeGeneration,
-	})
-	if err != nil || activated.State != "activated" {
-		t.Fatalf("provider activation retry = %#v, %v", activated, err)
-	}
-	if _, err := harness.client.Send(context.Background(), Command{
-		Type: "native_release", OwnerToken: "owner-provider-activation", NativeGeneration: reserved.NativeGeneration,
-	}); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestACPRehydrationIntegrityFailureQuarantinesBeforeQueuedPrompt(t *testing.T) {
-	harness := startWorkerHarness(t)
-	refreshGate := make(chan struct{})
-	refreshStarted := make(chan int, 1)
-	harness.acp.mu.Lock()
-	harness.acp.refreshErr = &acp.ProtocolError{Operation: "refresh", Message: "SECRET refresh transport failure"}
-	harness.acp.resumeErr = &acp.ProtocolError{Operation: "resume", Message: "SECRET resume transport failure"}
-	harness.acp.refreshGate = refreshGate
-	harness.acp.refreshStarted = refreshStarted
-	harness.acp.mu.Unlock()
-
-	failed, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-rehydrate-fails", Message: "do not dispatch stale"})
-	if err != nil || failed.State != "ready" {
-		t.Fatalf("failed rehydration receipt = %#v, %v", failed, err)
-	}
-	select {
-	case <-refreshStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("pre-prompt refresh did not start")
-	}
-	queued, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-rehydrate-failure", Message: "must not dispatch"})
-	if err != nil || queued.State != "queued" {
-		t.Fatalf("queued behind rehydration = %#v, %v", queued, err)
-	}
-	close(refreshGate)
-	waitFor(t, 3*time.Second, func() bool {
-		current, getErr := harness.repository.GetSession(context.Background(), "S-worker")
-		return getErr == nil && current.WorkerPID == 0 && current.Status == session.StatusStopped
-	})
-	select {
-	case requestID := <-harness.acp.started:
-		t.Fatalf("prompt reached provider without exact rehydration: %s", requestID)
-	default:
-	}
-	lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	terminal := map[string]bool{}
-	for _, line := range lines {
-		if line.Type != "turn_error" {
-			continue
-		}
-		if bytes.Contains(line.Data, []byte("SECRET")) || len(line.Data) > 512 {
-			t.Fatalf("public continuity failure leaked or was unbounded: %s", line.Data)
-		}
-		terminal[line.RequestID] = true
-	}
-	if !terminal["req-rehydrate-fails"] || !terminal["req-after-rehydrate-failure"] {
-		t.Fatalf("continuity quarantine terminal history = %#v", lines)
-	}
-}
-
-func TestACPRehydrationProviderConflictKeepsSafeTurnProvenance(t *testing.T) {
-	harness := startWorkerHarness(t)
-	harness.acp.mu.Lock()
-	harness.acp.refreshErr = &acp.ProviderTurnError{
-		Code: "turn_failed", DetailCode: "conversation_conflict", Message: "SECRET refresh provider detail", Retryable: true,
-	}
-	harness.acp.resumeErr = &acp.ProviderTurnError{
-		Code: "turn_failed", DetailCode: "conversation_conflict", Message: "SECRET resume provider detail", Retryable: true,
-	}
-	harness.acp.mu.Unlock()
-
-	accepted, err := harness.client.Send(context.Background(), Command{
-		Type: "prompt", RequestID: "req-rehydrate-conflict", Message: "do not dispatch through a provider conflict",
-	})
-	if err != nil || accepted.State != "ready" {
-		t.Fatalf("provider-conflict receipt = %#v, %v", accepted, err)
-	}
-	waitFor(t, 2*time.Second, func() bool {
-		lines, readErr := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
-		if readErr != nil {
-			return false
-		}
-		for _, line := range lines {
-			if line.Type != "turn_error" || line.RequestID != "req-rehydrate-conflict" {
-				continue
-			}
-			var failure struct {
-				Source    string `json:"source"`
-				Code      string `json:"code"`
-				Retryable bool   `json:"retryable"`
-				Message   string `json:"message"`
-			}
-			return json.Unmarshal(line.Data, &failure) == nil && failure.Source == "provider" && failure.Code == "conflict" &&
-				failure.Retryable && strings.Contains(failure.Message, "conversation conflict") && !bytes.Contains(line.Data, []byte("SECRET"))
-		}
-		return false
-	})
-	select {
-	case requestID := <-harness.acp.started:
-		t.Fatalf("provider-conflicted rehydration dispatched Prompt: %s", requestID)
-	default:
-	}
-	waitFor(t, 2*time.Second, func() bool {
-		current, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
-		return statusErr == nil && current.Status == string(session.StatusWaiting) && current.ActiveRequestID == ""
-	})
-	status, err := harness.client.Send(context.Background(), Command{Type: "status"})
-	if err != nil || status.Status != string(session.StatusWaiting) || status.ActiveRequestID != "" {
-		t.Fatalf("status after provider-conflicted rehydration = %#v, %v", status, err)
-	}
-}
-
-func TestGenerationScopedReservationRecoveryThenNativeExitContinuesACP(t *testing.T) {
-	harness := startWorkerHarness(t)
-	const ownerToken = "owner-reservation-recovery"
-	reserved, err := harness.client.Send(context.Background(), Command{
-		Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleReservation,
-	})
-	if err != nil || reserved.State != "reserved" || reserved.NativeGeneration == "" {
-		t.Fatalf("native reservation = %#v, %v", reserved, err)
-	}
-	marker, err := os.ReadFile(harness.runtime.NativeOwnerPath())
-	if err != nil || !strings.Contains(string(marker), `"state": "reserved"`) || !strings.Contains(string(marker), reserved.NativeGeneration) {
-		t.Fatalf("reservation marker = %q, %v", marker, err)
-	}
-	status, err := harness.client.Send(context.Background(), Command{Type: "native_reservation_status", OwnerToken: ownerToken})
-	if err != nil || status.State != "reserved" || status.NativeGeneration != reserved.NativeGeneration {
-		t.Fatalf("reservation status = %#v, %v", status, err)
-	}
-	recovered, err := harness.client.Send(context.Background(), Command{
-		Type: "native_recover_reservation", OwnerToken: ownerToken, NativeGeneration: reserved.NativeGeneration,
-	})
-	if err != nil || recovered.State != "released" {
-		t.Fatalf("reservation recovery = %#v, %v", recovered, err)
-	}
-	if _, err := harness.client.Send(context.Background(), Command{
-		Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleProvider, NativeGeneration: reserved.NativeGeneration,
-	}); err == nil || !strings.Contains(err.Error(), "reservation is no longer active") {
-		t.Fatalf("delayed recovered-generation activation error = %v", err)
-	}
-
-	second, err := harness.client.Send(context.Background(), Command{
-		Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleReservation,
-	})
-	if err != nil || second.State != "reserved" || second.NativeGeneration == "" || second.NativeGeneration == reserved.NativeGeneration {
-		t.Fatalf("second reservation = %#v, %v", second, err)
-	}
-	for _, stale := range []Command{
-		{Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleProvider, NativeGeneration: reserved.NativeGeneration},
-		{Type: "native_release", OwnerToken: ownerToken, NativeGeneration: reserved.NativeGeneration, NativeActivity: true},
-	} {
-		if _, err := harness.client.Send(context.Background(), stale); err == nil || !strings.Contains(err.Error(), "generation") {
-			t.Fatalf("stale generation command %#v error = %v", stale, err)
-		}
-	}
-	activated, err := harness.client.Send(context.Background(), Command{
-		Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleProvider, NativeGeneration: second.NativeGeneration,
-	})
-	if err != nil || activated.State != "activated" || activated.NativeGeneration != second.NativeGeneration {
-		t.Fatalf("reservation activation = %#v, %v", activated, err)
-	}
-	if _, err := harness.client.Send(context.Background(), Command{
-		Type: "native_recover_reservation", OwnerToken: ownerToken, NativeGeneration: second.NativeGeneration,
-	}); err == nil || !strings.Contains(err.Error(), "active provider-native ownership") {
-		t.Fatalf("active owner recovery error = %v", err)
-	}
-	if _, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-during-active-reservation-owner", Message: "do not cross surfaces"}); err == nil || !strings.Contains(err.Error(), "native harness is running") {
-		t.Fatalf("prompt during active native owner error = %v", err)
-	}
-	if _, err := harness.client.Send(context.Background(), Command{
-		Type: "native_release", OwnerToken: ownerToken, NativeGeneration: second.NativeGeneration, NativeActivity: true,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	accepted, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-reservation-recovery", Message: "continue"})
-	if err != nil || accepted.State != "ready" {
-		t.Fatalf("prompt after native release = %#v, %v", accepted, err)
-	}
-	waitStarted(t, harness.acp.started, "req-after-reservation-recovery")
-	harness.acp.Complete("req-after-reservation-recovery")
-}
-
-func TestNativeActivationPublishFailureRestoresRecoverableReservationWithoutProviderStart(t *testing.T) {
-	runtime, _ := disconnectedIdentityWorker(t, "acp-canonical", "native-canonical")
-	if err := os.MkdirAll(runtime.config.WorkersDirectory, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	history, err := sessionlog.Open(runtime.LogPath())
-	if err != nil {
-		t.Fatal(err)
-	}
-	runtime.log = history
-	runtime.hub = newHub(history.LastSequence())
-	t.Cleanup(func() {
-		if runtime.log != nil {
-			_ = runtime.log.Close()
-		}
-	})
-
-	const ownerToken = "owner-activation-publish-failure"
-	reserved, generation, err := runtime.acquireNative(ownerToken, NativeOwnerRoleReservation, "")
-	if err != nil || reserved != "reserved" || generation == "" {
-		t.Fatalf("native reservation = %q/%q, %v", reserved, generation, err)
-	}
-	if err := history.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	fixture, err := filepath.Abs(filepath.Join("..", "native", "testdata", "fake-native"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	record := filepath.Join(t.TempDir(), "provider-must-not-start")
-	runner := &native.ExecRunner{}
-	runner.SetReservationGeneration(generation)
-	runner.SetReservationActivator(func(context.Context) error {
-		_, _, activateErr := runtime.acquireNative(ownerToken, NativeOwnerRoleProvider, generation)
-		return activateErr
-	})
-	err = runner.Run(context.Background(), native.Invocation{
-		Command: fixture, WorkingDirectory: t.TempDir(),
-		Environment: map[string]string{"FAKE_NATIVE_RECORD": record},
-	}, strings.NewReader(""), io.Discard, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "restored the exact pre-launch reservation") || runner.NativeActivityOccurred() {
-		t.Fatalf("activation publish failure = %v, activity=%t", err, runner.NativeActivityOccurred())
-	}
-	if _, statErr := os.Stat(record); !os.IsNotExist(statErr) {
-		t.Fatalf("provider started after failed activation publish: %v", statErr)
-	}
-
-	body, err := os.ReadFile(runtime.NativeOwnerPath())
-	if err != nil {
-		t.Fatal(err)
-	}
-	var marker nativeOwnerMarker
-	if err := json.Unmarshal(body, &marker); err != nil {
-		t.Fatal(err)
-	}
-	if marker.State != nativeMarkerReserved || marker.Generation != generation || marker.OwnerToken != ownerToken {
-		t.Fatalf("rolled-back native marker = %#v", marker)
-	}
-	state, currentGeneration, err := runtime.nativeReservationStatus(ownerToken)
-	if err != nil || state != "reserved" || currentGeneration != generation {
-		t.Fatalf("rolled-back reservation status = %q/%q, %v", state, currentGeneration, err)
-	}
-
-	reopened, err := sessionlog.Open(runtime.LogPath())
-	if err != nil {
-		t.Fatal(err)
-	}
-	runtime.log = reopened
-	recovered, err := runtime.recoverNativeReservation(ownerToken, generation)
-	if err != nil || recovered != "released" {
-		t.Fatalf("rolled-back reservation recovery = %q, %v", recovered, err)
-	}
-}
-
-func TestNativeAcquirePublishFailureRestoresRefreshPendingAcrossRestart(t *testing.T) {
-	runtime, _ := disconnectedIdentityWorker(t, "acp-canonical", "native-canonical")
-	if err := os.MkdirAll(runtime.config.WorkersDirectory, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	const (
-		priorOwner      = "released-native-owner"
-		priorGeneration = "0123456789abcdef0123456789abcdef"
-	)
-	if err := runtime.persistNativeOwnership(nativeMarkerRefreshPending, priorOwner, priorGeneration); err != nil {
-		t.Fatal(err)
-	}
-	runtime.nativeReconcilePending = true
-	history, err := sessionlog.Open(runtime.LogPath())
-	if err != nil {
-		t.Fatal(err)
-	}
-	runtime.log = history
-	runtime.hub = newHub(history.LastSequence())
-	if err := history.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	if state, generation, err := runtime.acquireNative("new-native-owner", NativeOwnerRoleDirect, ""); err == nil || state != "" || generation != "" {
-		t.Fatalf("native acquire with failed journal = %q/%q, %v", state, generation, err)
-	}
-	body, err := os.ReadFile(runtime.NativeOwnerPath())
-	if err != nil {
-		t.Fatal(err)
-	}
-	var marker nativeOwnerMarker
-	if err := json.Unmarshal(body, &marker); err != nil {
-		t.Fatal(err)
-	}
-	if marker.State != nativeMarkerRefreshPending || marker.OwnerToken != priorOwner || marker.Generation != priorGeneration {
-		t.Fatalf("restored refresh marker = %#v", marker)
-	}
-
-	restarted, err := New(runtime.config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := restarted.restoreNativeOwnership(); err != nil {
-		t.Fatal(err)
-	}
-	restarted.mu.Lock()
-	owner, pending := restarted.nativeOwnerToken, restarted.nativeReconcilePending
-	restarted.mu.Unlock()
-	if owner != "" || !pending {
-		t.Fatalf("restart restored owner=%q pending=%t, want no provider authorization and durable freshness", owner, pending)
-	}
-}
-
-func TestProviderTranscriptReconcileFailureDoesNotBlockACP(t *testing.T) {
-	harness := startWorkerHarness(t)
-	const ownerToken = "owner-reconcile-retry"
-	harness.reconcile.mu.Lock()
-	harness.reconcile.err = errors.New("provider transcript is temporarily unreadable")
-	harness.reconcile.mu.Unlock()
-	acquired, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleDirect})
-	if err != nil {
-		t.Fatal(err)
-	}
-	released, err := harness.client.Send(context.Background(), Command{Type: "native_release", OwnerToken: ownerToken, NativeGeneration: acquired.NativeGeneration, NativeActivity: true})
-	if err != nil || released.State != "released" {
-		t.Fatalf("native release = %#v, %v", released, err)
-	}
-	accepted, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-during-reconcile-failure", Message: "continue"})
-	if err != nil || accepted.State != "ready" {
-		t.Fatalf("ACP prompt after native release = %#v, %v", accepted, err)
-	}
-	waitStarted(t, harness.acp.started, "req-during-reconcile-failure")
-	harness.acp.Complete("req-during-reconcile-failure")
-	waitFor(t, 2*time.Second, func() bool {
-		lines, readErr := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
-		if readErr != nil {
-			return false
-		}
-		for _, line := range lines {
-			if line.Type == "provider_transcript_reconcile_warning" {
-				return true
-			}
-		}
-		return false
-	})
-	if _, err := os.Stat(harness.runtime.NativeOwnerPath()); !os.IsNotExist(err) {
-		t.Fatalf("native owner marker remains after reconcile warning: %v", err)
-	}
-	status, err := harness.client.Send(context.Background(), Command{Type: "status"})
-	if err != nil || status.Status == string(session.StatusStopped) {
-		t.Fatalf("worker status after reconcile warning = %#v, %v", status, err)
-	}
-}
-
-func TestWorkerShutdownCancelsBlockedProviderTranscriptReconcile(t *testing.T) {
-	harness := startWorkerHarness(t)
-	harness.reconcile.mu.Lock()
-	harness.reconcile.wait = make(chan struct{})
-	harness.reconcile.mu.Unlock()
-	acquired, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: "owner-blocked-reconcile", NativeOwnerRole: NativeOwnerRoleDirect})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := harness.client.Send(context.Background(), Command{
-		Type: "native_release", OwnerToken: "owner-blocked-reconcile", NativeGeneration: acquired.NativeGeneration, NativeActivity: true,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-harness.reconcile.started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("provider transcript reconciliation did not start")
-	}
-
-	harness.cancel()
-	waitFor(t, 3*time.Second, func() bool {
-		current, loadErr := harness.repository.GetSession(context.Background(), harness.runtime.config.Session.ID)
-		return loadErr == nil && current.WorkerPID == 0 && current.WorkerSocket == ""
-	})
-}
-
-func TestNativeOwnershipSurvivesWorkerRestartUntilOwnerRelease(t *testing.T) {
-	harness := startWorkerHarness(t)
-	const ownerToken = "owner-survives-restart"
-	acquired, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleDirect})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-before-worker-restart", Message: "continue before restart"}); err == nil || !strings.Contains(err.Error(), "native harness is running") {
-		t.Fatalf("pre-restart native-open prompt error = %v", err)
-	}
-	harness.cancel()
-	waitFor(t, 3*time.Second, func() bool {
-		current, err := harness.repository.GetSession(context.Background(), harness.runtime.config.Session.ID)
-		return err == nil && current.WorkerPID == 0 && current.WorkerSocket == ""
-	})
-	if _, err := os.Stat(harness.runtime.NativeOwnerPath()); err != nil {
-		t.Fatalf("native owner marker did not survive worker shutdown: %v", err)
-	}
-
-	current, err := harness.repository.GetSession(context.Background(), harness.runtime.config.Session.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	restarted, err := New(Config{
-		Session: current, Profile: harness.runtime.config.Profile,
-		Repository: harness.repository, ACP: harness.acp,
-		WorkersDirectory:            harness.runtime.config.WorkersDirectory,
-		LogsDirectory:               harness.runtime.config.LogsDirectory,
-		RefreshTimeout:              250 * time.Millisecond,
-		ReconcileProviderTranscript: harness.reconcile.Reconcile,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	restartContext, stopRestart := context.WithCancel(context.Background())
-	restartDone := make(chan error, 1)
-	go func() { restartDone <- restarted.Run(restartContext) }()
-	t.Cleanup(func() {
-		stopRestart()
-		select {
-		case err := <-restartDone:
-			if err != nil {
-				t.Errorf("restarted Worker.Run() error = %v", err)
-			}
-		case <-time.After(3 * time.Second):
-			t.Error("restarted worker did not stop")
-		}
-	})
-	restartedClient := NewSocketClient(restarted.SocketPath())
-	waitFor(t, 3*time.Second, func() bool {
-		pingContext, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer cancel()
-		return restartedClient.Ping(pingContext) == nil
-	})
-	status, err := restartedClient.Send(context.Background(), Command{Type: "status"})
-	if err != nil || !status.NativeOwned || status.ActiveRequestID != "" {
-		t.Fatalf("status after worker restart = %#v, %v", status, err)
-	}
-	harness.acp.mu.Lock()
-	resumeCountWhileNative := harness.acp.resumeCount
-	harness.acp.mu.Unlock()
-	if resumeCountWhileNative != 0 {
-		t.Fatalf("worker restart ACP resumes = %d, want 0 while native remains open", resumeCountWhileNative)
-	}
-	if _, err := restartedClient.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-worker-restart", Message: "continue"}); err == nil || !strings.Contains(err.Error(), "native harness is running") {
-		t.Fatalf("restart native-open prompt error = %v", err)
-	}
-	if reused, err := restartedClient.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: NativeOwnerRoleDirect}); err != nil || reused.State != "already_acquired" {
-		t.Fatalf("restart-safe exclusive native reuse = %#v, %v", reused, err)
-	}
-	if _, err := restartedClient.Send(context.Background(), Command{Type: "native_release", OwnerToken: ownerToken, NativeGeneration: acquired.NativeGeneration, NativeActivity: true}); err != nil {
-		t.Fatal(err)
-	}
-	releaseMarker, err := os.ReadFile(restarted.NativeOwnerPath())
-	if err != nil || !bytes.Contains(releaseMarker, []byte(`"state": "refresh_pending"`)) {
-		t.Fatalf("restart-safe release freshness marker = %q, %v", releaseMarker, err)
-	}
-	afterRelease, err := restartedClient.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-native-release", Message: "continue after release"})
-	if err != nil || afterRelease.State != "ready" {
-		t.Fatalf("post-release prompt = %#v, %v", afterRelease, err)
-	}
-	waitStarted(t, harness.acp.started, "req-after-native-release")
-	if _, err := os.Stat(restarted.NativeOwnerPath()); !os.IsNotExist(err) {
-		t.Fatalf("native release freshness marker remains after exact ACP rehydration: %v", err)
-	}
-	harness.acp.Complete("req-after-native-release")
-	harness.acp.mu.Lock()
-	refreshCount, resumeCountAfterRelease := harness.acp.refreshCount, harness.acp.resumeCount
-	harness.acp.mu.Unlock()
-	if refreshCount != 1 || resumeCountAfterRelease != 0 {
-		t.Fatalf("provider calls after restart release: refresh=%d resume=%d, want 1/0", refreshCount, resumeCountAfterRelease)
-	}
-	if _, err := os.Stat(restarted.NativeOwnerPath()); !os.IsNotExist(err) {
-		t.Fatalf("native owner marker remains after restart refresh: %v", err)
-	}
-}
-
-func TestV3RestoresLegacyRefreshPendingUntilExactPromptRehydration(t *testing.T) {
-	runtime, fake := disconnectedIdentityWorker(t, "acp-canonical", "native-canonical")
-	fake.mu.Lock()
-	fake.resumeNativeID = "native-canonical"
-	fake.refreshNativeID = "native-canonical"
-	fake.inspectACP = "acp-canonical"
-	fake.inspectNative = "native-canonical"
-	fake.mu.Unlock()
-	if err := os.MkdirAll(runtime.config.WorkersDirectory, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := runtime.persistNativeOwnership(nativeMarkerRefreshPending, "legacy-v2-owner", "0123456789abcdef0123456789abcdef"); err != nil {
-		t.Fatal(err)
-	}
-	reconcile := newFakeTranscriptReconciler()
-	reconcileRelease := make(chan struct{})
-	reconcile.wait = reconcileRelease
-	runtime.config.ReconcileProviderTranscript = reconcile.Reconcile
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- runtime.Run(ctx) }()
-	defer func() {
-		cancel()
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Errorf("Worker.Run() error = %v", err)
-			}
-		case <-time.After(3 * time.Second):
-			t.Error("worker did not stop")
-		}
-	}()
-	client := NewSocketClient(runtime.SocketPath())
-	waitFor(t, 3*time.Second, func() bool { return client.Ping(context.Background()) == nil })
-	if marker, err := os.ReadFile(runtime.NativeOwnerPath()); err != nil || !bytes.Contains(marker, []byte(`"state": "refresh_pending"`)) {
-		t.Fatalf("legacy refresh_pending marker was not preserved before prompt: %q, %v", marker, err)
-	}
-	accepted, err := client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-legacy-refresh", Message: "continue immediately"})
-	if err != nil || accepted.State != "ready" {
-		t.Fatalf("prompt during legacy transcript reload = %#v, %v", accepted, err)
-	}
-	waitStarted(t, fake.started, "req-legacy-refresh")
-	if _, err := os.Stat(runtime.NativeOwnerPath()); !os.IsNotExist(err) {
-		t.Fatalf("legacy refresh_pending marker remains after exact rehydration: %v", err)
-	}
-	select {
-	case <-reconcile.started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("legacy transcript reconciliation did not start after exact rehydration")
-	}
-	fake.Complete("req-legacy-refresh")
-	close(reconcileRelease)
-	waitFor(t, 2*time.Second, func() bool {
-		lines, readErr := sessionlog.ReadFile(runtime.LogPath(), 0)
-		if readErr != nil {
-			return false
-		}
-		for _, line := range lines {
-			if line.Type == "provider_transcript_reconciled" {
-				return true
-			}
-		}
-		return false
-	})
-	status, err := client.Send(context.Background(), Command{Type: "status"})
-	if err != nil || status.Status == string(session.StatusStopped) {
-		t.Fatalf("worker after legacy reconciliation = %#v, %v", status, err)
-	}
-	fake.mu.Lock()
-	resumeCount := fake.resumeCount
-	fake.mu.Unlock()
-	if resumeCount != 1 {
-		t.Fatalf("legacy marker ACP resume count = %d, want 1", resumeCount)
-	}
-}
-
-func TestStartupRefreshMarkerReplacementBlocksBothSurfaces(t *testing.T) {
-	runtime, fake := disconnectedIdentityWorker(t, "acp-canonical", "native-canonical")
-	if err := os.MkdirAll(runtime.config.WorkersDirectory, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	const generation = "0123456789abcdef0123456789abcdef"
-	if err := runtime.persistNativeOwnership(nativeMarkerRefreshPending, "release-owner", generation); err != nil {
-		t.Fatal(err)
-	}
-	hookErr := make(chan error, 1)
-	fake.mu.Lock()
-	fake.resumeNativeID = "native-canonical"
-	fake.refreshNativeID = "native-canonical"
-	fake.inspectACP = "acp-canonical"
-	fake.inspectNative = "native-canonical"
-	fake.resumeHook = func() {
-		hookErr <- runtime.persistNativeOwnership(nativeMarkerOwned, "unexpected-owner", generation)
-	}
-	fake.mu.Unlock()
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- runtime.Run(ctx) }()
-	defer func() {
-		cancel()
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Errorf("Worker.Run() error = %v", err)
-			}
-		case <-time.After(3 * time.Second):
-			t.Error("worker did not stop")
-		}
-	}()
-	client := NewSocketClient(runtime.SocketPath())
-	waitFor(t, 3*time.Second, func() bool { return client.Ping(context.Background()) == nil })
-	if err := <-hookErr; err != nil {
-		t.Fatal(err)
-	}
-	preserved, err := os.ReadFile(runtime.NativeOwnerPath())
-	if err != nil || !bytes.Contains(preserved, []byte(`"state": "owned"`)) {
-		t.Fatalf("replacement marker = %q, %v", preserved, err)
-	}
-	if _, err := client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: "new-owner", NativeOwnerRole: NativeOwnerRoleDirect}); err == nil || !strings.Contains(err.Error(), "unexpectedly changed") {
-		t.Fatalf("native acquire with replaced marker error = %v", err)
-	}
-	if _, err := client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-marker-replacement", Message: "must not run"}); err == nil || !strings.Contains(err.Error(), "prompt was not accepted") {
-		t.Fatalf("ACP prompt with replaced marker error = %v", err)
-	}
-	afterPrompt, err := os.ReadFile(runtime.NativeOwnerPath())
-	if err != nil || !bytes.Equal(afterPrompt, preserved) {
-		t.Fatalf("blocked surfaces changed preserved replacement marker: before=%q after=%q err=%v", preserved, afterPrompt, err)
-	}
-	assertNoRequestLog(t, runtime.LogPath(), "req-after-marker-replacement")
-	fake.mu.Lock()
-	refreshCount := fake.refreshCount
-	fake.mu.Unlock()
-	if refreshCount != 0 {
-		t.Fatalf("ACP refresh calls after fail-closed marker replacement = %d, want 0", refreshCount)
-	}
-}
-
-func TestWorkerRestorePreservesReservationPhaseAndLegacyOwnedIsActive(t *testing.T) {
-	for _, test := range []struct {
-		name       string
-		marker     string
-		generation string
-		reserved   bool
-	}{
-		{name: "generation reservation", marker: nativeMarkerReserved, generation: "0123456789abcdef0123456789abcdef", reserved: true},
-		{name: "owned marker", marker: nativeMarkerOwned, generation: "abcdef0123456789abcdef0123456789"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			runtime, _ := disconnectedIdentityWorker(t, "acp-canonical", "native-canonical")
-			if err := os.MkdirAll(runtime.config.WorkersDirectory, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			const ownerToken = "owner-restored-phase"
-			if err := runtime.persistNativeOwnership(test.marker, ownerToken, test.generation); err != nil {
-				t.Fatal(err)
-			}
-			restored, err := New(runtime.config)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := restored.restoreNativeOwnership(); err != nil {
-				t.Fatal(err)
-			}
-			restored.mu.Lock()
-			owner, generation, reserved := restored.nativeOwnerToken, restored.nativeOwnerGeneration, restored.nativeOwnerReserved
-			restored.mu.Unlock()
-			if owner != ownerToken || generation != test.generation || reserved != test.reserved {
-				t.Fatalf("restored owner=%q generation=%q reserved=%t", owner, generation, reserved)
-			}
-			if !test.reserved {
-				if _, err := restored.recoverNativeReservation(ownerToken, test.generation); err == nil || !strings.Contains(err.Error(), "active provider-native ownership") {
-					t.Fatalf("legacy active recovery error = %v", err)
-				}
-			}
-		})
-	}
-}
-
-func TestOwnedNativeMarkerMigrationDistinguishesExclusiveAndExplicitStale(t *testing.T) {
-	for _, test := range []struct {
-		name       string
-		staleField string
-		wantStale  bool
-	}{
-		{name: "committed v2 marker without stale bit is reusable"},
-		{name: "explicit WIP stale marker is exit only", staleField: `,"stale_after_acp":true`, wantStale: true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			runtime, _ := disconnectedIdentityWorker(t, "acp-canonical", "native-canonical")
-			if err := os.MkdirAll(runtime.config.WorkersDirectory, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			const (
-				owner      = "legacy-owner"
-				generation = "0123456789abcdef0123456789abcdef"
-			)
-			body := fmt.Sprintf(`{"version":1,"session_id":"S-identity","state":"owned","owner_token":"legacy-owner","generation":"%s"%s}`, generation, test.staleField)
-			if err := os.WriteFile(runtime.NativeOwnerPath(), []byte(body), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if err := runtime.restoreNativeOwnership(); err != nil {
-				t.Fatal(err)
-			}
-			state, restoredGeneration, err := runtime.acquireNative(owner, NativeOwnerRoleDirect, "")
-			if test.wantStale {
-				if err == nil || !strings.Contains(err.Error(), "exit without sending another prompt") {
-					t.Fatalf("explicit stale reuse = %q/%q, %v", state, restoredGeneration, err)
-				}
-			} else if err != nil || state != "already_acquired" || restoredGeneration != generation {
-				t.Fatalf("exclusive v2 reuse = %q/%q, %v", state, restoredGeneration, err)
-			}
-			history, err := sessionlog.Open(runtime.LogPath())
-			if err != nil {
-				t.Fatal(err)
-			}
-			runtime.log = history
-			runtime.hub = newHub(history.LastSequence())
-			t.Cleanup(func() { _ = history.Close() })
-			released, err := runtime.releaseNative(owner, generation, false)
-			if err != nil || released != "released" {
-				t.Fatalf("exact marker release = %q, %v", released, err)
-			}
-			if _, err := os.Stat(runtime.NativeOwnerPath()); !os.IsNotExist(err) {
-				t.Fatalf("marker remains after exact release: %v", err)
-			}
-		})
-	}
-}
-
-func TestInvalidNativeOwnershipMarkerFailsClosedBeforeACPConnect(t *testing.T) {
-	for _, test := range []struct {
-		name string
-		body string
-	}{
-		{name: "malformed", body: "not-json\n"},
-		{name: "unknown phase", body: `{"version":1,"session_id":"S-identity","state":"future","owner_token":"owner"}`},
-		{name: "owned without generation", body: `{"version":1,"session_id":"S-identity","state":"owned","owner_token":"owner"}`},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			runtime, fake := disconnectedIdentityWorker(t, "acp-canonical", "native-canonical")
-			if err := os.MkdirAll(runtime.config.WorkersDirectory, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(runtime.NativeOwnerPath(), []byte(test.body), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			err := runtime.Run(context.Background())
-			if err == nil || !strings.Contains(err.Error(), "refusing ACP and native work") {
-				t.Fatalf("Worker.Run() invalid marker error = %v", err)
-			}
-			preserved, err := os.ReadFile(runtime.NativeOwnerPath())
-			if err != nil || string(preserved) != test.body {
-				t.Fatalf("invalid native marker was changed: %q, %v", preserved, err)
-			}
-			fake.mu.Lock()
-			startCount, resumeCount, refreshCount := fake.startCount, fake.resumeCount, fake.refreshCount
-			fake.mu.Unlock()
-			if startCount != 0 || resumeCount != 0 || refreshCount != 0 {
-				t.Fatalf("ACP calls with invalid native marker: start=%d resume=%d refresh=%d, want 0/0/0", startCount, resumeCount, refreshCount)
-			}
-		})
-	}
-}
-
-func TestACPRehydrationCleanupPreservesUntrustedMarker(t *testing.T) {
-	for _, test := range []struct {
-		name string
-		body string
-	}{
-		{name: "malformed", body: "not-json\n"},
-		{name: "wrong Session", body: `{"version":1,"session_id":"S-other","state":"refresh_pending","owner_token":"owner","generation":"0123456789abcdef0123456789abcdef"}`},
-		{name: "future version", body: `{"version":99,"session_id":"S-identity","state":"refresh_pending","owner_token":"owner","generation":"0123456789abcdef0123456789abcdef"}`},
-		{name: "unexpected owned", body: `{"version":1,"session_id":"S-identity","state":"owned","owner_token":"owner","generation":"0123456789abcdef0123456789abcdef","stale_after_acp":false}`},
-		{name: "unexpected reserved", body: `{"version":1,"session_id":"S-identity","state":"reserved","owner_token":"owner","generation":"0123456789abcdef0123456789abcdef","stale_after_acp":false}`},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			runtime, _ := disconnectedIdentityWorker(t, "acp-canonical", "native-canonical")
-			if err := os.MkdirAll(runtime.config.WorkersDirectory, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(runtime.NativeOwnerPath(), []byte(test.body), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			runtime.mu.Lock()
-			runtime.nativeReconcilePending = true
-			err := runtime.clearNativeRefreshPendingLocked()
-			stillPending := runtime.nativeReconcilePending
-			runtime.mu.Unlock()
-			if err == nil || !stillPending {
-				t.Fatalf("cleanup error=%v pending=%t", err, stillPending)
-			}
-			preserved, readErr := os.ReadFile(runtime.NativeOwnerPath())
-			if readErr != nil || string(preserved) != test.body {
-				t.Fatalf("untrusted marker changed: %q, %v", preserved, readErr)
-			}
-		})
-	}
-}
-
-func TestRuntimeRefreshMarkerReplacementBlocksBothSurfaces(t *testing.T) {
-	harness := startWorkerHarness(t)
-	const generation = "0123456789abcdef0123456789abcdef"
-	harness.runtime.mu.Lock()
-	if err := harness.runtime.persistNativeOwnership(nativeMarkerOwned, "unexpected-runtime-owner", generation); err != nil {
-		harness.runtime.mu.Unlock()
-		t.Fatal(err)
-	}
-	harness.runtime.nativeReconcilePending = true
-	harness.runtime.requireACPFreshnessLocked()
-	harness.runtime.mu.Unlock()
-	preserved, err := os.ReadFile(harness.runtime.NativeOwnerPath())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := harness.runtime.prepareACPDispatch(context.Background(), "req-replaced-at-runtime"); err == nil || !strings.Contains(err.Error(), "unexpectedly changed") {
-		t.Fatalf("runtime replacement preparation error = %v", err)
-	}
-	if _, err := harness.client.Send(context.Background(), Command{Type: "native_acquire", OwnerToken: "new-runtime-owner", NativeOwnerRole: NativeOwnerRoleDirect}); err == nil || !strings.Contains(err.Error(), "both ACP and native work are unavailable") {
-		t.Fatalf("native acquire after runtime replacement error = %v", err)
-	}
-	afterFailure, err := os.ReadFile(harness.runtime.NativeOwnerPath())
-	if err != nil || !bytes.Equal(afterFailure, preserved) {
-		t.Fatalf("runtime replacement marker changed: before=%q after=%q err=%v", preserved, afterFailure, err)
-	}
-	lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, line := range lines {
-		if line.Type == "turn_started" && line.RequestID == "req-replaced-at-runtime" {
-			t.Fatal("runtime marker replacement reached ACP dispatch")
-		}
-	}
-	if _, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-runtime-replacement", Message: "must not run"}); err == nil || !strings.Contains(err.Error(), "prompt was not accepted") {
-		t.Fatalf("ACP retry with blocked native marker error = %v", err)
-	}
-	assertNoRequestLog(t, harness.runtime.LogPath(), "req-after-runtime-replacement")
-	afterPrompt, err := os.ReadFile(harness.runtime.NativeOwnerPath())
-	if err != nil || !bytes.Equal(afterPrompt, preserved) {
-		t.Fatalf("blocked surfaces changed marker: before=%q after=%q err=%v", preserved, afterPrompt, err)
-	}
-}
-
-func TestPostTurnIdentityDriftQuarantinesTransportBeforeQueuedPrompt(t *testing.T) {
-	harness := startWorkerHarness(t)
-	harness.acp.mu.Lock()
-	harness.acp.inspectNative = "native-replacement"
-	harness.acp.resumeNativeID = "native-replacement"
-	harness.acp.mu.Unlock()
-	if _, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-before-drift", Message: "first"}); err != nil {
-		t.Fatal(err)
-	}
-	waitStarted(t, harness.acp.started, "req-before-drift")
-	if queued, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-must-not-run", Message: "second"}); err != nil || queued.State != "queued" {
-		t.Fatalf("queued prompt = %#v, %v", queued, err)
-	}
-	harness.acp.Complete("req-before-drift")
-
-	waitFor(t, 3*time.Second, func() bool {
-		current, err := harness.repository.GetSession(context.Background(), "S-worker")
-		return err == nil && current.WorkerPID == 0 && current.Status == session.StatusStopped
-	})
-	select {
-	case requestID := <-harness.acp.started:
-		t.Fatalf("queued prompt reached drifted ACP handle: %s", requestID)
-	case <-time.After(250 * time.Millisecond):
-	}
-	lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var unavailable, rejected bool
-	for _, line := range lines {
-		unavailable = unavailable || line.Type == "transport_unavailable"
-		rejected = rejected || (line.Type == "turn_error" && line.RequestID == "req-must-not-run")
-	}
-	if !unavailable || !rejected {
-		t.Fatalf("quarantine history unavailable=%t rejected=%t: %#v", unavailable, rejected, lines)
-	}
-}
-
-func TestProviderTurnFailureKeepsWorkerAndACPQueueUsable(t *testing.T) {
-	harness := startWorkerHarness(t)
-	harness.acp.mu.Lock()
-	harness.acp.promptErr = &acp.ProviderTurnError{Code: "turn_failed", DetailCode: "provider_busy", Message: "SECRET provider detail", Retryable: true}
-	harness.acp.mu.Unlock()
-	if _, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-provider-busy", Message: "first"}); err != nil {
-		t.Fatal(err)
-	}
-	waitStarted(t, harness.acp.started, "req-provider-busy")
-	queued, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-provider-busy", Message: "second"})
-	if err != nil || queued.State != "queued" {
-		t.Fatalf("queued prompt = %#v, %v", queued, err)
-	}
-	harness.acp.Complete("req-provider-busy")
-	waitStarted(t, harness.acp.started, "req-after-provider-busy")
-	harness.acp.mu.Lock()
-	harness.acp.promptErr = nil
-	harness.acp.mu.Unlock()
-	harness.acp.Complete("req-after-provider-busy")
-	waitFor(t, 2*time.Second, func() bool {
-		status, statusErr := harness.client.Send(context.Background(), Command{Type: "status"})
-		return statusErr == nil && status.Status == string(session.StatusWaiting) && status.ActiveRequestID == "" && status.Queued == 0
-	})
-	harness.acp.mu.Lock()
-	resumeCount, refreshCount := harness.acp.resumeCount, harness.acp.refreshCount
-	harness.acp.mu.Unlock()
-	if resumeCount != 0 || refreshCount != 2 {
-		t.Fatalf("provider turn rejection recovery/rehydration: resume=%d refresh=%d, want 0/2", resumeCount, refreshCount)
-	}
-	lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var failed, completed, safeProvenance bool
-	for _, line := range lines {
-		if line.Type == "turn_error" && line.RequestID == "req-provider-busy" {
-			failed = true
-			var failure struct {
-				Source    string `json:"source"`
-				Code      string `json:"code"`
-				Retryable bool   `json:"retryable"`
-				Message   string `json:"message"`
-			}
-			if json.Unmarshal(line.Data, &failure) == nil {
-				safeProvenance = failure.Source == "provider" && failure.Code == "busy" && failure.Retryable && strings.Contains(failure.Message, "provider is busy") && !bytes.Contains(line.Data, []byte("SECRET"))
-			}
-		}
-		completed = completed || (line.Type == "turn_completed" && line.RequestID == "req-after-provider-busy")
-	}
-	if !failed || !completed || !safeProvenance {
-		t.Fatalf("provider failure FIFO history failed=%t completed=%t safe=%t: %#v", failed, completed, safeProvenance, lines)
-	}
-}
-
-func TestPromptFailureRecoversOrQuarantinesBeforeQueuedPrompt(t *testing.T) {
-	harness := startWorkerHarness(t)
-	harness.acp.mu.Lock()
-	harness.acp.promptErr = &acp.ProtocolError{Operation: "runtime bridge", Message: "bridge disconnected"}
-	harness.acp.resumeNativeID = "native-replacement"
-	harness.acp.mu.Unlock()
-	if _, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-bridge-failure", Message: "first"}); err != nil {
-		t.Fatal(err)
-	}
-	waitStarted(t, harness.acp.started, "req-bridge-failure")
-	if queued, err := harness.client.Send(context.Background(), Command{Type: "prompt", RequestID: "req-after-bridge-failure", Message: "second"}); err != nil || queued.State != "queued" {
-		t.Fatalf("queued prompt = %#v, %v", queued, err)
-	}
-	harness.acp.Complete("req-bridge-failure")
-	waitFor(t, 3*time.Second, func() bool {
-		current, err := harness.repository.GetSession(context.Background(), "S-worker")
-		return err == nil && current.WorkerPID == 0 && current.Status == session.StatusStopped
-	})
-	select {
-	case requestID := <-harness.acp.started:
-		t.Fatalf("queued prompt reached failed ACP handle: %s", requestID)
-	case <-time.After(250 * time.Millisecond):
-	}
-	lines, err := sessionlog.ReadFile(harness.runtime.LogPath(), 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var rejected bool
-	for _, line := range lines {
-		rejected = rejected || (line.Type == "turn_error" && line.RequestID == "req-after-bridge-failure")
-	}
-	if !rejected {
-		t.Fatalf("queued prompt was not rejected after bridge failure: %#v", lines)
-	}
-}
-
-func TestCanonicalConversationCannotStartWithoutACPTransportIdentity(t *testing.T) {
-	runtime, fake := disconnectedIdentityWorker(t, "", "native-canonical")
-	if _, err := runtime.connectACP(context.Background()); err == nil || !strings.Contains(err.Error(), "refusing to start a replacement conversation") {
-		t.Fatalf("connectACP() error = %v", err)
-	}
-	fake.mu.Lock()
-	defer fake.mu.Unlock()
-	if fake.startCount != 0 || fake.resumeCount != 0 {
-		t.Fatalf("Start=%d Resume=%d, want neither called", fake.startCount, fake.resumeCount)
-	}
-}
-
-func TestResumeRejectsProviderIdentityDrift(t *testing.T) {
-	runtime, fake := disconnectedIdentityWorker(t, "acp-canonical-transport", "native-canonical")
-	fake.resumeNativeID = "native-replacement"
-	if _, err := runtime.connectACP(context.Background()); err == nil || !strings.Contains(err.Error(), "expected canonical provider conversation") {
-		t.Fatalf("connectACP() error = %v", err)
-	}
-	fake.mu.Lock()
-	defer fake.mu.Unlock()
-	if fake.startCount != 0 || fake.resumeCount != 1 {
-		t.Fatalf("Start=%d Resume=%d, want exact Resume only", fake.startCount, fake.resumeCount)
-	}
-}
-
-func disconnectedIdentityWorker(t *testing.T, acpSessionID, canonicalID string) (*Worker, *fakeACP) {
-	t.Helper()
-	root, err := os.MkdirTemp("/tmp", "atc-identity-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
-	repository, err := store.Open(context.Background(), filepath.Join(root, "agent.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = repository.Close() })
-	createdTask, err := repository.CreateTask(context.Background(), task.CreateParams{ID: "T-identity", Title: "Identity test"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	createdSession, err := repository.CreateSession(context.Background(), session.CreateParams{
-		ID: "S-identity", TaskID: createdTask.ID, Agent: "codex", Provider: "openai", RepoPath: root,
-		ACPSessionID: acpSessionID, NativeSessionID: canonicalID, ProviderConversationID: canonicalID,
-		ConversationIDSource: session.ConversationSourceNative, Status: session.StatusWaiting,
-		MetadataJSON: json.RawMessage(`{"permission":"read-approval"}`),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	fake := newFakeACP()
-	runtime, err := New(Config{
-		Session: createdSession, Profile: agents.Profile{Name: "codex", Provider: "openai", Command: "codex"},
-		Repository: repository, ACP: fake, WorkersDirectory: filepath.Join(root, "workers"), LogsDirectory: filepath.Join(root, "logs"),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return runtime, fake
-}
-
-func TestWorkerRejectsDuplicateAndUsesPrivateRuntimeFiles(t *testing.T) {
-	harness := startWorkerHarness(t)
-	duplicate, err := New(harness.runtime.config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = duplicate.Run(context.Background())
-	if !errors.Is(err, ErrAlreadyRunning) {
-		t.Fatalf("duplicate Worker.Run() error = %v", err)
-	}
-	for _, path := range []string{harness.runtime.SocketPath(), harness.runtime.MetadataPath(), harness.runtime.LockPath(), harness.runtime.LogPath()} {
-		info, err := os.Stat(path)
-		if err != nil {
-			t.Fatalf("stat %s: %v", path, err)
-		}
-		if got := info.Mode().Perm(); got != 0o600 {
-			t.Errorf("mode for %s = %o, want 600", path, got)
-		}
-	}
-}
-
-func TestPermissionMetadataDefaultsReadAndRequiresExplicitApproveAll(t *testing.T) {
-	for _, test := range []struct {
-		metadata string
-		want     acp.PermissionMode
-		ok       bool
-	}{
-		{"", acp.PermissionReadApproval, true},
-		{`{"permission":"read-approval"}`, acp.PermissionReadApproval, true},
-		{`{"permission":"approve-all"}`, acp.PermissionApproveAll, true},
-		{`{"permission":"write"}`, "", false},
-	} {
-		got, err := permissionFromMetadata(json.RawMessage(test.metadata))
-		if (err == nil) != test.ok || got != test.want {
-			t.Errorf("permissionFromMetadata(%q) = %q, %v", test.metadata, got, err)
-		}
-	}
-}
-
-func TestRuntimeTransportMarkerPreventsBlindLegacyCutover(t *testing.T) {
-	if usesRuntimeTransport(nil) || usesRuntimeTransport(json.RawMessage(`{"permission":"read-approval"}`)) {
-		t.Fatal("legacy Session metadata was treated as runtime-backed")
-	}
-	metadata := json.RawMessage(`{"permission":"read-approval","acp_transport":"acpx-runtime-v1"}`)
-	if !usesRuntimeTransport(metadata) {
-		t.Fatal("runtime-backed Session metadata was not recognized")
-	}
-}
-
-func TestReconcileStaleWorkerMarksSessionStoppedAndRemovesRuntimeFiles(t *testing.T) {
-	root, err := os.MkdirTemp("/tmp", "atc-stale-test-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(root)
-	home := config.Home{Root: root, Database: filepath.Join(root, "agent.db"), Workers: filepath.Join(root, "workers"), Logs: filepath.Join(root, "logs")}
-	if err := os.MkdirAll(home.Workers, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	repository, err := store.Open(context.Background(), home.Database)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer repository.Close()
-	createdTask, _ := repository.CreateTask(context.Background(), task.CreateParams{ID: "T-stale", Title: "Stale"})
-	createdSession, err := repository.CreateSession(context.Background(), session.CreateParams{ID: "S-stale", TaskID: createdTask.ID, Agent: "codex"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	socket := filepath.Join(home.Workers, "S-stale.sock")
-	metadata := filepath.Join(home.Workers, "S-stale.json")
-	if err := os.WriteFile(socket, []byte("stale"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(metadata, []byte(`{"pid":999999}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := repository.UpdateSessionWorker(context.Background(), createdSession.ID, 999999, socket, filepath.Join(home.Logs, "S-stale.jsonl"), session.StatusWorking); err != nil {
-		t.Fatal(err)
-	}
-	reconciled, err := ReconcileStale(context.Background(), home, repository)
-	if err != nil || len(reconciled) != 1 || reconciled[0] != createdSession.ID {
-		t.Fatalf("ReconcileStale() = %v, %v", reconciled, err)
-	}
-	stopped, err := repository.GetSession(context.Background(), createdSession.ID)
-	if err != nil || stopped.Status != session.StatusStopped || stopped.WorkerPID != 0 || stopped.WorkerSocket != "" {
-		t.Fatalf("stopped Session = %#v, %v", stopped, err)
-	}
-	for _, path := range []string{socket, metadata} {
-		if _, err := os.Stat(path); !os.IsNotExist(err) {
-			t.Errorf("stale runtime path %s still exists: %v", path, err)
-		}
-	}
-}
-
-func TestDetachedHiddenWorkerStartupLifecycleAndDiagnostics(t *testing.T) {
-	root, err := os.MkdirTemp("/tmp", "atc-detached-test-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
-	home := config.Home{
-		Root: root, Database: filepath.Join(root, "agent.db"), Agents: filepath.Join(root, "agents"),
-		Workers: filepath.Join(root, "workers"), Logs: filepath.Join(root, "logs"), Worktrees: filepath.Join(root, "worktrees"),
-	}
-	for _, directory := range []string{home.Root, home.Agents, home.Workers, home.Logs, home.Worktrees} {
-		if err := os.MkdirAll(directory, 0o700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	repo := filepath.Join(root, "repo")
-	if err := os.MkdirAll(repo, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	repository, err := store.Open(context.Background(), home.Database)
-	if err != nil {
-		t.Fatal(err)
-	}
-	createdTask, _ := repository.CreateTask(context.Background(), task.CreateParams{ID: "T-detached", Title: "Detached"})
-	_, err = repository.CreateSession(context.Background(), session.CreateParams{ID: "S-detached", TaskID: createdTask.ID, Agent: "codex", Provider: "openai", RepoPath: repo})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = repository.CreateSession(context.Background(), session.CreateParams{ID: "S-detached-failure", TaskID: createdTask.ID, Agent: "codex", Provider: "openai", RepoPath: repo})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := repository.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	executable := filepath.Join(root, "acpctl")
-	build := exec.Command("go", "build", "-o", executable, "./cmd/acpctl")
-	build.Dir = filepath.Join("..", "..")
-	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build acpctl: %v\n%s", err, output)
-	}
-	fixture, err := filepath.Abs(filepath.Join("..", "acp", "testdata", "fake-acpx"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("ACPX_BINARY", fixture)
-	t.Setenv("FAKE_ACPX_SCENARIO", "success")
-	result, err := Spawn(context.Background(), executable, home, "S-detached")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.PID == os.Getpid() || !IsProcessAlive(result.PID) {
-		t.Fatalf("detached PID = %d", result.PID)
-	}
-	client := NewSocketClient(result.Socket)
-	if err := client.Ping(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := client.Send(context.Background(), Command{Type: "stop"}); err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, 3*time.Second, func() bool { return !IsProcessAlive(result.PID) })
-	reopened, err := store.Open(context.Background(), home.Database)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reopened.Close()
-	stopped, err := reopened.GetSession(context.Background(), "S-detached")
-	if err != nil || stopped.Status != session.StatusStopped || stopped.WorkerPID != 0 || stopped.WorkerSocket != "" {
-		t.Fatalf("stopped Session = %#v, %v", stopped, err)
-	}
-
-	t.Setenv("FAKE_ACPX_SCENARIO", "nonzero")
-	_, err = Spawn(context.Background(), executable, home, "S-detached-failure")
-	if err == nil || !strings.Contains(err.Error(), "fixture ensure failed") {
-		t.Fatalf("Spawn() startup failure = %v, want underlying acpx detail", err)
-	}
-	failed, getErr := reopened.GetSession(context.Background(), "S-detached-failure")
-	if getErr != nil || failed.Status != session.StatusFailed {
-		t.Fatalf("failed Session = %#v, %v", failed, getErr)
-	}
-}
-
-func waitStarted(t *testing.T, started <-chan string, want string) {
-	t.Helper()
-	select {
-	case got := <-started:
-		if got != want {
-			t.Fatalf("started request = %q, want %q", got, want)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatalf("request %s did not start", want)
-	}
-}
-
-func assertNoRequestLog(t *testing.T, path, requestID string) {
-	t.Helper()
-	lines, err := sessionlog.ReadFile(path, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, line := range lines {
-		if line.RequestID == requestID {
-			t.Fatalf("rejected request %s was journaled as %s", requestID, line.Type)
-		}
-	}
-}
-
-func waitFor(t *testing.T, timeout time.Duration, condition func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if condition() {
-			return
+		if time.Now().After(deadline) {
+			t.Fatalf("worker did not become ready: %v", pingErr)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("condition did not become true")
+	t.Cleanup(func() {
+		stopContext, stopCancel := context.WithTimeout(context.Background(), time.Second)
+		_, _ = harness.client.Send(stopContext, Command{Type: "stop"})
+		stopCancel()
+		harness.cancel()
+		select {
+		case <-harness.done:
+		case <-time.After(3 * time.Second):
+			t.Error("worker did not stop")
+		}
+		if err := harness.runError(); err != nil && !harness.allowRunError {
+			t.Errorf("worker Run() = %v", err)
+		}
+	})
+	return harness
 }
 
-func requestCounts(lines chan Message) map[string]int {
-	counts := make(map[string]int)
+func (h *runningWorkerTest) runError() error {
+	h.errMu.Lock()
+	defer h.errMu.Unlock()
+	return h.err
+}
+
+func (h *runningWorkerTest) waitForRequestResult(t *testing.T, requestID string) []sessionlog.Line {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
 	for {
-		select {
-		case line := <-lines:
-			counts[line.RequestID]++
-		default:
-			return counts
+		lines, err := sessionlog.ReadFile(h.worker.LogPath(), 0)
+		if err != nil {
+			t.Fatal(err)
 		}
+		var requestLines []sessionlog.Line
+		for _, line := range lines {
+			if line.RequestID == requestID {
+				requestLines = append(requestLines, line)
+			}
+		}
+		if len(requestLines) > 0 && requestLines[len(requestLines)-1].Type == FrameProviderResult {
+			return requestLines
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("request %s did not reach provider_result; lines=%#v", requestID, requestLines)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (h *runningWorkerTest) waitIdle(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		message, err := h.client.Send(ctx, Command{Type: "status"})
+		cancel()
+		if err == nil && message.ActiveRequestID == "" && message.Status == string(session.StatusWaiting) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("worker did not become idle: %#v, %v", message, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func requestLineTypes(lines []sessionlog.Line) []string {
+	result := make([]string, 0, len(lines))
+	for _, line := range lines {
+		result = append(result, line.Type)
+	}
+	return result
+}
+
+func TestWorkerStartsOnceAndStreamsOrderedSessionChannelFrames(t *testing.T) {
+	port := &workerTestPort{catalog: advertisedWorkerTestCatalog()}
+	harness := startRunningWorkerTest(t, session.Session{ID: "S-start"}, port)
+	for _, request := range []struct{ id, text string }{{"REQ-one", "first"}, {"REQ-two", "second"}} {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		response, err := harness.client.Send(ctx, Command{Type: "prompt", RequestID: request.id, Message: request.text})
+		cancel()
+		if err != nil || response.Type != "accepted" {
+			t.Fatalf("prompt %s = %#v, %v", request.id, response, err)
+		}
+		lines := harness.waitForRequestResult(t, request.id)
+		if got, want := requestLineTypes(lines), []string{FrameClientCommand, FrameProviderEvent, FrameProviderResult}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("request %s line types = %v, want %v", request.id, got, want)
+		}
+		if got, want := string(lines[1].Data), `{"type":"text_delta","stream":"output","text":"ok","provider":"fixture"}`; got != want {
+			t.Fatalf("provider event was rewritten: %s, want %s", got, want)
+		}
+		harness.waitIdle(t)
+	}
+	port.mu.Lock()
+	defer port.mu.Unlock()
+	if len(port.startSpecs) != 1 || len(port.resumeSpecs) != 0 || len(port.promptSpecs) != 2 {
+		t.Fatalf("Port calls: start=%d resume=%d prompt=%d", len(port.startSpecs), len(port.resumeSpecs), len(port.promptSpecs))
+	}
+	if port.startSpecs[0].Model != "" || port.startSpecs[0].ReasoningEffort != "" {
+		t.Fatalf("identity-first Start carried provider controls: %#v", port.startSpecs[0])
+	}
+	allLines, err := sessionlog.ReadFile(harness.worker.LogPath(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range allLines {
+		if line.Type == FrameConnection && (strings.Contains(string(line.Data), `"pid"`) || strings.Contains(string(line.Data), `"socket"`)) {
+			t.Fatalf("public connection frame leaked worker coordinates: %s", line.Data)
+		}
+	}
+}
+
+func TestWorkerChannelIsImmediatelyAttachableWhileProviderStarts(t *testing.T) {
+	gate := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	port := &workerTestPort{catalog: advertisedWorkerTestCatalog(), startGate: gate, startEntered: entered}
+	harness := startAddressableWorkerTest(t, session.Session{ID: "S-starting"}, port)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("provider Start was not entered")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	status, err := harness.client.Send(ctx, Command{Type: "status"})
+	cancel()
+	if err != nil || status.Status != string(session.StatusStarting) {
+		t.Fatalf("starting status = %#v, %v", status, err)
+	}
+
+	streamContext, stopStream := context.WithCancel(context.Background())
+	streamed := make(chan Message, 2)
+	streamDone := make(chan error, 1)
+	go func() {
+		streamDone <- harness.client.Subscribe(streamContext, 0, func(message Message) error {
+			streamed <- message
+			return nil
+		})
+	}()
+	select {
+	case message := <-streamed:
+		if message.LineType != FrameConnection || !strings.Contains(string(message.Data), `"state":"connecting"`) {
+			t.Fatalf("first startup frame = %#v", message)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("subscriber did not receive connecting frame")
+	}
+
+	commands := []Command{
+		{Type: "prompt", RequestID: "REQ-too-early", Message: "do not send"},
+		{Type: "provider_options"},
+		{Type: "configure", Model: "model-selected"},
+		{Type: "cancel"},
+		{Type: "permission_response", PermissionID: "P-missing", OptionID: "allow-once"},
+	}
+	for _, command := range commands {
+		commandContext, commandCancel := context.WithTimeout(context.Background(), time.Second)
+		response, commandErr := harness.client.Send(commandContext, command)
+		commandCancel()
+		var starting *NotReadyError
+		if !errors.As(commandErr, &starting) || response.ErrorCode != "session_starting" {
+			t.Fatalf("%s during startup = %#v, %T %v", command.Type, response, commandErr, commandErr)
+		}
+	}
+	lines, err := sessionlog.ReadFile(harness.worker.LogPath(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range lines {
+		if line.Type == FrameClientCommand {
+			t.Fatalf("startup rejection was journaled as an accepted command: %#v", line)
+		}
+	}
+	port.mu.Lock()
+	if len(port.promptSpecs) != 0 || len(port.optionSpecs) != 0 || len(port.configureSpecs) != 0 || port.cancelCalls != 0 || len(port.permissionCalls) != 0 {
+		t.Fatalf("Port was called before ready: prompt=%d options=%d config=%d cancel=%d permission=%d", len(port.promptSpecs), len(port.optionSpecs), len(port.configureSpecs), port.cancelCalls, len(port.permissionCalls))
+	}
+	port.mu.Unlock()
+
+	close(gate)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		readyContext, readyCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		ready, readyErr := harness.client.Send(readyContext, Command{Type: "status"})
+		readyCancel()
+		if readyErr == nil && ready.Status == string(session.StatusWaiting) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("provider Port did not become ready: %#v, %v", ready, readyErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case message := <-streamed:
+		if message.LineType != FrameConnection || !strings.Contains(string(message.Data), `"state":"connected"`) {
+			t.Fatalf("second startup frame = %#v", message)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("subscriber did not receive connected frame")
+	}
+	stopStream()
+	<-streamDone
+	port.mu.Lock()
+	if len(port.startSpecs) != 1 || len(port.resumeSpecs) != 0 {
+		t.Fatalf("startup calls: start=%d resume=%d", len(port.startSpecs), len(port.resumeSpecs))
+	}
+	port.mu.Unlock()
+}
+
+func TestWorkerChannelIsImmediatelyAttachableWhileRuntimeProbeBlocks(t *testing.T) {
+	gate := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	port := &workerTestPort{catalog: advertisedWorkerTestCatalog(), probeGate: gate, probeEntered: entered}
+	harness := startAddressableWorkerTest(t, session.Session{ID: "S-probe-starting"}, port)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("runtime Probe was not entered")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	status, err := harness.client.Send(ctx, Command{Type: "status"})
+	cancel()
+	if err != nil || status.Status != string(session.StatusStarting) {
+		t.Fatalf("status while Probe blocks = %#v, %v", status, err)
+	}
+	port.mu.Lock()
+	if len(port.startSpecs) != 0 || len(port.resumeSpecs) != 0 {
+		port.mu.Unlock()
+		t.Fatal("provider identity call overtook runtime Probe")
+	}
+	port.mu.Unlock()
+	close(gate)
+	harness.waitIdle(t)
+}
+
+func TestWorkerBootstrapPreflightFailureIsReplayableBeforeAnyPortCall(t *testing.T) {
+	gate := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	port := &workerTestPort{}
+	port.preflight = func(ctx context.Context) error {
+		entered <- struct{}{}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-gate:
+			return errors.New("private persisted checkout drift detail")
+		}
+	}
+	harness := startAddressableWorkerTest(t, session.Session{ID: "S-preflight-fails"}, port)
+	harness.allowRunError = true
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("bootstrap preflight was not entered after admission")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	status, err := harness.client.Send(ctx, Command{Type: "status"})
+	cancel()
+	if err != nil || status.Status != string(session.StatusStarting) {
+		t.Fatalf("status while bootstrap preflight blocks = %#v, %v", status, err)
+	}
+	port.mu.Lock()
+	if port.probeCalls != 0 || len(port.startSpecs) != 0 || len(port.resumeSpecs) != 0 {
+		port.mu.Unlock()
+		t.Fatal("bootstrap drift reached the provider Port")
+	}
+	port.mu.Unlock()
+
+	close(gate)
+	select {
+	case <-harness.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not finish after bootstrap preflight failure")
+	}
+	lines, readErr := sessionlog.ReadFile(harness.worker.LogPath(), 0)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if got, want := requestLineTypes(lines), []string{FrameConnection, FrameWorkerError, FrameConnection}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("bootstrap preflight frame order = %v, want %v", got, want)
+	}
+	if strings.Contains(string(lines[1].Data), "private persisted checkout drift detail") {
+		t.Fatalf("bootstrap preflight leaked private detail: %s", lines[1].Data)
+	}
+	current, loadErr := harness.repo.GetSession(context.Background(), "S-preflight-fails")
+	if loadErr != nil || current.Status != session.StatusFailed {
+		t.Fatalf("bootstrap failure status = %#v, %v", current, loadErr)
+	}
+}
+
+func TestWorkerDoesNotStartProviderBeforePrivateChannelAdmission(t *testing.T) {
+	root, err := os.MkdirTemp("", "acpw-admission-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	current := session.Session{ID: "S-admission", RepoPath: root, Status: session.StatusStarting}
+	repository := &workerTestRepository{current: current}
+	startGate := make(chan struct{})
+	startEntered := make(chan struct{}, 1)
+	port := &workerTestPort{startGate: startGate, startEntered: startEntered}
+	runtime, err := New(Config{
+		Session: current, Profile: agents.Profile{Name: "fixture", Provider: "test", Command: "fixture-agent"},
+		Repository: repository, Port: port, WorkersDirectory: filepath.Join(root, "workers"), LogsDirectory: filepath.Join(root, "logs"),
+		PID: 4242, StartupTimeout: time.Second, ShutdownTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runtime.Run(ctx) }()
+	for deadline := time.Now().Add(time.Second); ; {
+		loaded, loadErr := repository.GetSession(context.Background(), current.ID)
+		if loadErr == nil && loaded.WorkerSocket != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Session Channel was not registered: %#v, %v", loaded, loadErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case <-startEntered:
+		t.Fatal("provider Start overtook the private channel admission")
+	case <-time.After(75 * time.Millisecond):
+	}
+	client := NewSocketClient(runtime.SocketPath())
+	pingContext, pingCancel := context.WithTimeout(context.Background(), time.Second)
+	pong, err := client.Send(pingContext, Command{Type: "ping", SessionID: current.ID})
+	pingCancel()
+	if err != nil || pong.Type != "pong" || pong.SessionID != current.ID || pong.State != string(session.StatusStarting) {
+		t.Fatalf("observational ping = %#v, %v", pong, err)
+	}
+	mismatchContext, mismatchCancel := context.WithTimeout(context.Background(), time.Second)
+	_, mismatchErr := client.Send(mismatchContext, Command{Type: "ping", SessionID: "S-other"})
+	mismatchCancel()
+	if mismatchErr == nil || !strings.Contains(mismatchErr.Error(), "target does not match") {
+		t.Fatalf("mismatched Session ping error = %v", mismatchErr)
+	}
+	mismatchContext, mismatchCancel = context.WithTimeout(context.Background(), time.Second)
+	_, mismatchErr = client.Admit(mismatchContext, "S-other")
+	mismatchCancel()
+	if mismatchErr == nil || !strings.Contains(mismatchErr.Error(), "target does not match") {
+		t.Fatalf("mismatched Session admission error = %v", mismatchErr)
+	}
+	select {
+	case <-startEntered:
+		t.Fatal("observational control traffic released provider startup")
+	case <-time.After(75 * time.Millisecond):
+	}
+	admissionContext, admissionCancel := context.WithTimeout(context.Background(), time.Second)
+	admitted, err := client.Admit(admissionContext, current.ID)
+	admissionCancel()
+	if err != nil || admitted.Type != "admission_ready" || admitted.State != string(session.StatusStarting) {
+		t.Fatalf("private admission = %#v, %v", admitted, err)
+	}
+	select {
+	case <-startEntered:
+	case <-time.After(time.Second):
+		t.Fatal("provider Start did not begin after channel admission")
+	}
+	close(startGate)
+	for deadline := time.Now().Add(time.Second); ; {
+		statusContext, statusCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		status, statusErr := client.Send(statusContext, Command{Type: "status"})
+		statusCancel()
+		if statusErr == nil && status.Status == string(session.StatusWaiting) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("provider did not reach waiting: %#v, %v", status, statusErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	stopContext, stopCancel := context.WithTimeout(context.Background(), time.Second)
+	_, err = client.Send(stopContext, Command{Type: "stop"})
+	stopCancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("worker stopped with error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not stop")
+	}
+}
+
+func TestWorkerProbeFailureIsReplayableWithoutProviderIdentityCall(t *testing.T) {
+	gate := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	port := &workerTestPort{probeGate: gate, probeEntered: entered, probeErr: errors.New("private probe detail")}
+	harness := startAddressableWorkerTest(t, session.Session{ID: "S-probe-fails"}, port)
+	harness.allowRunError = true
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("runtime Probe was not entered")
+	}
+	close(gate)
+	select {
+	case <-harness.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not finish after runtime Probe failure")
+	}
+	port.mu.Lock()
+	if len(port.startSpecs) != 0 || len(port.resumeSpecs) != 0 {
+		port.mu.Unlock()
+		t.Fatal("Probe failure reached provider identity call")
+	}
+	port.mu.Unlock()
+	lines, err := sessionlog.ReadFile(harness.worker.LogPath(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := requestLineTypes(lines), []string{FrameConnection, FrameWorkerError, FrameConnection}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Probe failure frame order = %v, want %v", got, want)
+	}
+	if strings.Contains(string(lines[1].Data), "private probe detail") {
+		t.Fatalf("Probe failure leaked private detail: %s", lines[1].Data)
+	}
+}
+
+func TestWorkerChannelIsImmediatelyAttachableWhileExactResumeStarts(t *testing.T) {
+	gate := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	port := &workerTestPort{
+		info:       acp.SessionInfo{RuntimeRef: "record-saved", ProviderRef: "provider-saved"},
+		resumeGate: gate, resumeEntered: entered,
+	}
+	harness := startAddressableWorkerTest(t, session.Session{
+		ID: "S-resume-starting", RuntimeRef: "record-saved", ProviderRef: "provider-saved",
+	}, port)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("provider Resume was not entered")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	status, err := harness.client.Send(ctx, Command{Type: "status"})
+	cancel()
+	if err != nil || status.Status != string(session.StatusStarting) {
+		t.Fatalf("resume startup status = %#v, %v", status, err)
+	}
+	close(gate)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		ping, pingErr := harness.client.Send(ctx, Command{Type: "ping", SessionID: harness.worker.config.Session.ID})
+		cancel()
+		if pingErr == nil && ping.State == string(session.StatusWaiting) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("exact Resume did not become ready: %#v, %v", ping, pingErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	port.mu.Lock()
+	defer port.mu.Unlock()
+	if len(port.startSpecs) != 0 || len(port.resumeSpecs) != 1 || port.resumeSpecs[0].ResumeProviderRef != "provider-saved" {
+		t.Fatalf("startup calls: start=%d resume=%#v", len(port.startSpecs), port.resumeSpecs)
+	}
+}
+
+func TestWorkerStartupFailureRemainsReplayableAndClearsOwnership(t *testing.T) {
+	gate := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	port := &workerTestPort{startGate: gate, startEntered: entered, startErr: errors.New("private provider startup detail")}
+	harness := startAddressableWorkerTest(t, session.Session{ID: "S-start-fails"}, port)
+	harness.allowRunError = true
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("provider Start was not entered")
+	}
+	close(gate)
+	select {
+	case <-harness.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not finish after provider startup failure")
+	}
+	lines, err := sessionlog.ReadFile(harness.worker.LogPath(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := requestLineTypes(lines), []string{FrameConnection, FrameWorkerError, FrameConnection}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("startup failure frame order = %v, want %v", got, want)
+	}
+	if strings.Contains(string(lines[1].Data), "private provider startup detail") || !strings.Contains(string(lines[1].Data), `"code":"provider_connect_failed"`) {
+		t.Fatalf("startup failure frame was unsafe or unclassified: %s", lines[1].Data)
+	}
+	current, err := harness.repo.GetSession(context.Background(), "S-start-fails")
+	if err != nil || current.Status != session.StatusFailed || current.WorkerPID != 0 || current.WorkerSocket != "" {
+		t.Fatalf("failed Session ownership = %#v, %v", current, err)
+	}
+}
+
+func TestWorkerProviderStartupTimeoutFailsThroughAttachedChannel(t *testing.T) {
+	gate := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	port := &workerTestPort{startGate: gate, startEntered: entered, startupTimeout: 75 * time.Millisecond}
+	harness := startAddressableWorkerTest(t, session.Session{ID: "S-start-timeout"}, port)
+	harness.allowRunError = true
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("provider Start was not entered")
+	}
+	select {
+	case <-harness.done:
+	case <-time.After(time.Second):
+		t.Fatal("provider startup timeout did not stop worker")
+	}
+	lines, err := sessionlog.ReadFile(harness.worker.LogPath(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := requestLineTypes(lines), []string{FrameConnection, FrameWorkerError, FrameConnection}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("startup timeout frame order = %v, want %v", got, want)
+	}
+	current, err := harness.repo.GetSession(context.Background(), "S-start-timeout")
+	if err != nil || current.Status != session.StatusFailed || current.WorkerSocket != "" {
+		t.Fatalf("timed-out Session = %#v, %v", current, err)
+	}
+}
+
+func TestWorkerUsesOneShutdownBudgetForUncooperativeStartupAndClose(t *testing.T) {
+	startGate := make(chan struct{})
+	closeGate := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	port := &workerTestPort{
+		startGate: startGate, startEntered: entered, startIgnoresCancel: true,
+		closeGate: closeGate, startupTimeout: 40 * time.Millisecond, shutdownTimeout: 90 * time.Millisecond,
+	}
+	harness := startAddressableWorkerTest(t, session.Session{ID: "S-one-shutdown-budget"}, port)
+	harness.allowRunError = true
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("provider Start was not entered")
+	}
+	started := time.Now()
+	select {
+	case <-harness.done:
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("worker consumed multiple shutdown budgets")
+	}
+	if elapsed := time.Since(started); elapsed > 220*time.Millisecond {
+		t.Fatalf("combined startup teardown took %s; want one 90ms shutdown budget after the 40ms startup bound", elapsed)
+	}
+	close(startGate)
+	close(closeGate)
+	current, err := harness.repo.GetSession(context.Background(), "S-one-shutdown-budget")
+	if err != nil || current.Status != session.StatusFailed || current.WorkerSocket == "" {
+		t.Fatalf("unproven teardown did not retain quarantine ownership: %#v, %v", current, err)
+	}
+}
+
+func TestWorkerStopDuringProviderStartupCancelsWithoutFailure(t *testing.T) {
+	gate := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	port := &workerTestPort{startGate: gate, startEntered: entered}
+	harness := startAddressableWorkerTest(t, session.Session{ID: "S-stop-starting"}, port)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("provider Start was not entered")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	response, err := harness.client.Send(ctx, Command{Type: "stop"})
+	cancel()
+	if err != nil || response.Type != "stopping" {
+		t.Fatalf("stop startup = %#v, %v", response, err)
+	}
+	select {
+	case <-harness.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not stop during provider startup")
+	}
+	lines, err := sessionlog.ReadFile(harness.worker.LogPath(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := requestLineTypes(lines), []string{FrameConnection, FrameConnection}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("startup stop frame order = %v, want %v", got, want)
+	}
+	if !strings.Contains(string(lines[1].Data), `"state":"stopped"`) {
+		t.Fatalf("startup stop terminal = %s", lines[1].Data)
+	}
+	current, err := harness.repo.GetSession(context.Background(), "S-stop-starting")
+	if err != nil || current.Status != session.StatusStopped || current.WorkerPID != 0 || current.WorkerSocket != "" {
+		t.Fatalf("stopped Session ownership = %#v, %v", current, err)
+	}
+}
+
+func TestWorkerClosesProviderPortBeforeClearingOwnership(t *testing.T) {
+	closeGate := make(chan struct{})
+	closeEntered := make(chan struct{}, 1)
+	port := &workerTestPort{catalog: advertisedWorkerTestCatalog(), closeGate: closeGate, closeEntered: closeEntered}
+	harness := startRunningWorkerTest(t, session.Session{ID: "S-close-order"}, port)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	response, err := harness.client.Send(ctx, Command{Type: "stop"})
+	cancel()
+	if err != nil || response.Type != "stopping" {
+		t.Fatalf("stop = %#v, %v", response, err)
+	}
+	select {
+	case <-closeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("provider Port close did not begin")
+	}
+	current, err := harness.repo.GetSession(context.Background(), "S-close-order")
+	if err != nil || current.WorkerSocket == "" || current.WorkerPID == 0 {
+		t.Fatalf("worker ownership cleared before provider Close: %#v, %v", current, err)
+	}
+	select {
+	case <-harness.done:
+		t.Fatal("worker exited before provider Close completed")
+	default:
+	}
+	close(closeGate)
+	select {
+	case <-harness.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not finish after provider Close")
+	}
+	current, err = harness.repo.GetSession(context.Background(), "S-close-order")
+	if err != nil || current.Status != session.StatusStopped || current.WorkerSocket != "" || current.WorkerPID != 0 {
+		t.Fatalf("worker ownership after provider Close = %#v, %v", current, err)
+	}
+	port.mu.Lock()
+	defer port.mu.Unlock()
+	if port.closeCalls != 1 {
+		t.Fatalf("provider Port Close calls = %d, want exactly one", port.closeCalls)
+	}
+}
+
+func TestWorkerClosesPortBeforeWaitingForBlockedProviderCall(t *testing.T) {
+	closed := make(chan struct{})
+	started := make(chan struct{}, 1)
+	port := &workerTestPort{catalog: advertisedWorkerTestCatalog(), closeSignal: closed}
+	port.prompt = func(_ context.Context, spec acp.PromptSpec, _ func(acp.Event) error) (acp.PromptReceipt, error) {
+		started <- struct{}{}
+		<-closed
+		return acp.PromptReceipt{RequestID: spec.RequestID}, context.Canceled
+	}
+	harness := startRunningWorkerTest(t, session.Session{ID: "S-close-unblocks-call"}, port)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	if _, err := harness.client.Send(ctx, Command{Type: "prompt", RequestID: "REQ-blocked", Message: "wait"}); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("provider call did not start")
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	if _, err := harness.client.Send(ctx, Command{Type: "stop"}); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case <-harness.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop waited on provider call before closing its Port")
+	}
+	port.mu.Lock()
+	defer port.mu.Unlock()
+	if port.closeCalls != 1 {
+		t.Fatalf("provider Port Close calls = %d, want exactly one", port.closeCalls)
+	}
+}
+
+func TestWorkerCloseTimeoutPreservesOwnershipForStaleRecovery(t *testing.T) {
+	closeGate := make(chan struct{})
+	closeEntered := make(chan struct{}, 1)
+	port := &workerTestPort{
+		catalog: advertisedWorkerTestCatalog(), closeGate: closeGate, closeEntered: closeEntered,
+		shutdownTimeout: 75 * time.Millisecond,
+	}
+	harness := startRunningWorkerTest(t, session.Session{ID: "S-close-timeout"}, port)
+	harness.allowRunError = true
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	_, err := harness.client.Send(ctx, Command{Type: "stop"})
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-closeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("provider Port close did not begin")
+	}
+	select {
+	case <-harness.done:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not enforce provider Close timeout")
+	}
+	current, err := harness.repo.GetSession(context.Background(), "S-close-timeout")
+	if err != nil || current.Status != session.StatusFailed || current.WorkerSocket == "" || current.WorkerPID == 0 {
+		t.Fatalf("unsafe Close cleared worker ownership: %#v, %v", current, err)
+	}
+	close(closeGate)
+}
+
+func TestWorkerShutdownAbandonsPendingPermissionBeforeUnprovenTeardown(t *testing.T) {
+	promptRelease := make(chan struct{})
+	closeRelease := make(chan struct{})
+	permissionEmitted := make(chan struct{})
+	promptReturned := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			close(promptRelease)
+			close(closeRelease)
+		})
+	}
+	defer release()
+
+	permissionRaw := json.RawMessage(`{"toolCall":{"toolCallId":"tool-stop","title":"Write file","kind":"edit"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"}]}`)
+	port := &workerTestPort{
+		catalog: advertisedWorkerTestCatalog(), closeGate: closeRelease,
+		shutdownTimeout: 75 * time.Millisecond,
+	}
+	port.prompt = func(_ context.Context, spec acp.PromptSpec, emit func(acp.Event) error) (acp.PromptReceipt, error) {
+		defer close(promptReturned)
+		if err := emit(acp.Event{Type: "session_request_permission", PermissionID: "bridge-stop", Raw: permissionRaw}); err != nil {
+			return acp.PromptReceipt{RequestID: spec.RequestID}, err
+		}
+		close(permissionEmitted)
+		<-promptRelease // Deliberately ignore Prompt cancellation to force quarantine.
+		return acp.PromptReceipt{RequestID: spec.RequestID}, context.Canceled
+	}
+	harness := startRunningWorkerTest(t, session.Session{ID: "S-stopperm"}, port)
+	harness.allowRunError = true
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	if _, err := harness.client.Send(ctx, Command{Type: "prompt", RequestID: "REQ-stop-permission", Message: "write"}); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case <-permissionEmitted:
+	case <-time.After(time.Second):
+		t.Fatal("provider permission was not emitted")
+	}
+	permissionID := PermissionConsoleID("REQ-stop-permission", "tool-stop")
+	for deadline := time.Now().Add(time.Second); ; {
+		statusContext, statusCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		status, statusErr := harness.client.Send(statusContext, Command{Type: "status"})
+		statusCancel()
+		if statusErr == nil && len(status.Permissions) == 1 && status.Permissions[0].ID == permissionID {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pending permission was not exposed: %#v, %v", status, statusErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	response, err := harness.client.Send(ctx, Command{Type: "stop"})
+	cancel()
+	if err != nil || response.Type != "stopping" {
+		t.Fatalf("stop = %#v, %v", response, err)
+	}
+	select {
+	case <-harness.done:
+	case <-time.After(time.Second):
+		t.Fatal("uncooperative provider calls did not reach the shutdown bound")
+	}
+
+	allLines, readErr := sessionlog.ReadFile(harness.worker.LogPath(), 0)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	var requestLines []sessionlog.Line
+	for _, line := range allLines {
+		if line.RequestID == "REQ-stop-permission" {
+			requestLines = append(requestLines, line)
+		}
+	}
+	if got, want := requestLineTypes(requestLines), []string{
+		FrameClientCommand, FrameProviderEvent, FramePermissionRequested, FramePermissionAbandoned,
+	}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("unsafe shutdown permission frames = %v, want %v", got, want)
+	}
+	current, loadErr := harness.repo.GetSession(context.Background(), "S-stopperm")
+	if loadErr != nil || current.Status != session.StatusFailed || current.WorkerPID == 0 || current.WorkerSocket == "" {
+		t.Fatalf("unsafe shutdown did not retain quarantine ownership: %#v, %v", current, loadErr)
+	}
+
+	release()
+	select {
+	case <-promptReturned:
+	case <-time.After(time.Second):
+		t.Fatal("test Prompt did not return after release")
+	}
+	select {
+	case <-harness.worker.portCloseDone:
+	case <-time.After(time.Second):
+		t.Fatal("test Port.Close did not return after release")
+	}
+}
+
+func TestWorkerNeverReplacementStartsAfterIdentitylessPriorAttempt(t *testing.T) {
+	gate := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	firstPort := &workerTestPort{startGate: gate, startEntered: entered}
+	first := startAddressableWorkerTest(t, session.Session{ID: "S-no-replacement"}, firstPort)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("first provider Start was not entered")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	_, err := first.client.Send(ctx, Command{Type: "stop"})
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-first.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first worker did not stop")
+	}
+	current, err := first.repo.GetSession(context.Background(), "S-no-replacement")
+	if err != nil || current.ProviderRef != "" {
+		t.Fatalf("identityless prior attempt = %#v, %v", current, err)
+	}
+
+	secondPort := &workerTestPort{}
+	second, err := New(Config{
+		Session: current, Profile: first.worker.config.Profile, Repository: first.repo, Port: secondPort,
+		WorkersDirectory: first.worker.config.WorkersDirectory, LogsDirectory: first.worker.config.LogsDirectory,
+		PID: 4243, StartupTimeout: time.Second, ShutdownTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- second.Run(context.Background()) }()
+	secondClient := NewSocketClient(second.SocketPath())
+	for deadline := time.Now().Add(time.Second); ; {
+		admitContext, admitCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		_, admitErr := secondClient.Admit(admitContext, current.ID)
+		admitCancel()
+		if admitErr == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("identityless restart channel was not addressable: %v", admitErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case err := <-secondDone:
+		if err == nil || !strings.Contains(err.Error(), "identity is unavailable") {
+			t.Fatalf("identityless restart error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("identityless restart did not fail closed")
+	}
+	secondPort.mu.Lock()
+	defer secondPort.mu.Unlock()
+	if len(secondPort.startSpecs) != 0 || len(secondPort.resumeSpecs) != 0 {
+		t.Fatalf("identityless restart called provider: start=%d resume=%d", len(secondPort.startSpecs), len(secondPort.resumeSpecs))
+	}
+}
+
+func TestWorkerPersistsSuccessfulStartIdentityWhenStopWinsStartupRace(t *testing.T) {
+	gate := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	port := &workerTestPort{
+		startGate: gate, startEntered: entered, startIgnoresCancel: true,
+		info: acp.SessionInfo{RuntimeRef: "record-raced", ProviderRef: "provider-raced"},
+	}
+	harness := startAddressableWorkerTest(t, session.Session{ID: "S-stop-start-race"}, port)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("provider Start was not entered")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	response, err := harness.client.Send(ctx, Command{Type: "stop"})
+	cancel()
+	if err != nil || response.Type != "stopping" {
+		t.Fatalf("stop startup = %#v, %v", response, err)
+	}
+	close(gate)
+	select {
+	case <-harness.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not finish the Start/Stop race")
+	}
+	current, err := harness.repo.GetSession(context.Background(), "S-stop-start-race")
+	if err != nil || current.Status != session.StatusStopped || current.ProviderRef != "provider-raced" || current.RuntimeRef != "record-raced" {
+		t.Fatalf("raced provider identity = %#v, %v", current, err)
+	}
+
+	resumedPort := &workerTestPort{info: acp.SessionInfo{RuntimeRef: "record-raced-2", ProviderRef: "provider-raced"}}
+	resumed := startRunningWorkerTest(t, current, resumedPort)
+	resumedPort.mu.Lock()
+	defer resumedPort.mu.Unlock()
+	if len(resumedPort.startSpecs) != 0 || len(resumedPort.resumeSpecs) != 1 || resumedPort.resumeSpecs[0].ResumeProviderRef != "provider-raced" {
+		t.Fatalf("next worker replaced raced identity: start=%d resume=%#v", len(resumedPort.startSpecs), resumedPort.resumeSpecs)
+	}
+	_ = resumed
+}
+
+func TestWorkerResumesSavedACPIdentityOnlyAtStartup(t *testing.T) {
+	port := &workerTestPort{
+		info:    acp.SessionInfo{RuntimeRef: "record-saved", ProviderRef: "acp-saved"},
+		catalog: advertisedWorkerTestCatalog(),
+	}
+	harness := startRunningWorkerTest(t, session.Session{
+		ID: "S-resume", RuntimeRef: "record-saved", ProviderRef: "acp-saved",
+	}, port)
+	for _, requestID := range []string{"REQ-one", "REQ-two"} {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_, err := harness.client.Send(ctx, Command{Type: "prompt", RequestID: requestID, Message: requestID})
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		harness.waitForRequestResult(t, requestID)
+		harness.waitIdle(t)
+	}
+	port.mu.Lock()
+	defer port.mu.Unlock()
+	if len(port.startSpecs) != 0 || len(port.resumeSpecs) != 1 || len(port.promptSpecs) != 2 {
+		t.Fatalf("Port calls: start=%d resume=%d prompt=%d", len(port.startSpecs), len(port.resumeSpecs), len(port.promptSpecs))
+	}
+	if port.resumeSpecs[0].ResumeProviderRef != "acp-saved" {
+		t.Fatalf("Resume() spec = %#v", port.resumeSpecs[0])
+	}
+}
+
+func TestWorkerRejectsInvalidProviderIdentityBeforeReadiness(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		savedRef       string
+		returnedRef    string
+		wantStartCall  int
+		wantResumeCall int
+	}{
+		{name: "Start missing reference", wantStartCall: 1},
+		{name: "Start oversized reference", returnedRef: strings.Repeat("p", 513), wantStartCall: 1},
+		{name: "Resume missing reference", savedRef: "provider-saved", wantResumeCall: 1},
+		{name: "Resume oversized reference", savedRef: "provider-saved", returnedRef: strings.Repeat("p", 513), wantResumeCall: 1},
+		{name: "saved reference is oversized", savedRef: strings.Repeat("p", 513)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			current := session.Session{ID: "S-invalid-identity", RepoPath: root, ProviderRef: test.savedRef, Status: session.StatusStarting}
+			port := &workerTestPort{info: acp.SessionInfo{RuntimeRef: "record-returned", ProviderRef: test.returnedRef}, exactInfo: true}
+			runtime, err := New(Config{
+				Session:          current,
+				Profile:          agents.Profile{Name: "fixture", Provider: "test", Command: "fixture-agent"},
+				Repository:       &workerTestRepository{current: current},
+				Port:             port,
+				WorkersDirectory: filepath.Join(root, "workers"),
+				LogsDirectory:    filepath.Join(root, "logs"),
+				PID:              4242,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := runtime.openPort(context.Background()); err == nil {
+				t.Fatal("openPort accepted invalid provider identity")
+			} else {
+				var identity *acp.IdentityError
+				if !errors.As(err, &identity) {
+					t.Fatalf("openPort error = %T %v, want IdentityError", err, err)
+				}
+			}
+			port.mu.Lock()
+			startCalls, resumeCalls := len(port.startSpecs), len(port.resumeSpecs)
+			port.mu.Unlock()
+			if startCalls != test.wantStartCall || resumeCalls != test.wantResumeCall {
+				t.Fatalf("Port calls: start=%d resume=%d, want start=%d resume=%d", startCalls, resumeCalls, test.wantStartCall, test.wantResumeCall)
+			}
+		})
+	}
+}
+
+func TestWorkerRejectsConcurrentCommandsWithoutJournalingAndDetachDoesNotCancel(t *testing.T) {
+	started := make(chan struct{})
+	providerCancelled := make(chan struct{})
+	promptCancelled := make(chan struct{})
+	var startOnce sync.Once
+	var providerCancelOnce sync.Once
+	var cancelOnce sync.Once
+	port := &workerTestPort{catalog: advertisedWorkerTestCatalog()}
+	port.prompt = func(ctx context.Context, spec acp.PromptSpec, _ func(acp.Event) error) (acp.PromptReceipt, error) {
+		startOnce.Do(func() { close(started) })
+		select {
+		case <-providerCancelled:
+			return acp.PromptReceipt{RequestID: spec.RequestID, StopReason: "cancelled"}, nil
+		case <-ctx.Done():
+			cancelOnce.Do(func() { close(promptCancelled) })
+			return acp.PromptReceipt{RequestID: spec.RequestID}, ctx.Err()
+		}
+	}
+	port.cancel = func(context.Context, acp.Target) error {
+		providerCancelOnce.Do(func() { close(providerCancelled) })
+		return nil
+	}
+	harness := startRunningWorkerTest(t, session.Session{ID: "S-busy"}, port)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	_, err := harness.client.Send(ctx, Command{Type: "prompt", RequestID: "REQ-active", Message: "hold open"})
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("provider prompt did not start")
+	}
+
+	subscribeContext, detach := context.WithCancel(context.Background())
+	subscribeDone := make(chan error, 1)
+	go func() {
+		subscribeDone <- harness.client.Subscribe(subscribeContext, 0, func(Message) error { return nil })
+	}()
+	detach()
+	select {
+	case <-subscribeDone:
+	case <-time.After(time.Second):
+		t.Fatal("subscriber did not detach")
+	}
+	select {
+	case <-promptCancelled:
+		t.Fatal("detaching a subscriber cancelled the provider turn")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	response, err := harness.client.Send(ctx, Command{Type: "prompt", RequestID: "REQ-rejected", Message: "must not queue"})
+	cancel()
+	var busy *BusyError
+	if !errors.As(err, &busy) || response.ErrorCode != "session_busy" || response.ActiveRequestID != "REQ-active" {
+		t.Fatalf("concurrent prompt = %#v, %T %v", response, err, err)
+	}
+	if strings.Contains(err.Error(), "must not queue") {
+		t.Fatalf("busy error leaked rejected prompt: %v", err)
+	}
+	lines, readErr := sessionlog.ReadFile(harness.worker.LogPath(), 0)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	for _, line := range lines {
+		if line.RequestID == "REQ-rejected" {
+			t.Fatalf("busy prompt was journaled: %#v", line)
+		}
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	_, err = harness.client.Send(ctx, Command{Type: "configure", Model: "model-selected", ReasoningEffort: "high"})
+	cancel()
+	if !errors.As(err, &busy) {
+		t.Fatalf("configure during turn = %T %v, want BusyError", err, err)
+	}
+	port.mu.Lock()
+	if len(port.optionSpecs) != 0 || len(port.configureSpecs) != 0 {
+		port.mu.Unlock()
+		t.Fatal("busy configure reached the provider")
+	}
+	port.mu.Unlock()
+
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	cancelled, err := harness.client.Send(ctx, Command{Type: "cancel", RequestID: "REQ-active"})
+	cancel()
+	if err != nil || cancelled.Type != "cancelled" {
+		t.Fatalf("cancel = %#v, %v", cancelled, err)
+	}
+	requestLines := harness.waitForRequestResult(t, "REQ-active")
+	if got := requestLineTypes(requestLines); !reflect.DeepEqual(got, []string{FrameClientCommand, FrameClientCommand, FrameProviderResult}) {
+		t.Fatalf("cancelled request line types = %v", got)
+	}
+	var terminal map[string]any
+	if err := json.Unmarshal(requestLines[len(requestLines)-1].Data, &terminal); err != nil || terminal["status"] != "cancelled" {
+		t.Fatalf("cancel terminal = %s, %v", requestLines[len(requestLines)-1].Data, err)
+	}
+	harness.waitIdle(t)
+
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	configured, err := harness.client.Send(ctx, Command{Type: "configure", Model: "model-selected", ReasoningEffort: "high"})
+	cancel()
+	if err != nil || configured.Type != "configured" || configured.ProviderOptions == nil || configured.ProviderOptions.Model.CurrentValue != "model-selected" || configured.ProviderOptions.ReasoningEffort.CurrentValue != "high" {
+		t.Fatalf("idle configure = %#v, %v", configured, err)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	configured, err = harness.client.Send(ctx, Command{Type: "configure", ReasoningEffort: "medium"})
+	cancel()
+	if err != nil || configured.ProviderOptions == nil || configured.ProviderOptions.Model.CurrentValue != "model-selected" || configured.ProviderOptions.ReasoningEffort.CurrentValue != "medium" {
+		t.Fatalf("partial configure = %#v, %v", configured, err)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	options, err := harness.client.Send(ctx, Command{Type: "provider_options"})
+	cancel()
+	if err != nil || options.Type != "provider_options" || options.ProviderOptions == nil || options.ProviderOptions.Model.CurrentValue != "model-selected" {
+		t.Fatalf("idle provider options = %#v, %v", options, err)
+	}
+	port.mu.Lock()
+	defer port.mu.Unlock()
+	if len(port.optionSpecs) != 5 || len(port.configureSpecs) != 2 || port.cancelCalls != 1 {
+		t.Fatalf("idle control calls: options=%d configure=%d cancel=%d", len(port.optionSpecs), len(port.configureSpecs), port.cancelCalls)
+	}
+	if port.configureSpecs[0].ResumeProviderRef != "acp-1" {
+		t.Fatalf("Configure did not use retained persisted identity: %#v", port.configureSpecs[0])
+	}
+	if port.configureSpecs[1].Model != "model-selected" || port.configureSpecs[1].ReasoningEffort != "medium" {
+		t.Fatalf("partial Configure did not protect the fresh live tuple: %#v", port.configureSpecs[1])
+	}
+}
+
+func TestWorkerQuietSubscriberEOFReleasesOnlyItsHubSlot(t *testing.T) {
+	promptStarted := make(chan struct{})
+	promptCancelled := make(chan struct{})
+	var startedOnce sync.Once
+	var cancelledOnce sync.Once
+	port := &workerTestPort{catalog: advertisedWorkerTestCatalog()}
+	port.prompt = func(ctx context.Context, spec acp.PromptSpec, _ func(acp.Event) error) (acp.PromptReceipt, error) {
+		startedOnce.Do(func() { close(promptStarted) })
+		<-ctx.Done()
+		cancelledOnce.Do(func() { close(promptCancelled) })
+		return acp.PromptReceipt{RequestID: spec.RequestID}, ctx.Err()
+	}
+	harness := startRunningWorkerTest(t, session.Session{ID: "S-quiet-subscriber-eof"}, port)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	if _, err := harness.client.Send(ctx, Command{Type: "prompt", RequestID: "REQ-quiet-subscriber-eof", Message: "hold"}); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case <-promptStarted:
+	case <-time.After(time.Second):
+		t.Fatal("provider prompt did not start")
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	status, err := harness.client.Send(ctx, Command{Type: "status"})
+	cancel()
+	if err != nil || status.ActiveRequestID != "REQ-quiet-subscriber-eof" {
+		t.Fatalf("active status = %#v, %v", status, err)
+	}
+	connection, err := net.Dial("unix", harness.worker.SocketPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.NewEncoder(connection).Encode(Command{Type: "subscribe", From: status.Seq}); err != nil {
+		_ = connection.Close()
+		t.Fatal(err)
+	}
+	waitForSubscribers := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(time.Second)
+		for {
+			harness.worker.hub.mu.Lock()
+			got := len(harness.worker.hub.subscribers)
+			harness.worker.hub.mu.Unlock()
+			if got == want {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("hub subscriber count = %d, want %d", got, want)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	waitForSubscribers(1)
+	if err := connection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitForSubscribers(0)
+
+	select {
+	case <-promptCancelled:
+		t.Fatal("quiet subscriber EOF cancelled the provider turn")
+	case <-time.After(50 * time.Millisecond):
+	}
+	port.mu.Lock()
+	cancelCalls, closeCalls := port.cancelCalls, port.closeCalls
+	port.mu.Unlock()
+	if cancelCalls != 0 || closeCalls != 0 {
+		t.Fatalf("quiet subscriber EOF affected provider Port: cancel=%d close=%d", cancelCalls, closeCalls)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	status, err = harness.client.Send(ctx, Command{Type: "status"})
+	cancel()
+	if err != nil || status.ActiveRequestID != "REQ-quiet-subscriber-eof" || status.Status != string(session.StatusWorking) {
+		t.Fatalf("status after quiet subscriber EOF = %#v, %v", status, err)
+	}
+}
+
+func TestWorkerCancelFailsChannelWhenRetainedPortCannotSettle(t *testing.T) {
+	started := make(chan struct{})
+	providerCancelled := make(chan struct{})
+	var startedOnce sync.Once
+	var cancelOnce sync.Once
+	port := &workerTestPort{catalog: advertisedWorkerTestCatalog()}
+	port.prompt = func(ctx context.Context, spec acp.PromptSpec, _ func(acp.Event) error) (acp.PromptReceipt, error) {
+		startedOnce.Do(func() { close(started) })
+		select {
+		case <-providerCancelled:
+			return acp.PromptReceipt{RequestID: spec.RequestID}, &acp.ProtocolError{
+				Operation: "prompt completion", Message: "retained provider Port is unavailable",
+			}
+		case <-ctx.Done():
+			return acp.PromptReceipt{RequestID: spec.RequestID}, ctx.Err()
+		}
+	}
+	port.cancel = func(context.Context, acp.Target) error {
+		cancelOnce.Do(func() { close(providerCancelled) })
+		return nil
+	}
+	harness := startRunningWorkerTest(t, session.Session{ID: "S-cancel-continuity"}, port)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	_, err := harness.client.Send(ctx, Command{Type: "prompt", RequestID: "REQ-cancel-continuity", Message: "hold open"})
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("provider prompt did not start")
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	response, err := harness.client.Send(ctx, Command{Type: "cancel", RequestID: "REQ-cancel-continuity"})
+	cancel()
+	var unavailable *ChannelUnavailableError
+	if !errors.As(err, &unavailable) || response.ErrorCode != "session_channel_failed" {
+		t.Fatalf("unsafe cancel = %#v, %T %v", response, err, err)
+	}
+	requestLines := harness.waitForRequestResult(t, "REQ-cancel-continuity")
+	if got, want := requestLineTypes(requestLines), []string{FrameClientCommand, FrameClientCommand, FrameProviderResult}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("unsafe cancel line types = %v, want %v", got, want)
+	}
+	var terminal map[string]any
+	if err := json.Unmarshal(requestLines[len(requestLines)-1].Data, &terminal); err != nil {
+		t.Fatal(err)
+	}
+	if terminal["status"] != "failed" || terminal["source"] != "transport" {
+		t.Fatalf("unsafe cancel terminal = %#v", terminal)
+	}
+	select {
+	case <-harness.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("unsafe cancellation did not stop the Session channel")
+	}
+	current, err := harness.repo.GetSession(context.Background(), "S-cancel-continuity")
+	if err != nil || current.Status != session.StatusFailed || current.WorkerSocket != "" {
+		t.Fatalf("unsafe cancel Session = %#v, %v", current, err)
+	}
+	port.mu.Lock()
+	defer port.mu.Unlock()
+	if len(port.promptSpecs) != 1 || port.cancelCalls != 1 {
+		t.Fatalf("provider calls after unsafe cancel: prompts=%d cancels=%d", len(port.promptSpecs), port.cancelCalls)
+	}
+}
+
+func TestWorkerCancelCommandFailureIsBoundedAndFailsClosed(t *testing.T) {
+	started := make(chan struct{})
+	var startedOnce sync.Once
+	port := &workerTestPort{catalog: advertisedWorkerTestCatalog()}
+	port.prompt = func(ctx context.Context, spec acp.PromptSpec, _ func(acp.Event) error) (acp.PromptReceipt, error) {
+		startedOnce.Do(func() { close(started) })
+		<-ctx.Done()
+		return acp.PromptReceipt{RequestID: spec.RequestID}, ctx.Err()
+	}
+	port.cancel = func(context.Context, acp.Target) error {
+		return errors.New("SECRET provider cancellation detail")
+	}
+	harness := startRunningWorkerTest(t, session.Session{ID: "S-cancel-command-fails"}, port)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	_, err := harness.client.Send(ctx, Command{Type: "prompt", RequestID: "REQ-cancel-command-fails", Message: "hold open"})
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("provider prompt did not start")
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	response, err := harness.client.Send(ctx, Command{Type: "cancel", RequestID: "REQ-cancel-command-fails"})
+	cancel()
+	var unavailable *ChannelUnavailableError
+	if !errors.As(err, &unavailable) || response.ErrorCode != "session_channel_failed" {
+		t.Fatalf("failed provider Cancel = %#v, %T %v", response, err, err)
+	}
+	requestLines := harness.waitForRequestResult(t, "REQ-cancel-command-fails")
+	var terminal map[string]any
+	if err := json.Unmarshal(requestLines[len(requestLines)-1].Data, &terminal); err != nil {
+		t.Fatal(err)
+	}
+	if terminal["status"] != "failed" || terminal["code"] != "provider_cancel_unconfirmed" {
+		t.Fatalf("failed Cancel terminal = %#v", terminal)
+	}
+	allLines, err := sessionlog.ReadFile(harness.worker.LogPath(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(allLines)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "SECRET provider cancellation detail") {
+		t.Fatalf("provider cancellation detail leaked into the channel: %s", encoded)
+	}
+}
+
+func TestWorkerDoesNotDispatchCancelWhenDurableCommandAppendFails(t *testing.T) {
+	started := make(chan struct{})
+	var startedOnce sync.Once
+	port := &workerTestPort{catalog: advertisedWorkerTestCatalog()}
+	port.prompt = func(ctx context.Context, spec acp.PromptSpec, _ func(acp.Event) error) (acp.PromptReceipt, error) {
+		startedOnce.Do(func() { close(started) })
+		<-ctx.Done()
+		return acp.PromptReceipt{RequestID: spec.RequestID}, ctx.Err()
+	}
+	harness := startRunningWorkerTest(t, session.Session{ID: "S-cancel-journal-failure"}, port)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	if _, err := harness.client.Send(ctx, Command{Type: "prompt", RequestID: "REQ-cancel-journal-failure", Message: "hold open"}); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("provider prompt did not start")
+	}
+	if err := harness.worker.log.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	response, err := harness.client.Send(ctx, Command{Type: "cancel", RequestID: "REQ-cancel-journal-failure"})
+	cancel()
+	var unavailable *ChannelUnavailableError
+	if !errors.As(err, &unavailable) || response.ErrorCode != "session_channel_failed" {
+		t.Fatalf("cancel with failed journal = %#v, %T %v", response, err, err)
+	}
+	select {
+	case <-harness.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("journal failure did not stop the Session channel")
+	}
+	port.mu.Lock()
+	cancelCalls := port.cancelCalls
+	port.mu.Unlock()
+	if cancelCalls != 0 {
+		t.Fatalf("cancel reached provider after its durable append failed %d times", cancelCalls)
+	}
+	lines, readErr := sessionlog.ReadFile(harness.worker.LogPath(), 0)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	for _, line := range lines {
+		if line.RequestID == "REQ-cancel-journal-failure" && line.Type == FrameClientCommand {
+			var command map[string]string
+			if err := json.Unmarshal(line.Data, &command); err != nil {
+				t.Fatal(err)
+			}
+			if command["command"] == "cancel" {
+				t.Fatalf("undurable cancel appeared in replay: %#v", lines)
+			}
+		}
+	}
+}
+
+func TestWorkerFailsStoppedWithoutDispatchingPromptWhenCommandJournalIsUnavailable(t *testing.T) {
+	port := &workerTestPort{catalog: advertisedWorkerTestCatalog()}
+	harness := startRunningWorkerTest(t, session.Session{ID: "S-prompt-journal-failure"}, port)
+	if err := harness.worker.log.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	response, err := harness.client.Send(ctx, Command{Type: "prompt", RequestID: "REQ-prompt-journal-failure", Message: "must not dispatch"})
+	cancel()
+	var unavailable *ChannelUnavailableError
+	if !errors.As(err, &unavailable) || response.ErrorCode != "session_channel_failed" {
+		t.Fatalf("prompt with failed journal = %#v, %T %v", response, err, err)
+	}
+	select {
+	case <-harness.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("prompt journal failure did not stop the Session channel")
+	}
+	port.mu.Lock()
+	defer port.mu.Unlock()
+	if len(port.promptSpecs) != 0 {
+		t.Fatalf("prompt reached provider after its durable append failed: %#v", port.promptSpecs)
+	}
+}
+
+func TestWorkerPermissionFramesAndDecisionStayOnRetainedPort(t *testing.T) {
+	port := &workerTestPort{catalog: advertisedWorkerTestCatalog(), permissionDecided: make(chan permissionDecision, 1)}
+	permissionRaw := json.RawMessage(`{"toolCall":{"toolCallId":"tool-1","title":"Write file","kind":"edit"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}`)
+	port.prompt = func(ctx context.Context, spec acp.PromptSpec, emit func(acp.Event) error) (acp.PromptReceipt, error) {
+		if err := emit(acp.Event{Type: "session_request_permission", PermissionID: "bridge-permission-1", Raw: permissionRaw}); err != nil {
+			return acp.PromptReceipt{RequestID: spec.RequestID}, err
+		}
+		select {
+		case <-port.permissionDecided:
+			return acp.PromptReceipt{RequestID: spec.RequestID, LastSeq: 1, StopReason: "end_turn"}, nil
+		case <-ctx.Done():
+			return acp.PromptReceipt{RequestID: spec.RequestID}, ctx.Err()
+		}
+	}
+	harness := startRunningWorkerTest(t, session.Session{ID: "S-permission"}, port)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	_, err := harness.client.Send(ctx, Command{Type: "prompt", RequestID: "REQ-permission", Message: "write"})
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	permissionID := PermissionConsoleID("REQ-permission", "tool-1")
+	deadline := time.Now().Add(2 * time.Second)
+	var permissionStatus Message
+	for {
+		ctx, cancel = context.WithTimeout(context.Background(), 200*time.Millisecond)
+		status, statusErr := harness.client.Send(ctx, Command{Type: "status"})
+		cancel()
+		if statusErr == nil && len(status.Permissions) == 1 && status.Permissions[0].ID == permissionID {
+			permissionStatus = status
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("permission was not exposed: %#v, %v", status, statusErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if permissionStatus.Seq == 0 || permissionStatus.Seq != harness.worker.log.LastSequence() {
+		t.Fatalf("permission snapshot watermark = %d, log = %d", permissionStatus.Seq, harness.worker.log.LastSequence())
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	decision, err := harness.client.Send(ctx, Command{Type: "permission_response", PermissionID: permissionID, OptionID: "allow-once"})
+	cancel()
+	if err != nil || decision.Type != "permission_responded" {
+		t.Fatalf("permission decision = %#v, %v", decision, err)
+	}
+	requestLines := harness.waitForRequestResult(t, "REQ-permission")
+	if got, want := requestLineTypes(requestLines), []string{FrameClientCommand, FrameProviderEvent, FramePermissionRequested, FramePermissionResolved, FrameProviderResult}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("permission line types = %v, want %v", got, want)
+	}
+	if got := string(requestLines[1].Data); got != string(permissionRaw) {
+		t.Fatalf("permission provider event was rewritten: %s", got)
+	}
+	port.mu.Lock()
+	defer port.mu.Unlock()
+	if got, want := port.permissionCalls, []permissionDecision{{permissionID: "bridge-permission-1", optionID: "allow-once"}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("provider permission decisions = %#v, want %#v", got, want)
+	}
+}
+
+func TestWorkerFailsClosedWhenPermissionResolutionCannotBeJournaled(t *testing.T) {
+	port := &workerTestPort{catalog: advertisedWorkerTestCatalog(), permissionDecided: make(chan permissionDecision, 1)}
+	permissionRaw := json.RawMessage(`{"toolCall":{"toolCallId":"tool-journal","title":"Write file","kind":"edit"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"}]}`)
+	port.prompt = func(ctx context.Context, spec acp.PromptSpec, emit func(acp.Event) error) (acp.PromptReceipt, error) {
+		if err := emit(acp.Event{Type: "session_request_permission", PermissionID: "bridge-journal", Raw: permissionRaw}); err != nil {
+			return acp.PromptReceipt{RequestID: spec.RequestID}, err
+		}
+		select {
+		case <-port.permissionDecided:
+			return acp.PromptReceipt{RequestID: spec.RequestID, LastSeq: 1, StopReason: "end_turn"}, nil
+		case <-ctx.Done():
+			return acp.PromptReceipt{RequestID: spec.RequestID}, ctx.Err()
+		}
+	}
+	harness := startRunningWorkerTest(t, session.Session{ID: "S-perm-journal"}, port)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	if _, err := harness.client.Send(ctx, Command{Type: "prompt", RequestID: "REQ-permission-journal-failure", Message: "write"}); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	cancel()
+	permissionID := PermissionConsoleID("REQ-permission-journal-failure", "tool-journal")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		ctx, cancel = context.WithTimeout(context.Background(), 200*time.Millisecond)
+		status, statusErr := harness.client.Send(ctx, Command{Type: "status"})
+		cancel()
+		if statusErr == nil && len(status.Permissions) == 1 && status.Permissions[0].ID == permissionID {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("permission was not exposed: %#v, %v", status, statusErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := harness.worker.log.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	response, err := harness.client.Send(ctx, Command{Type: "permission_response", PermissionID: permissionID, OptionID: "allow-once"})
+	cancel()
+	var unavailable *ChannelUnavailableError
+	if !errors.As(err, &unavailable) || response.ErrorCode != "session_channel_failed" {
+		t.Fatalf("permission response with failed journal = %#v, %T %v", response, err, err)
+	}
+	select {
+	case <-harness.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("permission journal failure did not stop the Session channel")
+	}
+	port.mu.Lock()
+	permissionCalls := append([]permissionDecision(nil), port.permissionCalls...)
+	port.mu.Unlock()
+	if got, want := permissionCalls, []permissionDecision{{permissionID: "bridge-journal", optionID: "allow-once"}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("provider permission calls = %#v, want %#v", got, want)
+	}
+	lines, readErr := sessionlog.ReadFile(harness.worker.LogPath(), 0)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	for _, line := range lines {
+		if line.Type == FramePermissionResolved {
+			t.Fatalf("undurable permission resolution appeared in replay: %#v", lines)
+		}
+	}
+}
+
+func TestWorkerRetainsPendingPermissionWhenProviderRejectsFirstDecisionAttempt(t *testing.T) {
+	port := &workerTestPort{
+		catalog: advertisedWorkerTestCatalog(), permissionDecided: make(chan permissionDecision, 1),
+		permissionErrors: []error{&acp.ProviderPermissionRejectedError{}},
+	}
+	permissionRaw := json.RawMessage(`{"toolCall":{"toolCallId":"tool-retry","title":"Write file","kind":"edit"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"}]}`)
+	port.prompt = func(ctx context.Context, spec acp.PromptSpec, emit func(acp.Event) error) (acp.PromptReceipt, error) {
+		if err := emit(acp.Event{Type: "session_request_permission", PermissionID: "bridge-retry", Raw: permissionRaw}); err != nil {
+			return acp.PromptReceipt{RequestID: spec.RequestID}, err
+		}
+		select {
+		case <-port.permissionDecided:
+			return acp.PromptReceipt{RequestID: spec.RequestID, LastSeq: 1, StopReason: "end_turn"}, nil
+		case <-ctx.Done():
+			return acp.PromptReceipt{RequestID: spec.RequestID}, ctx.Err()
+		}
+	}
+	harness := startRunningWorkerTest(t, session.Session{ID: "S-permission-retry"}, port)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	_, err := harness.client.Send(ctx, Command{Type: "prompt", RequestID: "REQ-permission-retry", Message: "write"})
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	permissionID := PermissionConsoleID("REQ-permission-retry", "tool-retry")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		ctx, cancel = context.WithTimeout(context.Background(), 200*time.Millisecond)
+		status, statusErr := harness.client.Send(ctx, Command{Type: "status"})
+		cancel()
+		if statusErr == nil && len(status.Permissions) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("permission was not exposed: %#v, %v", status, statusErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	firstResponse, firstErr := harness.client.Send(ctx, Command{Type: "permission_response", PermissionID: permissionID, OptionID: "allow-once"})
+	cancel()
+	var rejected *acp.ProviderPermissionRejectedError
+	if !errors.As(firstErr, &rejected) || firstResponse.ErrorCode != "permission_response_rejected" {
+		t.Fatalf("first provider decision = %#v, %T %v", firstResponse, firstErr, firstErr)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	status, statusErr := harness.client.Send(ctx, Command{Type: "status"})
+	cancel()
+	if statusErr != nil || len(status.Permissions) != 1 || status.Permissions[0].ID != permissionID {
+		t.Fatalf("failed decision consumed pending permission: %#v, %v", status, statusErr)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	response, retryErr := harness.client.Send(ctx, Command{Type: "permission_response", PermissionID: permissionID, OptionID: "allow-once"})
+	cancel()
+	if retryErr != nil || response.Type != "permission_responded" {
+		t.Fatalf("retried decision = %#v, %v", response, retryErr)
+	}
+	harness.waitForRequestResult(t, "REQ-permission-retry")
+}
+
+func TestWorkerPermissionContinuityFailureDurablyAbandonsCallbacksAndFailsPort(t *testing.T) {
+	port := &workerTestPort{
+		catalog:          advertisedWorkerTestCatalog(),
+		permissionErrors: []error{&acp.ProtocolError{Operation: "permission decision", Message: "lost acknowledgement"}},
+	}
+	permissionRaw := func(toolID string) json.RawMessage {
+		return json.RawMessage(fmt.Sprintf(`{"toolCall":{"toolCallId":%q,"title":"Write file","kind":"edit"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"}]}`, toolID))
+	}
+	port.prompt = func(ctx context.Context, spec acp.PromptSpec, emit func(acp.Event) error) (acp.PromptReceipt, error) {
+		for _, item := range []struct {
+			bridgeID string
+			toolID   string
+		}{{bridgeID: "bridge-continuity-a", toolID: "tool-continuity-a"}, {bridgeID: "bridge-continuity-b", toolID: "tool-continuity-b"}} {
+			if err := emit(acp.Event{Type: "session_request_permission", PermissionID: item.bridgeID, Raw: permissionRaw(item.toolID)}); err != nil {
+				return acp.PromptReceipt{RequestID: spec.RequestID}, err
+			}
+		}
+		<-ctx.Done()
+		return acp.PromptReceipt{RequestID: spec.RequestID}, ctx.Err()
+	}
+	harness := startRunningWorkerTest(t, session.Session{ID: "S-permission-continuity"}, port)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	if _, err := harness.client.Send(ctx, Command{Type: "prompt", RequestID: "REQ-permission-continuity", Message: "write"}); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	cancel()
+	permissionA := PermissionConsoleID("REQ-permission-continuity", "tool-continuity-a")
+	permissionB := PermissionConsoleID("REQ-permission-continuity", "tool-continuity-b")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		ctx, cancel = context.WithTimeout(context.Background(), 200*time.Millisecond)
+		status, statusErr := harness.client.Send(ctx, Command{Type: "status"})
+		cancel()
+		if statusErr == nil && len(status.Permissions) == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("permissions were not exposed: %#v, %v", status, statusErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	response, decisionErr := harness.client.Send(ctx, Command{Type: "permission_response", PermissionID: permissionA, OptionID: "allow-once"})
+	cancel()
+	var unavailable *ChannelUnavailableError
+	if !errors.As(decisionErr, &unavailable) || response.ErrorCode != "session_channel_failed" {
+		t.Fatalf("ambiguous permission decision = %#v, %T %v", response, decisionErr, decisionErr)
+	}
+	select {
+	case <-harness.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("permission continuity failure did not stop the Session worker")
+	}
+	lines, err := sessionlog.ReadFile(harness.worker.LogPath(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	abandoned := map[string]uint64{}
+	var workerErrorSeq uint64
+	for _, line := range lines {
+		switch line.Type {
+		case FramePermissionAbandoned:
+			var data map[string]string
+			if err := json.Unmarshal(line.Data, &data); err != nil {
+				t.Fatal(err)
+			}
+			abandoned[data["permission_id"]] = line.Seq
+		case FramePermissionResolved:
+			t.Fatalf("ambiguous permission decision was recorded as resolved: %#v", line)
+		case FrameWorkerError:
+			if strings.Contains(string(line.Data), "provider_permission_continuity_lost") {
+				workerErrorSeq = line.Seq
+			}
+		}
+	}
+	if len(abandoned) != 2 || abandoned[permissionA] == 0 || abandoned[permissionB] == 0 {
+		t.Fatalf("durable abandoned callbacks = %#v, want %q and %q", abandoned, permissionA, permissionB)
+	}
+	if workerErrorSeq == 0 || abandoned[permissionA] >= workerErrorSeq || abandoned[permissionB] >= workerErrorSeq {
+		t.Fatalf("abandonment must precede worker failure: abandoned=%#v worker_error=%d", abandoned, workerErrorSeq)
+	}
+	port.mu.Lock()
+	permissionCalls := append([]permissionDecision(nil), port.permissionCalls...)
+	closeCalls := port.closeCalls
+	port.mu.Unlock()
+	if got, want := permissionCalls, []permissionDecision{{permissionID: "bridge-continuity-a", optionID: "allow-once"}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("provider permission calls = %#v, want %#v", got, want)
+	}
+	if closeCalls != 1 {
+		t.Fatalf("provider Port Close calls = %d, want 1", closeCalls)
+	}
+}
+
+func TestWorkerAcceptedCancelFencesLaterPermissionDecision(t *testing.T) {
+	cancelEntered := make(chan struct{})
+	cancelRelease := make(chan struct{})
+	promptCancelled := make(chan struct{})
+	port := &workerTestPort{catalog: advertisedWorkerTestCatalog()}
+	port.cancel = func(context.Context, acp.Target) error {
+		close(cancelEntered)
+		<-cancelRelease
+		close(promptCancelled)
+		return nil
+	}
+	permissionRaw := json.RawMessage(`{"toolCall":{"toolCallId":"tool-cancel","title":"Write file","kind":"edit"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"}]}`)
+	port.prompt = func(ctx context.Context, spec acp.PromptSpec, emit func(acp.Event) error) (acp.PromptReceipt, error) {
+		if err := emit(acp.Event{Type: "session_request_permission", PermissionID: "bridge-cancel", Raw: permissionRaw}); err != nil {
+			return acp.PromptReceipt{RequestID: spec.RequestID}, err
+		}
+		select {
+		case <-promptCancelled:
+			return acp.PromptReceipt{RequestID: spec.RequestID, LastSeq: 1, StopReason: "cancelled"}, nil
+		case <-ctx.Done():
+			return acp.PromptReceipt{RequestID: spec.RequestID}, ctx.Err()
+		}
+	}
+	harness := startRunningWorkerTest(t, session.Session{ID: "S-permission-cancel-fence"}, port)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	if _, err := harness.client.Send(ctx, Command{Type: "prompt", RequestID: "REQ-permission-cancel", Message: "write"}); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	cancel()
+	permissionID := PermissionConsoleID("REQ-permission-cancel", "tool-cancel")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		ctx, cancel = context.WithTimeout(context.Background(), 200*time.Millisecond)
+		status, statusErr := harness.client.Send(ctx, Command{Type: "status"})
+		cancel()
+		if statusErr == nil && len(status.Permissions) == 1 && status.Permissions[0].ID == permissionID {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("permission was not exposed before cancel: %#v, %v", status, statusErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	type commandResult struct {
+		message Message
+		err     error
+	}
+	cancelResult := make(chan commandResult, 1)
+	go func() {
+		cancelCtx, cancelCall := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancelCall()
+		message, err := harness.client.Send(cancelCtx, Command{Type: "cancel", RequestID: "REQ-permission-cancel"})
+		cancelResult <- commandResult{message: message, err: err}
+	}()
+	select {
+	case <-cancelEntered:
+	case <-time.After(time.Second):
+		t.Fatal("Port.Cancel was not entered")
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	decision, decisionErr := harness.client.Send(ctx, Command{Type: "permission_response", PermissionID: permissionID, OptionID: "allow-once"})
+	cancel()
+	if decisionErr == nil || decision.Type != "error" {
+		t.Fatalf("permission after accepted cancel = %#v, %v", decision, decisionErr)
+	}
+	port.mu.Lock()
+	permissionCalls := append([]permissionDecision(nil), port.permissionCalls...)
+	port.mu.Unlock()
+	if len(permissionCalls) != 0 {
+		t.Fatalf("permission response overtook accepted cancel: %#v", permissionCalls)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	status, statusErr := harness.client.Send(ctx, Command{Type: "status"})
+	cancel()
+	if statusErr != nil || len(status.Permissions) != 0 {
+		t.Fatalf("accepted cancel left stale actionable permissions: %#v, %v", status, statusErr)
+	}
+
+	duplicateResult := make(chan commandResult, 1)
+	go func() {
+		cancelCtx, cancelCall := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancelCall()
+		message, err := harness.client.Send(cancelCtx, Command{Type: "cancel", RequestID: "REQ-permission-cancel"})
+		duplicateResult <- commandResult{message: message, err: err}
+	}()
+	select {
+	case result := <-duplicateResult:
+		t.Fatalf("duplicate cancel acknowledged before provider settlement: %#v, %v", result.message, result.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(cancelRelease)
+	select {
+	case result := <-cancelResult:
+		if result.err != nil || result.message.Type != "cancelled" {
+			t.Fatalf("cancel result = %#v, %v", result.message, result.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("accepted cancel did not settle")
+	}
+	select {
+	case result := <-duplicateResult:
+		if result.err != nil || result.message.Type != "cancelled" {
+			t.Fatalf("duplicate cancel result = %#v, %v", result.message, result.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("duplicate cancel did not observe provider settlement")
+	}
+	requestLines := harness.waitForRequestResult(t, "REQ-permission-cancel")
+	if got, want := requestLineTypes(requestLines), []string{
+		FrameClientCommand, FrameProviderEvent, FramePermissionRequested,
+		FrameClientCommand, FramePermissionAbandoned, FrameProviderResult,
+	}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("cancelled permission line types = %v, want %v", got, want)
+	}
+	for _, line := range requestLines {
+		if line.Type == FramePermissionResolved {
+			t.Fatalf("permission resolved after cancel: %#v", requestLines)
+		}
+	}
+	port.mu.Lock()
+	cancelCalls := port.cancelCalls
+	port.mu.Unlock()
+	if cancelCalls != 1 {
+		t.Fatalf("duplicate cancel reached provider %d times", cancelCalls)
+	}
+}
+
+func TestWorkerFatalProviderOptionsFailureStopsPoisonedPort(t *testing.T) {
+	port := &workerTestPort{
+		catalog:   advertisedWorkerTestCatalog(),
+		optionErr: &acp.ProtocolError{Operation: "fixture", Message: "private identity drift detail"},
+	}
+	harness := startRunningWorkerTest(t, session.Session{ID: "S-options-fatal"}, port)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	response, err := harness.client.Send(ctx, Command{Type: "provider_options"})
+	cancel()
+	var unavailable *ChannelUnavailableError
+	if !errors.As(err, &unavailable) || response.ErrorCode != "session_channel_failed" || strings.Contains(response.Message, "private identity drift detail") {
+		t.Fatalf("fatal options response = %#v, %T %v", response, err, err)
+	}
+	select {
+	case <-harness.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("poisoned provider Port did not stop")
+	}
+	lines, readErr := sessionlog.ReadFile(harness.worker.LogPath(), 0)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	var failures int
+	for _, line := range lines {
+		if line.Type == FrameWorkerError {
+			failures++
+			if strings.Contains(string(line.Data), "private identity drift detail") {
+				t.Fatalf("fatal options journal leaked private detail: %s", line.Data)
+			}
+		}
+	}
+	if failures != 1 {
+		t.Fatalf("fatal options worker errors = %d; lines=%#v", failures, lines)
+	}
+}
+
+func TestWorkerDoesNotDispatchAcceptedPromptAfterLifecycleFenceChanges(t *testing.T) {
+	port := &workerTestPort{catalog: advertisedWorkerTestCatalog()}
+	harness := startRunningWorkerTest(t, session.Session{ID: "S-prompt-lifecycle-fence"}, port)
+	harness.allowRunError = true
+	harness.repo.mu.Lock()
+	harness.repo.beforeWorkerCAS = func(before, after session.WorkerState) {
+		if before.Status != session.StatusWaiting || after.Status != session.StatusWorking {
+			return
+		}
+		harness.repo.mu.Lock()
+		harness.repo.current.Status = session.StatusFailed
+		harness.repo.mu.Unlock()
+	}
+	harness.repo.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	accepted, err := harness.client.Send(ctx, Command{Type: "prompt", RequestID: "REQ-lifecycle-fence", Message: "must not dispatch"})
+	cancel()
+	if err != nil || accepted.Type != "accepted" {
+		t.Fatalf("prompt admission = %#v, %v", accepted, err)
+	}
+	lines := harness.waitForRequestResult(t, "REQ-lifecycle-fence")
+	port.mu.Lock()
+	promptCalls := len(port.promptSpecs)
+	port.mu.Unlock()
+	if promptCalls != 0 {
+		t.Fatalf("lifecycle-fenced prompt reached provider %d times", promptCalls)
+	}
+	var terminal map[string]any
+	if err := json.Unmarshal(lines[len(lines)-1].Data, &terminal); err != nil || terminal["code"] != "session_lifecycle_changed" {
+		t.Fatalf("lifecycle-fenced terminal = %#v, %v", terminal, err)
+	}
+	select {
+	case <-harness.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("lifecycle-fenced worker did not stop")
+	}
+	current, loadErr := harness.repo.GetSession(context.Background(), "S-prompt-lifecycle-fence")
+	if loadErr != nil || current.Status != session.StatusFailed || current.WorkerPID == 0 || current.WorkerSocket == "" {
+		t.Fatalf("lifecycle quarantine = %#v, %v", current, loadErr)
+	}
+}
+
+func TestWorkerPartialConfigurationFailsClosedIfProviderResetsUnspecifiedControl(t *testing.T) {
+	catalog := advertisedWorkerTestCatalog()
+	catalog.Model.CurrentValue = "model-selected"
+	port := &workerTestPort{catalog: catalog, effortResetsModel: true}
+	harness := startRunningWorkerTest(t, session.Session{ID: "S-config-interdependent"}, port)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	response, err := harness.client.Send(ctx, Command{Type: "configure", ReasoningEffort: "high"})
+	cancel()
+	var configuration *acp.ProviderConfigurationError
+	if !errors.As(err, &configuration) || response.ErrorCode != "provider_configuration_failed" {
+		t.Fatalf("interdependent config = %#v, %T %v", response, err, err)
+	}
+	select {
+	case <-harness.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("uncertain provider configuration did not stop the Port")
+	}
+	port.mu.Lock()
+	defer port.mu.Unlock()
+	if len(port.configureSpecs) != 1 || port.configureSpecs[0].Model != "model-selected" || port.configureSpecs[0].ReasoningEffort != "high" {
+		t.Fatalf("Configure did not protect fresh current tuple: %#v", port.configureSpecs)
+	}
+}
+
+func TestWorkerPartialConfigurationPreservesUnselectableProviderDefault(t *testing.T) {
+	catalog := advertisedWorkerTestCatalog()
+	catalog.Model.CurrentValue = "provider-native-default"
+	catalog.Model.Choices = []acp.ProviderOptionChoice{
+		{Value: "model-selected", Label: "Selected model"},
+		{Value: "model-other", Label: "Other model"},
+	}
+	port := &workerTestPort{catalog: catalog}
+	harness := startRunningWorkerTest(t, session.Session{ID: "S-config-provider-default"}, port)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	response, err := harness.client.Send(ctx, Command{Type: "configure", ReasoningEffort: "high"})
+	cancel()
+	if err != nil || response.Type != "configured" || response.ProviderOptions == nil {
+		t.Fatalf("configure with unselectable current default = %#v, %v", response, err)
+	}
+	if response.ProviderOptions.Model.CurrentValue != "provider-native-default" || response.ProviderOptions.ReasoningEffort.CurrentValue != "high" {
+		t.Fatalf("configured catalog did not preserve provider default: %#v", response.ProviderOptions)
+	}
+	port.mu.Lock()
+	defer port.mu.Unlock()
+	if len(port.configureSpecs) != 1 || port.configureSpecs[0].Model != "" || port.configureSpecs[0].ReasoningEffort != "high" {
+		t.Fatalf("unadvertised provider default was sent back as a selection: %#v", port.configureSpecs)
+	}
+}
+
+func TestParsePendingPermissionBoundsEveryProviderField(t *testing.T) {
+	base := func() map[string]any {
+		return map[string]any{
+			"toolCall": map[string]any{"toolCallId": "tool-1", "title": "Write file", "kind": "edit"},
+			"options":  []any{map[string]any{"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"}},
+		}
+	}
+	tests := map[string]func(map[string]any, *acp.Event){
+		"bridge id": func(_ map[string]any, event *acp.Event) {
+			event.PermissionID = strings.Repeat("x", maxPermissionIDBytes+1)
+		},
+		"tool id": func(raw map[string]any, _ *acp.Event) {
+			raw["toolCall"].(map[string]any)["toolCallId"] = strings.Repeat("x", maxPermissionIDBytes+1)
+		},
+		"title": func(raw map[string]any, _ *acp.Event) {
+			raw["toolCall"].(map[string]any)["title"] = strings.Repeat("x", maxPermissionDisplayBytes+1)
+		},
+		"tool kind": func(raw map[string]any, _ *acp.Event) {
+			raw["toolCall"].(map[string]any)["kind"] = strings.Repeat("x", maxPermissionKindBytes+1)
+		},
+		"option id": func(raw map[string]any, _ *acp.Event) {
+			raw["options"].([]any)[0].(map[string]any)["optionId"] = strings.Repeat("x", maxPermissionIDBytes+1)
+		},
+		"option name": func(raw map[string]any, _ *acp.Event) {
+			raw["options"].([]any)[0].(map[string]any)["name"] = strings.Repeat("x", maxPermissionDisplayBytes+1)
+		},
+		"control text": func(raw map[string]any, _ *acp.Event) { raw["toolCall"].(map[string]any)["title"] = "unsafe\ntext" },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			raw := base()
+			event := acp.Event{PermissionID: "bridge-1"}
+			mutate(raw, &event)
+			encoded, err := json.Marshal(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			event.Raw = encoded
+			if _, err := parsePendingPermission("REQ-one", event); err == nil {
+				t.Fatal("unbounded provider permission field was accepted")
+			}
+		})
+	}
+}
+
+func TestWorkerLeavesProviderConfigurationOwnedByResumedPort(t *testing.T) {
+	port := &workerTestPort{catalog: advertisedWorkerTestCatalog()}
+	metadata := json.RawMessage(`{"model":"model-selected","reasoning_effort":"high"}`)
+	startRunningWorkerTest(t, session.Session{ID: "S-configured", MetadataJSON: metadata}, port)
+	port.mu.Lock()
+	defer port.mu.Unlock()
+	if len(port.startSpecs) != 1 || len(port.configureSpecs) != 0 {
+		t.Fatalf("Port calls: start=%d configure=%d", len(port.startSpecs), len(port.configureSpecs))
+	}
+	if port.startSpecs[0].Model != "" || port.startSpecs[0].ReasoningEffort != "" {
+		t.Fatalf("Start carried gateway metadata into provider configuration: %#v", port.startSpecs[0])
+	}
+	if _, err := os.Stat(filepath.Dir(port.startSpecs[0].WorkingDirectory)); err != nil {
+		t.Fatalf("working directory disappeared: %v", err)
 	}
 }

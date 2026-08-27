@@ -1,5 +1,6 @@
-// Package service contains shared Task Console application behavior used by
-// CLI, terminal, API, and web transports.
+// Package service contains the application behavior shared by the HTTP, CLI,
+// and terminal transports. A Session owns one provider connection; transports
+// only address that Session and observe its ordered frame journal.
 package service
 
 import (
@@ -7,8 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"path/filepath"
+	"os"
 	"strings"
 	"time"
 
@@ -17,7 +17,6 @@ import (
 	"github.com/yty-build/acp-gateway/internal/config"
 	gitrepo "github.com/yty-build/acp-gateway/internal/git"
 	"github.com/yty-build/acp-gateway/internal/identity"
-	"github.com/yty-build/acp-gateway/internal/native"
 	"github.com/yty-build/acp-gateway/internal/session"
 	"github.com/yty-build/acp-gateway/internal/sessionlog"
 	"github.com/yty-build/acp-gateway/internal/task"
@@ -59,21 +58,21 @@ type SessionService struct {
 	registry   *agents.Registry
 	home       config.Home
 	runtime    Runtime
-	executable string
 }
 
+// StartSessionParams contains Session identity and checkout configuration.
+// ParentSessionID is optional manager-to-child membership; it never implies a
+// mailbox, workflow, or hidden prompt fan-out.
 type StartSessionParams struct {
 	TaskID              string
+	ParentSessionID     string
 	Agent               string
 	Role                string
-	Model               string
-	ReasoningEffort     string
 	RepoPath            string
 	WorktreePath        string
 	Branch              string
 	Worktree            bool
 	AllowSharedCheckout bool
-	Prompt              string
 	ApproveAll          bool
 }
 
@@ -84,73 +83,45 @@ type LaunchResult struct {
 	Started   bool
 }
 
-// PermissionSnapshot is disposable transport state for viewers. It keeps the
-// actionable permissions and the live worker's protocol/decision readiness in
-// one read so a stale worker is never presented as accepting a decision.
+// ConnectedSession is one ordinary addressable Session Channel. ProviderOptions
+// is populated only by an explicit observational read after its Port connects.
+type ConnectedSession struct {
+	Session         session.Session
+	ProviderOptions acp.ProviderOptionCatalog
+}
+
+type ConnectedTask struct {
+	Task task.Task
+	ConnectedSession
+}
+
 type PermissionSnapshot struct {
 	Permissions    []worker.PendingPermission
+	Sequence       uint64
 	DecisionsReady bool
 	BlockedCode    string
 	BlockedMessage string
 }
 
-type TaskLaunchResult struct {
-	Task task.Task
-	LaunchResult
-}
-
-type NativeAttachOptions struct {
-	Runner                native.Runner
-	Verifier              native.Verifier
-	OwnerToken            string
-	ReservationGeneration string
-	Input                 io.Reader
-	Output                io.Writer
-	ErrorOutput           io.Writer
-}
-
-type NativeReservationRecoveryOptions struct {
-	Verifier native.ReservationRecoveryVerifier
-}
-
-type NativeReservationRecoveryResult struct {
-	State string
-}
-
 var ErrWorkerUpgradeRequired = errors.New("Session worker upgrade required")
 
-// WorkerUpgradeRequiredError is safe to expose through local transports. It
-// contains only Task Console identifiers and fixed recovery instructions—no
-// provider payload, authentication state, filesystem path, or socket detail.
 type WorkerUpgradeRequiredError struct {
-	SessionID       string
-	Operation       string
-	ProtocolVersion int
+	SessionID          string
+	Operation          string
+	ProtocolVersion    int
+	RequiredCapability string
 }
 
 func (e *WorkerUpgradeRequiredError) Error() string {
-	return fmt.Sprintf(
-		"Session %s worker upgrade required; %s. Return to any existing provider terminal and exit the provider CLI without sending another prompt; if it is tmux-hosted, run `tmux attach-session -t =%s` to reach it. Then run `acpctl session stop %s` and `acpctl session resume %s`. Worker protocol %d does not satisfy the required protocol %d and capability %s contract",
-		e.SessionID, e.Operation, native.TmuxSessionName(e.SessionID), e.SessionID, e.SessionID, e.ProtocolVersion, worker.ProtocolVersion, worker.CapabilityExclusiveNativeOwner,
-	)
+	return fmt.Sprintf("Session %s worker protocol %d cannot perform %s; stop and resume the Session with the current acpctl build", e.SessionID, e.ProtocolVersion, e.Operation)
 }
 
 func (e *WorkerUpgradeRequiredError) Unwrap() error { return ErrWorkerUpgradeRequired }
 
 func NewSessionService(repository SessionRepository, registry *agents.Registry, home config.Home, runtime Runtime) *SessionService {
-	service := &SessionService{repository: repository, registry: registry, home: home, runtime: runtime}
-	switch typed := runtime.(type) {
-	case LocalRuntime:
-		service.executable = typed.Executable
-	case *LocalRuntime:
-		service.executable = typed.Executable
-	}
-	return service
+	return &SessionService{repository: repository, registry: registry, home: home, runtime: runtime}
 }
 
-// AgentProfiles exposes the declarative registry through the shared service
-// boundary so terminal, web, and future clients do not read registry files or
-// duplicate provider knowledge.
 func (s *SessionService) AgentProfiles() ([]agents.Profile, error) {
 	if s.registry == nil {
 		return nil, fmt.Errorf("agent registry is unavailable")
@@ -163,16 +134,31 @@ func (s *SessionService) Prepare(params StartSessionParams) (session.CreateParam
 }
 
 func (s *SessionService) PrepareContext(ctx context.Context, params StartSessionParams) (session.CreateParams, error) {
+	if s.registry == nil {
+		return session.CreateParams{}, fmt.Errorf("agent registry is unavailable")
+	}
 	profile, err := s.registry.Get(params.Agent)
 	if err != nil {
 		return session.CreateParams{}, err
+	}
+	if params.ParentSessionID != "" {
+		parent, err := s.repository.GetSession(ctx, params.ParentSessionID)
+		if err != nil {
+			return session.CreateParams{}, fmt.Errorf("load parent Session: %w", err)
+		}
+		if params.TaskID == "" {
+			params.TaskID = parent.TaskID
+		}
+		if parent.TaskID != params.TaskID {
+			return session.CreateParams{}, fmt.Errorf("parent Session %s belongs to a different Task", parent.ID)
+		}
 	}
 	repoPath, err := gitrepo.ValidateRepository(ctx, params.RepoPath)
 	if err != nil {
 		return session.CreateParams{}, fmt.Errorf("resolve repo: %w", err)
 	}
 	worktreePath := ""
-	branch := params.Branch
+	branch := strings.TrimSpace(params.Branch)
 	if params.Worktree && params.WorktreePath != "" {
 		return session.CreateParams{}, fmt.Errorf("--worktree cannot be combined with an existing worktree path")
 	}
@@ -217,90 +203,169 @@ func (s *SessionService) PrepareContext(ctx context.Context, params StartSession
 	if role == "" {
 		role = "worker"
 	}
-	providerOptions := session.ProviderOptions{
-		Model: strings.TrimSpace(params.Model), ReasoningEffort: strings.TrimSpace(params.ReasoningEffort),
-	}
-	if err := providerOptions.Validate(); err != nil {
-		return session.CreateParams{}, err
-	}
-	if err := native.ValidateProviderOptions(profile, providerOptions); err != nil {
-		return session.CreateParams{}, err
-	}
-	metadata, err := SessionMetadata(params.ApproveAll, providerOptions)
+	metadata, err := sessionMetadata(params.ApproveAll, params.AllowSharedCheckout, params.Worktree)
 	if err != nil {
 		return session.CreateParams{}, err
 	}
 	return session.CreateParams{
-		ID: id, TaskID: params.TaskID, Role: role, Agent: profile.Name, Provider: profile.Provider,
+		ID: id, TaskID: params.TaskID, ParentSessionID: params.ParentSessionID,
+		Role: role, Agent: profile.Name, Provider: profile.Provider,
 		RepoPath: repoPath, WorktreePath: worktreePath, Branch: branch,
-		Status: session.StatusStarting, LogPath: filepath.Join(s.home.Logs, id+".jsonl"), MetadataJSON: metadata,
+		Status: session.StatusStarting, LogPath: sessionlog.ChannelPath(s.home.Logs, id), MetadataJSON: metadata,
 	}, nil
 }
 
-func (s *SessionService) Start(ctx context.Context, params StartSessionParams) (LaunchResult, error) {
+// ConnectSession creates one ordinary Session and returns as soon as its
+// Session Channel is attachable. Provider Start/Resume continues behind the
+// channel and reports connecting/connected/failed as ordered frames.
+func (s *SessionService) ConnectSession(ctx context.Context, params StartSessionParams) (ConnectedSession, error) {
 	if _, err := s.repository.GetTask(ctx, params.TaskID); err != nil {
-		return LaunchResult{}, err
+		return ConnectedSession{}, err
 	}
 	createParams, err := s.PrepareContext(ctx, params)
 	if err != nil {
-		return LaunchResult{}, err
+		return ConnectedSession{}, err
 	}
 	created, err := s.createSessionContext(ctx, createParams, params.Worktree, params.AllowSharedCheckout)
 	if err != nil {
-		return LaunchResult{Session: created}, err
+		return ConnectedSession{Session: created}, err
 	}
-	if _, err := s.repository.UpdateTaskStatus(ctx, params.TaskID, task.StatusWorking); err != nil {
-		created = s.markSessionFailed(created)
-		return LaunchResult{Session: created, State: string(created.Status)}, err
+	spawned, err := s.runtime.Spawn(ctx, created.ID)
+	if err != nil {
+		return ConnectedSession{Session: s.sessionAfterSpawnFailure(created)}, err
 	}
-	return s.Launch(ctx, created.ID, params.Prompt)
+	// Return the channel-admission snapshot deterministically. The provider may
+	// advance SQLite to waiting or failed immediately after the successful ping,
+	// but that race must not erase the client's attachable starting boundary.
+	admitted := created
+	admitted.WorkerPID = spawned.PID
+	admitted.WorkerSocket = spawned.Socket
+	admitted.Status = session.StatusStarting
+	if _, err := s.repository.UpdateTaskStatus(ctx, created.TaskID, task.StatusWorking); err != nil {
+		return ConnectedSession{Session: admitted}, err
+	}
+	return ConnectedSession{Session: admitted}, nil
 }
 
-// StartTask atomically creates the convenience Task -> first Session pair,
-// then provisions any requested worktree before launching its worker.
-func (s *SessionService) StartTask(ctx context.Context, taskParams task.CreateParams, params StartSessionParams) (TaskLaunchResult, error) {
+func (s *SessionService) ProviderOptions(ctx context.Context, id string) (ConnectedSession, error) {
+	current, err := s.repository.GetSession(ctx, id)
+	if err != nil {
+		return ConnectedSession{}, err
+	}
+	if err := requireProviderReady(current); err != nil {
+		return ConnectedSession{Session: current}, err
+	}
+	if current.WorkerSocket == "" {
+		return ConnectedSession{Session: current}, fmt.Errorf("Session %s has no live provider connection; resume it first", id)
+	}
+	return s.providerOptionsFromWorker(ctx, id, current.WorkerSocket)
+}
+
+func (s *SessionService) providerOptionsFromWorker(ctx context.Context, id, socket string) (ConnectedSession, error) {
+	current, err := s.repository.GetSession(ctx, id)
+	if err != nil {
+		return ConnectedSession{}, err
+	}
+	if err := s.requireCurrentWorkerProtocolAt(ctx, current, socket, "load provider options"); err != nil {
+		return ConnectedSession{Session: current}, err
+	}
+	message, err := s.runtime.Send(ctx, socket, worker.Command{Type: "provider_options"})
+	if err != nil {
+		return ConnectedSession{Session: current}, err
+	}
+	if message.ProviderOptions == nil {
+		return ConnectedSession{Session: current}, fmt.Errorf("Session %s provider did not return a configuration catalog", id)
+	}
+	return ConnectedSession{Session: current, ProviderOptions: *message.ProviderOptions}, nil
+}
+
+// Configure applies a tuple chosen from this live provider's advertised
+// catalog to the retained Port. Provider configuration is disposable live
+// state; the gateway does not persist or reapply it after a Port restart.
+func (s *SessionService) Configure(ctx context.Context, id string, options session.ProviderOptions) (ConnectedSession, error) {
+	current, err := s.repository.GetSession(ctx, id)
+	if err != nil {
+		return ConnectedSession{}, err
+	}
+	if err := requireProviderReady(current); err != nil {
+		return ConnectedSession{Session: current}, err
+	}
+	if current.WorkerSocket == "" {
+		return ConnectedSession{Session: current}, fmt.Errorf("Session %s has no live provider connection; resume it first", id)
+	}
+	if err := options.Validate(); err != nil {
+		return ConnectedSession{Session: current}, err
+	}
+	if err := s.requireCurrentWorkerProtocol(ctx, current, "configure provider"); err != nil {
+		return ConnectedSession{Session: current}, err
+	}
+	message, err := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{
+		Type: "configure", Model: options.Model, ReasoningEffort: options.ReasoningEffort,
+	})
+	if err != nil {
+		return ConnectedSession{Session: current}, err
+	}
+	updated, err := s.repository.GetSession(ctx, id)
+	if err != nil {
+		return ConnectedSession{Session: current}, err
+	}
+	result := ConnectedSession{Session: updated}
+	if message.ProviderOptions != nil {
+		result.ProviderOptions = *message.ProviderOptions
+	}
+	return result, nil
+}
+
+// ConnectTask atomically creates a Task and its first Session, then returns as
+// soon as that Session Channel is addressable. It never waits for provider
+// readiness, configures the Port, or submits a hidden first prompt.
+func (s *SessionService) ConnectTask(ctx context.Context, taskParams task.CreateParams, params StartSessionParams) (ConnectedTask, error) {
 	if taskParams.ID == "" {
 		id, err := identity.New("T")
 		if err != nil {
-			return TaskLaunchResult{}, err
+			return ConnectedTask{}, err
 		}
 		taskParams.ID = id
 	}
 	params.TaskID = taskParams.ID
 	createParams, err := s.PrepareContext(ctx, params)
 	if err != nil {
-		return TaskLaunchResult{}, err
+		return ConnectedTask{}, err
 	}
 	lock, err := gitrepo.LockRepository(ctx, s.home.Root, createParams.RepoPath)
 	if err != nil {
-		return TaskLaunchResult{}, err
+		return ConnectedTask{}, err
 	}
-	defer func() { _ = gitrepo.UnlockRepository(lock) }() // best-effort release; persistence errors remain primary
+	defer func() { _ = gitrepo.UnlockRepository(lock) }()
 	if err := s.checkCheckout(ctx, createParams, params.Worktree, params.AllowSharedCheckout, ""); err != nil {
-		return TaskLaunchResult{}, err
+		return ConnectedTask{}, err
 	}
-	createdTask, createdSession, err := s.repository.CreateTaskWithSession(ctx, taskParams, createParams)
+	createdTask, created, err := s.repository.CreateTaskWithSession(ctx, taskParams, createParams)
 	if err != nil {
-		return TaskLaunchResult{}, err
+		return ConnectedTask{}, err
 	}
-	partial := TaskLaunchResult{Task: createdTask, LaunchResult: LaunchResult{Session: createdSession}}
+	partial := ConnectedTask{Task: createdTask, ConnectedSession: ConnectedSession{Session: created}}
 	if params.Worktree {
-		planned := gitrepo.Worktree{Repository: createdSession.RepoPath, Path: createdSession.WorktreePath, Branch: createdSession.Branch}
+		planned := gitrepo.Worktree{Repository: created.RepoPath, Path: created.WorktreePath, Branch: created.Branch}
 		if err := planned.Create(ctx); err != nil {
-			partial.Session = s.markSessionFailed(createdSession)
-			_, _ = s.repository.UpdateTaskStatus(context.Background(), createdTask.ID, task.StatusFailed)
+			partial.Session = s.markSessionFailed(created)
 			return partial, err
 		}
 	}
 	if err := gitrepo.UnlockRepository(lock); err != nil {
-		partial.Session = s.markSessionFailed(partial.Session)
-		partial.State = string(partial.Session.Status)
+		partial.Session = s.markSessionFailed(created)
 		return partial, err
 	}
 	lock = nil
-	launched, err := s.Launch(ctx, createdSession.ID, params.Prompt)
-	partial.LaunchResult = launched
-	return partial, err
+	spawned, err := s.runtime.Spawn(ctx, created.ID)
+	if err != nil {
+		partial.Session = s.sessionAfterSpawnFailure(created)
+		return partial, err
+	}
+	partial.Session.WorkerPID = spawned.PID
+	partial.Session.WorkerSocket = spawned.Socket
+	partial.Session.Status = session.StatusStarting
+	return partial, nil
 }
 
 func (s *SessionService) createSessionContext(ctx context.Context, createParams session.CreateParams, createWorktree, allowShared bool) (session.Session, error) {
@@ -308,7 +373,7 @@ func (s *SessionService) createSessionContext(ctx context.Context, createParams 
 	if err != nil {
 		return session.Session{}, err
 	}
-	defer gitrepo.UnlockRepository(lock)
+	defer func() { _ = gitrepo.UnlockRepository(lock) }()
 	if err := s.checkCheckout(ctx, createParams, createWorktree, allowShared, ""); err != nil {
 		return session.Session{}, err
 	}
@@ -322,13 +387,16 @@ func (s *SessionService) createSessionContext(ctx context.Context, createParams 
 			return s.markSessionFailed(created), err
 		}
 	}
+	if err := gitrepo.UnlockRepository(lock); err != nil {
+		return s.markSessionFailed(created), err
+	}
+	lock = nil
 	return created, nil
 }
 
 func (s *SessionService) checkCheckout(ctx context.Context, createParams session.CreateParams, createWorktree, allowShared bool, excludeSessionID string) error {
 	if createWorktree {
-		planned := gitrepo.Worktree{Repository: createParams.RepoPath, Path: createParams.WorktreePath, Branch: createParams.Branch}
-		return planned.CheckAvailable(ctx)
+		return (gitrepo.Worktree{Repository: createParams.RepoPath, Path: createParams.WorktreePath, Branch: createParams.Branch}).CheckAvailable(ctx)
 	}
 	if allowShared {
 		return nil
@@ -337,22 +405,20 @@ func (s *SessionService) checkCheckout(ctx context.Context, createParams session
 	if checkout == "" {
 		checkout = createParams.RepoPath
 	}
-	existing, err := s.repository.ListSessions(ctx)
+	items, err := s.repository.ListSessions(ctx)
 	if err != nil {
 		return err
 	}
-	for _, current := range existing {
-		if current.ID == excludeSessionID {
+	for _, current := range items {
+		retainsWorkerOwnership := current.WorkerPID != 0 || current.WorkerSocket != ""
+		if current.ID == excludeSessionID || (!activeCheckoutStatus(current.Status) && !retainsWorkerOwnership) {
 			continue
 		}
-		if !activeCheckoutStatus(current.Status) {
-			continue
+		other := current.WorktreePath
+		if other == "" {
+			other = current.RepoPath
 		}
-		currentCheckout := current.WorktreePath
-		if currentCheckout == "" {
-			currentCheckout = current.RepoPath
-		}
-		if gitrepo.SameCheckout(checkout, currentCheckout) {
+		if gitrepo.SameCheckout(checkout, other) {
 			return fmt.Errorf("checkout %q is already used by active Session %s (%s); use --worktree or --allow-shared-checkout", checkout, current.ID, current.Status)
 		}
 	}
@@ -363,46 +429,19 @@ func activeCheckoutStatus(status session.Status) bool {
 	return status == session.StatusStarting || status == session.StatusWorking || status == session.StatusWaiting
 }
 
-// Launch starts the detached worker and submits the Task-derived initial turn.
-func (s *SessionService) Launch(ctx context.Context, sessionID, extraPrompt string) (LaunchResult, error) {
-	current, err := s.repository.GetSession(ctx, sessionID)
-	if err != nil {
-		return LaunchResult{}, err
-	}
-	taskItem, err := s.repository.GetTask(ctx, current.TaskID)
-	if err != nil {
-		return LaunchResult{}, err
-	}
-	requestID, err := acp.NewRequestID()
-	if err != nil {
-		current = s.markSessionFailed(current)
-		return LaunchResult{Session: current, State: string(current.Status)}, err
-	}
-	spawned, err := s.runtime.Spawn(ctx, current.ID)
-	if err != nil {
-		current = s.markSessionFailed(current)
-		return LaunchResult{Session: current, State: string(current.Status)}, err
-	}
-	message := BuildInitialPrompt(taskItem, current, extraPrompt)
-	displayMessage := BuildInitialDisplayMessage(taskItem, current, extraPrompt)
-	accepted, err := s.runtime.Send(ctx, spawned.Socket, worker.Command{
-		Type: "prompt", RequestID: requestID, Message: message, DisplayMessage: displayMessage,
-	})
-	if err != nil {
-		current = s.markSessionFailed(current)
-		return LaunchResult{Session: current, RequestID: requestID, State: string(current.Status)}, fmt.Errorf("submit initial Session prompt: %w", err)
-	}
-	if refreshed, refreshErr := s.repository.GetSession(ctx, current.ID); refreshErr == nil {
-		current = refreshed
-	}
-	return LaunchResult{Session: current, RequestID: requestID, State: accepted.State, Started: true}, nil
-}
-
 func (s *SessionService) markSessionFailed(current session.Session) session.Session {
 	if current.ID == "" {
 		return current
 	}
-	if failed, err := s.repository.UpdateSessionStatus(context.Background(), current.ID, session.StatusFailed); err == nil {
+	if current.Status != session.StatusStarting || current.WorkerPID != 0 || current.WorkerSocket != "" {
+		if refreshed, err := s.repository.GetSession(context.Background(), current.ID); err == nil {
+			return refreshed
+		}
+		return current
+	}
+	after := current.WorkerState()
+	after.Status = session.StatusFailed
+	if failed, _, err := s.repository.CompareAndSwapSessionWorker(context.Background(), current.ID, current.WorkerState(), after, ""); err == nil {
 		return failed
 	}
 	if refreshed, err := s.repository.GetSession(context.Background(), current.ID); err == nil {
@@ -411,76 +450,26 @@ func (s *SessionService) markSessionFailed(current session.Session) session.Sess
 	return current
 }
 
-func BuildInitialPrompt(taskItem task.Task, current session.Session, extra string) string {
-	workingPath := current.WorktreePath
-	if workingPath == "" {
-		workingPath = current.RepoPath
-	}
-	var builder strings.Builder
-	fmt.Fprintf(&builder, "Task %s: %s\n", taskItem.ID, taskItem.Title)
-	if taskItem.Description != "" {
-		fmt.Fprintf(&builder, "Description: %s\n", taskItem.Description)
-	} else {
-		builder.WriteString("Description: (none)\n")
-	}
-	fmt.Fprintf(&builder, "Session: %s\nRole: %s\nRepository: %s\n", current.ID, current.Role, current.RepoPath)
-	if current.WorktreePath != "" {
-		fmt.Fprintf(&builder, "Worktree: %s\n", current.WorktreePath)
-	}
-	if current.Branch != "" {
-		fmt.Fprintf(&builder, "Branch: %s\n", current.Branch)
-	}
-	fmt.Fprintf(&builder, "Work in the repository context at %s. This is one Session under the Task; preserve the Task/Session boundary.\n", workingPath)
-	if strings.TrimSpace(extra) != "" {
-		fmt.Fprintf(&builder, "\nSession-specific instructions:\n%s\n", strings.TrimSpace(extra))
-	}
-	return builder.String()
-}
-
-// BuildInitialDisplayMessage is the clean human-facing USER block for the
-// injected initial turn. The complete ACP prompt still carries IDs and checkout
-// context, but the transcript does not scrape or pretend that transport text
-// was typed by the user.
-func BuildInitialDisplayMessage(taskItem task.Task, current session.Session, extra string) string {
-	var builder strings.Builder
-	fmt.Fprintf(&builder, "Start work on %q as %s.", taskItem.Title, valueOrRole(current.Role))
-	if strings.TrimSpace(taskItem.Description) != "" {
-		fmt.Fprintf(&builder, "\n\n%s", strings.TrimSpace(taskItem.Description))
-	}
-	if strings.TrimSpace(extra) != "" {
-		fmt.Fprintf(&builder, "\n\n%s", strings.TrimSpace(extra))
-	}
-	return builder.String()
-}
-
-func valueOrRole(role string) string {
-	if strings.TrimSpace(role) == "" {
-		return "worker"
-	}
-	return strings.TrimSpace(role)
+// sessionAfterSpawnFailure preserves a terminal state established by the
+// worker or a concurrent lifecycle command. In particular, an orderly Stop can
+// win while Spawn is still completing the private admission handshake; the
+// losing Create call must not rewrite that stopped Session as failed.
+func (s *SessionService) sessionAfterSpawnFailure(created session.Session) session.Session {
+	return s.markSessionFailed(created)
 }
 
 func PermissionMetadata(approveAll bool) (json.RawMessage, error) {
-	return SessionMetadata(approveAll, session.ProviderOptions{})
+	return sessionMetadata(approveAll, false, false)
 }
 
-// SessionMetadata persists transport permission and optional provider controls
-// on the owning Session. Provider controls remain empty when the operator wants
-// the provider's default model or effort.
-func SessionMetadata(approveAll bool, options session.ProviderOptions) (json.RawMessage, error) {
-	if err := options.Validate(); err != nil {
-		return nil, err
-	}
+func sessionMetadata(approveAll, allowShared, createWorktree bool) (json.RawMessage, error) {
 	permission := string(acp.PermissionReadApproval)
 	if approveAll {
 		permission = string(acp.PermissionApproveAll)
 	}
-	metadata := map[string]string{"permission": permission, "acp_transport": acp.RuntimeTransport}
-	if options.Model != "" {
-		metadata[session.MetadataModelKey] = options.Model
-	}
-	if options.ReasoningEffort != "" {
-		metadata[session.MetadataReasoningEffortKey] = options.ReasoningEffort
+	metadata := map[string]any{
+		"permission":            permission,
+		"allow_shared_checkout": allowShared, "create_worktree": createWorktree,
 	}
 	encoded, err := json.Marshal(metadata)
 	return json.RawMessage(encoded), err
@@ -507,27 +496,86 @@ func (s *SessionService) ListByTask(ctx context.Context, taskID string) ([]sessi
 	return s.repository.ListSessionsByTask(ctx, taskID)
 }
 
+func (s *SessionService) Children(ctx context.Context, parentID string) ([]session.Session, error) {
+	parent, err := s.repository.GetSession(ctx, parentID)
+	if err != nil {
+		return nil, err
+	}
+	items, err := s.repository.ListSessionsByTask(ctx, parent.TaskID)
+	if err != nil {
+		return nil, err
+	}
+	children := make([]session.Session, 0)
+	for _, item := range items {
+		if item.ParentSessionID == parent.ID {
+			children = append(children, item)
+		}
+	}
+	return children, nil
+}
+
+// ConnectChild creates one ordinary child Session beneath a manager and opens
+// its provider Port without sending a prompt. The caller can inspect the
+// provider-advertised controls, configure the Port, and then address the child
+// through the same prompt API used for every other Session.
+func (s *SessionService) ConnectChild(ctx context.Context, parentID string, params StartSessionParams) (ConnectedSession, error) {
+	parent, err := s.repository.GetSession(ctx, parentID)
+	if err != nil {
+		return ConnectedSession{}, err
+	}
+	params.TaskID, params.ParentSessionID = parent.TaskID, parent.ID
+	if params.RepoPath == "" {
+		params.RepoPath, params.WorktreePath, params.Branch = parent.RepoPath, parent.WorktreePath, parent.Branch
+	}
+	return s.ConnectSession(ctx, params)
+}
+
+func (s *SessionService) PromptChild(ctx context.Context, parentID, childID, message string) (worker.Message, error) {
+	child, err := s.requireChild(ctx, parentID, childID)
+	if err != nil {
+		return worker.Message{}, err
+	}
+	return s.Prompt(ctx, child.ID, message)
+}
+
+func (s *SessionService) CancelChild(ctx context.Context, parentID, childID string) error {
+	child, err := s.requireChild(ctx, parentID, childID)
+	if err != nil {
+		return err
+	}
+	return s.Cancel(ctx, child.ID)
+}
+
+func (s *SessionService) requireChild(ctx context.Context, parentID, childID string) (session.Session, error) {
+	child, err := s.repository.GetSession(ctx, childID)
+	if err != nil {
+		return session.Session{}, err
+	}
+	if child.ParentSessionID != parentID {
+		return session.Session{}, fmt.Errorf("Session %s is not a child of manager Session %s", childID, parentID)
+	}
+	return child, nil
+}
+
 func (s *SessionService) Prompt(ctx context.Context, id, message string) (worker.Message, error) {
 	current, err := s.repository.GetSession(ctx, id)
 	if err != nil {
 		return worker.Message{}, err
 	}
-	if current.WorkerSocket == "" {
-		return worker.Message{}, fmt.Errorf("Session %s has no live worker; run 'acpctl session resume %s'", id, id)
+	if err := requireProviderReady(current); err != nil {
+		return worker.Message{}, err
 	}
-	if err := s.requireCurrentWorkerProtocol(ctx, current, "prompt not sent"); err != nil {
-		if errors.Is(err, ErrWorkerUpgradeRequired) {
-			return worker.Message{}, err
-		}
-		return worker.Message{}, fmt.Errorf("Session %s worker capability check failed; prompt not sent: %w", id, err)
+	if current.WorkerSocket == "" {
+		return worker.Message{}, fmt.Errorf("Session %s has no live provider connection; resume it first", id)
+	}
+	if err := s.requireCurrentWorkerProtocol(ctx, current, "send prompt"); err != nil {
+		return worker.Message{}, err
 	}
 	requestID, err := acp.NewRequestID()
 	if err != nil {
 		return worker.Message{}, err
 	}
-	return s.runtime.Send(ctx, current.WorkerSocket, worker.Command{
-		Type: "prompt", RequestID: requestID, Message: message, DisplayMessage: message,
-	})
+	return s.runtime.Send(ctx, current.WorkerSocket, worker.Command{Type: "prompt", RequestID: requestID, Message: message})
 }
 
 func (s *SessionService) Cancel(ctx context.Context, id string) error {
@@ -535,79 +583,94 @@ func (s *SessionService) Cancel(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	if err := requireProviderReady(current); err != nil {
+		return err
+	}
 	if current.WorkerSocket == "" {
-		return fmt.Errorf("Session %s has no live worker", id)
+		return fmt.Errorf("Session %s has no live provider connection", id)
+	}
+	if err := s.requireCurrentWorkerProtocol(ctx, current, "cancel provider turn"); err != nil {
+		return err
 	}
 	_, err = s.runtime.Send(ctx, current.WorkerSocket, worker.Command{Type: "cancel"})
 	return err
 }
 
-// DecidePermission resolves one currently pending ACP permission request using
-// an exact option offered by that provider. The Session worker validates both
-// the request and option and makes concurrent viewer decisions first-wins.
 func (s *SessionService) DecidePermission(ctx context.Context, id, permissionID, optionID string, cancelled bool) error {
 	current, err := s.repository.GetSession(ctx, id)
 	if err != nil {
 		return err
 	}
+	if err := requireProviderReady(current); err != nil {
+		return err
+	}
 	if current.WorkerSocket == "" {
-		return fmt.Errorf("Session %s has no live worker", id)
+		return fmt.Errorf("Session %s has no live provider connection", id)
 	}
-	if strings.TrimSpace(permissionID) == "" {
-		return fmt.Errorf("permission ID is required")
+	if err := s.requireCurrentWorkerProtocol(ctx, current, "respond to provider permission"); err != nil {
+		return err
 	}
-	if !cancelled && strings.TrimSpace(optionID) == "" {
-		return fmt.Errorf("permission option ID is required")
+	if permissionID == "" || (!cancelled && optionID == "") {
+		return fmt.Errorf("permission and offered option IDs are required")
 	}
-	if err := s.requireCurrentWorkerProtocol(ctx, current, "permission not sent"); err != nil {
-		if errors.Is(err, ErrWorkerUpgradeRequired) {
-			return err
-		}
-		return fmt.Errorf("Session %s worker capability check failed; permission not sent: %w", id, err)
-	}
-	_, err = s.runtime.Send(ctx, current.WorkerSocket, worker.Command{
-		Type: "permission_decision", PermissionID: permissionID, OptionID: optionID, Cancelled: cancelled,
-	})
+	_, err = s.runtime.Send(ctx, current.WorkerSocket, worker.Command{Type: "permission_response", PermissionID: permissionID, OptionID: optionID, Cancelled: cancelled})
 	return err
 }
 
-// PendingPermissions returns the worker's current actionable permission state.
-// A stopped Session has no in-memory pending callback, so it returns an empty
-// slice while durable history remains available through History/Follow.
 func (s *SessionService) PendingPermissions(ctx context.Context, id string) ([]worker.PendingPermission, error) {
 	snapshot, err := s.PendingPermissionSnapshot(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	return snapshot.Permissions, nil
+	return snapshot.Permissions, err
 }
 
-// PendingPermissionSnapshot returns permission choices together with a safe,
-// live-negotiated indication of whether this worker can accept a decision.
 func (s *SessionService) PendingPermissionSnapshot(ctx context.Context, id string) (PermissionSnapshot, error) {
 	current, err := s.repository.GetSession(ctx, id)
 	if err != nil {
 		return PermissionSnapshot{}, err
 	}
+	if current.Status == session.StatusStarting {
+		return startingPermissionSnapshot(), nil
+	}
 	if current.WorkerSocket == "" {
 		return PermissionSnapshot{Permissions: []worker.PendingPermission{}}, nil
+	}
+	if err := s.requireCurrentWorkerProtocol(ctx, current, "observe pending provider permissions"); err != nil {
+		var upgrade *WorkerUpgradeRequiredError
+		if errors.As(err, &upgrade) {
+			return PermissionSnapshot{
+				Permissions:    []worker.PendingPermission{},
+				DecisionsReady: false,
+				BlockedCode:    "worker_upgrade_required",
+				BlockedMessage: "The older Session worker must be stopped and resumed before permission decisions are safe.",
+			}, nil
+		}
+		return PermissionSnapshot{}, err
 	}
 	status, err := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{Type: "status"})
 	if err != nil {
 		return PermissionSnapshot{}, err
 	}
-	result := PermissionSnapshot{Permissions: append([]worker.PendingPermission(nil), status.Permissions...)}
-	if err := s.requireCurrentWorkerProtocol(ctx, current, "permission not sent"); err != nil {
-		if errors.Is(err, ErrWorkerUpgradeRequired) {
-			result.BlockedCode = "worker_upgrade_required"
-			result.BlockedMessage = err.Error()
-			return result, nil
-		}
-		result.BlockedCode = "worker_capability_unavailable"
-		result.BlockedMessage = fmt.Sprintf("Session %s worker capability could not be verified; permission controls remain disabled and no decision was sent", id)
-		return result, nil
+	workerStatus := status.Status
+	if workerStatus == "" {
+		// Compatibility for application-runtime test doubles; the v7 worker uses
+		// Status, while State belongs to command responses.
+		workerStatus = status.State
 	}
-	result.DecisionsReady = true
+	result := PermissionSnapshot{
+		Permissions: append([]worker.PendingPermission(nil), status.Permissions...),
+		Sequence:    status.Seq,
+	}
+	switch session.Status(workerStatus) {
+	case session.StatusWaiting, session.StatusWorking:
+		if status.Message == "" {
+			result.DecisionsReady = true
+			break
+		}
+		result.BlockedCode = "session_channel_failed"
+		result.BlockedMessage = "The provider connection is unavailable, so permission decisions are disabled."
+	default:
+		result.BlockedCode = "session_starting"
+		result.BlockedMessage = "The provider connection is still starting, so permission decisions are not available yet."
+	}
 	return result, nil
 }
 
@@ -620,48 +683,125 @@ func (s *SessionService) ResumeWithOptions(ctx context.Context, id string, allow
 	if err != nil {
 		return session.Session{}, err
 	}
-	if current.WorkerSocket != "" {
-		protocolErr := s.requireCurrentWorkerProtocol(ctx, current, "resume not performed")
-		if protocolErr == nil {
-			return current, fmt.Errorf("Session %s worker is already running", id)
-		}
-		if errors.Is(protocolErr, ErrWorkerUpgradeRequired) {
-			return session.Session{}, protocolErr
-		}
-	}
 	lock, err := gitrepo.LockRepository(ctx, s.home.Root, current.RepoPath)
 	if err != nil {
 		return session.Session{}, err
 	}
-	defer gitrepo.UnlockRepository(lock)
-	if err := s.checkCheckout(ctx, session.CreateParams{
-		ID: current.ID, RepoPath: current.RepoPath, WorktreePath: current.WorktreePath,
-	}, false, allowSharedCheckout, current.ID); err != nil {
-		return session.Session{}, err
-	}
-	spawned, err := s.runtime.Spawn(ctx, id)
+	defer func() { _ = gitrepo.UnlockRepository(lock) }()
+	current, err = s.repository.GetSession(ctx, id)
 	if err != nil {
 		return session.Session{}, err
 	}
-	_ = spawned
-	return s.repository.GetSession(ctx, id)
+	if current.WorkerSocket != "" {
+		if err := s.requireCurrentWorkerProtocol(ctx, current, "resume"); err == nil {
+			return current, fmt.Errorf("Session %s worker is already running", id)
+		} else {
+			var upgrade *WorkerUpgradeRequiredError
+			if errors.As(err, &upgrade) {
+				return current, err
+			}
+			if current.Status == session.StatusFailed {
+				return current, fmt.Errorf("Session %s retains quarantined worker ownership because provider teardown was not proven; manual provider-process teardown is required before clearing ownership", id)
+			}
+			return current, fmt.Errorf("Session %s retains unresponsive worker ownership; stale-worker reconciliation will quarantine it, and manual provider-process teardown is required before ownership can be cleared", id)
+		}
+	}
+	if current.WorkerPID != 0 {
+		if current.Status == session.StatusFailed {
+			return current, fmt.Errorf("Session %s retains quarantined worker ownership because provider teardown was not proven; manual provider-process teardown is required before clearing ownership", id)
+		}
+		return current, fmt.Errorf("Session %s retains unresponsive worker ownership; stale-worker reconciliation will quarantine it, and manual provider-process teardown is required before ownership can be cleared", id)
+	}
+	if current.ProviderRef == "" {
+		return current, fmt.Errorf("Session %s has no saved provider reference and cannot be resumed; create a new Session", id)
+	}
+	if err := acp.ValidateProviderRefValue("resume Session", current.ProviderRef); err != nil {
+		return current, err
+	}
+	if !current.CanResume() {
+		if current.Status == session.StatusStarting {
+			return current, &worker.NotReadyError{SessionID: current.ID}
+		}
+		return current, fmt.Errorf("Session %s is %s and is not in an ownerless terminal state that can Resume", id, current.Status)
+	}
+	if !allowSharedCheckout {
+		allowSharedCheckout = metadataBool(current.MetadataJSON, "allow_shared_checkout")
+	}
+	if err := s.checkCheckout(ctx, session.CreateParams{ID: current.ID, RepoPath: current.RepoPath, WorktreePath: current.WorktreePath}, false, allowSharedCheckout, current.ID); err != nil {
+		return session.Session{}, err
+	}
+	starting := current.WorkerState()
+	starting.Status = session.StatusStarting
+	transitioned, swapped, err := s.repository.CompareAndSwapSessionWorker(ctx, id, current.WorkerState(), starting, "")
+	if err != nil {
+		return session.Session{}, err
+	}
+	if !swapped {
+		return transitioned, fmt.Errorf("Session %s lifecycle changed while Resume was starting; retry against its current state", id)
+	}
+	if transitioned.WorkerState() != starting {
+		return transitioned, fmt.Errorf("Session %s lifecycle changed after Resume admission; retry against its current state", id)
+	}
+	current = transitioned
+	spawned, err := s.runtime.Spawn(ctx, id)
+	if err != nil {
+		return s.sessionAfterSpawnFailure(current), err
+	}
+	current.WorkerPID = spawned.PID
+	current.WorkerSocket = spawned.Socket
+	current.Status = session.StatusStarting
+	return current, nil
 }
 
 func (s *SessionService) Stop(ctx context.Context, id string) error {
-	current, err := s.repository.GetSession(ctx, id)
-	if err != nil {
-		return err
-	}
-	if current.WorkerSocket == "" {
-		if current.Status == session.StatusStopped {
-			return nil
+	for {
+		current, err := s.repository.GetSession(ctx, id)
+		if err != nil {
+			return err
 		}
-		return fmt.Errorf("Session %s has no live worker", id)
+		if current.WorkerSocket == "" {
+			if current.WorkerPID != 0 {
+				return fmt.Errorf("Session %s retains unresponsive worker ownership; stale-worker reconciliation will quarantine it, and manual provider-process teardown is required before ownership can be cleared", id)
+			}
+			if current.Status == session.StatusStopped {
+				return nil
+			}
+			stopped := current.WorkerState()
+			stopped.Status = session.StatusStopped
+			_, swapped, err := s.repository.CompareAndSwapSessionWorker(ctx, id, current.WorkerState(), stopped, "")
+			if err != nil {
+				return err
+			}
+			if swapped {
+				return nil
+			}
+			// A worker may have claimed the ownerless starting row between our
+			// read and CAS. Reload and stop that exact owner instead of reporting
+			// success while provider startup continues.
+			continue
+		}
+		if _, err := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{Type: "stop"}); err != nil {
+			refreshed, loadErr := s.repository.GetSession(ctx, id)
+			if loadErr != nil {
+				return loadErr
+			}
+			if refreshed.WorkerState() != current.WorkerState() {
+				if refreshed.WorkerPID == 0 && refreshed.WorkerSocket == "" && refreshed.Status == session.StatusStopped {
+					return nil
+				}
+				continue
+			}
+			if current.Status == session.StatusFailed {
+				return fmt.Errorf("Session %s retains quarantined worker ownership because provider teardown was not proven; manual provider-process teardown is required before clearing ownership", id)
+			}
+			return err
+		}
+		break
 	}
-	if _, err := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{Type: "stop"}); err != nil {
-		return err
-	}
-	deadline := time.Now().Add(3 * time.Second)
+	// Runtime Port teardown is bounded below the worker's shutdown budget; the
+	// service waits one outer budget so a successful Stop never reports timeout
+	// while the worker is still proving provider-process termination.
+	deadline := time.Now().Add(7 * time.Second)
 	for time.Now().Before(deadline) {
 		refreshed, err := s.repository.GetSession(ctx, id)
 		if err != nil {
@@ -675,396 +815,236 @@ func (s *SessionService) Stop(ctx context.Context, id string) error {
 	return fmt.Errorf("Session %s worker did not stop in time", id)
 }
 
-// AttachNative opens the real provider harness for the Session's exact
-// canonical provider conversation. The worker reserves one exclusive native
-// harness so neither a second provider-native process nor an ACP prompt can
-// write concurrently. Attachment itself remains a disposable viewer and never
-// owns a tmux-hosted provider lifecycle.
-func (s *SessionService) AttachNative(ctx context.Context, id string, options NativeAttachOptions) error {
-	explicitOwnerProcess := strings.TrimSpace(options.OwnerToken) != ""
-	current, err := s.repository.GetSession(ctx, id)
-	if err != nil {
-		return err
-	}
-	if options.ErrorOutput == nil {
-		options.ErrorOutput = io.Discard
-	}
-	if options.Output == nil {
-		options.Output = io.Discard
-	}
-	if options.Input == nil {
-		options.Input = strings.NewReader("")
-	}
-	conversationID := strings.TrimSpace(current.ProviderConversationID)
-	if conversationID == "" {
-		return fmt.Errorf("Session %s has no canonical provider conversation ID; native attachment is unavailable and no replacement conversation was started", id)
-	}
-	if current.WorkerSocket == "" {
-		return fmt.Errorf("Session %s has no live worker to coordinate native harness ownership; resume the Session before native attachment", id)
-	}
-	if s.registry == nil {
-		return fmt.Errorf("agent registry is required for provider-native attachment")
-	}
-	profile, err := s.registry.Get(current.Agent)
-	if err != nil {
-		return err
-	}
-	providerOptions, err := session.ParseProviderOptions(current.MetadataJSON)
-	if err != nil {
-		return err
-	}
-	workingDirectory := current.WorktreePath
-	if workingDirectory == "" {
-		workingDirectory = current.RepoPath
-	}
-	if options.Verifier == nil {
-		options.Verifier = native.StoreVerifier{}
-	}
-	if _, err := options.Verifier.Verify(ctx, profile, conversationID, workingDirectory); err != nil {
-		return fmt.Errorf("Session %s native attachment: %w", id, err)
-	}
-	verifiedAt := time.Now().UTC()
-	current, err = s.repository.UpdateSessionConversation(ctx, current.ID, conversationID, session.ConversationSourceProviderStore, &verifiedAt)
-	if err != nil {
-		return err
-	}
-	invocation, err := native.BuildResume(profile, conversationID, workingDirectory, native.ProviderOptions{
-		Model: providerOptions.Model, ReasoningEffort: providerOptions.ReasoningEffort,
-	})
-	if err != nil {
-		return fmt.Errorf("Session %s native attachment: %w", id, err)
-	}
-	ownerToken, err := native.OwnerToken(s.home.Root, current.ID)
-	if err != nil {
-		return err
-	}
-	if options.OwnerToken != "" && options.OwnerToken != ownerToken {
-		return fmt.Errorf("Session %s native owner token does not match this Agent Task Console state root", id)
-	}
-	options.OwnerToken = ownerToken
-	if err := s.requireExclusiveNativeWorker(ctx, current); err != nil {
-		return err
-	}
-	if options.Runner == nil {
-		if strings.TrimSpace(s.executable) != "" {
-			options.Runner = &native.TmuxRunner{
-				Executable: s.executable, ConsoleSessionID: current.ID, StateRoot: s.home.Root, OwnerToken: ownerToken,
-			}
-		} else {
-			options.Runner = &native.ExecRunner{}
-		}
-	} else if runner, ok := options.Runner.(*native.TmuxRunner); ok {
-		if runner.OwnerToken != "" && runner.OwnerToken != ownerToken {
-			return fmt.Errorf("Session %s native runner owner token does not match", id)
-		}
-		runner.OwnerToken = ownerToken
-	}
-	ownerRole := worker.NativeOwnerRoleDirect
-	reservationRunner, usesReservation := options.Runner.(native.ReservationRunner)
-	if usesReservation && !explicitOwnerProcess {
-		ownerRole = worker.NativeOwnerRoleReservation
-	} else if explicitOwnerProcess {
-		ownerRole = worker.NativeOwnerRoleProvider
-	}
-	acquired, err := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{
-		Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: ownerRole,
-		NativeGeneration: options.ReservationGeneration,
-	})
-	if err != nil {
-		action := "reserve"
-		if ownerRole == worker.NativeOwnerRoleProvider {
-			action = "activate"
-			if options.ReservationGeneration != "" {
-				if cleanupErr := s.releaseRejectedNativeActivationReservation(current, ownerToken, options.ReservationGeneration); cleanupErr != nil {
-					return fmt.Errorf("Session %s native attachment could not activate its native harness: %w; exact reservation cleanup was not safe: %v", id, err, cleanupErr)
-				}
-			}
-		}
-		return fmt.Errorf("Session %s native attachment could not %s its native harness: %w", id, action, err)
-	}
-	if acquired.Type != "native_acquired" {
-		return fmt.Errorf("Session %s native attachment received unexpected worker response %q", id, acquired.Type)
-	}
-	validAcquisition := false
-	switch ownerRole {
-	case worker.NativeOwnerRoleReservation:
-		validAcquisition = acquired.State == "reserved" || acquired.State == "already_reserved" || acquired.State == "already_acquired"
-	case worker.NativeOwnerRoleProvider:
-		validAcquisition = acquired.State == "activated"
-	case worker.NativeOwnerRoleDirect:
-		validAcquisition = acquired.State == "acquired" || acquired.State == "already_acquired"
-	}
-	if !validAcquisition {
-		return fmt.Errorf("Session %s native attachment received unsafe acquisition state %q for role %q; preserving ownership and refusing to start a provider process", id, acquired.State, ownerRole)
-	}
-	if acquired.NativeGeneration == "" {
-		return fmt.Errorf("Session %s native attachment received no ownership generation; preserving ownership and refusing to start a provider process", id)
-	}
-	if options.ReservationGeneration != "" && acquired.NativeGeneration != options.ReservationGeneration {
-		return fmt.Errorf("Session %s native ownership generation changed; preserving ownership and refusing a stale provider process", id)
-	}
-	options.ReservationGeneration = acquired.NativeGeneration
-	preexistingOuterOwnership := (acquired.State == "already_reserved" || acquired.State == "already_acquired") && !explicitOwnerProcess
-	ownershipAware, ownershipAwareOK := options.Runner.(native.PreexistingOwnershipAwareRunner)
-	if preexistingOuterOwnership && !ownershipAwareOK {
-		return fmt.Errorf("Session %s already has native ownership, but this outer viewer cannot prove attach-only behavior; preserving ownership and refusing to start a second provider process", id)
-	}
-	if ownershipAwareOK {
-		if stateAware, ok := options.Runner.(native.PreexistingOwnershipStateAwareRunner); ok {
-			phase := ""
-			switch acquired.State {
-			case "already_reserved":
-				phase = native.PreexistingOwnershipReserved
-			case "already_acquired":
-				phase = native.PreexistingOwnershipActive
-			}
-			stateAware.SetPreexistingOwnershipState(phase)
-		} else {
-			ownershipAware.SetPreexistingOwnership(preexistingOuterOwnership)
-		}
-	}
-	if usesReservation && acquired.State == "reserved" {
-		reservationRunner.SetReservationGeneration(acquired.NativeGeneration)
-		reservationRunner.SetReservationActivator(func(activateContext context.Context) error {
-			activated, activateErr := s.runtime.Send(activateContext, current.WorkerSocket, worker.Command{
-				Type: "native_acquire", OwnerToken: ownerToken, NativeOwnerRole: worker.NativeOwnerRoleProvider,
-				NativeGeneration: acquired.NativeGeneration,
-			})
-			if activateErr != nil {
-				return activateErr
-			}
-			if activated.Type != "native_acquired" || activated.State != "activated" {
-				return fmt.Errorf("unexpected reservation activation response %q/%q; refusing to start a duplicate provider process", activated.Type, activated.State)
-			}
-			return nil
-		})
-	} else if usesReservation {
-		reservationRunner.SetReservationGeneration(acquired.NativeGeneration)
-	}
-	runErr := options.Runner.Run(ctx, invocation, options.Input, options.Output, options.ErrorOutput)
-	mayContinue := false
-	if aware, ok := options.Runner.(native.MayContinueRunner); ok {
-		mayContinue = aware.ProcessMayContinue()
-	}
-	activityOccurred := true
-	if aware, ok := options.Runner.(native.ActivityAwareRunner); ok {
-		activityOccurred = aware.NativeActivityOccurred()
-	}
-	// An outer viewer that receives an existing generation did not create its
-	// ownership and must never release it after its own attach failure. The
-	// private _native process supplies both the stable token and exact generation;
-	// it is the lifecycle owner and releases after the provider process exits.
-	shouldRelease := acquired.State == "acquired" || acquired.State == "reserved" || explicitOwnerProcess
-	if !mayContinue && shouldRelease {
-		releaseErr := s.releaseNativeOwnership(current, ownerToken, acquired.NativeGeneration, activityOccurred, options.ErrorOutput)
-		if releaseErr != nil && runErr == nil {
-			return releaseErr
-		}
-		if releaseErr != nil {
-			return fmt.Errorf("native harness for Session %s: %v; additionally failed to release native harness ownership: %w", id, runErr, releaseErr)
-		}
-	}
-	if runErr != nil {
-		return fmt.Errorf("native harness for Session %s: %w", id, runErr)
+func requireProviderReady(current session.Session) error {
+	if current.Status == session.StatusStarting {
+		return &worker.NotReadyError{SessionID: current.ID}
 	}
 	return nil
 }
 
-// RecoverNativeReservation clears only an outer tmux reservation that never
-// became an active provider owner. The exact stable tmux harness must first be
-// proven absent; an active marker remains fail-closed even when tmux is gone.
-func (s *SessionService) RecoverNativeReservation(ctx context.Context, id string, options NativeReservationRecoveryOptions) (NativeReservationRecoveryResult, error) {
-	current, err := s.repository.GetSession(ctx, id)
-	if err != nil {
-		return NativeReservationRecoveryResult{}, err
-	}
-	if current.WorkerSocket == "" {
-		return NativeReservationRecoveryResult{}, fmt.Errorf("Session %s has no live worker; resume it before native reservation recovery", id)
-	}
-	if err := s.requireCurrentWorkerProtocol(ctx, current, "native reservation not recovered"); err != nil {
-		return NativeReservationRecoveryResult{}, err
-	}
-	ownerToken, err := native.OwnerToken(s.home.Root, current.ID)
-	if err != nil {
-		return NativeReservationRecoveryResult{}, err
-	}
-	reservation, err := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{
-		Type: "native_reservation_status", OwnerToken: ownerToken,
-	})
-	if err != nil && strings.Contains(err.Error(), "owner token") &&
-		(strings.Contains(err.Error(), "does not match") || strings.Contains(err.Error(), "mismatch")) {
-		// Committed protocol-v2 reservations used exclusive ownership but a
-		// versioned token. Inspect that exact legacy token only for orphaned
-		// reservation recovery; active legacy ownership remains fail-closed and
-		// releasable solely by its exact lifecycle owner.
-		legacyOwnerToken, tokenErr := native.LegacyExclusiveOwnerTokenV2(s.home.Root, current.ID)
-		if tokenErr != nil {
-			return NativeReservationRecoveryResult{}, tokenErr
-		}
-		legacyReservation, legacyErr := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{
-			Type: "native_reservation_status", OwnerToken: legacyOwnerToken,
-		})
-		if legacyErr == nil {
-			ownerToken = legacyOwnerToken
-			reservation = legacyReservation
-			err = nil
-		}
-	}
-	if err != nil {
-		return NativeReservationRecoveryResult{}, fmt.Errorf("Session %s native reservation recovery refused: %w", id, err)
-	}
-	if reservation.Type != "native_reservation_status" {
-		return NativeReservationRecoveryResult{}, fmt.Errorf("Session %s native reservation recovery received unexpected worker response %q", id, reservation.Type)
-	}
-	switch reservation.State {
-	case "reserved":
-		if reservation.NativeGeneration == "" {
-			return NativeReservationRecoveryResult{}, fmt.Errorf("Session %s native reservation has no generation; recovery is unsafe and remains blocked", id)
-		}
-	case "active":
-		return NativeReservationRecoveryResult{}, fmt.Errorf("Session %s has active provider-native ownership. Missing tmux Session %s does not prove provider exit; native recovery is refused to avoid starting a second provider process", id, native.TmuxSessionName(id))
-	case "released":
-		return NativeReservationRecoveryResult{}, fmt.Errorf("Session %s has no orphaned native reservation to recover", id)
-	default:
-		return NativeReservationRecoveryResult{}, fmt.Errorf("Session %s native reservation recovery received unknown ownership phase %q", id, reservation.State)
-	}
-	verifier := options.Verifier
-	if verifier == nil {
-		verifier = native.TmuxReservationRecoveryVerifier{}
-	}
-	if err := verifier.VerifyReservationAbsent(ctx, current.ID); err != nil {
-		return NativeReservationRecoveryResult{}, err
-	}
-	recovered, err := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{
-		Type: "native_recover_reservation", OwnerToken: ownerToken, NativeGeneration: reservation.NativeGeneration,
-	})
-	if err != nil {
-		return NativeReservationRecoveryResult{}, fmt.Errorf("Session %s native reservation recovery refused: %w", id, err)
-	}
-	if recovered.Type != "native_reservation_recovered" {
-		return NativeReservationRecoveryResult{}, fmt.Errorf("Session %s native reservation recovery received unexpected worker response %q", id, recovered.Type)
-	}
-	switch recovered.State {
-	case "released", "already_released", "refresh_scheduled":
-		return NativeReservationRecoveryResult{State: recovered.State}, nil
-	default:
-		return NativeReservationRecoveryResult{}, fmt.Errorf("Session %s native reservation recovery received unknown state %q", id, recovered.State)
+func startingPermissionSnapshot() PermissionSnapshot {
+	return PermissionSnapshot{
+		Permissions:    []worker.PendingPermission{},
+		DecisionsReady: false,
+		BlockedCode:    "session_starting",
+		BlockedMessage: "The provider connection is still starting, so permission decisions are not available yet.",
 	}
 }
 
 func (s *SessionService) requireCurrentWorkerProtocol(ctx context.Context, current session.Session, operation string) error {
-	response, err := s.runtime.Send(ctx, current.WorkerSocket, worker.Command{Type: "ping"})
+	return s.requireCurrentWorkerProtocolAt(ctx, current, current.WorkerSocket, operation)
+}
+
+func (s *SessionService) requireCurrentWorkerProtocolAt(ctx context.Context, current session.Session, socket, operation string) error {
+	response, err := s.runtime.Send(ctx, socket, worker.Command{Type: "ping", SessionID: current.ID})
 	if err != nil {
 		return err
 	}
-	if response.Type == "pong" && response.ProtocolVersion >= worker.ProtocolVersion && workerHasCapability(response, worker.CapabilityExclusiveNativeOwner) {
+	if response.Type == "pong" && response.SessionID == current.ID && response.ProtocolVersion >= worker.ProtocolVersion && workerHasCapability(response, worker.CapabilitySessionChannel) {
 		return nil
 	}
-	return &WorkerUpgradeRequiredError{SessionID: current.ID, Operation: operation, ProtocolVersion: response.ProtocolVersion}
-}
-
-func (s *SessionService) requireExclusiveNativeWorker(ctx context.Context, current session.Session) error {
-	err := s.requireCurrentWorkerProtocol(ctx, current, "native not started")
-	if err == nil || errors.Is(err, ErrWorkerUpgradeRequired) {
-		return err
-	}
-	return fmt.Errorf("Session %s worker capability check failed; native not started: %w", current.ID, err)
+	return &WorkerUpgradeRequiredError{SessionID: current.ID, Operation: operation, ProtocolVersion: response.ProtocolVersion, RequiredCapability: worker.CapabilitySessionChannel}
 }
 
 func workerHasCapability(response worker.Message, capability string) bool {
-	for _, candidate := range response.Capabilities {
-		if candidate == capability {
+	for _, current := range response.Capabilities {
+		if current == capability {
 			return true
 		}
 	}
 	return false
 }
 
-func (s *SessionService) releaseNativeOwnership(current session.Session, ownerToken, generation string, activity bool, notices io.Writer) error {
-	releaseContext, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	message, err := s.runtime.Send(releaseContext, current.WorkerSocket, worker.Command{
-		Type: "native_release", OwnerToken: ownerToken, NativeGeneration: generation, NativeActivity: activity,
-	})
-	if err != nil {
-		return fmt.Errorf("release native provider ownership: %w", err)
+func metadataBool(encoded json.RawMessage, key string) bool {
+	var metadata map[string]any
+	if json.Unmarshal(encoded, &metadata) != nil {
+		return false
 	}
-	if message.Type != "native_released" {
-		return fmt.Errorf("unexpected worker response %q while releasing native provider ownership", message.Type)
+	switch value := metadata[key].(type) {
+	case bool:
+		return value
+	case string:
+		return strings.EqualFold(strings.TrimSpace(value), "true")
+	default:
+		return false
 	}
-	if activity {
-		fmt.Fprintln(notices, "Agent Task Console: native process exited; provider transcript reload requested. ACP prompts remain available.")
-	}
-	return nil
 }
 
-func (s *SessionService) releaseRejectedNativeActivationReservation(current session.Session, ownerToken, generation string) error {
-	probeContext, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	status, err := s.runtime.Send(probeContext, current.WorkerSocket, worker.Command{
-		Type: "native_reservation_status", OwnerToken: ownerToken,
-	})
-	if err != nil {
-		return fmt.Errorf("verify rejected native activation reservation: %w", err)
-	}
-	if status.Type != "native_reservation_status" || status.State != "reserved" || status.NativeGeneration != generation {
-		return fmt.Errorf("the exact native reservation is no longer proven reserved; ownership was preserved")
-	}
-	return s.releaseNativeOwnership(current, ownerToken, generation, false, io.Discard)
-}
-
-func (s *SessionService) History(ctx context.Context, id string, cursor uint64) ([]sessionlog.Line, error) {
-	current, err := s.repository.GetSession(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	return sessionlog.ReadFile(s.logPath(current), cursor)
-}
-
-// Replay streams durable history without materializing a long-lived Session's
-// entire JSONL file. It returns the last position delivered so a transport can
-// hand off to Follow without a gap.
 func (s *SessionService) Replay(ctx context.Context, id string, cursor uint64, consume func(sessionlog.Line) error) (uint64, error) {
+	if consume == nil {
+		return cursor, fmt.Errorf("Session replay consumer is required")
+	}
 	current, err := s.repository.GetSession(ctx, id)
 	if err != nil {
 		return cursor, err
 	}
-	return sessionlog.WalkFile(ctx, s.logPath(current), cursor, 0, func(line sessionlog.Line) error {
-		if err := ctx.Err(); err != nil {
-			return err
+	available, err := s.replayPathAvailable(current, cursor)
+	if err != nil || !available {
+		return cursor, err
+	}
+	path := s.logPath(current)
+	reader := sessionlog.NewReplayCursor(path, cursor, 0)
+	defer reader.Close()
+	delivered := cursor
+	for {
+		line, ok, err := reader.Next(ctx)
+		if err != nil {
+			return delivered, err
 		}
-		return consume(line)
-	})
+		if !ok {
+			unread, unreadErr := reader.HasUnreadBytes()
+			if unreadErr != nil {
+				return delivered, unreadErr
+			}
+			if unread && !s.sessionReplayWriterLive(ctx, current) {
+				if err := reader.SetStrictEOF(true); err != nil {
+					return delivered, err
+				}
+				continue
+			}
+			return delivered, nil
+		}
+		if err := consume(line); err != nil {
+			return delivered, err
+		}
+		delivered = line.Seq
+	}
+}
+
+// FreshReplayCursor returns the bounded initial viewer window without reading
+// provider history or materializing the retained channel. An explicit saved
+// nonzero cursor bypasses this policy and resumes exactly.
+func (s *SessionService) FreshReplayCursor(ctx context.Context, id string, maxRecords int) (uint64, bool, error) {
+	if maxRecords <= 0 {
+		return 0, false, fmt.Errorf("tail replay record limit must be positive")
+	}
+	current, err := s.repository.GetSession(ctx, id)
+	if err != nil {
+		return 0, false, err
+	}
+	available, err := s.replayPathAvailable(current, 0)
+	if err != nil || !available {
+		return 0, false, err
+	}
+	return sessionlog.TailCursor(s.logPath(current), maxRecords)
 }
 
 func (s *SessionService) Follow(ctx context.Context, id string, cursor uint64, consume func(sessionlog.Line) error) error {
-	current, err := s.repository.GetSession(ctx, id)
-	if err != nil {
-		return err
-	}
-	if current.WorkerSocket == "" {
-		lines, err := sessionlog.ReadFile(s.logPath(current), cursor)
+	delivered := cursor
+	for {
+		current, err := s.repository.GetSession(ctx, id)
 		if err != nil {
 			return err
 		}
-		for _, line := range lines {
-			if err := consume(line); err != nil {
-				return err
+		available, replayErr := s.replayPathAvailable(current, delivered)
+		if replayErr != nil {
+			return replayErr
+		}
+		if !available {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(25 * time.Millisecond):
 			}
+			continue
 		}
-		return nil
+		if current.WorkerSocket == "" {
+			_, err := sessionlog.WalkFile(ctx, s.logPath(current), delivered, 0, func(line sessionlog.Line) error {
+				if err := consume(line); err != nil {
+					return err
+				}
+				delivered = line.Seq
+				return nil
+			})
+			return err
+		}
+		socket := current.WorkerSocket
+		var consumerErr error
+		protocolErr := s.requireCurrentWorkerProtocolAt(ctx, current, socket, "follow Session Channel")
+		var upgrade *WorkerUpgradeRequiredError
+		if errors.As(protocolErr, &upgrade) {
+			return protocolErr
+		}
+		if protocolErr != nil {
+			err = protocolErr
+		} else {
+			err = s.runtime.Subscribe(ctx, socket, delivered, func(message worker.Message) error {
+				if message.Type != "line" || message.Seq <= delivered {
+					return nil
+				}
+				line := sessionlog.Line{Seq: message.Seq, Timestamp: message.Timestamp, RequestID: message.RequestID, Type: message.LineType, Data: message.Data}
+				if consumeErr := consume(line); consumeErr != nil {
+					consumerErr = consumeErr
+					return consumeErr
+				}
+				delivered = message.Seq
+				return nil
+			})
+		}
+		if consumerErr != nil {
+			return consumerErr
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		// A live subscription may end just before worker teardown clears its
+		// socket from SQLite (or because the bounded hub shed a slow viewer).
+		// Replay the suffix first so a terminal startup frame is never lost in
+		// that ownership window. Replay uses a live-safe cursor: a concurrent
+		// writer's unterminated syscall suffix is withheld until ownership ends,
+		// rather than being misreported as durable corruption.
+		replayed, replayErr := s.Replay(ctx, id, delivered, consume)
+		delivered = replayed
+		if replayErr != nil {
+			return replayErr
+		}
+		refreshed, refreshErr := s.repository.GetSession(ctx, id)
+		if refreshErr != nil {
+			return refreshErr
+		}
+		if refreshed.WorkerSocket == "" || refreshed.WorkerSocket != socket || err == nil {
+			// Ownership changed after the live subscription boundary. Continue
+			// from the last applied sequence so terminal startup frames are
+			// replayed without gaps or duplicates.
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(25 * time.Millisecond):
+			}
+			continue
+		}
+		// A still-responsive worker returning a classified stream error is a
+		// protocol failure rather than a teardown race; surface it instead of
+		// retrying forever. If ping also fails, let the worker row settle and
+		// retry from the last durable cursor.
+		pingContext, cancelPing := context.WithTimeout(ctx, 250*time.Millisecond)
+		pingErr := s.requireCurrentWorkerProtocolAt(pingContext, current, socket, "verify Session Channel after stream failure")
+		cancelPing()
+		if pingErr == nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
 	}
-	return s.runtime.Subscribe(ctx, current.WorkerSocket, cursor, func(message worker.Message) error {
-		if message.Type != "line" {
-			return nil
-		}
-		return consume(sessionlog.Line{Seq: message.Seq, Timestamp: message.Timestamp, RequestID: message.RequestID, Type: message.LineType, Data: message.Data})
-	})
+}
+
+func (s *SessionService) replayPathAvailable(current session.Session, cursor uint64) (bool, error) {
+	_, err := os.Stat(s.logPath(current))
+	if err == nil {
+		return true, nil
+	}
+	if !os.IsNotExist(err) {
+		return false, fmt.Errorf("stat Session Channel replay: %w", err)
+	}
+	if cursor == 0 && current.Status == session.StatusStarting && current.WorkerPID == 0 && current.WorkerSocket == "" {
+		return false, nil
+	}
+	return false, &ReplayUnavailableError{}
 }
 
 func (s *SessionService) logPath(current session.Session) string {
-	if current.LogPath != "" {
-		return current.LogPath
-	}
-	return filepath.Join(s.home.Logs, current.ID+".jsonl")
+	return sessionlog.ChannelPath(s.home.Logs, current.ID)
 }

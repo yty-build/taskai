@@ -333,32 +333,31 @@ func TestRepositoryLockHonorsContextAndReleases(t *testing.T) {
 	}
 }
 
-func TestCaptureReviewSnapshotIncludesBranchStatusAndDiffs(t *testing.T) {
+func TestRepositoryLockUsesCommonDirectoryAcrossLinkedWorktrees(t *testing.T) {
+	ctx := context.Background()
+	stateRoot := t.TempDir()
 	repository := initializeRepository(t)
-	if err := os.WriteFile(filepath.Join(repository, "README.md"), []byte("changed\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(repository, "staged.txt"), []byte("staged evidence\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	gitOutput(t, repository, "add", "staged.txt")
-	if err := os.WriteFile(filepath.Join(repository, "untracked.txt"), []byte("untracked evidence\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	snapshot, err := CaptureReviewSnapshot(context.Background(), repository)
+	linked := filepath.Join(t.TempDir(), "linked")
+	gitOutput(t, repository, "worktree", "add", "-b", "linked-lock-test", linked, "HEAD")
+
+	mainLock, err := LockRepository(ctx, stateRoot, repository)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.Branch != "main" || snapshot.Truncated {
-		t.Fatalf("snapshot metadata = %#v", snapshot)
+	waitContext, cancel := context.WithTimeout(ctx, 80*time.Millisecond)
+	defer cancel()
+	if _, err := LockRepository(waitContext, stateRoot, linked); err == nil || !strings.Contains(err.Error(), "context deadline exceeded") {
+		t.Fatalf("linked worktree bypassed main repository lock: %v", err)
 	}
-	for _, expected := range []string{"README.md", "staged.txt", "untracked.txt"} {
-		if !strings.Contains(snapshot.Status, expected) {
-			t.Errorf("status missing %q: %s", expected, snapshot.Status)
-		}
+	if err := UnlockRepository(mainLock); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(snapshot.StagedDiff, "staged evidence") || !strings.Contains(snapshot.UnstagedDiff, "-fixture") || !strings.Contains(snapshot.UnstagedDiff, "+changed") {
-		t.Fatalf("snapshot diffs = staged %q, unstaged %q", snapshot.StagedDiff, snapshot.UnstagedDiff)
+	linkedLock, err := LockRepository(ctx, stateRoot, linked)
+	if err != nil {
+		t.Fatalf("linked worktree lock after release: %v", err)
+	}
+	if err := UnlockRepository(linkedLock); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -1,422 +1,305 @@
-# Local API and SSE contract
+# Local API and Session Channel contract
 
-`acpctl serve` exposes a versioned Task/Session API for the local web UI and future clients. It is a transport over the same application services as the CLI and terminal console.
+`acpctl serve` exposes the same Task and Session services used by CLI and the structured terminal.
 
 ## Boundary
 
-- Default base URL: `http://127.0.0.1:8080`
+- Default URL: `http://127.0.0.1:8080`
 - Health: `GET /healthz`
 - API root: `/api/v1`
-- JSON request bodies: UTF-8, one object, maximum 1 MiB, unknown fields rejected
-- Timestamps: UTC RFC 3339 with fractional precision when present
-- Streams: `text/event-stream`
+- JSON bodies: UTF-8 object, at most 1 MiB, unknown fields rejected
+- Times: UTC RFC 3339
+- Current stream transport: Server-Sent Events
 
-V1 accepts only explicit loopback listen IPs and rejects wildcard, hostname, and public binding requests. The web handler also rejects non-loopback Host headers and cross-origin mutations.
+V1 accepts explicit loopback IPs only. It rejects wildcard, hostname, and public binds. Mutations require a loopback Host and same-origin browser request.
 
-This is not an authenticated public service. See [OPERATIONS.md](OPERATIONS.md#public-service-boundary).
+HTTP commands plus the SSE stream form one logical bidirectional Session Channel. A future WebSocket may carry the same command and frame envelopes; it is not required for V1.
 
 ## DTOs
 
-Task:
+### Task
 
 ```json
 {
-  "id": "T-…",
+  "id": "T-123",
   "title": "Fix login regression",
   "description": "Reproduce and repair",
   "status": "working",
   "external_ref": "APP-91",
   "metadata": {"priority": "high"},
   "session_count": 2,
-  "created_at": "2026-08-14T20:00:00Z",
-  "updated_at": "2026-08-14T20:02:00Z"
+  "created_at": "2026-08-25T20:00:00Z",
+  "updated_at": "2026-08-25T20:02:00Z"
 }
 ```
 
-Session:
+### Session
 
 ```json
 {
-  "id": "S-…",
-  "task_id": "T-…",
-  "role": "implementer",
+  "id": "S-123",
+  "task_id": "T-123",
+  "parent_session_id": "S-manager",
+  "role": "worker",
   "agent": "codex",
   "provider": "openai",
   "repo_path": "/work/product",
-  "worktree_path": "/home/me/.agent/worktrees/T-…-S-…",
-  "branch": "agent/T-…/S-…",
+  "worktree_path": "/private/state/worktrees/T-123-S-123",
+  "branch": "agent/T-123/S-123",
   "status": "waiting",
   "permission": "read-approval",
   "worker_running": true,
-  "conversation_ready": true,
-  "conversation_verified": true,
-  "conversation_verified_at": "2026-08-14T20:01:30Z",
-  "created_at": "2026-08-14T20:00:00Z",
-  "updated_at": "2026-08-14T20:02:00Z",
-  "last_activity_at": "2026-08-14T20:02:00Z"
+  "resumable": false,
+  "created_at": "2026-08-25T20:00:00Z",
+  "updated_at": "2026-08-25T20:02:00Z",
+  "last_activity_at": "2026-08-25T20:02:00Z"
 }
 ```
 
-Activity:
+`resumable` is true only when an exact provider reference exists and no worker ownership remains. The API never exposes that reference, PID, socket, log path, raw metadata representation, credentials, or environment.
+
+### Channel frame
 
 ```json
 {
-  "session_id": "S-…",
-  "position": 17,
-  "request_id": "REQ-…",
-  "kind": "acp",
-  "timestamp": "2026-08-14T20:02:00Z",
-  "activity": "Run tests · completed",
-  "display": {
-    "type": "tool_upsert",
-    "tool": {
-      "id": "opaque-display-key",
-      "title": "Run tests",
-      "kind": "execute",
-      "status": "completed",
-      "detail": "PASS",
-      "detail_label": "result"
-    }
-  },
-  "cursor": "opaque-task-cursor-only"
+  "session_id": "S-123",
+  "seq": 42,
+  "request_id": "REQ-9",
+  "timestamp": "2026-08-25T20:02:01Z",
+  "type": "provider_event",
+  "data": {"type":"text_delta","text":"Checking the repository now."}
 }
 ```
 
-`activity` is a short, backward-compatible sanitized summary. `display` is an optional semantic delta for structured clients. Its `type` is one of `user_message`, `legacy_user_message`, `assistant_chunk`, `thought_chunk`, `tool_upsert`, `plan_replace`, `permission`, `error_upsert`, or `turn_state`. Clients merge deltas by request ID and monotonic position; tool IDs and assistant message IDs are opaque display-grouping keys, not provider identifiers.
+The complete journal frame type vocabulary is:
 
-Conversation projection:
+- `connection`
+- `client_command`
+- `provider_event`
+- `provider_result`
+- `permission_requested`
+- `permission_resolved`
+- `permission_abandoned`
+- `worker_error`
 
-```json
-{
-  "source": "provider-store",
-  "checkpoint": "opaque-provider-generation",
-  "gateway_cursor": 17,
-  "turns": [
-    {
-      "key": "opaque-presentation-key",
-      "committed": true,
-      "surface": "native",
-      "activities": []
-    },
-    {
-      "key": "REQ-…",
-      "committed": false,
-      "surface": "acp",
-      "activities": []
-    }
-  ],
-  "diagnostics": [],
-  "truncated": false
-}
-```
+For `provider_event`, `data` is the normalized runtime event object verbatim. This includes unknown runtime event types and fields; the outer frame remains `provider_event`. Clients must retain or render unknown event objects safely instead of inventing a new outer frame type.
 
-`source: "provider-store"` means the committed base came from the exact
-canonical provider conversation after identity and checkout verification:
-provider JSONL for Codex, Claude, and Grok, or provider SQLite for OpenCode.
-`source: "gateway-log"` is an explicit fallback and includes a safe `warning`;
-it never claims that gateway JSONL is the provider's committed transcript.
-`committed: false` identifies a provisional ACP turn that has not yet matched a
-provider-store commit. `checkpoint`, turn `key`, and activity IDs are opaque
-presentation/reconnect values, not new domain entities or provider IDs.
-Turn `surface` is transient presentation attribution: `acp` is backed by a
-gateway invocation, `native` is a provider-store turn with no gateway match
-only when matched ACP turns on both sides and complete gateway history prove
-that distinction, and `unknown` is used for leading, trailing, repeated,
-ambiguous, or bounded history that cannot support a safe attribution.
+The public envelope fields are `session_id`, `seq`, optional `request_id`, `timestamp`, `type`, and `data`. Frames do not claim that output is committed/provisional or came from an ACP/native surface.
 
-The service reads one bounded provider snapshot, joins gateway activity through
-the returned `gateway_cursor`, and returns the result as one bounded object. If
-provider history is unavailable on initial load, the same endpoint returns a
-bounded gateway-history projection with `source: "gateway-log"` and a warning.
-Clients fetch it before opening the Session stream after `gateway_cursor`. A
-successful post-turn or post-native reconciliation produces a replacement
-projection that clients publish atomically; it does not require a page clear or
-provider-file access.
+### Configuration options
 
-The projection is deliberately bounded. Each provider-store transcript record,
-including reasoning, is at most 128 KiB; gateway assistant text is at most
-128 KiB and gateway thought text at most 32 KiB. Tool detail is at most 64 KiB,
-plan text 128 KiB/128 entries, and preview text 2 KiB/three lines. The browser
-applies its own 32 KiB per-turn reasoning bound when reducing either source.
-Tool output uses an allowlist of normalized text/diff/terminal fields. Paths
-become basenames; commands, queries, URLs, raw input/output objects, arbitrary
-metadata, provider/worker error detail, and structured credential/environment
-fields are omitted. Allowlisted text, diffs, and terminal output are content
-rather than a secret-scanning boundary and may contain sensitive repository or
-tool-produced values. `truncated: true` reports that provider history or the
-gateway overlay/fallback was omitted or clipped by the shared-service bounds;
-activity-level `truncated` flags identify clipped display records where one is
-still present. Truncation does not change the provider/gateway source role.
-
-For `permission_requested`, Activity may additionally include a sanitized actionable permission object:
+`GET /api/v1/sessions/{id}/provider-options` makes an observational read from the currently connected Port. Its `provider_options` object has this shape:
 
 ```json
 {
-  "permission": {
-    "id": "permission-…:tool-…",
-    "request_id": "REQ-…",
-    "title": "Write marker",
-    "kind": "edit",
-    "state": "waiting",
-    "options": [
-      {"id":"allow-once","name":"Allow once","kind":"allow_once"},
-      {"id":"reject-once","name":"Reject","kind":"reject_once"}
+  "model": {
+    "supported": true,
+    "current_value": "opaque-current",
+    "choices": [
+      {"value": "opaque-provider-value", "label": "Provider label"}
     ]
+  },
+  "reasoning_effort": {
+    "supported": false,
+    "unavailable_reason": "not_advertised",
+    "choices": []
   }
 }
 ```
 
-Only safe labels and the exact permission/option IDs needed to decide are exposed. Raw tool input, provider environment/auth, provider/worker errors, ACP wire data, and worker paths remain private.
-
-The three `conversation_*` fields expose only safe continuity state. Database/runtime-only values remain intentionally absent: worker PID, Unix socket, JSONL path, metadata JSON storage representation, the canonical provider conversation ID, acpx record ID, ACP Session ID, native adapter ID, and raw ACP data.
+Catalog text is printable, sanitized, and bounded. Values are exact opaque provider values. Clients never supply a hard-coded list. Blank in a configuration field means leave that live control unchanged; on a fresh Port its current value is the provider default.
 
 ## Routes
 
 | Method | Path | Result |
 | --- | --- | --- |
-| `GET` | `/healthz` | `{status:"ok", api_version:"v1"}` |
-| `GET` | `/api/v1/tasks` | Task DTO list |
-| `POST` | `/api/v1/tasks` | Create Task |
-| `GET` | `/api/v1/tasks/{id}` | Task DTO plus child Session DTOs |
-| `GET` | `/api/v1/tasks/{id}/sessions` | Child Session DTO list |
-| `POST` | `/api/v1/tasks/{id}/sessions` | Start Session and initial request |
-| `GET` | `/api/v1/tasks/{id}/stream` | Aggregate Task SSE |
-| `GET` | `/api/v1/sessions/{id}` | Session DTO |
-| `GET` | `/api/v1/sessions/{id}/conversation` | Bounded committed provider snapshot + gateway overlay and cursor |
-| `POST` | `/api/v1/sessions/{id}/prompt` | Submit ACP prompt; return request ID and lifecycle state |
-| `GET` | `/api/v1/sessions/{id}/permissions` | Current actionable permission list |
-| `POST` | `/api/v1/sessions/{id}/permissions/decision` | Select an exact offered option |
-| `POST` | `/api/v1/sessions/{id}/cancel` | Request active-turn cancellation |
-| `POST` | `/api/v1/sessions/{id}/resume` | Resume worker |
-| `POST` | `/api/v1/sessions/{id}/stop` | Stop worker |
-| `POST` | `/api/v1/sessions/{id}/review` | Create independent reviewer Session |
-| `GET` | `/api/v1/sessions/{id}/stream` | Session SSE |
+| `GET` | `/healthz` | local health |
+| `GET` | `/api/v1/tasks` | Task list |
+| `POST` | `/api/v1/tasks` | create Task |
+| `GET` | `/api/v1/tasks/{id}` | Task plus child Sessions |
+| `GET` | `/api/v1/tasks/{id}/sessions` | Session list |
+| `POST` | `/api/v1/tasks/{id}/sessions` | create Session; return when channel is attachable |
+| `GET` | `/api/v1/tasks/{id}/stream` | aggregate child frame stream |
+| `GET` | `/api/v1/sessions/{id}` | Session metadata/runtime state |
+| `GET` | `/api/v1/sessions/{id}/stream` | ordered Session frames |
+| `GET` | `/api/v1/sessions/{id}/provider-options` | live provider-advertised controls |
+| `POST` | `/api/v1/sessions/{id}/config` | set advertised provider config |
+| `POST` | `/api/v1/sessions/{id}/prompt` | submit one prompt |
+| `GET` | `/api/v1/sessions/{id}/permissions` | current actionable permissions plus atomic channel-sequence watermark |
+| `POST` | `/api/v1/sessions/{id}/permissions/response` | choose an exact option |
+| `POST` | `/api/v1/sessions/{id}/cancel` | cancel active turn |
+| `POST` | `/api/v1/sessions/{id}/resume` | start worker; begin exact Port Resume behind channel |
+| `POST` | `/api/v1/sessions/{id}/stop` | stop worker, retain Session |
+| `GET` | `/api/v1/sessions/{id}/children` | direct child Sessions |
+| `POST` | `/api/v1/sessions/{id}/children` | create child under same Task |
+| `POST` | `/api/v1/sessions/{id}/children/{child}/prompt` | address one exact child |
+| `POST` | `/api/v1/sessions/{id}/children/{child}/cancel` | cancel one exact child |
+
+The child routes are human/operator-facing API controls. They create or address ordinary Sessions after same-Task validation; they are not tools injected into the parent provider. V1 has no child wait endpoint and does not route child output or a synthesized result into the parent Session.
+
+There is no merged conversation, provider-history, prepare, launch, provider-options reconnect, native attach, or special review endpoint.
+
+The permissions response contains `permissions`, `sequence`, `decisions_ready`, `blocked_code`, and `blocked_message`. For a live current worker, `sequence` is the journal high-water captured atomically with its permission callbacks. A viewer applies the list only after its Session stream reaches that sequence and rejects a snapshot older than an already-applied permission frame or snapshot. Sequence zero is readiness-only for an offline/incompatible worker and never authoritatively retires durable permission cards.
 
 ## Requests
 
-Create Task:
+### Create Task
 
-```bash
-curl -sS http://127.0.0.1:8080/api/v1/tasks \
-  -H 'Content-Type: application/json' \
-  -d '{"title":"Fix login","description":"Reproduce and repair","external_ref":"APP-91","metadata":{"priority":"high"}}'
+```json
+{
+  "title": "Fix login regression",
+  "description": "Reproduce and repair",
+  "external_ref": "APP-91",
+  "metadata": {"priority": "high"}
+}
 ```
 
-Start Session:
+### Create Session
 
 ```json
 {
   "agent": "codex",
-  "role": "implementer",
-  "model": "gpt-5.6-sol",
-  "reasoning_effort": "high",
+  "role": "worker",
+  "parent_session_id": "S-manager",
   "repo_path": "/absolute/path/to/repo",
-  "prompt": "Run the complete test suite",
   "worktree": true,
   "approve_all": false,
   "allow_shared_checkout": false
 }
 ```
 
-The `201` response contains `session`, `request_id`, and worker queue `state`.
-`model` and `reasoning_effort` are optional, bounded provider values. Blank or
-omitted fields mean Provider default. Explicit values are immutable Session
-metadata, returned as `requested_model` and `requested_reasoning_effort`; these
-names describe requested controls and do not claim an inferred effective value.
-The same optional request fields are accepted when creating a reviewer Session.
+Creation never submits a user turn and does not accept `prompt`, `model`, or `reasoning_effort` fields. It persists the Session, starts its worker, and returns `201` as soon as the Session Channel is addressable. The top-level response contains only the complete `session` DTO, whose status is `starting`; it does not contain `provider_options`.
 
-Supported explicit controls for the pinned adapters are:
+The worker has already journaled `connection` with `data.state == "connecting"`, so the client can attach `/stream` immediately. The client waits for `connection.data.state == "connected"`, reads provider options, optionally configures, and sends a separate prompt command.
 
-| Agent | Model | Reasoning effort |
-| --- | --- | --- |
-| Codex | yes, provider-advertised | yes, provider-advertised |
-| Claude | yes, provider-advertised | yes; leave blank for Claude's default sentinel |
-| OpenCode | yes, provider-advertised | no |
-| Grok / Grok Build | no; Provider default only | no; Provider default only |
-| Gemini / custom profiles | no declared native-parity contract | no declared native-parity contract |
+If provider startup fails after creation returns, the same Session emits failure frames and becomes failed. A client must inspect that resource rather than blindly create another.
 
-Unsupported combinations fail validation before a Session is created. Values
-that require ACP advertisement are checked after the exact provider identity is
-persisted but before the initial prompt. If that post-identity configuration
-fails, the API still returns `201` with the failed `session` and a bounded
-`warning` (`session_start_failed`) so clients open that saved resource instead
-of accidentally creating a duplicate. Provider/bridge detail remains redacted.
-A Session that did start but encountered a later Task-status write error uses
-`session_started_with_warning` instead.
+`parent_session_id`, when supplied, must name a Session in the URL Task and must not introduce a cycle.
 
-Repository selection is explicit. If `repo_path` names a non-repository folder
-with exactly one immediate Git checkout, the API does not start a Session or
-silently retarget it. It returns `422` with
-`code: "repository_selection_required"` and the canonical
-`suggested_repo_path`; the client may offer that path for a deliberate second
-submission. Folders with no checkout, multiple checkouts, or more than the
-bounded discovery limit require an exact repository path. The gateway never
-initializes the supplied directory.
+Repository selection is exact. If one immediate child repository can be suggested, the server returns a typed `repository_selection_required` error with the canonical suggestion and performs no mutation.
 
-Prompt:
-
-```bash
-curl -sS http://127.0.0.1:8080/api/v1/sessions/S-…/prompt \
-  -H 'Content-Type: application/json' \
-  -d '{"message":"Check the one-hour case"}'
-```
-
-Successful submission is `202 Accepted` with a new `request_id` and `state`. If
-another ACP turn is active, the worker keeps this request in its ACP-to-ACP FIFO
-because the public runtime supports one active turn per Session; the API does
-not inject it into that active turn. If an exclusive provider-native owner or
-pre-launch reservation exists, submission fails with `409` before a request is
-journaled or queued; the client must exit the provider normally, wait for exact
-release, and retry. At the head of the ACP FIFO, every accepted request first
-refreshes the idle adapter on the exact persisted ACP Session, falling back to
-exact Resume, even when no managed native marker is present. Successful
-continuity emits correlated `acp_rehydrated` before `turn_started`; failure
-sends no prompt.
-
-Permission decision:
-
-```json
-{"permission_id":"permission-…:tool-…","option_id":"allow-once","cancelled":false}
-```
-
-The permission-list response also reports whether the live worker can safely
-accept a browser decision:
+### Configure
 
 ```json
 {
-  "permissions": [],
-  "decisions_ready": false,
-  "blocked_code": "worker_upgrade_required",
-  "blocked_message": "safe recovery instructions"
+  "model": "opaque-provider-value",
+  "reasoning_effort": "high"
 }
 ```
 
-When `decisions_ready` is false, clients must keep every pending request visible
-but disable its decision controls. `blocked_message` is a sanitized local-user
-recovery message; the decision has not been sent to the provider.
+Each nonblank field must exactly match a currently advertised opaque value. A blank field leaves that live control unchanged. Configuration is synchronous: `200` is returned only after the worker applies the selection. The response contains the `session` and refreshed observational `provider_options`. Failure is returned as an HTTP error; no `config_changed` journal frame is emitted. Selections are not Session metadata and are not reapplied by the gateway. After Resume, the provider's advertised current values are authoritative.
 
-IDs are opaque and must come from the current permission list or stream event. The worker revalidates Session, active request, permission, and offered option; concurrent callers receive one accepted decision and a `409` conflict for later attempts. Detaching or closing the client leaves an undecided permission pending.
-
-Cancel and stop require an empty request body. Resume accepts an empty body or:
+### Prompt
 
 ```json
-{"allow_shared_checkout": true}
+{"message":"Check the one-hour case"}
 ```
 
-Prompt, permission decision, and Resume against an already-live worker first
-negotiate worker protocol v3 and `exclusive-native-owner-v2`. The capability
-proves generation-scoped duplicate-native protection and cross-surface writer
-exclusion. A responsive incompatible worker returns `409` with error code
-`worker_upgrade_required`; the requested provider write is not sent and Resume
-does not spawn a replacement worker. Read endpoints, conversation/history and
-SSE, permission listing, Cancel, and Stop remain available for safe migration.
-Run the exact `acpctl session stop <session-id>` and
-`acpctl session resume <session-id>`
-commands carried in the sanitized error.
+An accepted prompt returns `202` with its `request_id`. The stream carries a `client_command` record with the exact submitted text, immediate `provider_event` records, and one terminal `provider_result`.
 
-Review:
-
-```json
-{"agent": "claude", "allow_active_producer": false}
-```
-
-The safe default rejects a producer whose worker/check-out may still change.
-
-## Session stream
-
-Connect from the beginning:
-
-```bash
-curl -N http://127.0.0.1:8080/api/v1/sessions/S-…/stream
-```
-
-Example event:
-
-```text
-id: 17
-event: activity
-data: {"session_id":"S-…","position":17,"request_id":"REQ-…","kind":"acp","timestamp":"…","activity":"…"}
-```
-
-Reconnect after position 17 with either mechanism:
-
-```bash
-curl -N -H 'Last-Event-ID: 17' http://127.0.0.1:8080/api/v1/sessions/S-…/stream
-curl -N 'http://127.0.0.1:8080/api/v1/sessions/S-…/stream?cursor=17'
-```
-
-If both are supplied they must agree. Positions are monotonically increasing within the Session. `request_id` correlates output with prompt submission.
-
-Browser EventSource clients that need a one-time resume point may use `?seed=17`. The seed applies only when `Last-Event-ID` is absent; after the first response, automatic reconnect uses the browser's advancing `Last-Event-ID`. Do not combine `seed` with `cursor`.
-
-After the connection's stored replay, the Session stream emits an unnumbered `event: ready` with `data: {}`. Activity received after that marker belongs to the live side of this connection; clients may use the boundary to suppress assistive announcements during history hydration. Every reconnect receives its own marker, and the marker does not advance the activity cursor.
-
-For a stopped Session, the server sends all gateway journal records after the
-cursor, emits `ready`, and closes. For an active Session, records appended after
-the replay snapshot are delivered after `ready` through the worker subscription
-without a cursor gap. This stream-append meaning is distinct from a turn being
-committed in the provider-owned conversation store.
-
-## Task stream
-
-Task activity has no synthetic global row or Event entity. It merges each child
-Session's durable gateway journal as an operational attention feed. It is not
-the committed conversation projection. Its SSE `id` is an opaque URL-safe
-cursor representing the last delivered position for each Session:
-
-```text
-id: eyJTLTEiOjE3LCJTLTIiOjl9
-event: activity
-data: {"session_id":"S-2","position":9,"request_id":"REQ-…","kind":"acp","timestamp":"…","activity":"…","cursor":"eyJ…"}
-```
-
-Pass the opaque value unchanged in `Last-Event-ID` or `?cursor=`. Do not decode or construct it. A reconnect replays only records not acknowledged for their owning Session. Newly created Sessions are discovered while the Task stream remains connected.
-
-Task cursor limits protect the local HTTP process from unbounded headers. Malformed, oversized, concatenated, or conflicting cursors receive `400`. If the Task's own Session set cannot fit a valid bounded cursor, opening its aggregate stream fails closed with `422 stream_limit`; individual Session streams remain available.
-
-## Errors
-
-Errors use a stable envelope:
+If another turn is active, the server returns `409`:
 
 ```json
 {
   "error": {
-    "code": "validation_failed",
-    "message": "Task title is required"
+    "code": "session_busy",
+    "message": "This Session already has an active turn. Wait, cancel it, or retry later."
   }
 }
 ```
 
-Common statuses:
+The rejected prompt is not queued and is not recorded as accepted.
 
-| Status | Meaning |
-| --- | --- |
-| `400` | malformed JSON/body/cursor |
-| `404` | Task or Session not found |
-| `409` | worker upgrade required, checkout, active-producer, permission race, native/ACP writer ownership, or lifecycle conflict |
-| `422` | valid JSON with invalid domain/profile/repository input, including an explicit nested-repository selection request |
-| `502` | worker operation failed; internal socket detail is suppressed |
-| `500` | internal storage/server failure with sanitized message |
+### Permission response
+
+```json
+{
+  "permission_id": "opaque-permission-id",
+  "option_id": "opaque-option-id",
+  "cancelled": false
+}
+```
+
+The worker validates Session, active request, permission, and exact offered option. Concurrent responses accept the first valid decision and return conflict for later attempts.
+
+### Cancel, stop, and resume
+
+Cancel and stop require an empty request body. Cancel targets the active turn. Stop is a lifecycle operation: it ends the worker and closes that worker's Port. The Session is resumable only if a provider identity was established and teardown cleared worker ownership; otherwise its DTO says `resumable: false`. There is no separate close command or HTTP close endpoint.
+
+Resume accepts an empty object or an explicit shared-checkout override. It starts one worker and invokes exact provider Resume once. It never starts a replacement conversation when the saved reference cannot resume.
+
+Create and Resume use the same immediate-attach startup contract: the worker socket and stream are available first, the response Session is `starting` and contains no provider options, and one provider Start or exact Resume proceeds behind the channel. Provider startup is bounded to 30 seconds. Stop remains available during `starting`; it cancels startup, closes the worker, and leaves the Session stopped.
+
+Until the stream reports `connection.data.state == "connected"`, these provider-dependent operations return HTTP `409` with `error.code == "session_starting"`: provider-options, configure, prompt, cancel, and permission response. They do not reach the provider and are not queued or journaled as accepted. Metadata/status, stream subscription and replay, current permission observation, and Stop remain available.
+
+## Session stream
+
+Connect before sending a prompt:
+
+```bash
+curl -N http://127.0.0.1:8080/api/v1/sessions/S-123/stream
+```
+
+Example:
+
+```text
+id: 42
+event: frame
+data: {"session_id":"S-123","seq":42,"request_id":"REQ-9","timestamp":"2026-08-25T20:02:01Z","type":"provider_event","data":{"type":"text_delta","text":"Checking now."}}
+```
+
+Reconnect after sequence 42 using one mechanism:
+
+```bash
+curl -N -H 'Last-Event-ID: 42' http://127.0.0.1:8080/api/v1/sessions/S-123/stream
+curl -N 'http://127.0.0.1:8080/api/v1/sessions/S-123/stream?cursor=42'
+```
+
+If both are supplied, they must agree. A fresh stream (no cursor, or caller-supplied numeric cursor `0`) establishes a live boundary and replays at most the last 256 retained frames before releasing later frames in order. Its transport-only `ready` event contains `cursor`, `earliest_sequence`, and `clipped`; `clipped: true` explicitly means older channel audit is outside this viewer window. The event also sets its SSE ID to the effective replay boundary. At boundary zero that ID is the opaque reconnect-only token `exact:0`, allowing EventSource to disconnect after `ready` but before frame one and still resume exactly; clients should retain and return the ID rather than reinterpret it as a numeric cursor. A nonzero `Last-Event-ID` or `cursor` resumes exactly from that saved sequence. Full audit export uses the streaming CLI log command rather than an unbounded browser replay.
+
+If the requested sequence is older than retention, the server reports the earliest available sequence. It does not load provider history as a fallback.
+
+If a persisted owned or terminal Session has lost its channel journal, the stream ends with `channel_error.code == "replay_unavailable"`, `reset_cursor: false`, and bounded Resume guidance. Clearing the cursor cannot recreate missing gateway audit; Resume must establish a new live channel, and earlier audit remains unavailable.
+
+Once the Session or Task resource and supplied cursor have validated, any failure while computing the initial replay window is returned on the SSE connection as a bounded terminal `channel_error`, even when it occurs before `ready`. Clients must close that connection and display the bounded message; they must not expect the response to change back to a JSON action-error body.
+
+## Task stream
+
+Task activity is a computed merge of child Session frames. Its cursor is an opaque encoding of independent per-Session positions plus a Task-membership boundary. On a fresh request, each Session present at that boundary selects the bounded 256-frame tail policy. On resume, every explicitly present child position is exact, including zero (the boundary immediately before sequence one). A current child absent from a server-issued saved cursor was created after its membership boundary and therefore also resumes at exact zero; this remains lossless even when the saved cursor came from an empty Task and the new child accumulated more than one fresh replay window while disconnected. Before frames, the transport-only `ready` event sets its SSE ID and returns the same effective opaque `cursor` plus a `sessions` map whose entries contain `cursor`, `earliest_sequence`, and `clipped`. If one saved child cursor is invalid, `channel_error` identifies that `session_id` and sets `reset_cursor: true`; reconnect without the old aggregate cursor to establish fresh bounded windows.
+
+A Session created after the Task stream's initial boundary is read from sequence one, so its activity is not silently clipped before a replay-window notice. The stream discovers such Sessions and remains bounded. It is not a global Event stream entity.
+
+## Optional WebSocket
+
+A later WebSocket endpoint may use:
+
+```text
+/api/v1/sessions/{id}/connect
+```
+
+Client messages carry `prompt`, `cancel`, `permission_response`, and `configure`; server messages carry the same mechanical journal frames. Stop remains a lifecycle action. Adding WebSocket transport must not change services, persistence, Port ownership, or replay semantics.
+
+## Errors
+
+Errors use:
+
+```json
+{"error":{"code":"stable_code","message":"safe actionable text"}}
+```
+
+Expected codes include `not_found`, `invalid_request`, `repository_selection_required`, `checkout_conflict`, `validation_failed`, `session_starting`, `session_busy`, `session_conflict`, `worker_upgrade_required`, `provider_setup_unavailable`, `replay_unavailable`, `session_operation_failed`, `stream_limit`, `stream_unsupported`, `origin_forbidden`, and `internal_error`. A persisted Session may also be returned with a bounded startup warning rather than being hidden behind an error-only response.
+
+Provider errors, paths, environment, credentials, commands derived from raw tool input, sockets, log paths, and provider references are not copied into browser errors.
 
 ## Client rules
 
-- Treat IDs and Task cursor tokens as opaque strings.
-- Persist the last successfully processed SSE `id`, not merely the last received bytes.
-- Deduplicate activities by `(session_id, position)`.
-- Hydrate structured conversation from `/conversation`, then follow the Session
-  stream after its returned `gateway_cursor`. Treat the provider-store snapshot
-  as committed and unmatched gateway-JSONL/ACP deltas as provisional. Clients
-  do not open provider files or perform ACP Resume themselves.
-- Publish a refreshed bounded conversation projection atomically while
-  preserving local scroll/focus/draft/selection/disclosure state. Never clear
-  the visible transcript while fetching it.
-- Display `source`, `warning`, delayed-refresh/fallback state, and `committed` honestly;
-  never promote gateway fallback to canonical provider history.
-- Route Task-scoped input only after a user/client selects a Session.
-- Treat a native-owner/reservation `409` as a rejected ACP submission, not a
-  queued request; show exit-and-retry guidance and do not synthesize an
-  optimistic turn.
-- A disconnected prompt client must reconnect using its cursor to receive completed correlated output.
-- Do not infer permission from noninteractive use; set `approve_all` explicitly.
-- Never invent a permission option ID; display only the exact current `options`, distinguish persistent `*_always` choices, and handle `409` as another viewer winning the race.
-- Do not present the local API as an authenticated remote endpoint.
+- Attach stream before prompt.
+- Treat `connection.data.state == "connecting"` as an observable startup state. Wait for `connected` before provider-options, configure, prompt, cancel, or permission response; do not spin-retry `session_starting`.
+- Treat Session ID and sequence as the only replay identity.
+- Do not invent provider history from frames.
+- Render unknown `provider_event.data` objects safely.
+- Do not retry a busy prompt automatically.
+- Do not retry an ambiguous failed submission without first inspecting stream state.
+- Keep permission cards actionable across viewer reconnect.
+- Use the synchronous configure response or a fresh observational provider-options read for the connected Port's current values. Session metadata does not carry requested or effective model/effort state.
+- Do not present the loopback API as a public authenticated service.
