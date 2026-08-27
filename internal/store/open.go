@@ -28,12 +28,24 @@ const (
 const (
 	stateDirectoryMode os.FileMode = 0o700
 	stateFileMode      os.FileMode = 0o600
+
+	databaseJournalFilename = DatabaseFilename + "-journal"
+	databaseWALFilename     = DatabaseFilename + "-wal"
+	databaseSHMFilename     = DatabaseFilename + "-shm"
 )
+
+var sqliteStateFilenames = [...]string{
+	DatabaseFilename,
+	databaseJournalFilename,
+	databaseWALFilename,
+	databaseSHMFilename,
+}
 
 // Store persists only Task, Session, and non-secret provider Settings metadata.
 type Store struct {
 	mu       sync.RWMutex
 	db       *sql.DB
+	root     *stateRoot
 	stateDir string
 	dbPath   string
 	closed   bool
@@ -51,25 +63,38 @@ func Open(ctx context.Context, stateDir string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve state directory: %w", err)
 	}
-	if err := ensureStateDirectory(absDir); err != nil {
+	root, err := openStateRoot(absDir)
+	if err != nil {
 		return nil, err
 	}
-	dbPath := filepath.Join(absDir, DatabaseFilename)
-	if err := ensureDatabaseFile(dbPath); err != nil {
-		return nil, err
+	rootOnlyCleanup := func(cause error) (*Store, error) {
+		unregisterErr := root.unregisterVFS()
+		closeErr := root.Close()
+		return nil, errors.Join(cause, unregisterErr, closeErr)
+	}
+	if err := root.prepareSQLiteFiles(); err != nil {
+		return rootOnlyCleanup(err)
+	}
+	vfsName, err := root.registerVFS()
+	if err != nil {
+		return rootOnlyCleanup(err)
 	}
 
-	dsn := databaseDSN(dbPath)
+	dbPath := filepath.Join(absDir, DatabaseFilename)
+	dsn := databaseDSNWithVFS(DatabaseFilename, vfsName)
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
-		return nil, fmt.Errorf("open metadata database: %w", err)
+		return rootOnlyCleanup(fmt.Errorf("open metadata database: %w", err))
 	}
 	db.SetMaxOpenConns(8)
 	db.SetMaxIdleConns(4)
-	opened := &Store{db: db, stateDir: absDir, dbPath: dbPath}
+	opened := &Store{db: db, root: root, stateDir: absDir, dbPath: dbPath}
 	cleanup := func(cause error) (*Store, error) {
 		closeErr := db.Close()
-		return nil, errors.Join(cause, closeErr)
+		permissionErr := root.secureFiles()
+		unregisterErr := root.unregisterVFS()
+		rootCloseErr := root.Close()
+		return nil, errors.Join(cause, closeErr, permissionErr, unregisterErr, rootCloseErr)
 	}
 
 	if err := db.PingContext(ctx); err != nil {
@@ -118,7 +143,9 @@ func (store *Store) Close() error {
 	store.closed = true
 	closeErr := store.db.Close()
 	permissionErr := store.secureFilesUnlocked()
-	return errors.Join(closeErr, permissionErr)
+	unregisterErr := store.root.unregisterVFS()
+	rootCloseErr := store.root.Close()
+	return errors.Join(closeErr, permissionErr, unregisterErr, rootCloseErr)
 }
 
 // UserVersion returns SQLite PRAGMA user_version through a cancellable query.
@@ -136,9 +163,21 @@ func (store *Store) UserVersion(ctx context.Context) (int, error) {
 }
 
 func databaseDSN(path string) string {
-	value := &url.URL{Scheme: "file", Path: filepath.ToSlash(path)}
+	return databaseDSNWithVFS(path, "")
+}
+
+func databaseDSNWithVFS(path, vfsName string) string {
+	value := &url.URL{Scheme: "file"}
+	if filepath.IsAbs(path) {
+		value.Path = filepath.ToSlash(path)
+	} else {
+		value.Opaque = filepath.ToSlash(path)
+	}
 	query := url.Values{}
 	query.Set("_txlock", "immediate")
+	if vfsName != "" {
+		query.Set("vfs", vfsName)
+	}
 	query["_pragma"] = []string{
 		"busy_timeout(" + strconv.FormatInt(BusyTimeout.Milliseconds(), 10) + ")",
 		"foreign_keys(1)",
@@ -148,42 +187,6 @@ func databaseDSN(path string) string {
 	return value.String()
 }
 
-func ensureStateDirectory(path string) error {
-	if info, err := os.Lstat(path); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-			return fmt.Errorf("%w: state directory is not a real directory", ErrUnsafeStatePath)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("inspect state directory: %w", err)
-	} else if err := os.MkdirAll(path, stateDirectoryMode); err != nil {
-		return fmt.Errorf("create state directory: %w", err)
-	}
-	if err := os.Chmod(path, stateDirectoryMode); err != nil {
-		return fmt.Errorf("secure state directory: %w", err)
-	}
-	return nil
-}
-
-// ensureDatabaseFile rejects an observed symlink/non-file. Descriptor-relative
-// no-follow traversal that closes the remaining Lstat/Open race is deferred to
-// the coordinated M09 filesystem-hardening packet.
-func ensureDatabaseFile(path string) error {
-	if info, err := os.Lstat(path); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-			return fmt.Errorf("%w: database is not a regular file", ErrUnsafeStatePath)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("inspect metadata database: %w", err)
-	}
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, stateFileMode)
-	if err != nil {
-		return fmt.Errorf("create metadata database: %w", err)
-	}
-	closeErr := file.Close()
-	chmodErr := os.Chmod(path, stateFileMode)
-	return errors.Join(closeErr, chmodErr)
-}
-
 func (store *Store) secureFiles() error {
 	store.mu.RLock()
 	defer store.mu.RUnlock()
@@ -191,25 +194,7 @@ func (store *Store) secureFiles() error {
 }
 
 func (store *Store) secureFilesUnlocked() error {
-	if err := os.Chmod(store.stateDir, stateDirectoryMode); err != nil {
-		return fmt.Errorf("secure state directory: %w", err)
-	}
-	for _, path := range []string{store.dbPath, store.dbPath + "-wal", store.dbPath + "-shm"} {
-		info, err := os.Lstat(path)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return fmt.Errorf("inspect state file: %w", err)
-		}
-		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-			return fmt.Errorf("%w: %s is not a regular file", ErrUnsafeStatePath, filepath.Base(path))
-		}
-		if err := os.Chmod(path, stateFileMode); err != nil {
-			return fmt.Errorf("secure %s: %w", filepath.Base(path), err)
-		}
-	}
-	return nil
+	return store.root.secureFiles()
 }
 
 func (store *Store) afterWrite(ctx context.Context, err error) error {
