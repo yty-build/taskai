@@ -182,6 +182,9 @@ func TestAddManagerFiltersAndRoutesToSettings(t *testing.T) {
 	if strings.Contains(view, "Disabled Manager") || strings.Contains(view, "Worker") {
 		t.Fatalf("unavailable provider offered in Add Manager:\n%s", view)
 	}
+	if !strings.Contains(view, "Subordinate-only providers are delegated by the Manager") {
+		t.Fatalf("Add Manager did not explain subordinate-only providers:\n%s", view)
+	}
 	updateKey(model, "tab")
 	model.Update(tea.PasteMsg{Content: "  exact manager label  "})
 	runCmd(t, model, updateKey(model, "enter"))
@@ -203,6 +206,9 @@ func TestAddManagerFiltersAndRoutesToSettings(t *testing.T) {
 	updateKey(model2, "a")
 	if !strings.Contains(model2.View().Content, "No enabled Manager-capable provider") {
 		t.Fatalf("missing unavailable route:\n%s", model2.View().Content)
+	}
+	if !strings.Contains(model2.View().Content, "Subordinate-only providers cannot start a top-level Session") {
+		t.Fatalf("missing subordinate-only explanation:\n%s", model2.View().Content)
 	}
 	updateKey(model2, "enter")
 	if model2.screen != screenSettings {

@@ -106,8 +106,9 @@ func newProductionProviders(projectCWD string) (productionProviders, error) {
 	if err := registry.Register(gemini); err != nil {
 		return productionProviders{}, runtime.ErrUnsupported
 	}
+	grokAuth := pinnedProviderAuth{kind: pinnedAuthGrok}
 	grok := connector.GrokProfile(
-		connector.GrokConformance().Exact, nil, nil, connector.ReplayBinding{},
+		connector.GrokConformance().Exact, grokAuth, nil, connector.ReplayBinding{},
 	)
 	if err := registry.Register(grok); err != nil {
 		return productionProviders{}, runtime.ErrUnsupported

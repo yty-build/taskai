@@ -17,9 +17,9 @@ Capabilities fail closed unless the compiled connector, native Session boundary,
 | Codex | Yes | Yes | Yes | Yes, through exact App Server `thread/read` | Settings |
 | Claude Code | No | Yes | Yes | Conditional on an exact safe native root and project scope | Settings |
 | Gemini CLI | No | No | No | No | No |
-| Grok Build | No | No | No | No | No |
+| Grok Build | No | No | No | No | Settings (`grok models` recheck) |
 
-Gemini 0.25 includes a timestamp in its native record key that ACP does not return, and Grok 1.0.5's exact workspace-key derivation is not proven. TaskAI does not enumerate provider history or guess either mapping. Claude scoped capabilities also fail closed for a non-BMP project path, and Claude Replay remains unavailable when its configured native root is absent or unsafe.
+Gemini 0.25 includes a timestamp in its native record key that ACP does not return, and Grok 1.0.5's exact workspace-key derivation is not proven. TaskAI does not enumerate provider history or guess either mapping. Grok authentication and its output-discarded `grok models` recheck are available independently of those ACP capability claims. Claude scoped capabilities also fail closed for a non-BMP project path, and Claude Replay remains unavailable when its configured native root is absent or unsafe. Claude is intentionally absent from Add Manager: its pinned ACP connector exposes subordinate Sessions, but no conforming non-MCP carrier for TaskAI's required `taskai_delegate` Manager capability.
 
 ## Build and inspect
 

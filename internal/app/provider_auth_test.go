@@ -76,20 +76,44 @@ func (runner *pinnedAuthRunnerFake) Run(
 }
 
 func TestPinnedAuthenticationUsesExactLiteralVectorAndCurrentStreams(t *testing.T) {
-	runner := &pinnedAuthRunnerFake{}
-	auth := pinnedProviderAuth{kind: pinnedAuthClaude, authRunner: runner}
-	in := bytes.NewBufferString("provider input")
-	var output bytes.Buffer
-	streams := connector.AuthIO{In: in, Out: &output, Err: &output}
-	if err := auth.Authenticate(t.Context(), streams); err != nil {
-		t.Fatal(err)
+	for _, test := range []struct {
+		name string
+		kind pinnedAuthKind
+		exe  string
+		args []string
+	}{
+		{name: "Claude", kind: pinnedAuthClaude, exe: "claude", args: []string{"auth", "login"}},
+		{name: "Grok", kind: pinnedAuthGrok, exe: "grok", args: []string{"login"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &pinnedAuthRunnerFake{}
+			auth := pinnedProviderAuth{kind: test.kind, authRunner: runner}
+			in := bytes.NewBufferString("provider input")
+			var output bytes.Buffer
+			streams := connector.AuthIO{In: in, Out: &output, Err: &output}
+			if err := auth.Authenticate(t.Context(), streams); err != nil {
+				t.Fatal(err)
+			}
+			if runner.calls != 1 || runner.spec.Executable != test.exe ||
+				!reflect.DeepEqual(runner.spec.Args, test.args) || runner.spec.Dir != "" {
+				t.Fatalf("authentication vector = %#v", runner.spec)
+			}
+			if runner.stdin != in || runner.stdout != &output || runner.stderr != &output {
+				t.Fatalf("authentication streams were not passed through exactly")
+			}
+		})
 	}
-	if runner.calls != 1 || runner.spec.Executable != "claude" ||
-		!reflect.DeepEqual(runner.spec.Args, []string{"auth", "login"}) || runner.spec.Dir != "" {
-		t.Fatalf("authentication vector = %#v", runner.spec)
+}
+
+func TestPinnedGrokProbeUsesExactLiteralVector(t *testing.T) {
+	runner := &pinnedStatusRunnerFake{}
+	auth := pinnedProviderAuth{kind: pinnedAuthGrok, status: runner}
+	if got := auth.Probe(t.Context()); got != connector.AuthConnected {
+		t.Fatalf("Probe = %q, want %q", got, connector.AuthConnected)
 	}
-	if runner.stdin != in || runner.stdout != &output || runner.stderr != &output {
-		t.Fatalf("authentication streams were not passed through exactly")
+	if len(runner.calls) != 1 || runner.calls[0].Executable != "grok" ||
+		!reflect.DeepEqual(runner.calls[0].Args, []string{"models"}) || runner.calls[0].Dir != "" {
+		t.Fatalf("probe vector = %#v", runner.calls)
 	}
 }
 

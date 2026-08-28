@@ -82,6 +82,16 @@ func TestProductionProvidersUseLiteralPinnedCommandsAndTruthfulCapabilities(t *t
 			t.Fatalf("%s did not fail closed: %#v", id, profile)
 		}
 	}
+	grok, err := bundle.registry.Profile("grok-build")
+	if err != nil {
+		t.Fatal(err)
+	}
+	grokAuth, ok := grok.Auth.(pinnedProviderAuth)
+	if !ok || grokAuth.probeCommand().Executable != "grok" ||
+		!reflect.DeepEqual(grokAuth.probeCommand().Args, []string{"models"}) ||
+		!reflect.DeepEqual(grokAuth.authenticationCommand().Args, []string{"login"}) {
+		t.Fatalf("Grok auth = %#v", grok.Auth)
+	}
 
 	wantCatalog := map[string][]string{
 		"codex":       {"codex", "app-server"},

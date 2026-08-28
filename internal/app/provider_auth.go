@@ -15,6 +15,7 @@ type pinnedAuthKind uint8
 const (
 	pinnedAuthCodex pinnedAuthKind = iota + 1
 	pinnedAuthClaude
+	pinnedAuthGrok
 )
 
 var errPinnedAuthCommandMissing = errors.New("pinned provider auth command missing")
@@ -105,6 +106,12 @@ func (auth pinnedProviderAuth) probeCommand() connector.CommandSpec {
 		return connector.CommandSpec{Executable: codexExecutable, Args: []string{"login", "status"}}
 	case pinnedAuthClaude:
 		return connector.CommandSpec{Executable: "claude", Args: []string{"auth", "status"}}
+	case pinnedAuthGrok:
+		// Grok Build 1.0.5 has no status-only auth subcommand. `models` is its
+		// bounded, non-mutating authenticated request: success proves that the
+		// installed connector can use its provider-owned credentials. Output is
+		// discarded by literalStatusRunner and never reaches TaskAI state or UI.
+		return connector.CommandSpec{Executable: grokExecutable, Args: []string{"models"}}
 	default:
 		return connector.CommandSpec{}
 	}
@@ -116,6 +123,8 @@ func (auth pinnedProviderAuth) authenticationCommand() connector.CommandSpec {
 		return connector.CommandSpec{Executable: codexExecutable, Args: []string{"login"}}
 	case pinnedAuthClaude:
 		return connector.CommandSpec{Executable: "claude", Args: []string{"auth", "login"}}
+	case pinnedAuthGrok:
+		return connector.CommandSpec{Executable: grokExecutable, Args: []string{"login"}}
 	default:
 		return connector.CommandSpec{}
 	}

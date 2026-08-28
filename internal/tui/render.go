@@ -621,6 +621,7 @@ func (m *Model) renderAddManager(c *canvas) {
 	if len(providers) == 0 {
 		c.line(2, "No enabled Manager-capable provider is available.")
 		c.line(3, "Enable, authenticate if needed, and recheck in Settings.")
+		c.line(4, "Subordinate-only providers cannot start a top-level Session.")
 		c.buttons(c.height-2,
 			button{"Back", mouseBack, 0},
 			button{"Open Settings", mouseRouteSettings, 0},
@@ -630,6 +631,7 @@ func (m *Model) renderAddManager(c *canvas) {
 		return
 	}
 	c.line(1, "Only enabled providers with a conformed Manager claim are offered.")
+	c.line(2, "Subordinate-only providers are delegated by the Manager, not started here.")
 	maxRows := max(0, c.height-8)
 	start := selectedWindow(indexProvider(providers, m.addProvider), len(providers), maxRows)
 	for row, provider := range providers[start:min(len(providers), start+maxRows)] {

@@ -100,6 +100,7 @@
 ## add-manager-standard
 00|TaskAI / Task / Add Manager
 01|Only enabled providers with a conformed Manager claim are o…
+02|Subordinate-only providers are delegated by the Manager, no…
 03|> Codex                         M:yes R:yes P:no | Connected
 13|Optional label> Exact Manager label
 16|[Back] [Create Manager] [Help]
@@ -109,12 +110,14 @@
 00|TaskAI / Task / Add Manager
 02|No enabled Manager-capable provider is available.
 03|Enable, authenticate if needed, and recheck in Settings.
+04|Subordinate-only providers cannot start a top-level Session.
 16|[Back] [Open Settings] [Help]
 17|Enter Settings  Esc back
 
 ## add-manager-safe-error
 00|TaskAI / Task / Add Manager
 01|Only enabled providers with a conformed Manager claim are o…
+02|Subordinate-only providers are delegated by the Manager, no…
 03|> Codex                         M:yes R:yes P:no | Connected
 13|Optional label> Retry label
 14|Manager start failed (connector-unavailable)
