@@ -449,9 +449,9 @@ kbd{
   color:#C7D0DE;overflow-x:auto;flex:none;max-width:100%;
   background:
     radial-gradient(120% 90% at 50% 40%, transparent 55%, rgba(0,0,0,.45) 100%),
-    radial-gradient(52% 42% at 18% 8%, rgba(64,140,220,.16), transparent 60%),
-    radial-gradient(44% 38% at 82% 88%, rgba(90,110,220,.12), transparent 60%),
-    radial-gradient(40% 34% at 55% 45%, rgba(70,130,235,.09), transparent 62%),
+    radial-gradient(52% 42% at 18% 8%, rgba(64,140,220,.21), transparent 60%),
+    radial-gradient(44% 38% at 82% 88%, rgba(90,110,220,.16), transparent 60%),
+    radial-gradient(40% 34% at 55% 45%, rgba(70,130,235,.12), transparent 62%),
     #03050A;
   border:1px solid var(--line-soft);border-radius:8px;padding:16px 18px;
 }
@@ -466,7 +466,7 @@ kbd{
 .tty .sel{background:rgba(32,52,78,.95)}
 .tty .att{background:rgba(18,40,58,.85)}
 .tty .acp{background:rgba(14,35,52,.9)}
-.tty .chip{background:rgba(22,33,54,.9)}
+.tty .chip{background:rgba(18,27,44,.9)}
 .tty .kcap{background:#1B2740;color:#E2EAF6}
 .tty .hud{color:#7E8AA0}
 .tty .bold{color:#E9EEF6;font-weight:600}
@@ -1524,7 +1524,7 @@ function termBase(cls){ return cls==='u'?'usr':(cls==='dim'||cls==='res')?'dm':c
 function hudRows(W){
   const t=new Date(), pp=n=>String(n).padStart(2,'0');
   const clock=pp(t.getHours())+':'+pp(t.getMinutes())+':'+pp(t.getSeconds());
-  const title=(state.screen==='task' && curTask()) ? 'T A S K A I   ·   TASK — '+curTask().name.toUpperCase() : 'T A S K A I   ·   PORTFOLIO';
+  const title=(state.screen==='task' && curTask()) ? 'T A S K A I   ·   TASK · '+curTask().name.toUpperCase() : 'T A S K A I   ·   PORTFOLIO';
   const live=[...allSessions()].filter(s=>s.state!=='done').length;
   const active=tasks.filter(x=>['run','wait'].includes(taskState(x))).length;
   const warn=tasks.some(x=>taskState(x)==='wait');
@@ -1549,12 +1549,12 @@ function kbarRows(W,pairs,cliNote){
 }
 
 function ttyHome(){
-  const W=118, M=2, CW=W-2*M, IN=CW-2, out=[];
+  const W=124, M=2, CW=W-2*M, IN=CW-2, out=[];
   const mrg=' '.repeat(M);
   const cardRow=(segs,bcls,bg)=>tline([tseg(mrg),tseg('│',bcls+' pnl'),...fit(segs,IN,bg||'pnl'),tseg('│',bcls+' pnl')]);
-  const cardTop=(bcls,dash)=>tline([tseg(mrg),tseg((dash?'╭'+'╌'.repeat(IN)+'╮':'╭'+'─'.repeat(IN)+'╮'),(bcls==='b'?'bt':bcls)+' pnl')]);
-  const cardBot=(bcls,dash)=>tline([tseg(mrg),tseg((dash?'╰'+'╌'.repeat(IN)+'╯':'╰'+'─'.repeat(IN)+'╯'),bcls+' pnl')]);
-  const brRow=(l,r)=>tline([tseg(' '.repeat(M-1)),tseg(l,'ion'),tseg(' '.repeat(CW)),tseg(r,'ion')]);
+  const cardTop=(bcls,dash)=>tline([tseg(mrg),tseg((dash?'╭'+'╌'.repeat(IN)+'╮':'╭'+'─'.repeat(IN)+'╮'),(bcls==='b'?'bt':bcls)+(dash?'':' pnl'))]);
+  const cardBot=(bcls,dash)=>tline([tseg(mrg),tseg((dash?'╰'+'╌'.repeat(IN)+'╯':'╰'+'─'.repeat(IN)+'╯'),bcls+(dash?'':' pnl'))]);
+  const brRow=(l,r)=>tline([tseg(' '.repeat(M-1)),tseg(l,'ion bold'),tseg(' '.repeat(CW)),tseg(r,'ion bold')]);
 
   out.push(...hudRows(W));
   out.push('');
@@ -1574,43 +1574,47 @@ function ttyHome(){
   rows.forEach((r,vi)=>{
     const t=r.t, ts=taskState(t), sel=vi===state.homeSel;
     const [g,gc]=stGlyphT(ts==='idle'?'off':ts);
-    const stat=ts==='wait'?'NEEDS ATTENTION':ts==='done'?'COMPLETE':ts==='idle'?'EMPTY':'WORKING';
+    const stat=(ts==='wait'?'NEEDS ATTENTION':ts==='done'?'COMPLETE':ts==='idle'?'EMPTY':'WORKING').split('').join(' ');
     const scls=ts==='wait'?'amb':ts==='run'?'ion':'dm';
     const bcls=sel?'bsel':'b';
     const mc=t.managers.length;
-    const CS=IN-26-Math.max(0,mc*2-4);
-    // row 1: glyph + name … constellation dots … status
-    const r1=[tseg(' '),tseg(g,gc),tseg('  '),tseg(tclip(t.name,CS-6),'bold')];
-    let pad1=CS-tlen(r1); if(pad1>0) r1.push(tseg(' '.repeat(pad1)));
-    t.managers.forEach(m=>{ r1.push(tseg('●',m.state==='wait'?'amb':m.state==='done'?'ft':'ion'),tseg(' ')); });
-    let pad2=IN-2-stat.length-tlen(r1); if(pad2>0) r1.push(tseg(' '.repeat(pad2)));
+    const statusStart=IN-2-stat.length;
+    const dotsStart=statusStart-5-3*mc;
+    // row 1: glyph + name … dots on a dim track … letterspaced status
+    const r1=[tseg(' '),tseg(g,gc),tseg('  '),tseg(tclip(t.name,dotsStart-6),'bold')];
+    let pad1=dotsStart-tlen(r1); if(pad1>0) r1.push(tseg(' '.repeat(pad1)));
+    t.managers.forEach(m=>{ r1.push(tseg('╌','ft'),tseg('●',m.state==='wait'?'amb':m.state==='done'?'ft':'ion'),tseg('╌','ft')); });
+    let pad2=statusStart-tlen(r1); if(pad2>0) r1.push(tseg(' '.repeat(pad2)));
     r1.push(tseg(stat,scls));
-    // row 2: managers meta + sub markers under dots
+    // row 2: managers meta + ╷ tails directly beneath each dot
     const mg=mc?('Managers: '+t.managers.map(m=>m.name+' · '+HARNESS[m.h].name).join(',  ')):'Add the first Manager to begin';
-    const r2=[tseg('    '),tseg(tclip(mg,CS-6),'ft')];
-    let pad3=CS-tlen(r2); if(pad3>0) r2.push(tseg(' '.repeat(pad3)));
-    t.managers.forEach(m=>{ r2.push(m.subs.length?tseg('╰·', m.subs.some(s=>s.state==='wait')?'amb':'ft'):tseg('  ')); });
-    if(sel) out.push(brRow('⌜','⌝'));
+    const r2=[tseg('    '),tseg(tclip(mg,dotsStart-6),'ft')];
+    let pad3=dotsStart-tlen(r2); if(pad3>0) r2.push(tseg(' '.repeat(pad3)));
+    t.managers.forEach(m=>{ r2.push(tseg(' '),tseg(m.subs.length?'╷':' ', m.subs.some(s=>s.state==='wait')?'amb':'ft'),tseg(' ')); });
+    if(sel) out.push(brRow('┌','┐'));
     out.push(cardTop(bcls));
+    out.push(cardRow([tseg('')],bcls,'pnl'));
     out.push(cardRow(r1,bcls,'pnl'));
     out.push(cardRow(r2,bcls,'pnl'));
+    out.push(cardRow([tseg('')],bcls,'pnl'));
     out.push(cardBot(bcls));
-    out.push(sel?brRow('⌞','⌟'):'');
+    out.push(sel?brRow('└','┘'):'');
   });
   const gSel=state.homeSel===rows.length;
-  if(gSel) out.push(brRow('⌜','⌝'));
-  out.push(cardTop(gSel?'bsel':'bd',!gSel));
+  const gRow=segs=>tline([tseg(mrg),tseg('┆',gSel?'bsel':'bd'),...fit(segs,IN,''),tseg('┆',gSel?'bsel':'bd')]);
+  if(gSel) out.push(brRow('┌','┐'));
+  out.push(cardTop(gSel?'bsel':'bd',true));
   const gpad=Math.floor((IN-13)/2);
-  out.push(cardRow([tseg(' '.repeat(gpad)),tseg('+ New task ','ft'),tseg(' n ','kcap')],gSel?'bsel':'bd','pnl'));
-  out.push(cardBot(gSel?'bsel':'bd',!gSel));
-  out.push(gSel?brRow('⌞','⌟'):'');
+  out.push(gRow([tseg(' '.repeat(gpad)),tseg('+ New task ','ft'),tseg(' n ','kcap')]));
+  out.push(cardBot(gSel?'bsel':'bd',true));
+  out.push(gSel?brRow('└','┘'):'');
   out.push('');
   out.push(...kbarRows(W,[['Enter','Open'],['n','New task'],['h','Harnesses'],['/','Find'],['b','Concept'],['?','Help']]));
   return out.join('\n');
 }
 
 function ttyTask(){
-  const W=118, RW=38, G=2, PW=W-RW-G, RI=RW-2, PI=PW-2;
+  const W=124, RW=32, G=2, PW=W-RW-G, RI=RW-2, PI=PW-2;
   const t=curTask(); if(!t) return '';
   const rows=flatTree(t);
   const att=sessById(state.attached);
@@ -1632,11 +1636,13 @@ function ttyTask(){
     const [g,gc]=stGlyphT(r.sess.state);
     const pre=r.kind==='s'?' └─ ':' ';
     const hn=HARNESS[r.sess.h].name;
-    const segs=[tseg(pre,'b'),tseg(g,gc),tseg(' '+tclip(r.sess.name,RI-pre.length-hn.length-8),'usr')];
+    const segs=[tseg(pre,'b'),tseg(g,gc),tseg(' '+tclip(r.sess.name,RI-pre.length-hn.length-6),'usr')];
     const rpad=RI-tlen(segs)-hn.length-3;
     if(rpad>0) segs.push(tseg(' '.repeat(rpad)));
     segs.push(tseg('• ',hcls(r.sess.h)),tseg(hn,'ft'),tseg(' '));
+    rl.push(sel?rrow([tseg('┌','ion bold'),tseg(' '.repeat(RI-4)),tseg('┐','ion bold')],'pnl'):rrow([tseg('')],'pnl'));
     rl.push(rrow(segs, sel?'sel':attn?'att':'pnl'));
+    if(sel) rl.push(rrow([tseg('└','ion bold'),tseg(' '.repeat(RI-4)),tseg('┘','ion bold')],'pnl'));
   });
   rl.push(rrow([tseg(' + Manager ','ft'),tseg(' m ','kcap')],'pnl'));
   const fillAt=rl.length;
@@ -1699,7 +1705,7 @@ function ttyTask(){
   out.push('');
   out.push(...(cli
     ? kbarRows(W,null,true)
-    : kbarRows(W,[['Enter','Attach'],['a','Add Subordinate'],['m','Add Manager'],['d','Destroy'],['T','Home'],['Ctrl+G','Focus CLI']])));
+    : kbarRows(W,[['Enter','Attach'],['a','Add Subordinate'],['m','Add Manager'],['d','Destroy'],['D','Destroy task'],['b','Replica'],['T','Home'],['Ctrl+G','Focus CLI']])));
   return out.join('\n');
 }
 
