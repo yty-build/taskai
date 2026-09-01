@@ -1,38 +1,15 @@
-// ABOUTME: taskai binary — TUI, `--attach-claude <dir>` live session host, `session prompt`
-// ABOUTME: conduit client, and `--dump-frame` for tests and parity tooling.
+// ABOUTME: taskai binary — the live TUI, `session prompt` conduit client, `context`
+// ABOUTME: service CLI, and `--dump-frame` for tests and parity tooling.
 
+mod app;
 mod control;
 
-use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::io::{self, Read};
+use std::path::PathBuf;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::terminal;
-use taskai_connectors::claude::{install_context_hook, install_hooks, ClaudeConnector};
-use taskai_connectors::events::wait_for_event;
-use taskai_connectors::{Conduit, Mode as ConduitMode};
-use taskai_core::registry::{ProviderMapping, Registry, SessionState, Source};
-use taskai_pane::Pane;
+use taskai_core::registry::Registry;
 use taskai_tui::color::set_truecolor;
-use taskai_tui::input::{route, Focus, Route};
-use taskai_tui::render::{dump, render};
-use taskai_tui::screens::pane as pane_screen;
-use taskai_tui::state::{advance, Screen, St};
-
-enum Mode {
-    Board,
-    Pane,
-}
-
-struct App {
-    st: St,
-    mode: Mode,
-    focus: Focus,
-    pane: Option<Arc<Mutex<Pane>>>,
-    title: String,
-}
+use taskai_tui::render::dump;
 
 fn taskai_home() -> PathBuf {
     if let Ok(h) = std::env::var("TASKAI_HOME") {
@@ -96,7 +73,7 @@ fn main() -> io::Result<()> {
                 }
             }
         }
-        None => run_tui(attach),
+        None => app::App::new(taskai_home())?.run(attach),
     }
 }
 
@@ -261,220 +238,4 @@ fn context_cmd(args: &[String]) -> io::Result<()> {
         }
     }
     Ok(())
-}
-
-fn clock_now() -> String {
-    chrono::Local::now().format("%H:%M:%S").to_string()
-}
-
-/// Registers the task and Lead session, installs hooks, launches the real Claude CLI in
-/// a pane, watches for its SessionStart to bind the provider session, serves the socket.
-fn setup_attach(dir: &Path, cols: usize, rows: usize) -> io::Result<(Arc<Mutex<Pane>>, String)> {
-    let dir = dir.canonicalize()?;
-    let home = taskai_home();
-    let run = home.join("run");
-    std::fs::create_dir_all(&run)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700))?;
-    }
-    let connector = ClaudeConnector::default();
-    let cap = connector.probe();
-    if cap.mode != ConduitMode::OwnedTui {
-        return Err(io_err(format!("claude unavailable: {}", cap.detail)));
-    }
-    let events = install_hooks(&dir, &run).map_err(io_err)?;
-    taskai_context::install_bootstrap(&dir).map_err(io_err)?;
-    if let Ok(exe) = std::env::current_exe() {
-        install_context_hook(&dir, &exe).map_err(io_err)?;
-    }
-    let mut registry = Registry::open(&home.join("state")).map_err(io_err)?;
-    let name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "task".into());
-    let task = registry.create_task(&name, &dir, Source::HumanUi).map_err(io_err)?;
-    let sref = registry
-        .create_session(&task, None, "Lead", "claude", &dir, Source::HumanUi)
-        .map_err(io_err)?;
-
-    let (br, bc) = pane_screen::body_size(cols, rows);
-    let (prog, cargs) = connector.launch_command();
-    let argv: Vec<&str> = cargs.iter().map(String::as_str).collect();
-    let home_str = home.display().to_string();
-    let envs = [("TASKAI_SESSION_REF", sref.as_str()), ("TASKAI_HOME", home_str.as_str())];
-    let pane = Arc::new(Mutex::new(
-        Pane::spawn(&prog, &argv, &dir, br as u16, bc as u16, &envs).map_err(io_err)?,
-    ));
-
-    let session_id = Arc::new(Mutex::new(None::<String>));
-    let offset = std::fs::metadata(&events).map(|m| m.len()).unwrap_or(0);
-    {
-        let events = events.clone();
-        let sid = Arc::clone(&session_id);
-        let sref2 = sref.clone();
-        let version = cap.version.clone().unwrap_or_default();
-        std::thread::spawn(move || {
-            if let Ok(ev) = wait_for_event(&events, "SessionStart", None, offset, Duration::from_secs(300)) {
-                if let Some(id) = ev.session_id {
-                    *sid.lock().unwrap() = Some(id.clone());
-                    let _ = registry.bind_provider(
-                        &sref2,
-                        ProviderMapping {
-                            provider: "claude".into(),
-                            provider_session_id: id,
-                            runtime_id: format!("pid:{}", std::process::id()),
-                            connector_version: version,
-                        },
-                    );
-                    let _ = registry.set_state(&sref2, SessionState::Live);
-                }
-            }
-        });
-    }
-    control::serve(
-        control::sock_path(&home),
-        control::Served {
-            session_ref: sref.clone(),
-            pane: Arc::clone(&pane),
-            events,
-            session_id,
-            conduit: Arc::new(Conduit::new()),
-        },
-    )?;
-    Ok((pane, format!("Lead · Claude Code · {sref}")))
-}
-
-fn run_tui(attach: Option<PathBuf>) -> io::Result<()> {
-    let (c, r) = terminal::size().unwrap_or((120, 40));
-    let (cols, rows) = ((c as usize).max(110), (r as usize).max(30));
-    let mut app = App {
-        st: St::new(),
-        mode: Mode::Board,
-        focus: Focus::Cli,
-        pane: None,
-        title: "Shell".into(),
-    };
-    if let Some(dir) = attach {
-        let (pane, title) = setup_attach(&dir, cols, rows)?;
-        app.pane = Some(pane);
-        app.title = title;
-        app.mode = Mode::Pane;
-        app.st.screen = Screen::Home;
-    }
-    let mut out = io::stdout();
-    terminal::enable_raw_mode()?;
-    write!(out, "\x1b[?1049h\x1b[?25l\x1b[2J")?;
-    out.flush()?;
-    let result = event_loop(&mut out, &mut app);
-    write!(out, "\x1b[?25h\x1b[?1049l\x1b[0m")?;
-    out.flush()?;
-    terminal::disable_raw_mode()?;
-    result
-}
-
-fn event_loop(out: &mut impl Write, app: &mut App) -> io::Result<()> {
-    loop {
-        advance(&mut app.st);
-        let (c, r) = terminal::size().unwrap_or((120, 40));
-        let (cols, rows) = ((c as usize).max(110), (r as usize).max(30));
-        let frame = match app.mode {
-            Mode::Board => render(&app.st, cols, rows, &clock_now()),
-            Mode::Pane => {
-                let (br, bc) = pane_screen::body_size(cols, rows);
-                let view: Vec<Vec<pane_screen::PaneCell>> = match &app.pane {
-                    Some(p) => {
-                        let mut p = p.lock().unwrap();
-                        if p.size() != (br, bc) {
-                            let _ = p.resize(br as u16, bc as u16);
-                        }
-                        p.cells()
-                            .into_iter()
-                            .map(|row| {
-                                row.into_iter()
-                                    .map(|c| pane_screen::PaneCell {
-                                        text: c.text,
-                                        fg: c.fg,
-                                        bg: c.bg,
-                                        bold: c.bold,
-                                    })
-                                    .collect()
-                            })
-                            .collect()
-                    }
-                    None => Vec::new(),
-                };
-                pane_screen::frame(&app.title, &view, app.focus, cols, rows, &clock_now())
-            }
-        };
-        write!(out, "\x1b[?2026h\x1b[H{}\x1b[?2026l", frame.join("\r\n"))?;
-        out.flush()?;
-
-        let mut waited = false;
-        while event::poll(if waited { Duration::ZERO } else { Duration::from_millis(100) })? {
-            waited = true;
-            if let Event::Key(k) = event::read()? {
-                if k.kind == KeyEventKind::Release {
-                    continue;
-                }
-                if !handle(app, k, cols, rows) {
-                    return Ok(());
-                }
-            }
-        }
-    }
-}
-
-fn handle(app: &mut App, k: KeyEvent, cols: usize, rows: usize) -> bool {
-    match app.mode {
-        Mode::Board => {
-            if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
-                return false;
-            }
-            match app.st.screen {
-                Screen::Boot => app.st.screen = Screen::Home,
-                _ => match k.code {
-                    KeyCode::Char('q') => return false,
-                    KeyCode::Up => app.st.home_sel = app.st.home_sel.saturating_sub(1),
-                    KeyCode::Down => app.st.home_sel = (app.st.home_sel + 1).min(3),
-                    KeyCode::Enter => {
-                        if app.pane.is_none() {
-                            let (br, bc) = pane_screen::body_size(cols, rows);
-                            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-                            let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
-                            if let Ok(p) = Pane::spawn(&shell, &[], &cwd, br as u16, bc as u16, &[]) {
-                                app.pane = Some(Arc::new(Mutex::new(p)));
-                            }
-                        }
-                        if app.pane.is_some() {
-                            app.mode = Mode::Pane;
-                            app.focus = Focus::Cli;
-                        }
-                    }
-                    _ => {}
-                },
-            }
-            true
-        }
-        Mode::Pane => {
-            match route(app.focus, k) {
-                Route::Boundary => {
-                    app.focus = match app.focus {
-                        Focus::Cli => Focus::Nav,
-                        Focus::Nav => Focus::Cli,
-                    }
-                }
-                Route::Forward(bytes) => {
-                    if let Some(p) = &app.pane {
-                        let _ = p.lock().unwrap().write_bytes(&bytes);
-                    }
-                }
-                Route::Nav(ev) => match ev.code {
-                    KeyCode::Enter => app.focus = Focus::Cli,
-                    KeyCode::Char('q') => return false,
-                    KeyCode::Char('T') => app.mode = Mode::Board,
-                    _ => {}
-                },
-            }
-            true
-        }
-    }
 }

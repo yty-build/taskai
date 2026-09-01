@@ -165,3 +165,39 @@ fn blast_radius_and_destroy() {
     assert!(reg.task(&t).is_none());
     assert!(reg.tasks().is_empty());
 }
+
+// Expectation: HUD counts derive from the one session list — a HANDOFF session never
+// counts LIVE; ATTENTION rolls up to its task; COMPLETE tasks drop out of active.
+// Why: the journey-coherence lesson — state miscounts are product-truth bugs.
+// Value: the masthead can't lie.
+#[test]
+fn hud_counts_and_task_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut reg = Registry::open(tmp.path()).unwrap();
+    let t1 = reg.create_task("Repository evaluation", Path::new("/tmp/buzz"), Source::HumanUi).unwrap();
+    let lead = reg.create_session(&t1, None, "Lead", "claude", Path::new("/tmp/buzz"), Source::HumanUi).unwrap();
+    let ver = reg.create_session(&t1, Some(&lead), "Verification", "grok", Path::new("/tmp/wt"), Source::HumanUi).unwrap();
+    reg.set_state(&lead, SessionState::Live).unwrap();
+    reg.set_state(&ver, SessionState::Handoff).unwrap();
+
+    let t2 = reg.create_task("Production release", Path::new("/tmp/shop"), Source::HumanUi).unwrap();
+    let ship = reg.create_session(&t2, None, "Ship", "opencode", Path::new("/tmp/shop"), Source::HumanUi).unwrap();
+    reg.set_state(&ship, SessionState::Attention).unwrap();
+
+    let t3 = reg.create_task("API migration", Path::new("/tmp/atlas"), Source::HumanUi).unwrap();
+    let done = reg.create_session(&t3, None, "Migrator", "grok", Path::new("/tmp/atlas"), Source::HumanUi).unwrap();
+    reg.set_state(&done, SessionState::Complete).unwrap();
+
+    let t4 = reg.create_task("Empty", Path::new("/tmp/e"), Source::HumanUi).unwrap();
+
+    let hud = reg.hud_counts();
+    assert_eq!(hud.live, 1, "handoff and attention are never LIVE");
+    assert_eq!(hud.queued, 1, "handoff counts queued");
+    assert_eq!(hud.attention, 1);
+    assert_eq!(hud.tasks_active, 2, "t1 and t2; complete t3 and empty t4 excluded");
+
+    assert_eq!(reg.task_status(&t1), "WORKING");
+    assert_eq!(reg.task_status(&t2), "NEEDS ATTENTION");
+    assert_eq!(reg.task_status(&t3), "COMPLETE");
+    assert_eq!(reg.task_status(&t4), "READY");
+}

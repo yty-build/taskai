@@ -154,16 +154,22 @@ fn keys_row(keys: &[(&str, &str)], pw: usize) -> String {
     row(&ks, pw, GLASS, 2)
 }
 
-pub fn drawer_panel(blink: bool, drawer: &Drawer, note: &[Vec<Seg>], pw: usize) -> Vec<String> {
+pub struct DrawerView {
+    pub title: String,
+    pub fields: Vec<(String, String, bool)>,
+    pub keys: Vec<(&'static str, &'static str)>,
+}
+
+pub fn drawer_panel_view(blink: bool, d: &DrawerView, note: &[Vec<Seg>], pw: usize) -> Vec<String> {
     let b = GLASS_HI;
     let mut lines = vec![row(&[s("▄".repeat(pw), Some(b), Some(VOID))], pw, VOID, 0)];
-    lines.push(row(&[sb(drawer.title, Some(TEXT), Some(b))], pw, b, 2));
+    lines.push(row(&[sb(d.title.as_str(), Some(TEXT), Some(b))], pw, b, 2));
     lines.push(row(&[], pw, GLASS, 0));
-    for (label, value, focus) in drawer.fields {
+    for (label, value, focus) in &d.fields {
         lines.push(row(&[s(label.to_uppercase(), Some(FT), Some(GLASS))], pw, GLASS, 2));
         let mut val = vec![
             s(" ", None, Some(GLASS_IN)),
-            s(*value, Some(if *focus { TEXT } else { DIM }), Some(GLASS_IN)),
+            s(value.as_str(), Some(if *focus { TEXT } else { DIM }), Some(GLASS_IN)),
         ];
         if *focus {
             val.push(s(if blink { "▍" } else { " " }, Some(ION), Some(GLASS_IN)));
@@ -180,10 +186,23 @@ pub fn drawer_panel(blink: bool, drawer: &Drawer, note: &[Vec<Seg>], pw: usize) 
         lines.push(row(segs, pw, GLASS, 2));
     }
     lines.push(row(&[], pw, GLASS, 0));
-    lines.push(keys_row(drawer.keys, pw));
+    lines.push(keys_row(&d.keys, pw));
     lines.push(row(&[], pw, GLASS, 0));
     lines.push(row(&[s("▀".repeat(pw), Some(GLASS), Some(VOID))], pw, VOID, 0));
     lines
+}
+
+pub fn drawer_panel(blink: bool, drawer: &Drawer, note: &[Vec<Seg>], pw: usize) -> Vec<String> {
+    let view = DrawerView {
+        title: drawer.title.into(),
+        fields: drawer
+            .fields
+            .iter()
+            .map(|(l, v, f)| (l.to_string(), v.to_string(), *f))
+            .collect(),
+        keys: drawer.keys.to_vec(),
+    };
+    drawer_panel_view(blink, &view, note, pw)
 }
 
 fn clip54(t: &str) -> String {
@@ -205,21 +224,28 @@ pub fn sub_panel(blink: bool) -> Vec<String> {
     drawer_panel(blink, &SUBORDINATE, &note, 58)
 }
 
-pub fn destroy_panel(blink: bool) -> Vec<String> {
+pub fn destroy_panel_view(
+    blink: bool,
+    title: &str,
+    blast: &[String],
+    kept: &[&str],
+    expect: &str,
+    typed: &str,
+) -> Vec<String> {
     let pw = 62;
     let mut lines = vec![row(&[s("▄".repeat(pw), Some(RED_GLASS), Some(VOID))], pw, VOID, 0)];
-    lines.push(row(&[sb(DESTROY_TITLE, Some(RED), Some(RED_GLASS))], pw, RED_GLASS, 2));
+    lines.push(row(&[sb(title, Some(RED), Some(RED_GLASS))], pw, RED_GLASS, 2));
     lines.push(row(&[], pw, GLASS, 0));
-    for b in DESTROY_BLAST {
+    for b in blast {
         lines.push(row(
-            &[s("● ", Some(RED), Some(GLASS)), s(*b, Some(TEXT), Some(GLASS))],
+            &[s("● ", Some(RED), Some(GLASS)), s(b.as_str(), Some(TEXT), Some(GLASS))],
             pw,
             GLASS,
             2,
         ));
     }
     lines.push(row(&[], pw, GLASS, 0));
-    for k in DESTROY_KEPT {
+    for k in kept {
         lines.push(row(
             &[s("✓ ", Some(FT), Some(GLASS)), s(*k, Some(DIM), Some(GLASS))],
             pw,
@@ -231,7 +257,7 @@ pub fn destroy_panel(blink: bool) -> Vec<String> {
     lines.push(row(
         &[
             s("Type ", Some(FT), Some(GLASS)),
-            sb(DESTROY_CONFIRM, Some(TEXT), Some(GLASS)),
+            sb(expect, Some(TEXT), Some(GLASS)),
             s(" to confirm", Some(FT), Some(GLASS)),
         ],
         pw,
@@ -240,7 +266,7 @@ pub fn destroy_panel(blink: bool) -> Vec<String> {
     ));
     let cur = if blink { "▍" } else { " " };
     let mut val = vec![
-        s(format!(" {DESTROY_CONFIRM}"), Some(TEXT), Some(GLASS_IN)),
+        s(format!(" {typed}"), Some(TEXT), Some(GLASS_IN)),
         s(cur, Some(ION), Some(GLASS_IN)),
     ];
     val.push(s(
@@ -261,6 +287,64 @@ pub fn destroy_panel(blink: bool) -> Vec<String> {
         pw,
         GLASS,
         2,
+    ));
+    lines.push(row(&[], pw, GLASS, 0));
+    lines.push(row(&[s("▀".repeat(pw), Some(GLASS), Some(VOID))], pw, VOID, 0));
+    lines
+}
+
+pub fn destroy_panel(blink: bool) -> Vec<String> {
+    let blast: Vec<String> = DESTROY_BLAST.iter().map(|b| b.to_string()).collect();
+    destroy_panel_view(blink, DESTROY_TITLE, &blast, DESTROY_KEPT, DESTROY_CONFIRM, DESTROY_CONFIRM)
+}
+
+/// The repository explorer: navigate directories, choose one with Space.
+pub fn explorer_panel(cwd: &str, entries: &[(String, bool)], sel: usize) -> Vec<String> {
+    let pw = 66;
+    let b = GLASS_HI;
+    let mut lines = vec![row(&[s("▄".repeat(pw), Some(b), Some(VOID))], pw, VOID, 0)];
+    lines.push(row(&[sb("Choose repository", Some(TEXT), Some(b))], pw, b, 2));
+    lines.push(row(&[], pw, GLASS, 0));
+    lines.push(row(&[s("CURRENT PATH", Some(FT), Some(GLASS))], pw, GLASS, 2));
+    let shown_path: String = if cwd.chars().count() > pw - 6 {
+        format!("…{}", cwd.chars().rev().take(pw - 7).collect::<Vec<_>>().into_iter().rev().collect::<String>())
+    } else {
+        cwd.to_string()
+    };
+    let mut pathrow = vec![s(format!(" {shown_path}"), Some(DIM), Some(GLASS_IN))];
+    pathrow.push(s(
+        " ".repeat((pw as isize - 4 - seglen(&pathrow) as isize).max(0) as usize),
+        None,
+        Some(GLASS_IN),
+    ));
+    lines.push(row(&pathrow, pw, GLASS, 2));
+    lines.push(row(&[], pw, GLASS, 0));
+    let window = 12usize;
+    let start = sel.saturating_sub(window.saturating_sub(1).min(sel));
+    let start = start.min(entries.len().saturating_sub(window.min(entries.len())));
+    for (i, (name, is_dir)) in entries.iter().enumerate().skip(start).take(window) {
+        let selected = i == sel;
+        let fill = if selected { GLASS_HI } else { GLASS };
+        let marker = if *is_dir { "▸ " } else { "  " };
+        let label = if *is_dir { format!("{name}/") } else { name.clone() };
+        let mut segs = vec![
+            s(marker, Some(if selected { ION } else { FT }), Some(fill)),
+            s(label, Some(if selected { TEXT } else { DIM }), Some(fill)),
+        ];
+        segs.push(s(
+            " ".repeat((pw as isize - 4 - seglen(&segs) as isize).max(0) as usize),
+            None,
+            Some(fill),
+        ));
+        lines.push(row(&segs, pw, fill, 2));
+    }
+    for _ in entries.len().saturating_sub(start).min(window)..window {
+        lines.push(row(&[], pw, GLASS, 0));
+    }
+    lines.push(row(&[], pw, GLASS, 0));
+    lines.push(keys_row(
+        &[("↑/↓", "Move"), ("Enter", "Open"), ("←", "Parent"), ("Space", "Choose"), ("Esc", "Cancel")],
+        pw,
     ));
     lines.push(row(&[], pw, GLASS, 0));
     lines.push(row(&[s("▀".repeat(pw), Some(GLASS), Some(VOID))], pw, VOID, 0));

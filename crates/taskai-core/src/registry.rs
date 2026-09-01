@@ -61,6 +61,14 @@ pub enum Item {
     Session(String),
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HudCounts {
+    pub live: usize,
+    pub queued: usize,
+    pub attention: usize,
+    pub tasks_active: usize,
+}
+
 /// The exact provider binding behind a session ref, filled in when a connector attaches.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderMapping {
@@ -238,6 +246,45 @@ impl Registry {
         self.data.audit.len() as u64
     }
 
+    /// HUD counts derive from the one session list; a Handoff session is never LIVE.
+    pub fn hud_counts(&self) -> HudCounts {
+        let mut c = HudCounts::default();
+        for s in &self.data.sessions {
+            match s.state {
+                SessionState::Live => c.live += 1,
+                SessionState::Queued | SessionState::Handoff => c.queued += 1,
+                SessionState::Attention => c.attention += 1,
+                _ => {}
+            }
+        }
+        c.tasks_active = self
+            .data
+            .tasks
+            .iter()
+            .filter(|t| {
+                let sessions = self.sessions_of(&t.task_ref);
+                !sessions.is_empty()
+                    && sessions.iter().any(|s| s.state != SessionState::Complete)
+            })
+            .count();
+        c
+    }
+
+    /// The task row's aggregate state word: attention rises through the hierarchy.
+    pub fn task_status(&self, task: &str) -> &'static str {
+        let sessions = self.sessions_of(task);
+        if sessions.is_empty() {
+            return "READY";
+        }
+        if sessions.iter().any(|s| s.state == SessionState::Attention) {
+            return "NEEDS ATTENTION";
+        }
+        if sessions.iter().all(|s| s.state == SessionState::Complete) {
+            return "COMPLETE";
+        }
+        "WORKING"
+    }
+
     pub fn set_state(&mut self, r: &str, state: SessionState) -> Result<(), Error> {
         let s = self
             .data
@@ -257,6 +304,18 @@ impl Registry {
             .find(|s| s.session_ref == r)
             .ok_or_else(|| Error::NotFound(format!("session {r}")))?;
         s.provider = Some(mapping);
+        self.persist()
+    }
+
+    /// Drops a provider binding proven unresumable — reconciled from native truth.
+    pub fn clear_provider(&mut self, r: &str) -> Result<(), Error> {
+        let s = self
+            .data
+            .sessions
+            .iter_mut()
+            .find(|s| s.session_ref == r)
+            .ok_or_else(|| Error::NotFound(format!("session {r}")))?;
+        s.provider = None;
         self.persist()
     }
 
