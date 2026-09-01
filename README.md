@@ -8,6 +8,9 @@ selected session's actual native CLI — Claude Code, Codex, OpenCode, or Grok C
 `Ctrl+G` is the one reserved boundary chord; every other keystroke passes through to
 the CLI unchanged.
 
+The project is TaskAI; the repository is named `acp-gateway` after the agent-conduit work
+it grew out of.
+
 ## Install
 
 ```sh
@@ -69,3 +72,7 @@ protocol in `docs/test_plan.md`; results land in `tests/evidence/`.
 
 `docs/` holds the product vision, the backend communication contract, and the build and
 test plans. `feature-tmux.md` is the proposed durable-session specification.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
