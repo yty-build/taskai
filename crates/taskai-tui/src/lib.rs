@@ -10,3 +10,4 @@ pub mod render;
 pub mod screens;
 pub mod seg;
 pub mod state;
+pub mod view;

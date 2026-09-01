@@ -1,27 +1,55 @@
-// ABOUTME: Screen dispatch — routes state to the active screen renderer, composites
-// ABOUTME: overlays, and builds deterministic fixture frames for --dump-frame and tests.
+// ABOUTME: Screen dispatch over the fixture world — used by --dump-frame, parity tests,
+// ABOUTME: and the demo; the live app calls the screen renderers with registry views.
 
-use crate::fixture::FIXED_CLOCK;
+use crate::fixture::{
+    self, BOOT_METER, FIXED_CLOCK, HARNESS_SUMMARY,
+};
 use crate::overlay::{destroy_panel, help_panel, newtask_panel, overlay, sub_panel};
 use crate::screens::{attach, attention, boot, harness, home, task};
 use crate::state::{Screen, St};
 
 pub fn render(st: &St, cols: usize, rows: usize, clock: &str) -> Vec<String> {
     match st.screen {
-        Screen::Boot => boot::frame(st.boot_k, cols, rows),
-        Screen::Home => {
-            home::frame(st.home_sel, &st.spark_t1, &st.spark_t2, cols, rows, clock)
+        Screen::Boot => boot::frame(&fixture::probe_rows(), BOOT_METER, st.boot_k, cols, rows),
+        Screen::Home => home::frame(
+            &fixture::home_rows(&st.spark_t1, &st.spark_t2),
+            &fixture::hud(),
+            st.home_sel,
+            cols,
+            rows,
+            clock,
+        ),
+        Screen::Harnesses => {
+            harness::frame(&fixture::harness_rows(), HARNESS_SUMMARY, &fixture::hud(), cols, rows, clock)
         }
-        Screen::Harnesses => harness::frame(cols, rows, clock),
-        Screen::Task => task::frame(st, cols, rows, clock),
+        Screen::Task => task::frame(
+            &fixture::task_view(st.rail_sel),
+            &fixture::hud(),
+            st,
+            cols,
+            rows,
+            clock,
+        ),
         Screen::Attach => attach::frame(st, cols, rows),
         Screen::Attention => attention::frame(st, cols, rows, clock),
         Screen::NewTask | Screen::Subordinate | Screen::Destroy | Screen::Help => {
             let base = match st.prev {
-                Screen::Home | Screen::Harnesses => {
-                    home::frame(st.home_sel, &st.spark_t1, &st.spark_t2, cols, rows, clock)
-                }
-                _ => task::frame(st, cols, rows, clock),
+                Screen::Home | Screen::Harnesses => home::frame(
+                    &fixture::home_rows(&st.spark_t1, &st.spark_t2),
+                    &fixture::hud(),
+                    st.home_sel,
+                    cols,
+                    rows,
+                    clock,
+                ),
+                _ => task::frame(
+                    &fixture::task_view(st.rail_sel),
+                    &fixture::hud(),
+                    st,
+                    cols,
+                    rows,
+                    clock,
+                ),
             };
             let panel = match st.screen {
                 Screen::NewTask => newtask_panel(st.blink),

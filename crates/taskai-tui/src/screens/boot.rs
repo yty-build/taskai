@@ -2,12 +2,13 @@
 // ABOUTME: and the readiness meter.
 
 use crate::color::{dull, harness_color, AMB, DIM, FT, GLASS, GLASS_IN, ION, TEXT, VOID};
-use crate::fixture::{BOOT_METER, PROBES, TAGLINE};
+use crate::fixture::TAGLINE;
+use crate::view::ProbeRow;
 use crate::seg::{row, s, sb, seglen, vrow, Seg};
 
 const SW: usize = 56;
 
-pub fn frame(boot_k: usize, cols: usize, rows: usize) -> Vec<String> {
+pub fn frame(probes: &[ProbeRow], meter_done: &str, boot_k: usize, cols: usize, rows: usize) -> Vec<String> {
     let ind = cols.saturating_sub(SW) / 2;
     let srow = |segs: Vec<Seg>| -> String {
         let used = seglen(&segs);
@@ -34,12 +35,12 @@ pub fn frame(boot_k: usize, cols: usize, rows: usize) -> Vec<String> {
         s(TAGLINE, Some(FT), Some(GLASS)),
     ]));
     lines.push(srow(vec![]));
-    let shown = PROBES.len().min((boot_k / 3 + 1).max(1));
-    for p in &PROBES[..shown] {
+    let shown = probes.len().min((boot_k / 3 + 1).max(1));
+    for p in &probes[..shown] {
         let mut segs = vec![
-            s("▌", Some(harness_color(p.hkey)), Some(GLASS)),
+            s("▌", Some(harness_color(&p.hkey)), Some(GLASS)),
             s("  ", None, Some(GLASS)),
-            s(p.name, Some(DIM), Some(GLASS)),
+            s(p.name.as_str(), Some(DIM), Some(GLASS)),
         ];
         let tail: Vec<Seg> = if p.ready {
             vec![s("✓ ", Some(FT), Some(GLASS)), s("READY", Some(FT), Some(GLASS))]
@@ -54,12 +55,12 @@ pub fn frame(boot_k: usize, cols: usize, rows: usize) -> Vec<String> {
         segs.extend(tail);
         lines.push(srow(segs));
     }
-    for _ in 0..PROBES.len() - shown {
+    for _ in 0..probes.len().saturating_sub(shown) {
         lines.push(srow(vec![]));
     }
     lines.push(srow(vec![]));
     let k = boot_k.min(19);
-    let cap = if boot_k >= 19 { BOOT_METER } else { "probing harnesses…" };
+    let cap = if boot_k >= 19 { meter_done } else { "probing harnesses…" };
     lines.push(srow(vec![
         s(" ".repeat(k), None, Some(dull(ION, 0.30))),
         s(" ".repeat(24 - k), None, Some(GLASS_IN)),

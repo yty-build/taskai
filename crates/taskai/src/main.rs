@@ -431,7 +431,7 @@ fn handle(app: &mut App, k: KeyEvent, cols: usize, rows: usize) -> bool {
             }
             match app.st.screen {
                 Screen::Boot => app.st.screen = Screen::Home,
-                Screen::Home => match k.code {
+                _ => match k.code {
                     KeyCode::Char('q') => return false,
                     KeyCode::Up => app.st.home_sel = app.st.home_sel.saturating_sub(1),
                     KeyCode::Down => app.st.home_sel = (app.st.home_sel + 1).min(3),

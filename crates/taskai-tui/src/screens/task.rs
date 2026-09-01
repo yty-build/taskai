@@ -4,14 +4,12 @@
 use crate::chrome::{keybar, masthead, PAD};
 use crate::color::{
     harness_color, Rgb, AMB, AMB_GLASS, CLI_BG, CLI_EDGE, DIM, FT, GLASS, GLASS_HI, GLASS_IN, ION,
-    KCAP, OK, TEXT, VOID,
+    KCAP, OK, TEXT, VOID, RESET,
 };
-use crate::fixture::{
-    Feed, SessionRow, FEED_ARCH, FEED_DELIV, FEED_LEAD, HANDOFF_CMD, HANDOFF_EXCHANGES,
-    HANDOFF_NOTE, HUD_HOME, LAMP, SESSIONS, SPIN_PHRASES, TASK_CRUMB,
-};
+use crate::fixture::Feed;
 use crate::seg::{clip_segs, row, s, sb, seglen, vrow, Seg};
 use crate::state::{St, View};
+use crate::view::{HandoffRow, Hud, PaneBody, TaskView};
 
 pub const RAIL_W: usize = 34;
 pub const GAP: usize = 2;
@@ -37,32 +35,19 @@ fn pad(n: isize) -> String {
     " ".repeat(n.max(0) as usize)
 }
 
-pub fn feed_for(key: &str) -> &'static [Feed] {
-    match key {
-        "lead" => FEED_LEAD,
-        "arch" => FEED_ARCH,
-        "deliv" => FEED_DELIV,
-        _ => &[],
-    }
-}
-
-pub fn phrase_for(key: &str) -> &'static str {
-    SPIN_PHRASES.iter().find(|(k, _)| *k == key).map(|(_, p)| *p).unwrap_or("Working…")
-}
-
-pub fn rail_lines(st: &St, h: usize) -> Vec<String> {
+pub fn rail_lines(view: &TaskView, st: &St, h: usize) -> Vec<String> {
     let w = RAIL_W;
     let inner = w - 2;
     let rl = |segs: Vec<Seg>| row(&clip_segs(&segs, inner), w, GLASS, 2);
 
-    let sel_s = &SESSIONS[st.rail_sel.min(SESSIONS.len() - 1)];
+    let sel_i = st.rail_sel.min(view.sessions.len().saturating_sub(1));
     let mut top = vec![row(&[s("▄".repeat(w), Some(GLASS), Some(VOID))], w, VOID, 0)];
-    top.push(rl(vec![sb("Repository evaluation", Some(TEXT), None)]));
-    top.push(rl(vec![s("/Users/me/GitHub/buzz", Some(FT), None)]));
+    top.push(rl(vec![sb(view.title.as_str(), Some(TEXT), None)]));
+    top.push(rl(vec![s(view.repo.as_str(), Some(FT), None)]));
     top.push(rl(vec![]));
     top.push(rl(vec![s("TEAM", Some(FT), None)]));
     top.push(rl(vec![]));
-    for (i, sess) in SESSIONS.iter().enumerate() {
+    for (i, sess) in view.sessions.iter().enumerate() {
         let sel = st.rail_sel == i;
         let fill = if sel { GLASS_HI } else { GLASS };
         let live = sess.live;
@@ -79,34 +64,34 @@ pub fn rail_lines(st: &St, h: usize) -> Vec<String> {
         let (name_row, h_ind) = if sess.depth == 0 {
             (
                 vec![
-                    s("▌", Some(harness_color(sess.hkey)), Some(fill)),
+                    s("▌", Some(harness_color(&sess.hkey)), Some(fill)),
                     s(" ", None, Some(fill)),
                     dot,
                     s(" ", None, Some(fill)),
-                    Seg { text: sess.name.into(), fg: Some(TEXT), bg: Some(fill), bold: sel },
+                    Seg { text: sess.name.clone(), fg: Some(TEXT), bg: Some(fill), bold: sel },
                 ],
                 4usize,
             )
         } else {
             (
                 vec![
-                    s("▌", Some(harness_color(sess.hkey)), Some(fill)),
+                    s("▌", Some(harness_color(&sess.hkey)), Some(fill)),
                     s("  ", None, Some(fill)),
                     s("└─ ", Some(FT), Some(fill)),
                     dot,
                     s(" ", None, Some(fill)),
-                    Seg { text: sess.name.into(), fg: Some(TEXT), bg: Some(fill), bold: sel },
+                    Seg { text: sess.name.clone(), fg: Some(TEXT), bg: Some(fill), bold: sel },
                 ],
                 7usize,
             )
         };
         top.push(row(&name_row, w, fill, 0));
-        let sword = sess.state_word;
+        let sword = sess.state_word.as_str();
         let swcol = if sel && live { ION } else if live { FT } else { AMB };
         let mut sub = vec![
-            s("▌", Some(harness_color(sess.hkey)), Some(fill)),
+            s("▌", Some(harness_color(&sess.hkey)), Some(fill)),
             s(" ".repeat(h_ind), None, Some(fill)),
-            s(sess.harness, Some(FT), Some(fill)),
+            s(sess.harness.as_str(), Some(FT), Some(fill)),
         ];
         sub.push(s(
             pad(w as isize - 2 - seglen(&sub) as isize - sword.chars().count() as isize),
@@ -125,10 +110,15 @@ pub fn rail_lines(st: &St, h: usize) -> Vec<String> {
     ]));
 
     let mut bot = vec![rl(vec![])];
+    let (sel_ws, sel_conduit) = view
+        .sessions
+        .get(sel_i)
+        .map(|sess| (sess.ws.clone(), sess.conduit.to_lowercase()))
+        .unwrap_or_default();
     let tele = [
-        ("WORKSPACE", ws_short(sel_s.ws, inner - 1)),
-        ("CONDUIT", sel_s.conduit.to_lowercase()),
-        ("TEAM", "4 sessions · 4 harnesses".to_string()),
+        ("WORKSPACE", ws_short(&sel_ws, inner - 1)),
+        ("CONDUIT", sel_conduit),
+        ("TEAM", view.team_line.clone()),
     ];
     for (label, value) in tele {
         bot.push(rl(vec![s(label, Some(FT), None)]));
@@ -237,16 +227,34 @@ fn spinner_tail(st: &St) -> String {
     )
 }
 
-pub fn pane_lines(st: &St, pw: usize, h: usize) -> Vec<String> {
-    let sess: &SessionRow = &SESSIONS[st.rail_sel.min(SESSIONS.len() - 1)];
-    let accent = harness_color(sess.hkey);
+fn fit_body(mut lines: Vec<String>, rows_: Vec<String>, body_h: usize, pw: usize, base: Rgb) -> Vec<String> {
+    if rows_.len() > body_h {
+        let skip = rows_.len() - body_h;
+        lines.extend(rows_.into_iter().skip(skip));
+    } else {
+        let missing = body_h - rows_.len();
+        lines.extend(rows_);
+        for _ in 0..missing {
+            lines.push(row(&[], pw, base, 0));
+        }
+    }
+    lines
+}
+
+pub fn pane_lines(view: &TaskView, st: &St, pw: usize, h: usize) -> Vec<String> {
+    let sel_i = st.rail_sel.min(view.sessions.len().saturating_sub(1));
+    let Some(sess) = view.sessions.get(sel_i) else {
+        return empty_pane(pw, h, "No session attached — add the first Manager with  m");
+    };
+    let accent = harness_color(&sess.hkey);
     let b = GLASS_HI;
     let head = vec![
-        sb(sess.name, Some(TEXT), Some(b)),
+        sb(sess.name.as_str(), Some(TEXT), Some(b)),
         s(" · ", Some(FT), Some(b)),
-        s(sess.harness, Some(accent), Some(b)),
+        s(sess.harness.as_str(), Some(accent), Some(b)),
     ];
-    let mut right: Vec<Seg> = vec![s(sess.conduit, Some(FT), Some(b)), s("   ", None, Some(b))];
+    let mut right: Vec<Seg> =
+        vec![s(sess.conduit.as_str(), Some(FT), Some(b)), s("   ", None, Some(b))];
     if sess.live {
         right.push(s("● ", Some(ION), Some(b)));
         right.push(s("LIVE", Some(ION), Some(b)));
@@ -272,122 +280,179 @@ pub fn pane_lines(st: &St, pw: usize, h: usize) -> Vec<String> {
         row(&hrow, pw, b, PAD),
     ];
 
-    if sess.key == "ver" {
-        lines.extend(handoff_pane(st, pw, h - lines.len()));
-        return lines;
-    }
-
-    let native = st.view == View::Native;
-    let base = if native { CLI_BG } else { GLASS };
-    let body_h = (h as isize - lines.len() as isize - if native { 5 } else { 3 }).max(0) as usize;
-    let mut rows_ = vec![row(&[], pw, base, 0)];
-    if native {
-        let hdr = if sess.hkey == "claude" {
-            format!("✻ {} · claude-fable-5 · {}", sess.harness, sess.ws)
-        } else {
-            format!("✻ {} · {}", sess.harness, sess.ws)
-        };
-        let mut chars = hdr.chars();
-        let first = chars.next().map(|c| c.to_string()).unwrap_or_default();
-        let rest: String = chars.collect();
-        rows_.push(row(
-            &[s(first, Some(accent), Some(base)), s(rest, Some(FT), Some(base))],
-            pw,
-            base,
-            2,
-        ));
-        rows_.push(row(&[], pw, base, 0));
-    }
-    rows_.extend(feed_rows(feed_for(sess.key), pw, base, accent, native));
-    rows_.push(row(&[], pw, base, 0));
-    rows_.push(row(
-        &[
-            s(
-                format!("{} ", SPIN_GLYPHS[st.spin_i % SPIN_GLYPHS.len()]),
-                Some(accent),
-                Some(base),
-            ),
-            s(phrase_for(sess.key), Some(TEXT), Some(base)),
-            s(format!("  {}", spinner_tail(st)), Some(FT), Some(base)),
-        ],
-        pw,
-        base,
-        2,
-    ));
-    if rows_.len() > body_h {
-        let skip = rows_.len() - body_h;
-        lines.extend(rows_.into_iter().skip(skip));
-    } else {
-        let missing = body_h - rows_.len();
-        lines.extend(rows_);
-        for _ in 0..missing {
-            lines.push(row(&[], pw, base, 0));
+    match &view.body {
+        PaneBody::Handoff { note, exchanges, cmd } => {
+            lines.extend(handoff_pane(st, note, exchanges, cmd, pw, h - lines.len()));
+            lines
+        }
+        PaneBody::Feed { entries, phrase } => {
+            let native = st.view == View::Native;
+            let base = if native { CLI_BG } else { GLASS };
+            let body_h =
+                (h as isize - lines.len() as isize - if native { 5 } else { 3 }).max(0) as usize;
+            let mut rows_ = vec![row(&[], pw, base, 0)];
+            if native {
+                let hdr = if sess.hkey == "claude" {
+                    format!("✻ {} · claude-fable-5 · {}", sess.harness, sess.ws)
+                } else {
+                    format!("✻ {} · {}", sess.harness, sess.ws)
+                };
+                let mut chars = hdr.chars();
+                let first = chars.next().map(|c| c.to_string()).unwrap_or_default();
+                let rest: String = chars.collect();
+                rows_.push(row(
+                    &[s(first, Some(accent), Some(base)), s(rest, Some(FT), Some(base))],
+                    pw,
+                    base,
+                    2,
+                ));
+                rows_.push(row(&[], pw, base, 0));
+            }
+            rows_.extend(feed_rows(entries, pw, base, accent, native));
+            rows_.push(row(&[], pw, base, 0));
+            rows_.push(row(
+                &[
+                    s(
+                        format!("{} ", SPIN_GLYPHS[st.spin_i % SPIN_GLYPHS.len()]),
+                        Some(accent),
+                        Some(base),
+                    ),
+                    s(*phrase, Some(TEXT), Some(base)),
+                    s(format!("  {}", spinner_tail(st)), Some(FT), Some(base)),
+                ],
+                pw,
+                base,
+                2,
+            ));
+            lines = fit_body(lines, rows_, body_h, pw, base);
+            let cur = if st.blink { "█" } else { " " };
+            if native {
+                let bw = pw - 4;
+                lines.push(row(
+                    &[s(format!("╭{}╮", "─".repeat(bw - 2)), Some(CLI_EDGE), Some(base))],
+                    pw,
+                    base,
+                    2,
+                ));
+                lines.push(row(
+                    &[
+                        s("│", Some(CLI_EDGE), Some(base)),
+                        s(" > ", Some(DIM), Some(base)),
+                        s(cur, Some(TEXT), Some(base)),
+                        s(" ".repeat(bw - 6), None, Some(base)),
+                        s("│", Some(CLI_EDGE), Some(base)),
+                    ],
+                    pw,
+                    base,
+                    2,
+                ));
+                lines.push(row(
+                    &[s(format!("╰{}╯", "─".repeat(bw - 2)), Some(CLI_EDGE), Some(base))],
+                    pw,
+                    base,
+                    2,
+                ));
+                lines.push(row(&[s("? for shortcuts", Some(FT), Some(base))], pw, base, 4));
+            } else {
+                lines.push(row(
+                    &[s("❯ ", Some(ION), Some(GLASS_HI)), s(cur, Some(ION), Some(GLASS_HI))],
+                    pw,
+                    GLASS_HI,
+                    PAD,
+                ));
+                lines.push(row(&[], pw, GLASS_HI, 0));
+            }
+            lines.push(row(
+                &[s("▀".repeat(pw), Some(if native { base } else { GLASS_HI }), Some(VOID))],
+                pw,
+                VOID,
+                0,
+            ));
+            lines
+        }
+        PaneBody::Cells(cells) => {
+            let base = CLI_BG;
+            let body_h = (h as isize - lines.len() as isize - 1).max(0) as usize;
+            for r in 0..body_h {
+                match cells.get(r) {
+                    Some(cr) => {
+                        let mut segs: Vec<Seg> = Vec::new();
+                        for c in cr {
+                            match segs.last_mut() {
+                                Some(last)
+                                    if last.fg == c.fg
+                                        && last.bg == c.bg
+                                        && last.bold == c.bold =>
+                                {
+                                    last.text.push_str(&c.text)
+                                }
+                                _ => segs.push(Seg {
+                                    text: c.text.clone(),
+                                    fg: c.fg,
+                                    bg: c.bg,
+                                    bold: c.bold,
+                                }),
+                            }
+                        }
+                        lines.push(row(&segs, pw, base, 0));
+                    }
+                    None => lines.push(row(&[], pw, base, 0)),
+                }
+            }
+            lines.push(row(&[s("▀".repeat(pw), Some(base), Some(VOID))], pw, VOID, 0));
+            lines
+        }
+        PaneBody::Empty(msg) => {
+            lines.extend(empty_pane(pw, h - lines.len(), msg));
+            lines
         }
     }
+}
 
-    let cur = if st.blink { "█" } else { " " };
-    if native {
-        let bw = pw - 4;
-        lines.push(row(
-            &[s(format!("╭{}╮", "─".repeat(bw - 2)), Some(CLI_EDGE), Some(base))],
-            pw,
-            base,
-            2,
-        ));
-        lines.push(row(
-            &[
-                s("│", Some(CLI_EDGE), Some(base)),
-                s(" > ", Some(DIM), Some(base)),
-                s(cur, Some(TEXT), Some(base)),
-                s(" ".repeat(bw - 6), None, Some(base)),
-                s("│", Some(CLI_EDGE), Some(base)),
-            ],
-            pw,
-            base,
-            2,
-        ));
-        lines.push(row(
-            &[s(format!("╰{}╯", "─".repeat(bw - 2)), Some(CLI_EDGE), Some(base))],
-            pw,
-            base,
-            2,
-        ));
-        lines.push(row(&[s("? for shortcuts", Some(FT), Some(base))], pw, base, 4));
-    } else {
-        lines.push(row(
-            &[s("❯ ", Some(ION), Some(GLASS_HI)), s(cur, Some(ION), Some(GLASS_HI))],
-            pw,
-            GLASS_HI,
-            PAD,
-        ));
-        lines.push(row(&[], pw, GLASS_HI, 0));
+fn empty_pane(pw: usize, h: usize, msg: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mid = h / 2;
+    for i in 0..h.saturating_sub(1) {
+        if i == mid {
+            let padn = pw.saturating_sub(msg.chars().count()) / 2;
+            lines.push(row(
+                &[s(" ".repeat(padn), None, Some(GLASS)), s(msg, Some(FT), Some(GLASS))],
+                pw,
+                GLASS,
+                0,
+            ));
+        } else {
+            lines.push(row(&[], pw, GLASS, 0));
+        }
     }
-    lines.push(row(
-        &[s("▀".repeat(pw), Some(if native { base } else { GLASS_HI }), Some(VOID))],
-        pw,
-        VOID,
-        0,
-    ));
+    lines.push(row(&[s("▀".repeat(pw), Some(GLASS), Some(VOID))], pw, VOID, 0));
     lines
 }
 
-pub fn handoff_pane(st: &St, pw: usize, h: usize) -> Vec<String> {
+pub fn handoff_pane(
+    st: &St,
+    note: &str,
+    exchanges: &[HandoffRow],
+    cmd: &str,
+    pw: usize,
+    h: usize,
+) -> Vec<String> {
     let base = GLASS;
     let mut lines = vec![row(&[], pw, base, 0)];
     lines.push(row(
-        &[s("◌ ", Some(AMB), Some(base)), s(HANDOFF_NOTE, Some(DIM), Some(base))],
+        &[s("◌ ", Some(AMB), Some(base)), s(note, Some(DIM), Some(base))],
         pw,
         base,
         2,
     ));
     lines.push(row(&[], pw, base, 0));
-    for ex in HANDOFF_EXCHANGES {
-        match ex.kind {
+    for ex in exchanges {
+        match ex.kind.as_str() {
             "sent" => lines.push(row(
                 &[
                     s("❯ ", Some(DIM), Some(base)),
                     s(format!("{}   ", ex.ts), Some(FT), Some(base)),
-                    s(ex.text, Some(TEXT), Some(base)),
+                    s(ex.text.as_str(), Some(TEXT), Some(base)),
                 ],
                 pw,
                 base,
@@ -397,7 +462,7 @@ pub fn handoff_pane(st: &St, pw: usize, h: usize) -> Vec<String> {
                 &[
                     s("  ⎿ ", Some(FT), Some(base)),
                     s(format!("{}   ", ex.ts), Some(FT), Some(base)),
-                    s(ex.text, Some(DIM), Some(base)),
+                    s(ex.text.as_str(), Some(DIM), Some(base)),
                 ],
                 pw,
                 base,
@@ -422,7 +487,7 @@ pub fn handoff_pane(st: &St, pw: usize, h: usize) -> Vec<String> {
     lines.push(row(
         &[
             s("❯ ", Some(ION), Some(GLASS_IN)),
-            s(HANDOFF_CMD, Some(DIM), Some(GLASS_IN)),
+            s(cmd, Some(DIM), Some(GLASS_IN)),
             s(format!(" {cur}"), Some(ION), Some(GLASS_IN)),
         ],
         pw,
@@ -437,18 +502,26 @@ pub fn handoff_pane(st: &St, pw: usize, h: usize) -> Vec<String> {
     lines
 }
 
-pub fn frame(st: &St, cols: usize, rows: usize, clock: &str) -> Vec<String> {
-    let mut lines = masthead(cols, TASK_CRUMB, HUD_HOME, Some(LAMP), clock);
+pub fn frame(
+    view: &TaskView,
+    hud: &Hud,
+    st: &St,
+    cols: usize,
+    rows: usize,
+    clock: &str,
+) -> Vec<String> {
+    let hud_items: Vec<(&str, Rgb)> = hud.items.iter().map(|(t, c)| (t.as_str(), *c)).collect();
+    let mut lines = masthead(cols, &view.crumb, &hud_items, hud.lamp.as_deref(), clock);
     lines.push(vrow(cols));
     let h = rows.saturating_sub(lines.len() + 4);
     let pw = cols - RAIL_W - GAP;
-    let rail = rail_lines(st, h);
-    let pane = pane_lines(st, pw, h);
+    let rail = rail_lines(view, st, h);
+    let pane = pane_lines(view, st, pw, h);
     let gap = format!("{}{}", crate::color::bg(VOID), " ".repeat(GAP));
     for i in 0..h {
         let r = rail.get(i).cloned().unwrap_or_else(|| row(&[], RAIL_W, VOID, 0));
         let p = pane.get(i).cloned().unwrap_or_else(|| row(&[], pw, VOID, 0));
-        lines.push(format!("{r}{gap}{p}{}", crate::color::RESET));
+        lines.push(format!("{r}{gap}{p}{RESET}"));
     }
     lines.push(vrow(cols));
     lines.extend(keybar(

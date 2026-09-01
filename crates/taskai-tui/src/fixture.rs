@@ -269,3 +269,113 @@ pub const HELP_CONDUITS: &[(&str, &str)] = &[
     ("shared-live", "The CLI streams live; you type into it directly"),
     ("handoff-resume", "Prompts queue; results return on completion — never shown as live"),
 ];
+
+pub const HARNESS_SUMMARY: &str = "4 of 5 ready · 4 live · 1 queued";
+
+use crate::view::{HandoffRow, HarnessRowView, HomeTaskRow, Hud, PaneBody, ProbeRow, TaskView};
+
+pub fn hud() -> Hud {
+    Hud {
+        items: HUD_HOME.iter().map(|(t, c)| (t.to_string(), *c)).collect(),
+        lamp: Some(LAMP.to_string()),
+    }
+}
+
+pub fn probe_rows() -> Vec<ProbeRow> {
+    PROBES
+        .iter()
+        .map(|p| ProbeRow { name: p.name.into(), hkey: p.hkey.into(), ready: p.ready })
+        .collect()
+}
+
+pub fn home_rows(spark_t1: &[u8], spark_t2: &[u8]) -> Vec<HomeTaskRow> {
+    use crate::screens::home::spark_str;
+    TASKS
+        .iter()
+        .enumerate()
+        .map(|(i, t)| HomeTaskRow {
+            name: t.name.into(),
+            status: t.status.into(),
+            managers: t
+                .managers
+                .iter()
+                .map(|m| (m.role.to_string(), m.harness.to_string(), m.hkey.to_string()))
+                .collect(),
+            spark: match i {
+                0 => spark_str(spark_t1),
+                1 => spark_str(spark_t2),
+                _ => "▁".repeat(12),
+            },
+            spark_live: t.status == "WORKING",
+            meta: t.meta.into(),
+        })
+        .collect()
+}
+
+pub fn harness_rows() -> Vec<HarnessRowView> {
+    HARNESSES
+        .iter()
+        .map(|h| HarnessRowView {
+            name: h.name.into(),
+            hkey: h.hkey.into(),
+            bin: h.bin.into(),
+            sessions: if h.hkey == "grok" { "1 queued".into() } else { h.sessions.into() },
+            conduit: h.conduit.into(),
+            setup: h.setup,
+        })
+        .collect()
+}
+
+pub fn feed_for(key: &str) -> &'static [Feed] {
+    match key {
+        "lead" => FEED_LEAD,
+        "arch" => FEED_ARCH,
+        "deliv" => FEED_DELIV,
+        _ => &[],
+    }
+}
+
+pub fn phrase_for(key: &str) -> &'static str {
+    SPIN_PHRASES.iter().find(|(k, _)| *k == key).map(|(_, p)| *p).unwrap_or("Working…")
+}
+
+pub fn task_view(rail_sel: usize) -> TaskView {
+    let sessions = SESSIONS
+        .iter()
+        .map(|s| crate::view::RailRow {
+            key: s.key.into(),
+            name: s.name.into(),
+            harness: s.harness.into(),
+            hkey: s.hkey.into(),
+            live: s.live,
+            depth: s.depth,
+            conduit: s.conduit.into(),
+            state_word: s.state_word.into(),
+            ws: s.ws.into(),
+        })
+        .collect::<Vec<_>>();
+    let sel = rail_sel.min(SESSIONS.len() - 1);
+    let body = if SESSIONS[sel].key == "ver" {
+        PaneBody::Handoff {
+            note: HANDOFF_NOTE.into(),
+            exchanges: HANDOFF_EXCHANGES
+                .iter()
+                .map(|e| HandoffRow { kind: e.kind.into(), ts: e.ts.into(), text: e.text.into() })
+                .collect(),
+            cmd: HANDOFF_CMD.into(),
+        }
+    } else {
+        PaneBody::Feed {
+            entries: feed_for(SESSIONS[sel].key),
+            phrase: phrase_for(SESSIONS[sel].key),
+        }
+    };
+    TaskView {
+        crumb: TASK_CRUMB.into(),
+        title: "Repository evaluation".into(),
+        repo: "/Users/me/GitHub/buzz".into(),
+        team_line: "4 sessions · 4 harnesses".into(),
+        sessions,
+        body,
+    }
+}
