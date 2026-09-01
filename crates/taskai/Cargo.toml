@@ -1,0 +1,17 @@
+[package]
+name = "taskai"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+taskai-tui = { path = "../taskai-tui" }
+taskai-pane = { path = "../taskai-pane" }
+taskai-core = { path = "../taskai-core" }
+taskai-connectors = { path = "../taskai-connectors" }
+taskai-context = { path = "../taskai-context" }
+crossterm = "0.28"
+chrono = "0.4"
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
