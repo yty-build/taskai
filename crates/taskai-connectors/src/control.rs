@@ -42,9 +42,14 @@ pub struct Shared {
 impl Shared {
     /// Correlation-only dispatch log: source, target, event — never prompt content.
     fn note(&self, source: &str, target: &str, event: &str) {
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        if let Ok(mut f) =
-            std::fs::OpenOptions::new().create(true).append(true).open(&self.log)
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log)
         {
             let _ = writeln!(
                 f,
@@ -64,11 +69,9 @@ pub fn serve(sock_path: PathBuf, shared: Shared) -> std::io::Result<()> {
         std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))?;
     }
     std::thread::spawn(move || {
-        for conn in listener.incoming() {
-            if let Ok(stream) = conn {
-                let s = shared.clone();
-                std::thread::spawn(move || handle(stream, &s));
-            }
+        for stream in listener.incoming().flatten() {
+            let s = shared.clone();
+            std::thread::spawn(move || handle(stream, &s));
         }
     });
     Ok(())
@@ -103,7 +106,9 @@ fn handle(mut stream: UnixStream, shared: &Shared) {
         let attached: Vec<String> = shared.panes.lock().unwrap().keys().cloned().collect();
         return respond(
             &mut stream,
-            err(format!("session {target} is not attached; attached: {attached:?}")),
+            err(format!(
+                "session {target} is not attached; attached: {attached:?}"
+            )),
         );
     };
 
@@ -112,7 +117,10 @@ fn handle(mut stream: UnixStream, shared: &Shared) {
             shared.note(&source, &target, "cancel");
             let mut pane = pane.lock().unwrap();
             match pane.write_bytes(b"\x1b") {
-                Ok(()) => respond(&mut stream, serde_json::json!({"ok": true, "event": "cancel"})),
+                Ok(()) => respond(
+                    &mut stream,
+                    serde_json::json!({"ok": true, "event": "cancel"}),
+                ),
                 Err(e) => respond(&mut stream, err(format!("cancel failed: {e}"))),
             }
         }
@@ -138,7 +146,9 @@ fn handle(mut stream: UnixStream, shared: &Shared) {
             if wait && sid.is_none() {
                 return respond(
                     &mut stream,
-                    err(format!("session {target} is starting; provider identity not yet bound")),
+                    err(format!(
+                        "session {target} is starting; provider identity not yet bound"
+                    )),
                 );
             }
             let _guard = match shared.conduit.begin_turn(&target) {
@@ -148,7 +158,9 @@ fn handle(mut stream: UnixStream, shared: &Shared) {
                     return respond(&mut stream, err(e.to_string()));
                 }
             };
-            let offset = std::fs::metadata(&shared.events).map(|m| m.len()).unwrap_or(0);
+            let offset = std::fs::metadata(&shared.events)
+                .map(|m| m.len())
+                .unwrap_or(0);
             shared.note(&source, &target, "dispatch");
             {
                 let mut pane = pane.lock().unwrap();
@@ -157,7 +169,10 @@ fn handle(mut stream: UnixStream, shared: &Shared) {
                 }
             }
             if !wait {
-                return respond(&mut stream, serde_json::json!({"ok": true, "dispatched": true}));
+                return respond(
+                    &mut stream,
+                    serde_json::json!({"ok": true, "dispatched": true}),
+                );
             }
             match wait_for_event(
                 &shared.events,
@@ -190,7 +205,9 @@ fn client_call(sock: &Path, req: serde_json::Value) -> Result<serde_json::Value,
         .map_err(|e| format!("TaskAI runtime not reachable at {}: {e}", sock.display()))?;
     writeln!(stream, "{req}").map_err(|e| e.to_string())?;
     let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).map_err(|e| e.to_string())?;
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .map_err(|e| e.to_string())?;
     serde_json::from_str(&line).map_err(|e| format!("bad response {line:?}: {e}"))
 }
 
@@ -214,5 +231,8 @@ pub fn client_prompt(
 }
 
 pub fn client_cancel(sock: &Path, session_ref: &str) -> Result<serde_json::Value, String> {
-    client_call(sock, serde_json::json!({"cmd": "cancel", "ref": session_ref, "source": "human"}))
+    client_call(
+        sock,
+        serde_json::json!({"cmd": "cancel", "ref": session_ref, "source": "human"}),
+    )
 }

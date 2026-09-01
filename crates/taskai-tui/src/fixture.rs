@@ -8,11 +8,7 @@ pub const BOOT_METER: &str = "4 of 5 harnesses ready";
 pub const FIXED_CLOCK: &str = "12:00:00";
 pub const LAMP: &str = "ATTENTION · 1";
 
-pub const HUD_HOME: &[(&str, Rgb)] = &[
-    ("4 LIVE", ION),
-    ("1 QUEUED", DIM),
-    ("2 TASKS ACTIVE", DIM),
-];
+pub const HUD_HOME: &[(&str, Rgb)] = &[("4 LIVE", ION), ("1 QUEUED", DIM), ("2 TASKS ACTIVE", DIM)];
 
 pub struct Probe {
     pub name: &'static str,
@@ -21,11 +17,31 @@ pub struct Probe {
 }
 
 pub const PROBES: &[Probe] = &[
-    Probe { name: "Claude Code", hkey: "claude", ready: true },
-    Probe { name: "Codex", hkey: "codex", ready: true },
-    Probe { name: "OpenCode", hkey: "opencode", ready: true },
-    Probe { name: "Grok CLI", hkey: "grok", ready: true },
-    Probe { name: "Aider", hkey: "aider", ready: false },
+    Probe {
+        name: "Claude Code",
+        hkey: "claude",
+        ready: true,
+    },
+    Probe {
+        name: "Codex",
+        hkey: "codex",
+        ready: true,
+    },
+    Probe {
+        name: "OpenCode",
+        hkey: "opencode",
+        ready: true,
+    },
+    Probe {
+        name: "Grok CLI",
+        hkey: "grok",
+        ready: true,
+    },
+    Probe {
+        name: "Aider",
+        hkey: "aider",
+        ready: false,
+    },
 ];
 
 pub struct ManagerRef {
@@ -46,23 +62,43 @@ pub const TASKS: &[TaskRow] = &[
         name: "Repository evaluation",
         status: "WORKING",
         managers: &[
-            ManagerRef { role: "Lead", harness: "Claude Code", hkey: "claude" },
-            ManagerRef { role: "Delivery", harness: "Codex", hkey: "codex" },
+            ManagerRef {
+                role: "Lead",
+                harness: "Claude Code",
+                hkey: "claude",
+            },
+            ManagerRef {
+                role: "Delivery",
+                harness: "Codex",
+                hkey: "codex",
+            },
         ],
         meta: "4 sessions · buzz",
     },
     TaskRow {
         name: "Production release",
         status: "NEEDS ATTENTION",
-        managers: &[ManagerRef { role: "Ship", harness: "OpenCode", hkey: "opencode" }],
+        managers: &[ManagerRef {
+            role: "Ship",
+            harness: "OpenCode",
+            hkey: "opencode",
+        }],
         meta: "1 session · shop",
     },
     TaskRow {
         name: "API migration",
         status: "COMPLETE",
         managers: &[
-            ManagerRef { role: "Migrator", harness: "Grok CLI", hkey: "grok" },
-            ManagerRef { role: "Docs", harness: "Codex", hkey: "codex" },
+            ManagerRef {
+                role: "Migrator",
+                harness: "Grok CLI",
+                hkey: "grok",
+            },
+            ManagerRef {
+                role: "Docs",
+                harness: "Codex",
+                hkey: "codex",
+            },
         ],
         meta: "2 sessions · atlas",
     },
@@ -90,15 +126,55 @@ pub struct HarnessRow {
 }
 
 pub const HARNESSES: &[HarnessRow] = &[
-    HarnessRow { name: "Claude Code", hkey: "claude", bin: "claude · v2.1", sessions: "1 live", conduit: "owned-tui", setup: false },
-    HarnessRow { name: "Codex", hkey: "codex", bin: "codex · v0.9", sessions: "1 live", conduit: "shared-live", setup: false },
-    HarnessRow { name: "OpenCode", hkey: "opencode", bin: "opencode · v1.4", sessions: "2 live", conduit: "shared-live", setup: false },
-    HarnessRow { name: "Grok CLI", hkey: "grok", bin: "grok · v0.3", sessions: "1 active", conduit: "handoff-resume", setup: false },
-    HarnessRow { name: "Aider", hkey: "aider", bin: "not found on PATH", sessions: "—", conduit: "—", setup: true },
+    HarnessRow {
+        name: "Claude Code",
+        hkey: "claude",
+        bin: "claude · v2.1",
+        sessions: "1 live",
+        conduit: "owned-tui",
+        setup: false,
+    },
+    HarnessRow {
+        name: "Codex",
+        hkey: "codex",
+        bin: "codex · v0.9",
+        sessions: "1 live",
+        conduit: "shared-live",
+        setup: false,
+    },
+    HarnessRow {
+        name: "OpenCode",
+        hkey: "opencode",
+        bin: "opencode · v1.4",
+        sessions: "2 live",
+        conduit: "shared-live",
+        setup: false,
+    },
+    HarnessRow {
+        name: "Grok CLI",
+        hkey: "grok",
+        bin: "grok · v0.3",
+        sessions: "1 active",
+        conduit: "handoff-resume",
+        setup: false,
+    },
+    HarnessRow {
+        name: "Aider",
+        hkey: "aider",
+        bin: "not found on PATH",
+        sessions: "—",
+        conduit: "—",
+        setup: true,
+    },
 ];
 
-pub const KEYS_HARNESS: &[(&str, &str)] =
-    &[("p", "Probe"), ("c", "Configure"), ("+", "Custom CLI"), ("T", "Home"), ("?", "Help")];
+pub const KEYS_HARNESS: &[(&str, &str)] = &[
+    ("p", "Probe"),
+    ("c", "Configure"),
+    ("+", "Custom CLI"),
+    ("T", "Home"),
+    ("?", "Help"),
+];
 
 pub struct SessionRow {
     pub key: &'static str,
@@ -113,10 +189,50 @@ pub struct SessionRow {
 }
 
 pub const SESSIONS: &[SessionRow] = &[
-    SessionRow { key: "lead", name: "Lead", harness: "Claude Code", hkey: "claude", live: true, depth: 0, conduit: "OWNED-TUI", state_word: "LIVE", ws: "~/GitHub/buzz" },
-    SessionRow { key: "arch", name: "Architecture", harness: "OpenCode", hkey: "opencode", live: true, depth: 1, conduit: "SHARED-LIVE", state_word: "LIVE", ws: "~/GitHub/buzz-worktrees/auth-pass" },
-    SessionRow { key: "deliv", name: "Delivery", harness: "Codex", hkey: "codex", live: true, depth: 0, conduit: "SHARED-LIVE", state_word: "LIVE", ws: "~/GitHub/buzz-worktrees/retry-backoff" },
-    SessionRow { key: "ver", name: "Verification", harness: "Grok CLI", hkey: "grok", live: false, depth: 1, conduit: "HANDOFF-RESUME", state_word: "HANDOFF", ws: "~/GitHub/buzz-worktrees/verification-pass" },
+    SessionRow {
+        key: "lead",
+        name: "Lead",
+        harness: "Claude Code",
+        hkey: "claude",
+        live: true,
+        depth: 0,
+        conduit: "OWNED-TUI",
+        state_word: "LIVE",
+        ws: "~/GitHub/buzz",
+    },
+    SessionRow {
+        key: "arch",
+        name: "Architecture",
+        harness: "OpenCode",
+        hkey: "opencode",
+        live: true,
+        depth: 1,
+        conduit: "SHARED-LIVE",
+        state_word: "LIVE",
+        ws: "~/GitHub/buzz-worktrees/auth-pass",
+    },
+    SessionRow {
+        key: "deliv",
+        name: "Delivery",
+        harness: "Codex",
+        hkey: "codex",
+        live: true,
+        depth: 0,
+        conduit: "SHARED-LIVE",
+        state_word: "LIVE",
+        ws: "~/GitHub/buzz-worktrees/retry-backoff",
+    },
+    SessionRow {
+        key: "ver",
+        name: "Verification",
+        harness: "Grok CLI",
+        hkey: "grok",
+        live: false,
+        depth: 1,
+        conduit: "HANDOFF-RESUME",
+        state_word: "HANDOFF",
+        ws: "~/GitHub/buzz-worktrees/verification-pass",
+    },
 ];
 
 #[derive(Clone)]
@@ -204,10 +320,26 @@ pub struct Handoff {
 pub const HANDOFF_NOTE: &str =
     "HANDOFF-RESUME · Grok CLI does not stream. Prompts queue; results return on completion.";
 pub const HANDOFF_EXCHANGES: &[Handoff] = &[
-    Handoff { kind: "sent", ts: "17:02", text: "Verify release gates against docs/release-gates.md." },
-    Handoff { kind: "ret", ts: "17:09", text: "Pass 1 complete — 3 gates checked, 1 flagged: rollback untested." },
-    Handoff { kind: "sent", ts: "17:31", text: "Re-check rollback gate after the staging dry run." },
-    Handoff { kind: "wait", ts: "", text: "Queued · resumes on completion" },
+    Handoff {
+        kind: "sent",
+        ts: "17:02",
+        text: "Verify release gates against docs/release-gates.md.",
+    },
+    Handoff {
+        kind: "ret",
+        ts: "17:09",
+        text: "Pass 1 complete — 3 gates checked, 1 flagged: rollback untested.",
+    },
+    Handoff {
+        kind: "sent",
+        ts: "17:31",
+        text: "Re-check rollback gate after the staging dry run.",
+    },
+    Handoff {
+        kind: "wait",
+        ts: "",
+        text: "Queued · resumes on completion",
+    },
 ];
 pub const HANDOFF_CMD: &str = "taskai session prompt verification --stdin --wait";
 
@@ -217,7 +349,11 @@ pub struct Drawer {
     pub keys: &'static [(&'static str, &'static str)],
 }
 
-pub const DRAWER_KEYS: &[(&str, &str)] = &[("Enter", "Create"), ("Tab", "Next field"), ("Esc", "Cancel")];
+pub const DRAWER_KEYS: &[(&str, &str)] = &[
+    ("Enter", "Create"),
+    ("Tab", "Next field"),
+    ("Esc", "Cancel"),
+];
 
 pub const NEWTASK: Drawer = Drawer {
     title: "New task",
@@ -247,17 +383,28 @@ pub const SUBORDINATE_NOTE: &str =
     "Runs in an isolated worktree. Repo and history are preserved on destroy.";
 
 pub const DESTROY_TITLE: &str = "Destroy task — API migration";
-pub const DESTROY_BLAST: &[&str] = &["2 sessions will be closed", "Task record removed from TaskAI"];
-pub const DESTROY_KEPT: &[&str] =
-    &["Repository untouched", "Worktrees preserved", "Git history preserved"];
+pub const DESTROY_BLAST: &[&str] = &[
+    "2 sessions will be closed",
+    "Task record removed from TaskAI",
+];
+pub const DESTROY_KEPT: &[&str] = &[
+    "Repository untouched",
+    "Worktrees preserved",
+    "Git history preserved",
+];
 pub const DESTROY_CONFIRM: &str = "api-migration";
 
 pub const HELP_BOUNDARY: (&str, &str) = (
     "Ctrl+G",
     "The boundary — the only chord TaskAI reserves. Everything else belongs to your CLI.",
 );
-pub const HELP_GLOBAL: &[(&str, &str)] =
-    &[("T", "Home"), ("n", "New task"), ("h", "Harnesses"), ("/", "Find"), ("?", "Help")];
+pub const HELP_GLOBAL: &[(&str, &str)] = &[
+    ("T", "Home"),
+    ("n", "New task"),
+    ("h", "Harnesses"),
+    ("/", "Find"),
+    ("?", "Help"),
+];
 pub const HELP_TASK: &[(&str, &str)] = &[
     ("Enter", "Attach"),
     ("a", "Add Subordinate"),
@@ -265,9 +412,18 @@ pub const HELP_TASK: &[(&str, &str)] = &[
     ("d", "Destroy"),
 ];
 pub const HELP_CONDUITS: &[(&str, &str)] = &[
-    ("owned-tui", "TaskAI hosts the CLI's own interface, full fidelity"),
-    ("shared-live", "The CLI streams live; you type into it directly"),
-    ("handoff-resume", "Prompts queue; results return on completion — never shown as live"),
+    (
+        "owned-tui",
+        "TaskAI hosts the CLI's own interface, full fidelity",
+    ),
+    (
+        "shared-live",
+        "The CLI streams live; you type into it directly",
+    ),
+    (
+        "handoff-resume",
+        "Prompts queue; results return on completion — never shown as live",
+    ),
 ];
 
 pub const HARNESS_SUMMARY: &str = "4 of 5 ready · 4 live · 1 queued";
@@ -284,7 +440,11 @@ pub fn hud() -> Hud {
 pub fn probe_rows() -> Vec<ProbeRow> {
     PROBES
         .iter()
-        .map(|p| ProbeRow { name: p.name.into(), hkey: p.hkey.into(), ready: p.ready })
+        .map(|p| ProbeRow {
+            name: p.name.into(),
+            hkey: p.hkey.into(),
+            ready: p.ready,
+        })
         .collect()
 }
 
@@ -299,7 +459,13 @@ pub fn home_rows(spark_t1: &[u8], spark_t2: &[u8]) -> Vec<HomeTaskRow> {
             managers: t
                 .managers
                 .iter()
-                .map(|m| (m.role.to_string(), m.harness.to_string(), m.hkey.to_string()))
+                .map(|m| {
+                    (
+                        m.role.to_string(),
+                        m.harness.to_string(),
+                        m.hkey.to_string(),
+                    )
+                })
                 .collect(),
             spark: match i {
                 0 => spark_str(spark_t1),
@@ -319,7 +485,11 @@ pub fn harness_rows() -> Vec<HarnessRowView> {
             name: h.name.into(),
             hkey: h.hkey.into(),
             bin: h.bin.into(),
-            sessions: if h.hkey == "grok" { "1 queued".into() } else { h.sessions.into() },
+            sessions: if h.hkey == "grok" {
+                "1 queued".into()
+            } else {
+                h.sessions.into()
+            },
             conduit: h.conduit.into(),
             setup: h.setup,
         })
@@ -336,7 +506,11 @@ pub fn feed_for(key: &str) -> &'static [Feed] {
 }
 
 pub fn phrase_for(key: &str) -> &'static str {
-    SPIN_PHRASES.iter().find(|(k, _)| *k == key).map(|(_, p)| *p).unwrap_or("Working…")
+    SPIN_PHRASES
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, p)| *p)
+        .unwrap_or("Working…")
 }
 
 pub fn task_view(rail_sel: usize) -> TaskView {
@@ -360,7 +534,11 @@ pub fn task_view(rail_sel: usize) -> TaskView {
             note: HANDOFF_NOTE.into(),
             exchanges: HANDOFF_EXCHANGES
                 .iter()
-                .map(|e| HandoffRow { kind: e.kind.into(), ts: e.ts.into(), text: e.text.into() })
+                .map(|e| HandoffRow {
+                    kind: e.kind.into(),
+                    ts: e.ts.into(),
+                    text: e.text.into(),
+                })
                 .collect(),
             cmd: HANDOFF_CMD.into(),
         }

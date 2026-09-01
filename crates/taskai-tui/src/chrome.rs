@@ -9,12 +9,22 @@ pub const PAD: usize = 3;
 
 /// Half-block upper edge: reads as a rounded slab top on the void.
 pub fn soft_top(fill: Rgb, width: usize) -> String {
-    row(&[s("▄".repeat(width), Some(fill), Some(VOID))], width, VOID, 0)
+    row(
+        &[s("▄".repeat(width), Some(fill), Some(VOID))],
+        width,
+        VOID,
+        0,
+    )
 }
 
 /// Half-block lower edge.
 pub fn soft_bot(fill: Rgb, width: usize) -> String {
-    row(&[s("▀".repeat(width), Some(fill), Some(VOID))], width, VOID, 0)
+    row(
+        &[s("▀".repeat(width), Some(fill), Some(VOID))],
+        width,
+        VOID,
+        0,
+    )
 }
 
 /// The HUD strip: wordmark, crumb, right-side counts, attention lamp, clock.
@@ -48,7 +58,11 @@ pub fn masthead(
         .max(1) as usize;
     left.push(s(" ".repeat(gap), None, Some(b)));
     left.extend(right);
-    vec![soft_top(b, cols), row(&left, cols, b, PAD), soft_bot(b, cols)]
+    vec![
+        soft_top(b, cols),
+        row(&left, cols, b, PAD),
+        soft_bot(b, cols),
+    ]
 }
 
 /// Hairline rule, then centered keycap chips: ` key ` on KCAP fill, label on the void.
@@ -65,7 +79,12 @@ pub fn keybar(cols: usize, pairs: &[(&str, &str)]) -> Vec<String> {
     let mut centered = vec![s(" ".repeat(pad), None, Some(VOID))];
     centered.extend(segs);
     vec![
-        row(&[s("─".repeat(cols), Some(HAIR), Some(VOID))], cols, VOID, 0),
+        row(
+            &[s("─".repeat(cols), Some(HAIR), Some(VOID))],
+            cols,
+            VOID,
+            0,
+        ),
         row(&centered, cols, VOID, 0),
     ]
 }

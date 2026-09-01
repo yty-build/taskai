@@ -32,7 +32,13 @@ fn app_server_initialize_handshake() {
     let c = CodexConnector::default();
     let mut server = c.spawn_app_server().unwrap();
     let result = server.initialize(Duration::from_secs(15)).unwrap();
-    assert!(result["userAgent"].as_str().unwrap_or("").contains("taskai"), "{result}");
+    assert!(
+        result["userAgent"]
+            .as_str()
+            .unwrap_or("")
+            .contains("taskai"),
+        "{result}"
+    );
     assert!(result["codexHome"].is_string(), "{result}");
 }
 
@@ -48,7 +54,11 @@ fn app_server_lists_threads() {
     let mut server = c.spawn_app_server().unwrap();
     server.initialize(Duration::from_secs(15)).unwrap();
     let result = server
-        .request("thread/list", serde_json::json!({"limit": 3}), Duration::from_secs(15))
+        .request(
+            "thread/list",
+            serde_json::json!({"limit": 3}),
+            Duration::from_secs(15),
+        )
         .unwrap();
     assert!(result["data"].is_array(), "thread/list shape: {result}");
 }
@@ -64,7 +74,11 @@ fn app_server_reports_unknown_method() {
     let mut server = c.spawn_app_server().unwrap();
     server.initialize(Duration::from_secs(15)).unwrap();
     let err = server
-        .request("taskai/bogus", serde_json::json!({}), Duration::from_secs(15))
+        .request(
+            "taskai/bogus",
+            serde_json::json!({}),
+            Duration::from_secs(15),
+        )
         .unwrap_err();
     assert!(err.to_string().contains("unknown variant"), "{err}");
 }

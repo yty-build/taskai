@@ -14,8 +14,10 @@ pub fn ready(name: &str, cap: &Capability) -> bool {
     if cap.mode != Mode::Unsupported {
         return true;
     }
-    let notice =
-        format!("unproven: {name} is absent or unsupported ({}) — this proof did not run", cap.detail);
+    let notice = format!(
+        "unproven: {name} is absent or unsupported ({}) — this proof did not run",
+        cap.detail
+    );
     assert!(
         std::env::var("TASKAI_REQUIRE_HARNESSES").is_err(),
         "{notice} (TASKAI_REQUIRE_HARNESSES is set)"

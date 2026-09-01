@@ -90,7 +90,11 @@ fn wait_for(pane: &Pane, needle: &str) {
         if pane.text().contains(needle) {
             return;
         }
-        assert!(Instant::now() < deadline, "timed out waiting for {needle:?}; grid:\n{}", pane.text());
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {needle:?}; grid:\n{}",
+            pane.text()
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -101,7 +105,15 @@ fn wait_for(pane: &Pane, needle: &str) {
 #[test]
 fn real_process_renders_into_grid() {
     let cwd = std::env::current_dir().unwrap();
-    let pane = Pane::spawn("/bin/sh", &["-c", "printf 'taskai-pane-ok'; sleep 2"], &cwd, 24, 80, &[]).unwrap();
+    let pane = Pane::spawn(
+        "/bin/sh",
+        &["-c", "printf 'taskai-pane-ok'; sleep 2"],
+        &cwd,
+        24,
+        80,
+        &[],
+    )
+    .unwrap();
     wait_for(&pane, "taskai-pane-ok");
 }
 

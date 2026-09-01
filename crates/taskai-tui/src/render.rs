@@ -1,10 +1,8 @@
 // ABOUTME: Screen dispatch over the fixture world — used by --dump-frame, parity tests,
 // ABOUTME: and the demo; the live app calls the screen renderers with registry views.
 
-use crate::fixture::{
-    self, BOOT_METER, FIXED_CLOCK, HARNESS_SUMMARY,
-};
 use crate::color::{DIM, ION, VOID};
+use crate::fixture::{self, BOOT_METER, FIXED_CLOCK, HARNESS_SUMMARY};
 use crate::overlay::{destroy_panel, help_panel, newtask_panel, overlay, sub_panel};
 use crate::screens::{attach, attention, boot, harness, home, task};
 use crate::seg::{row, s, vrow};
@@ -74,9 +72,14 @@ pub fn render(st: &St, cols: usize, rows: usize, clock: &str) -> Vec<String> {
             rows,
             clock,
         ),
-        Screen::Harnesses => {
-            harness::frame(&fixture::harness_rows(), HARNESS_SUMMARY, &fixture::hud(), cols, rows, clock)
-        }
+        Screen::Harnesses => harness::frame(
+            &fixture::harness_rows(),
+            HARNESS_SUMMARY,
+            &fixture::hud(),
+            cols,
+            rows,
+            clock,
+        ),
         Screen::Task => task::frame(
             &fixture::task_view(st.rail_sel),
             &fixture::hud(),

@@ -34,7 +34,9 @@ fn server_is_authenticated_and_creates_sessions() {
     let c = OpenCodeConnector::default();
     let server = c.start_server(tmp.path()).unwrap();
 
-    let (code, _) = server.http_unauthenticated("GET", "/session", None).unwrap();
+    let (code, _) = server
+        .http_unauthenticated("GET", "/session", None)
+        .unwrap();
     assert_eq!(code, 401, "unauthenticated must be refused");
 
     let (code, body) = server.http("GET", "/session", None).unwrap();
@@ -87,10 +89,17 @@ fn live_opencode_turn_correlates() {
 
     let body = serde_json::json!({"parts": [{"type": "text", "text": "Reply with exactly TASKAI-M5-OK and nothing else."}]});
     let (code, resp) = server
-        .http("POST", &format!("/session/{id}/message"), Some(&body.to_string()))
+        .http(
+            "POST",
+            &format!("/session/{id}/message"),
+            Some(&body.to_string()),
+        )
         .unwrap();
     assert_eq!(code, 200, "{resp}");
-    assert!(resp.contains("TASKAI-M5-OK") || resp.contains(&id), "response correlates: {resp}");
+    assert!(
+        resp.contains("TASKAI-M5-OK") || resp.contains(&id),
+        "response correlates: {resp}"
+    );
 
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut idle_seen = false;
@@ -104,6 +113,8 @@ fn live_opencode_turn_correlates() {
         }
     }
     assert!(idle_seen, "session idle edge observed");
-    let (_, msgs) = server.http("GET", &format!("/session/{id}/message"), None).unwrap();
+    let (_, msgs) = server
+        .http("GET", &format!("/session/{id}/message"), None)
+        .unwrap();
     assert!(msgs.contains("TASKAI-M5-OK"), "history integrity: {msgs}");
 }

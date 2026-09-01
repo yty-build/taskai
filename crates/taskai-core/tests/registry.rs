@@ -16,20 +16,48 @@ fn open(dir: &Path) -> Registry {
 fn refs_never_recycled() {
     let tmp = tempfile::tempdir().unwrap();
     let mut reg = open(tmp.path());
-    let t = reg.create_task("Repository evaluation", Path::new("/tmp/buzz"), Source::HumanUi).unwrap();
-    let s1 = reg
-        .create_session(&t, None, "Lead", "claude", Path::new("/tmp/buzz"), Source::HumanUi)
+    let t = reg
+        .create_task(
+            "Repository evaluation",
+            Path::new("/tmp/buzz"),
+            Source::HumanUi,
+        )
         .unwrap();
-    reg.destroy(&Item::Session(s1.clone()), Source::HumanUi).unwrap();
+    let s1 = reg
+        .create_session(
+            &t,
+            None,
+            "Lead",
+            "claude",
+            Path::new("/tmp/buzz"),
+            Source::HumanUi,
+        )
+        .unwrap();
+    reg.destroy(&Item::Session(s1.clone()), Source::HumanUi)
+        .unwrap();
     let s2 = reg
-        .create_session(&t, None, "Lead", "claude", Path::new("/tmp/buzz"), Source::HumanUi)
+        .create_session(
+            &t,
+            None,
+            "Lead",
+            "claude",
+            Path::new("/tmp/buzz"),
+            Source::HumanUi,
+        )
         .unwrap();
     assert_ne!(s1, s2);
 
     drop(reg);
     let mut reg = open(tmp.path());
     let s3 = reg
-        .create_session(&t, None, "Delivery", "codex", Path::new("/tmp/buzz"), Source::HumanUi)
+        .create_session(
+            &t,
+            None,
+            "Delivery",
+            "codex",
+            Path::new("/tmp/buzz"),
+            Source::HumanUi,
+        )
         .unwrap();
     assert!(![s1, s2].contains(&s3));
 }
@@ -41,31 +69,98 @@ fn refs_never_recycled() {
 fn topology_rules() {
     let tmp = tempfile::tempdir().unwrap();
     let mut reg = open(tmp.path());
-    let t1 = reg.create_task("Repository evaluation", Path::new("/tmp/buzz"), Source::HumanUi).unwrap();
-    let t2 = reg.create_task("Production release", Path::new("/tmp/shop"), Source::HumanUi).unwrap();
+    let t1 = reg
+        .create_task(
+            "Repository evaluation",
+            Path::new("/tmp/buzz"),
+            Source::HumanUi,
+        )
+        .unwrap();
+    let t2 = reg
+        .create_task(
+            "Production release",
+            Path::new("/tmp/shop"),
+            Source::HumanUi,
+        )
+        .unwrap();
     let lead = reg
-        .create_session(&t1, None, "Lead", "claude", Path::new("/tmp/buzz"), Source::HumanUi)
+        .create_session(
+            &t1,
+            None,
+            "Lead",
+            "claude",
+            Path::new("/tmp/buzz"),
+            Source::HumanUi,
+        )
         .unwrap();
     let arch = reg
-        .create_session(&t1, Some(&lead), "Architecture", "opencode", Path::new("/tmp/wt"), Source::HumanUi)
+        .create_session(
+            &t1,
+            Some(&lead),
+            "Architecture",
+            "opencode",
+            Path::new("/tmp/wt"),
+            Source::HumanUi,
+        )
         .unwrap();
     let deliv = reg
-        .create_session(&t1, None, "Delivery", "codex", Path::new("/tmp/buzz"), Source::HumanUi)
+        .create_session(
+            &t1,
+            None,
+            "Delivery",
+            "codex",
+            Path::new("/tmp/buzz"),
+            Source::HumanUi,
+        )
         .unwrap();
 
     assert!(reg.session(&lead).unwrap().parent.is_none());
-    assert_eq!(reg.session(&arch).unwrap().parent.as_deref(), Some(lead.as_str()));
-    let of_t1: Vec<_> = reg.sessions_of(&t1).iter().map(|s| s.session_ref.clone()).collect();
+    assert_eq!(
+        reg.session(&arch).unwrap().parent.as_deref(),
+        Some(lead.as_str())
+    );
+    let of_t1: Vec<_> = reg
+        .sessions_of(&t1)
+        .iter()
+        .map(|s| s.session_ref.clone())
+        .collect();
     assert_eq!(of_t1, vec![lead.clone(), arch.clone(), deliv.clone()]);
-    let kids: Vec<_> = reg.children_of(&lead).iter().map(|s| s.session_ref.clone()).collect();
+    let kids: Vec<_> = reg
+        .children_of(&lead)
+        .iter()
+        .map(|s| s.session_ref.clone())
+        .collect();
     assert_eq!(kids, vec![arch.clone()]);
 
-    assert!(reg.create_session("t999", None, "X", "codex", Path::new("/tmp"), Source::HumanUi).is_err());
     assert!(reg
-        .create_session(&t2, Some(&lead), "X", "codex", Path::new("/tmp"), Source::HumanUi)
+        .create_session(
+            "t999",
+            None,
+            "X",
+            "codex",
+            Path::new("/tmp"),
+            Source::HumanUi
+        )
         .is_err());
     assert!(reg
-        .create_session(&t1, Some(&arch), "X", "codex", Path::new("/tmp"), Source::HumanUi)
+        .create_session(
+            &t2,
+            Some(&lead),
+            "X",
+            "codex",
+            Path::new("/tmp"),
+            Source::HumanUi
+        )
+        .is_err());
+    assert!(reg
+        .create_session(
+            &t1,
+            Some(&arch),
+            "X",
+            "codex",
+            Path::new("/tmp"),
+            Source::HumanUi
+        )
         .is_err());
 }
 
@@ -76,16 +171,38 @@ fn topology_rules() {
 fn mutations_attributed() {
     let tmp = tempfile::tempdir().unwrap();
     let mut reg = open(tmp.path());
-    let t = reg.create_task("Repository evaluation", Path::new("/tmp/buzz"), Source::HumanUi).unwrap();
+    let t = reg
+        .create_task(
+            "Repository evaluation",
+            Path::new("/tmp/buzz"),
+            Source::HumanUi,
+        )
+        .unwrap();
     let lead = reg
-        .create_session(&t, None, "Lead", "claude", Path::new("/tmp/buzz"), Source::HumanUi)
+        .create_session(
+            &t,
+            None,
+            "Lead",
+            "claude",
+            Path::new("/tmp/buzz"),
+            Source::HumanUi,
+        )
         .unwrap();
-    reg.create_session(&t, Some(&lead), "Architecture", "opencode", Path::new("/tmp/wt"), Source::Session(lead.clone()))
-        .unwrap();
+    reg.create_session(
+        &t,
+        Some(&lead),
+        "Architecture",
+        "opencode",
+        Path::new("/tmp/wt"),
+        Source::Session(lead.clone()),
+    )
+    .unwrap();
 
     assert_eq!(reg.session(&lead).unwrap().created_by, Source::HumanUi);
     let audit = reg.audit();
-    assert!(audit.iter().any(|a| a.action == "create_task" && a.source == Source::HumanUi));
+    assert!(audit
+        .iter()
+        .any(|a| a.action == "create_task" && a.source == Source::HumanUi));
     assert!(audit
         .iter()
         .any(|a| a.action == "create_session" && a.source == Source::Session(lead.clone())));
@@ -100,9 +217,22 @@ fn persistence_survives_restart() {
     let (t, lead);
     {
         let mut reg = open(tmp.path());
-        t = reg.create_task("Repository evaluation", Path::new("/tmp/buzz"), Source::HumanUi).unwrap();
+        t = reg
+            .create_task(
+                "Repository evaluation",
+                Path::new("/tmp/buzz"),
+                Source::HumanUi,
+            )
+            .unwrap();
         lead = reg
-            .create_session(&t, None, "Lead", "claude", Path::new("/tmp/buzz"), Source::HumanUi)
+            .create_session(
+                &t,
+                None,
+                "Lead",
+                "claude",
+                Path::new("/tmp/buzz"),
+                Source::HumanUi,
+            )
             .unwrap();
         reg.set_state(&lead, SessionState::Live).unwrap();
     }
@@ -130,21 +260,58 @@ fn set_state_unknown_ref_errors() {
 fn blast_radius_and_destroy() {
     let tmp = tempfile::tempdir().unwrap();
     let mut reg = open(tmp.path());
-    let t = reg.create_task("Repository evaluation", Path::new("/tmp/buzz"), Source::HumanUi).unwrap();
+    let t = reg
+        .create_task(
+            "Repository evaluation",
+            Path::new("/tmp/buzz"),
+            Source::HumanUi,
+        )
+        .unwrap();
     let lead = reg
-        .create_session(&t, None, "Lead", "claude", Path::new("/tmp/buzz"), Source::HumanUi)
+        .create_session(
+            &t,
+            None,
+            "Lead",
+            "claude",
+            Path::new("/tmp/buzz"),
+            Source::HumanUi,
+        )
         .unwrap();
     let arch = reg
-        .create_session(&t, Some(&lead), "Architecture", "opencode", Path::new("/tmp/wt"), Source::HumanUi)
+        .create_session(
+            &t,
+            Some(&lead),
+            "Architecture",
+            "opencode",
+            Path::new("/tmp/wt"),
+            Source::HumanUi,
+        )
         .unwrap();
     let deliv = reg
-        .create_session(&t, None, "Delivery", "codex", Path::new("/tmp/buzz"), Source::HumanUi)
+        .create_session(
+            &t,
+            None,
+            "Delivery",
+            "codex",
+            Path::new("/tmp/buzz"),
+            Source::HumanUi,
+        )
         .unwrap();
     let ver = reg
-        .create_session(&t, Some(&deliv), "Verification", "grok", Path::new("/tmp/wt2"), Source::HumanUi)
+        .create_session(
+            &t,
+            Some(&deliv),
+            "Verification",
+            "grok",
+            Path::new("/tmp/wt2"),
+            Source::HumanUi,
+        )
         .unwrap();
 
-    assert_eq!(reg.blast(&Item::Session(arch.clone())).unwrap(), vec![arch.clone()]);
+    assert_eq!(
+        reg.blast(&Item::Session(arch.clone())).unwrap(),
+        vec![arch.clone()]
+    );
     assert_eq!(
         reg.blast(&Item::Session(lead.clone())).unwrap(),
         vec![lead.clone(), arch.clone()]
@@ -154,13 +321,17 @@ fn blast_radius_and_destroy() {
         vec![lead.clone(), arch.clone(), deliv.clone(), ver.clone()]
     );
 
-    let removed = reg.destroy(&Item::Session(lead.clone()), Source::HumanUi).unwrap();
+    let removed = reg
+        .destroy(&Item::Session(lead.clone()), Source::HumanUi)
+        .unwrap();
     assert_eq!(removed, vec![lead.clone(), arch.clone()]);
     assert!(reg.session(&lead).is_none());
     assert!(reg.session(&arch).is_none());
     assert!(reg.session(&deliv).is_some());
 
-    let removed = reg.destroy(&Item::Task(t.clone()), Source::HumanUi).unwrap();
+    let removed = reg
+        .destroy(&Item::Task(t.clone()), Source::HumanUi)
+        .unwrap();
     assert_eq!(removed, vec![deliv, ver]);
     assert!(reg.task(&t).is_none());
     assert!(reg.tasks().is_empty());
@@ -174,27 +345,82 @@ fn blast_radius_and_destroy() {
 fn hud_counts_and_task_status() {
     let tmp = tempfile::tempdir().unwrap();
     let mut reg = Registry::open(tmp.path()).unwrap();
-    let t1 = reg.create_task("Repository evaluation", Path::new("/tmp/buzz"), Source::HumanUi).unwrap();
-    let lead = reg.create_session(&t1, None, "Lead", "claude", Path::new("/tmp/buzz"), Source::HumanUi).unwrap();
-    let ver = reg.create_session(&t1, Some(&lead), "Verification", "grok", Path::new("/tmp/wt"), Source::HumanUi).unwrap();
+    let t1 = reg
+        .create_task(
+            "Repository evaluation",
+            Path::new("/tmp/buzz"),
+            Source::HumanUi,
+        )
+        .unwrap();
+    let lead = reg
+        .create_session(
+            &t1,
+            None,
+            "Lead",
+            "claude",
+            Path::new("/tmp/buzz"),
+            Source::HumanUi,
+        )
+        .unwrap();
+    let ver = reg
+        .create_session(
+            &t1,
+            Some(&lead),
+            "Verification",
+            "grok",
+            Path::new("/tmp/wt"),
+            Source::HumanUi,
+        )
+        .unwrap();
     reg.set_state(&lead, SessionState::Live).unwrap();
     reg.set_state(&ver, SessionState::Handoff).unwrap();
 
-    let t2 = reg.create_task("Production release", Path::new("/tmp/shop"), Source::HumanUi).unwrap();
-    let ship = reg.create_session(&t2, None, "Ship", "opencode", Path::new("/tmp/shop"), Source::HumanUi).unwrap();
+    let t2 = reg
+        .create_task(
+            "Production release",
+            Path::new("/tmp/shop"),
+            Source::HumanUi,
+        )
+        .unwrap();
+    let ship = reg
+        .create_session(
+            &t2,
+            None,
+            "Ship",
+            "opencode",
+            Path::new("/tmp/shop"),
+            Source::HumanUi,
+        )
+        .unwrap();
     reg.set_state(&ship, SessionState::Attention).unwrap();
 
-    let t3 = reg.create_task("API migration", Path::new("/tmp/atlas"), Source::HumanUi).unwrap();
-    let done = reg.create_session(&t3, None, "Migrator", "grok", Path::new("/tmp/atlas"), Source::HumanUi).unwrap();
+    let t3 = reg
+        .create_task("API migration", Path::new("/tmp/atlas"), Source::HumanUi)
+        .unwrap();
+    let done = reg
+        .create_session(
+            &t3,
+            None,
+            "Migrator",
+            "grok",
+            Path::new("/tmp/atlas"),
+            Source::HumanUi,
+        )
+        .unwrap();
     reg.set_state(&done, SessionState::Complete).unwrap();
 
-    let t4 = reg.create_task("Empty", Path::new("/tmp/e"), Source::HumanUi).unwrap();
+    let t4 = reg
+        .create_task("Empty", Path::new("/tmp/e"), Source::HumanUi)
+        .unwrap();
 
     let hud = reg.hud_counts();
     assert_eq!(hud.live, 1, "handoff and attention are never LIVE");
     assert_eq!(hud.queued, 1, "handoff counts queued");
     assert_eq!(hud.attention, 1);
-    assert_eq!(hud.tasks_active, 2, "t1 and t2; complete t3 and empty t4 excluded");
+    assert_eq!(
+        hud.tasks_active, 2,
+        "t1 and t2; complete t3 and empty t4 excluded"
+    );
 
     assert_eq!(reg.task_status(&t1), "WORKING");
     assert_eq!(reg.task_status(&t2), "NEEDS ATTENTION");

@@ -139,7 +139,10 @@ fn session_cmd(args: &[String]) -> io::Result<()> {
             if format_json {
                 println!("{resp}");
             } else if ok {
-                println!("completed · session {}", resp["session_id"].as_str().unwrap_or("?"));
+                println!(
+                    "completed · session {}",
+                    resp["session_id"].as_str().unwrap_or("?")
+                );
             } else {
                 eprintln!("error: {}", resp["error"].as_str().unwrap_or("unknown"));
             }

@@ -53,8 +53,14 @@ fn frame_painter_is_stable_across_repeated_tall_redraws() {
     let frame = dump("subordinate", cols, rows).unwrap();
     let painted = paint_frame(&frame, None);
 
-    assert!(!painted.contains('\n'), "frame painter must not emit line feeds");
-    assert!(!painted.contains('\r'), "frame painter must not emit carriage returns");
+    assert!(
+        !painted.contains('\n'),
+        "frame painter must not emit line feeds"
+    );
+    assert!(
+        !painted.contains('\r'),
+        "frame painter must not emit carriage returns"
+    );
     for row_number in 1..=rows {
         assert!(
             painted.contains(&format!("\x1b[{row_number};1H")),
@@ -128,7 +134,11 @@ fn compact_terminal_uses_its_real_viewport() {
     let frame = resize_frame(80, 20);
     assert_eq!(frame.len(), 20);
     assert!(frame.iter().all(|line| cell_count(line) == 80));
-    let text = frame.iter().map(|line| strip_sgr(line)).collect::<Vec<_>>().join("\n");
+    let text = frame
+        .iter()
+        .map(|line| strip_sgr(line))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(text.contains("TASKAI · RESIZE NEEDED"));
     assert!(text.contains("Required  110 × 30"));
 }
@@ -160,7 +170,15 @@ fn home_keybar_layout() {
     let frame = dump("home", cols, rows).unwrap();
     assert!(strip_sgr(&frame[rows - 3]).chars().all(|c| c == '─'));
     let keys = strip_sgr(&frame[rows - 2]);
-    for label in [" Enter ", " Open", " n ", " New task", " h ", " Harnesses", " ? "] {
+    for label in [
+        " Enter ",
+        " Open",
+        " n ",
+        " New task",
+        " h ",
+        " Harnesses",
+        " ? ",
+    ] {
         assert!(keys.contains(label), "missing {label:?} in {keys:?}");
     }
 }
@@ -172,7 +190,11 @@ fn home_keybar_layout() {
 fn home_board_content() {
     set_truecolor(true);
     let frame = dump("home", 110, 30).unwrap();
-    let text = frame.iter().map(|l| strip_sgr(l)).collect::<Vec<_>>().join("\n");
+    let text = frame
+        .iter()
+        .map(|l| strip_sgr(l))
+        .collect::<Vec<_>>()
+        .join("\n");
     for needle in [
         "Repository evaluation",
         "WORKING",
@@ -196,7 +218,11 @@ fn home_board_content() {
 fn boot_slab_content() {
     set_truecolor(true);
     let frame = dump("boot", 110, 30).unwrap();
-    let text = frame.iter().map(|l| strip_sgr(l)).collect::<Vec<_>>().join("\n");
+    let text = frame
+        .iter()
+        .map(|l| strip_sgr(l))
+        .collect::<Vec<_>>()
+        .join("\n");
     for needle in [
         "T A S K A I",
         "Your agents. Your terminal. One boundary.",

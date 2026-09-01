@@ -53,8 +53,14 @@ fn frames_match_prototype_fixtures() {
                             eprintln!(
                                 "{screen} {cols}x{rows} cell ({r},{c}): \
                                  want {:?} fg{:?} bg{:?} b{} · got {:?} fg{:?} bg{:?} b{}",
-                                w.contents(), w.fgcolor(), w.bgcolor(), w.bold(),
-                                g.contents(), g.fgcolor(), g.bgcolor(), g.bold()
+                                w.contents(),
+                                w.fgcolor(),
+                                w.bgcolor(),
+                                w.bold(),
+                                g.contents(),
+                                g.fgcolor(),
+                                g.bgcolor(),
+                                g.bold()
                             );
                         }
                         diffs += 1;

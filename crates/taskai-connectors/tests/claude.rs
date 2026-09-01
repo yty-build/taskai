@@ -14,7 +14,10 @@ use taskai_connectors::{Conduit, Mode};
 // Value: version gating never guesses.
 #[test]
 fn parses_version_output() {
-    assert_eq!(parse_version("2.1.226 (Claude Code)"), Some("2.1.226".into()));
+    assert_eq!(
+        parse_version("2.1.226 (Claude Code)"),
+        Some("2.1.226".into())
+    );
     assert_eq!(parse_version("claude 3.0.0\n"), Some("3.0.0".into()));
     assert_eq!(parse_version("no digits here"), None);
 }
@@ -36,7 +39,10 @@ fn probe_real_claude() {
 // panic. Why: failed identity is `unsupported` (backend §8). Value: honest degradation.
 #[test]
 fn probe_missing_binary_is_unsupported() {
-    let cap = ClaudeConnector { bin: "taskai-no-such-cli".into() }.probe();
+    let cap = ClaudeConnector {
+        bin: "taskai-no-such-cli".into(),
+    }
+    .probe();
     assert_eq!(cap.mode, Mode::Unsupported);
 }
 
@@ -56,8 +62,10 @@ fn hooks_install_merges_and_is_idempotent() {
     let events = install_hooks(&ws, tmp.path()).unwrap();
     install_hooks(&ws, tmp.path()).unwrap();
 
-    let cfg: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(ws.join(".claude/settings.local.json")).unwrap()).unwrap();
+    let cfg: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(ws.join(".claude/settings.local.json")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(cfg["permissions"]["allow"][0], "Bash(ls:*)");
     let stops = cfg["hooks"]["Stop"].as_array().unwrap();
     let all = serde_json::to_string(&stops).unwrap();
@@ -77,7 +85,11 @@ fn hooks_install_merges_and_is_idempotent() {
 fn event_watch_matches_kind_session_and_offset() {
     let tmp = tempfile::tempdir().unwrap();
     let f = tmp.path().join("events.jsonl");
-    std::fs::write(&f, "{\"hook_event_name\":\"Stop\",\"session_id\":\"old\"}\n").unwrap();
+    std::fs::write(
+        &f,
+        "{\"hook_event_name\":\"Stop\",\"session_id\":\"old\"}\n",
+    )
+    .unwrap();
     let offset = std::fs::metadata(&f).unwrap().len();
 
     let f2 = f.clone();
@@ -85,8 +97,16 @@ fn event_watch_matches_kind_session_and_offset() {
         std::thread::sleep(Duration::from_millis(200));
         use std::io::Write;
         let mut fh = std::fs::OpenOptions::new().append(true).open(&f2).unwrap();
-        writeln!(fh, "{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"abc\"}}").unwrap();
-        writeln!(fh, "{{\"hook_event_name\":\"Stop\",\"session_id\":\"abc\"}}").unwrap();
+        writeln!(
+            fh,
+            "{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"abc\"}}"
+        )
+        .unwrap();
+        writeln!(
+            fh,
+            "{{\"hook_event_name\":\"Stop\",\"session_id\":\"abc\"}}"
+        )
+        .unwrap();
     });
 
     let ev = wait_for_event(&f, "Stop", None, offset, Duration::from_secs(5)).unwrap();
@@ -128,10 +148,16 @@ fn real_claude_renders_in_pane() {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         let text = pane.text();
-        if ["Claude", "claude", "trust", "Welcome"].iter().any(|m| text.contains(m)) {
+        if ["Claude", "claude", "trust", "Welcome"]
+            .iter()
+            .any(|m| text.contains(m))
+        {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "claude never rendered; grid:\n{text}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "claude never rendered; grid:\n{text}"
+        );
         std::thread::sleep(Duration::from_millis(200));
     }
 }
@@ -155,8 +181,14 @@ fn live_claude_turn_renders_and_stops() {
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     let mut pane = taskai_pane::Pane::spawn(&prog, &argv, &ws, 40, 120, &[]).unwrap();
 
-    let start = wait_for_event(&events, "SessionStart", None, offset, Duration::from_secs(120))
-        .expect("SessionStart hook");
+    let start = wait_for_event(
+        &events,
+        "SessionStart",
+        None,
+        offset,
+        Duration::from_secs(120),
+    )
+    .expect("SessionStart hook");
     let sid = start.session_id.clone().expect("session id");
 
     pane.write_bytes(&ClaudeConnector::prompt_bytes(
@@ -164,10 +196,20 @@ fn live_claude_turn_renders_and_stops() {
     ))
     .unwrap();
 
-    let stop = wait_for_event(&events, "Stop", Some(&sid), start.offset, Duration::from_secs(300))
-        .expect("Stop hook");
+    let stop = wait_for_event(
+        &events,
+        "Stop",
+        Some(&sid),
+        start.offset,
+        Duration::from_secs(300),
+    )
+    .expect("Stop hook");
     assert_eq!(stop.session_id.as_deref(), Some(sid.as_str()));
-    assert!(pane.text().contains("TASKAI-M3-OK"), "grid:\n{}", pane.text());
+    assert!(
+        pane.text().contains("TASKAI-M3-OK"),
+        "grid:\n{}",
+        pane.text()
+    );
 }
 
 // Expectation: versions below the connector's declared minimum downgrade the capability

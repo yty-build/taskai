@@ -12,12 +12,17 @@ use taskai_pane::Pane;
 
 fn shared_with_cat(tmp: &std::path::Path) -> (Shared, std::path::PathBuf) {
     let cwd = std::env::current_dir().unwrap();
-    let pane = Arc::new(Mutex::new(Pane::spawn("/bin/sh", &["-c", "cat -v"], &cwd, 24, 120, &[]).unwrap()));
+    let pane = Arc::new(Mutex::new(
+        Pane::spawn("/bin/sh", &["-c", "cat -v"], &cwd, 24, 120, &[]).unwrap(),
+    ));
     let events = tmp.join("events.jsonl");
     std::fs::write(&events, "").unwrap();
     let shared = Shared {
         panes: Arc::new(Mutex::new(HashMap::from([("s1".to_string(), pane)]))),
-        session_ids: Arc::new(Mutex::new(HashMap::from([("s1".to_string(), "sid1".to_string())]))),
+        session_ids: Arc::new(Mutex::new(HashMap::from([(
+            "s1".to_string(),
+            "sid1".to_string(),
+        )]))),
         harnesses: Arc::new(Mutex::new(HashMap::from([
             ("s1".to_string(), "claude".to_string()),
             ("s9".to_string(), "codex".to_string()),
@@ -32,8 +37,15 @@ fn shared_with_cat(tmp: &std::path::Path) -> (Shared, std::path::PathBuf) {
 }
 
 fn append_stop(events: &std::path::Path, sid: &str) {
-    let mut f = std::fs::OpenOptions::new().append(true).open(events).unwrap();
-    writeln!(f, "{{\"hook_event_name\":\"Stop\",\"session_id\":\"{sid}\"}}").unwrap();
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(events)
+        .unwrap();
+    writeln!(
+        f,
+        "{{\"hook_event_name\":\"Stop\",\"session_id\":\"{sid}\"}}"
+    )
+    .unwrap();
 }
 
 // Expectation: a prompt dispatches into the real pty (bracketed paste visible via cat),
@@ -103,10 +115,21 @@ fn refusals_are_specific() {
     shared.session_ids.lock().unwrap().remove("s1");
     let r = client_prompt(&sock, "s1", "x", true, None).unwrap();
     assert_eq!(r["ok"], false);
-    assert!(r["error"].as_str().unwrap().contains("not yet bound"), "{r}");
-    shared.session_ids.lock().unwrap().insert("s1".into(), "sid1".into());
+    assert!(
+        r["error"].as_str().unwrap().contains("not yet bound"),
+        "{r}"
+    );
+    shared
+        .session_ids
+        .lock()
+        .unwrap()
+        .insert("s1".into(), "sid1".into());
 
-    shared.harnesses.lock().unwrap().insert("s1".into(), "codex".into());
+    shared
+        .harnesses
+        .lock()
+        .unwrap()
+        .insert("s1".into(), "codex".into());
     let r = client_prompt(&sock, "s1", "x", false, None).unwrap();
     assert_eq!(r["ok"], false);
     assert!(r["error"].as_str().unwrap().contains("owned-tui"), "{r}");
@@ -133,5 +156,8 @@ fn dispatch_log_attributes_without_content() {
     assert!(log.contains("\"source\":\"s7\""), "{log}");
     assert!(log.contains("\"source\":\"human\""), "{log}");
     assert!(log.contains("\"target\":\"s1\""), "{log}");
-    assert!(!log.contains("secret"), "log must never carry prompt content: {log}");
+    assert!(
+        !log.contains("secret"),
+        "log must never carry prompt content: {log}"
+    );
 }

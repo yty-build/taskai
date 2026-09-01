@@ -42,11 +42,16 @@ pub struct Capability {
 /// Numeric dotted-version comparison against a connector's declared minimum.
 pub fn version_ok(version: &str, minimum: &str) -> bool {
     let parse = |v: &str| -> Vec<u64> {
-        v.split('.').map(|c| c.trim().parse().unwrap_or(0)).collect()
+        v.split('.')
+            .map(|c| c.trim().parse().unwrap_or(0))
+            .collect()
     };
     let (v, m) = (parse(version), parse(minimum));
     for i in 0..v.len().max(m.len()) {
-        let (a, b) = (v.get(i).copied().unwrap_or(0), m.get(i).copied().unwrap_or(0));
+        let (a, b) = (
+            v.get(i).copied().unwrap_or(0),
+            m.get(i).copied().unwrap_or(0),
+        );
         if a != b {
             return a > b;
         }
@@ -60,7 +65,10 @@ pub fn gate_version(cap: Capability, minimum: &str) -> Capability {
         Some(v) if !version_ok(v, minimum) => Capability {
             mode: Mode::Unsupported,
             version: cap.version.clone(),
-            detail: format!("{} — version {v} is below the supported minimum {minimum}", cap.detail),
+            detail: format!(
+                "{} — version {v} is below the supported minimum {minimum}",
+                cap.detail
+            ),
         },
         _ => cap,
     }
@@ -110,7 +118,9 @@ pub struct TurnGuard {
 
 impl Conduit {
     pub fn new() -> Conduit {
-        Conduit { active: Arc::new(Mutex::new(HashSet::new())) }
+        Conduit {
+            active: Arc::new(Mutex::new(HashSet::new())),
+        }
     }
 
     pub fn begin_turn(&self, session_ref: &str) -> Result<TurnGuard, Error> {
@@ -118,7 +128,10 @@ impl Conduit {
         if !active.insert(session_ref.to_string()) {
             return Err(Error::Busy(session_ref.to_string()));
         }
-        Ok(TurnGuard { active: Arc::clone(&self.active), session_ref: session_ref.to_string() })
+        Ok(TurnGuard {
+            active: Arc::clone(&self.active),
+            session_ref: session_ref.to_string(),
+        })
     }
 }
 

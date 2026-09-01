@@ -10,7 +10,11 @@ use crate::Error;
 pub enum WorkspaceChoice {
     SameRepo,
     OtherRepo(PathBuf),
-    Worktree { base: PathBuf, branch: String, name: String },
+    Worktree {
+        base: PathBuf,
+        branch: String,
+        name: String,
+    },
 }
 
 /// The path the choice resolves to — shown in the drawer before anything is created.
@@ -19,7 +23,10 @@ pub fn preview(choice: &WorkspaceChoice, manager_repo: &Path) -> PathBuf {
         WorkspaceChoice::SameRepo => manager_repo.to_path_buf(),
         WorkspaceChoice::OtherRepo(p) => p.clone(),
         WorkspaceChoice::Worktree { base, name, .. } => {
-            let repo_name = base.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+            let repo_name = base
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default();
             base.parent()
                 .unwrap_or(Path::new("."))
                 .join(format!("{repo_name}-worktrees"))
@@ -53,7 +60,9 @@ pub fn provision(choice: &WorkspaceChoice, manager_repo: &Path) -> Result<PathBu
                 .args(["-b", name, branch])
                 .output()?;
             if !out.status.success() {
-                return Err(Error::Git(String::from_utf8_lossy(&out.stderr).trim().to_string()));
+                return Err(Error::Git(
+                    String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                ));
             }
             Ok(path)
         }

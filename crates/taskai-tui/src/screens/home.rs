@@ -6,8 +6,8 @@ use crate::color::{
     harness_color, AMB, AMB_GLASS, DIM, FT, GLASS, GLASS_HI, GLASS_IN, ION, KCAP, TEXT, VOID,
 };
 use crate::fixture::KEYS_HOME;
-use crate::view::{HomeTaskRow, Hud};
 use crate::seg::{row, s, sb, seglen, vrow, Seg};
+use crate::view::{HomeTaskRow, Hud};
 
 pub const SPARK_GLYPHS: &str = "▁▂▃▄▅▆▇";
 
@@ -38,7 +38,12 @@ pub fn frame(
         let is_sel = sel == i;
         let fill = if is_sel { GLASS_HI } else { GLASS };
         let stripe = harness_color(t.managers.first().map(|m| m.2.as_str()).unwrap_or(""));
-        lines.push(row(&[s("▄".repeat(cols), Some(fill), Some(VOID))], cols, VOID, 0));
+        lines.push(row(
+            &[s("▄".repeat(cols), Some(fill), Some(VOID))],
+            cols,
+            VOID,
+            0,
+        ));
 
         let name = vec![
             s("▌", Some(stripe), Some(fill)),
@@ -46,7 +51,11 @@ pub fn frame(
             sb(t.name.as_str(), Some(TEXT), Some(fill)),
         ];
         let stat: Vec<Seg> = match t.status.as_str() {
-            "WORKING" => vec![s("WORKING", Some(if is_sel { ION } else { DIM }), Some(fill))],
+            "WORKING" => vec![s(
+                "WORKING",
+                Some(if is_sel { ION } else { DIM }),
+                Some(fill),
+            )],
             "NEEDS ATTENTION" => vec![s(" ATTENTION ", Some(AMB), Some(AMB_GLASS))],
             other => vec![s(other, Some(FT), Some(fill))],
         };
@@ -66,23 +75,44 @@ pub fn frame(
             m.push(s("● ", Some(harness_color(hkey)), Some(fill)));
             m.push(s(format!("{role} · {harness}"), Some(FT), Some(fill)));
         }
-        m.push(s(pad(cols as isize - 52 - seglen(&m) as isize), None, Some(fill)));
+        m.push(s(
+            pad(cols as isize - 52 - seglen(&m) as isize),
+            None,
+            Some(fill),
+        ));
         m.push(s(spark, Some(scol), Some(fill)));
         m.push(s(
-            pad(cols as isize - PAD as isize - seglen(&m) as isize - t.meta.chars().count() as isize),
+            pad(cols as isize
+                - PAD as isize
+                - seglen(&m) as isize
+                - t.meta.chars().count() as isize),
             None,
             Some(fill),
         ));
         m.push(s(t.meta.as_str(), Some(FT), Some(fill)));
         lines.push(row(&m, cols, fill, 0));
-        lines.push(row(&[s("▀".repeat(cols), Some(fill), Some(VOID))], cols, VOID, 0));
+        lines.push(row(
+            &[s("▀".repeat(cols), Some(fill), Some(VOID))],
+            cols,
+            VOID,
+            0,
+        ));
         lines.push(vrow(cols));
     }
 
     let ghost_sel = sel == tasks.len();
     let gfill = if ghost_sel { GLASS } else { GLASS_IN };
-    lines.push(row(&[s("▄".repeat(cols), Some(gfill), Some(VOID))], cols, VOID, 0));
-    let mut g = vec![s("+ New task", Some(if ghost_sel { DIM } else { FT }), Some(gfill))];
+    lines.push(row(
+        &[s("▄".repeat(cols), Some(gfill), Some(VOID))],
+        cols,
+        VOID,
+        0,
+    ));
+    let mut g = vec![s(
+        "+ New task",
+        Some(if ghost_sel { DIM } else { FT }),
+        Some(gfill),
+    )];
     g.push(s(
         pad(cols as isize - PAD as isize * 2 - seglen(&g) as isize - 3),
         None,
@@ -90,7 +120,12 @@ pub fn frame(
     ));
     g.push(s(" n ", Some(TEXT), Some(KCAP)));
     lines.push(row(&g, cols, gfill, PAD));
-    lines.push(row(&[s("▀".repeat(cols), Some(gfill), Some(VOID))], cols, VOID, 0));
+    lines.push(row(
+        &[s("▀".repeat(cols), Some(gfill), Some(VOID))],
+        cols,
+        VOID,
+        0,
+    ));
 
     while lines.len() < rows.saturating_sub(3) {
         lines.push(vrow(cols));

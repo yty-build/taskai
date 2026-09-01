@@ -26,7 +26,10 @@ fn probe_real_grok_is_handoff_resume() {
 // Why: failed identity is `unsupported` (backend §8). Value: honest degradation.
 #[test]
 fn probe_missing_binary_is_unsupported() {
-    let cap = GrokConnector { bin: "taskai-no-such-cli".into() }.probe();
+    let cap = GrokConnector {
+        bin: "taskai-no-such-cli".into(),
+    }
+    .probe();
     assert_eq!(cap.mode, Mode::Unsupported);
 }
 
@@ -53,7 +56,10 @@ fn resume_command_is_exact_id_native() {
     let c = GrokConnector::default();
     let (prog, args) = c.resume_command("0199aaaa-bbbb-cccc-dddd-eeeeffff0000");
     assert_eq!(prog, "grok");
-    assert_eq!(args, vec!["--resume", "0199aaaa-bbbb-cccc-dddd-eeeeffff0000"]);
+    assert_eq!(
+        args,
+        vec!["--resume", "0199aaaa-bbbb-cccc-dddd-eeeeffff0000"]
+    );
 }
 
 // Expectation: one full billed handoff — ACP session/new + prompt returns a stop reason,
@@ -93,7 +99,11 @@ fn live_grok_handoff_and_resume() {
         if pane.text().contains("TASKAI-M6-OK") {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "resume never showed the reply:\n{}", pane.text());
+        assert!(
+            std::time::Instant::now() < deadline,
+            "resume never showed the reply:\n{}",
+            pane.text()
+        );
         std::thread::sleep(Duration::from_millis(300));
     }
 }

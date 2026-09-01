@@ -26,15 +26,23 @@ impl StdioRpc {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()?;
-        let stdin = child.stdin.take().ok_or_else(|| Error::Invalid("no stdin".into()))?;
-        let stdout = child.stdout.take().ok_or_else(|| Error::Invalid("no stdout".into()))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::Invalid("no stdin".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::Invalid("no stdout".into()))?;
         let pending: Arc<Mutex<HashMap<u64, Sender<serde_json::Value>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let (notif_tx, notif_rx) = channel();
         let p2 = Arc::clone(&pending);
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                    continue;
+                };
                 if let Some(id) = v["id"].as_u64() {
                     if let Some(tx) = p2.lock().unwrap().remove(&id) {
                         let _ = tx.send(v);
@@ -44,7 +52,13 @@ impl StdioRpc {
                 let _ = notif_tx.send(v);
             }
         });
-        Ok(StdioRpc { child, stdin, pending, notifications: notif_rx, next_id: 1 })
+        Ok(StdioRpc {
+            child,
+            stdin,
+            pending,
+            notifications: notif_rx,
+            next_id: 1,
+        })
     }
 
     pub fn request(

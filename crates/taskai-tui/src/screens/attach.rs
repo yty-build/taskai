@@ -51,7 +51,10 @@ pub fn frame(st: &St, cols: usize, rows: usize) -> Vec<String> {
     let first = chars.next().map(|c| c.to_string()).unwrap_or_default();
     let rest: String = chars.collect();
     rows_.push(row(
-        &[s(first, Some(CLAUDE), Some(base)), s(rest, Some(FT), Some(base))],
+        &[
+            s(first, Some(CLAUDE), Some(base)),
+            s(rest, Some(FT), Some(base)),
+        ],
         cols,
         base,
         2,
@@ -95,7 +98,11 @@ pub fn frame(st: &St, cols: usize, rows: usize) -> Vec<String> {
     let text: String = ATTACH_COMPOSER.chars().take(st.typed).collect();
     let bw = cols - 4;
     lines.push(row(
-        &[s(format!("╭{}╮", "─".repeat(bw - 2)), Some(CLI_EDGE), Some(base))],
+        &[s(
+            format!("╭{}╮", "─".repeat(bw - 2)),
+            Some(CLI_EDGE),
+            Some(base),
+        )],
         cols,
         base,
         2,
@@ -106,7 +113,11 @@ pub fn frame(st: &St, cols: usize, rows: usize) -> Vec<String> {
             s(" > ", Some(DIM), Some(base)),
             s(text.clone(), Some(TEXT), Some(base)),
             s(cur, Some(TEXT), Some(base)),
-            s(pad(bw as isize - 7 - text.chars().count() as isize), None, Some(base)),
+            s(
+                pad(bw as isize - 7 - text.chars().count() as isize),
+                None,
+                Some(base),
+            ),
             s("│", Some(CLI_EDGE), Some(base)),
         ],
         cols,
@@ -114,7 +125,11 @@ pub fn frame(st: &St, cols: usize, rows: usize) -> Vec<String> {
         2,
     ));
     lines.push(row(
-        &[s(format!("╰{}╯", "─".repeat(bw - 2)), Some(CLI_EDGE), Some(base))],
+        &[s(
+            format!("╰{}╯", "─".repeat(bw - 2)),
+            Some(CLI_EDGE),
+            Some(base),
+        )],
         cols,
         base,
         2,
@@ -122,13 +137,22 @@ pub fn frame(st: &St, cols: usize, rows: usize) -> Vec<String> {
     lines.push(row(
         &[
             s("? for shortcuts", Some(FT), Some(base)),
-            s("   ⏵⏵ accept edits on (shift+tab to cycle)", Some(FT), Some(base)),
+            s(
+                "   ⏵⏵ accept edits on (shift+tab to cycle)",
+                Some(FT),
+                Some(base),
+            ),
         ],
         cols,
         base,
         4,
     ));
-    lines.push(row(&[s("▀".repeat(cols), Some(base), Some(VOID))], cols, VOID, 0));
+    lines.push(row(
+        &[s("▀".repeat(cols), Some(base), Some(VOID))],
+        cols,
+        VOID,
+        0,
+    ));
     while lines.len() < rows {
         lines.push(vrow(cols));
     }

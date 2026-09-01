@@ -35,7 +35,12 @@ impl Pane {
         cols: u16,
         envs: &[(&str, &str)],
     ) -> Result<Pane, Error> {
-        let pty = native_pty_system().openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
+        let pty = native_pty_system().openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
         let mut cmd = CommandBuilder::new(prog);
         cmd.args(args);
         cmd.cwd(cwd);
@@ -59,7 +64,12 @@ impl Pane {
                 g.lock().unwrap().process(&buf[..n]);
             }
         });
-        Ok(Pane { master: pty.master, writer, child, grid })
+        Ok(Pane {
+            master: pty.master,
+            writer,
+            child,
+            grid,
+        })
     }
 
     pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), Error> {
@@ -69,8 +79,16 @@ impl Pane {
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), Error> {
-        self.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
-        self.grid.lock().unwrap().set_size(rows as usize, cols as usize);
+        self.master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        self.grid
+            .lock()
+            .unwrap()
+            .set_size(rows as usize, cols as usize);
         Ok(())
     }
 

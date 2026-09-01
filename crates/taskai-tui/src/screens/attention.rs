@@ -3,7 +3,7 @@
 
 use crate::chrome::{keybar, masthead, PAD};
 use crate::color::{
-    bg, harness_color, Rgb, AMB, AMB_GLASS, FT, GLASS, GLASS_HI, ION, OPENC, TEXT, VOID, RESET,
+    bg, harness_color, Rgb, AMB, AMB_GLASS, FT, GLASS, GLASS_HI, ION, OPENC, RESET, TEXT, VOID,
 };
 use crate::fixture::{ATTENTION_CRUMB, FEED_SHIP, HUD_HOME, LAMP};
 use crate::screens::task::{feed_rows, GAP, RAIL_W};
@@ -51,13 +51,22 @@ pub fn frame(st: &St, cols: usize, rows: usize, clock: &str) -> Vec<String> {
         s("   ", None, Some(afill)),
         s("OpenCode", Some(FT), Some(afill)),
     ];
-    sub.push(s(pad(w as isize - 2 - seglen(&sub) as isize - 9), None, Some(afill)));
+    sub.push(s(
+        pad(w as isize - 2 - seglen(&sub) as isize - 9),
+        None,
+        Some(afill),
+    ));
     sub.push(s("ATTENTION", Some(AMB), Some(afill)));
     rail.push(row(&sub, w, afill, 0));
     while rail.len() < h.saturating_sub(1) {
         rail.push(rl(vec![]));
     }
-    rail.push(row(&[s("▀".repeat(w), Some(GLASS), Some(VOID))], w, VOID, 0));
+    rail.push(row(
+        &[s("▀".repeat(w), Some(GLASS), Some(VOID))],
+        w,
+        VOID,
+        0,
+    ));
 
     let b = GLASS_HI;
     let head = vec![
@@ -98,18 +107,31 @@ pub fn frame(st: &St, cols: usize, rows: usize, clock: &str) -> Vec<String> {
     while pane.len() < h.saturating_sub(1) {
         pane.push(row(&[], pw, GLASS, 0));
     }
-    pane.push(row(&[s("▀".repeat(pw), Some(GLASS_HI), Some(VOID))], pw, VOID, 0));
+    pane.push(row(
+        &[s("▀".repeat(pw), Some(GLASS_HI), Some(VOID))],
+        pw,
+        VOID,
+        0,
+    ));
 
     let gapstr = format!("{}{}", bg(VOID), " ".repeat(GAP));
     for i in 0..h {
         let r = rail.get(i).cloned().unwrap_or_else(|| row(&[], w, VOID, 0));
-        let p = pane.get(i).cloned().unwrap_or_else(|| row(&[], pw, VOID, 0));
+        let p = pane
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| row(&[], pw, VOID, 0));
         lines.push(format!("{r}{gapstr}{p}{RESET}"));
     }
     lines.push(vrow(cols));
     lines.extend(keybar(
         cols,
-        &[("y", "Approve"), ("n", "Decline"), ("T", "Home"), ("Ctrl+G", "Focus CLI")],
+        &[
+            ("y", "Approve"),
+            ("n", "Decline"),
+            ("T", "Home"),
+            ("Ctrl+G", "Focus CLI"),
+        ],
     ));
     lines.push(vrow(cols));
     lines.truncate(rows);

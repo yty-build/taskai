@@ -26,7 +26,11 @@ impl GrokConnector {
             Ok(out) if out.status.success() => {
                 let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 crate::gate_version(
-                    Capability { mode: Mode::HandoffResume, version: parse_version(&text), detail: text },
+                    Capability {
+                        mode: Mode::HandoffResume,
+                        version: parse_version(&text),
+                        detail: text,
+                    },
                     "1.0.0",
                 )
             }
@@ -35,7 +39,11 @@ impl GrokConnector {
                 version: None,
                 detail: String::from_utf8_lossy(&out.stderr).trim().to_string(),
             },
-            Err(e) => Capability { mode: Mode::Unsupported, version: None, detail: e.to_string() },
+            Err(e) => Capability {
+                mode: Mode::Unsupported,
+                version: None,
+                detail: e.to_string(),
+            },
         }
     }
 
@@ -51,7 +59,9 @@ impl GrokConnector {
 
     /// The exclusive handoff channel: the ACP agent over stdio.
     pub fn spawn_acp(&self) -> Result<AcpAgent, Error> {
-        Ok(AcpAgent { rpc: StdioRpc::spawn(&self.bin, &["agent", "stdio"])? })
+        Ok(AcpAgent {
+            rpc: StdioRpc::spawn(&self.bin, &["agent", "stdio"])?,
+        })
     }
 }
 

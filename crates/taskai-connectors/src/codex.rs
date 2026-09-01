@@ -14,7 +14,9 @@ pub struct CodexConnector {
 
 impl Default for CodexConnector {
     fn default() -> Self {
-        CodexConnector { bin: "codex".into() }
+        CodexConnector {
+            bin: "codex".into(),
+        }
     }
 }
 
@@ -25,7 +27,11 @@ impl CodexConnector {
             Ok(out) if out.status.success() => {
                 let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 crate::gate_version(
-                    Capability { mode: Mode::SharedLive, version: parse_version(&text), detail: text },
+                    Capability {
+                        mode: Mode::SharedLive,
+                        version: parse_version(&text),
+                        detail: text,
+                    },
                     "0.100.0",
                 )
             }
@@ -34,7 +40,11 @@ impl CodexConnector {
                 version: None,
                 detail: String::from_utf8_lossy(&out.stderr).trim().to_string(),
             },
-            Err(e) => Capability { mode: Mode::Unsupported, version: None, detail: e.to_string() },
+            Err(e) => Capability {
+                mode: Mode::Unsupported,
+                version: None,
+                detail: e.to_string(),
+            },
         }
     }
 
@@ -46,7 +56,9 @@ impl CodexConnector {
     /// The TaskAI sidecar: `codex app-server` speaking JSON-RPC on stdio against the
     /// same thread store the visible TUI uses.
     pub fn spawn_app_server(&self) -> Result<AppServer, Error> {
-        Ok(AppServer { rpc: StdioRpc::spawn(&self.bin, &["app-server"])? })
+        Ok(AppServer {
+            rpc: StdioRpc::spawn(&self.bin, &["app-server"])?,
+        })
     }
 }
 

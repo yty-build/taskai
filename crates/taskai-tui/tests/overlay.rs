@@ -2,9 +2,7 @@
 // ABOUTME: screenshot-sized, and ultrawide terminal viewports.
 
 use taskai_tui::color::{set_truecolor, DIM, FT, GLASS};
-use taskai_tui::overlay::{
-    centered_overlay, drawer_panel_view, form_panel_width, DrawerView,
-};
+use taskai_tui::overlay::{centered_overlay, drawer_panel_view, form_panel_width, DrawerView};
 use taskai_tui::seg::{cell_count, s, strip_sgr, vrow};
 
 fn live_worktree_panel(cols: usize) -> Vec<String> {
@@ -68,7 +66,10 @@ fn live_subordinate_form_is_centered_broad_and_complete() {
         let expected_top = preferred_top.min(max_top);
         let expected_left = (cols - expected_width) / 2;
         assert_eq!(title_row, expected_top + 1);
-        assert_eq!(plain[title_row].find("Add Subordinate"), Some(expected_left + 2));
+        assert_eq!(
+            plain[title_row].find("Add Subordinate"),
+            Some(expected_left + 2)
+        );
 
         let text = plain.join("\n");
         for expected in [
@@ -90,7 +91,10 @@ fn live_subordinate_form_is_centered_broad_and_complete() {
             "Esc",
             "Cancel",
         ] {
-            assert!(text.contains(expected), "{cols}x{rows} missing {expected:?}");
+            assert!(
+                text.contains(expected),
+                "{cols}x{rows} missing {expected:?}"
+            );
         }
 
         let bottom = expected_top + panel.len() - 1;

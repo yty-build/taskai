@@ -16,7 +16,9 @@ pub struct OpenCodeConnector {
 
 impl Default for OpenCodeConnector {
     fn default() -> Self {
-        OpenCodeConnector { bin: "opencode".into() }
+        OpenCodeConnector {
+            bin: "opencode".into(),
+        }
     }
 }
 
@@ -27,7 +29,11 @@ impl OpenCodeConnector {
             Ok(out) if out.status.success() => {
                 let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 crate::gate_version(
-                    Capability { mode: Mode::SharedLive, version: parse_version(&text), detail: text },
+                    Capability {
+                        mode: Mode::SharedLive,
+                        version: parse_version(&text),
+                        detail: text,
+                    },
                     "1.18.0",
                 )
             }
@@ -36,7 +42,11 @@ impl OpenCodeConnector {
                 version: None,
                 detail: String::from_utf8_lossy(&out.stderr).trim().to_string(),
             },
-            Err(e) => Capability { mode: Mode::Unsupported, version: None, detail: e.to_string() },
+            Err(e) => Capability {
+                mode: Mode::Unsupported,
+                version: None,
+                detail: e.to_string(),
+            },
         }
     }
 
@@ -45,7 +55,13 @@ impl OpenCodeConnector {
         let port = free_port()?;
         let password = format!("taskai-{}", random_hex());
         let child = Command::new(&self.bin)
-            .args(["serve", "--port", &port.to_string(), "--hostname", "127.0.0.1"])
+            .args([
+                "serve",
+                "--port",
+                &port.to_string(),
+                "--hostname",
+                "127.0.0.1",
+            ])
             .current_dir(dir)
             .env("OPENCODE_SERVER_PASSWORD", &password)
             .stdout(Stdio::null())
@@ -111,12 +127,24 @@ impl Server {
         let mut resp = Vec::new();
         stream.read_to_end(&mut resp)?;
         let resp = String::from_utf8_lossy(&resp).to_string();
-        let code = resp.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
-        let payload = resp.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+        let code = resp
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        let payload = resp
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_default();
         Ok((code, payload))
     }
 
-    pub fn http(&self, method: &str, path: &str, body: Option<&str>) -> Result<(u16, String), Error> {
+    pub fn http(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> Result<(u16, String), Error> {
         self.raw_http(method, path, body, true)
     }
 
@@ -133,7 +161,9 @@ impl Server {
     pub fn create_session(&self) -> Result<String, Error> {
         let (code, body) = self.http("POST", "/session", Some("{}"))?;
         if code != 200 {
-            return Err(Error::Invalid(format!("create session: HTTP {code}: {body}")));
+            return Err(Error::Invalid(format!(
+                "create session: HTTP {code}: {body}"
+            )));
         }
         extract_after(&body, "\"id\":\"")
             .ok_or_else(|| Error::Invalid(format!("no session id in {body}")))
@@ -203,12 +233,24 @@ fn b64(input: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for chunk in input.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(T[(n >> 18) as usize & 63] as char);
         out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }

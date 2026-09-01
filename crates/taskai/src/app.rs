@@ -27,8 +27,8 @@ use taskai_tui::overlay::{
     help_panel, DrawerView,
 };
 use taskai_tui::render::{paint_frame, resize_frame, MIN_COLS, MIN_ROWS};
-use taskai_tui::screens::{boot, harness, home, task};
 use taskai_tui::screens::pane::{cell_row, PaneCell};
+use taskai_tui::screens::{boot, harness, home, task};
 use taskai_tui::seg::{row, s, seglen, vrow, Seg};
 use taskai_tui::state::{advance, Screen as StScreen, St, View};
 use taskai_tui::view::{HarnessRowView, HomeTaskRow, Hud, PaneBody, ProbeRow, RailRow, TaskView};
@@ -87,7 +87,11 @@ struct Explorer {
 
 impl Explorer {
     fn open(cwd: &Path) -> Explorer {
-        let mut e = Explorer { cwd: cwd.to_path_buf(), entries: Vec::new(), sel: 0 };
+        let mut e = Explorer {
+            cwd: cwd.to_path_buf(),
+            entries: Vec::new(),
+            sel: 0,
+        };
         e.refresh();
         e
     }
@@ -260,8 +264,10 @@ impl App {
     pub fn run(&mut self, attach: Option<PathBuf>) -> io::Result<()> {
         if let Some(dir) = attach {
             let dir = dir.canonicalize()?;
-            let name =
-                dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or("task".into());
+            let name = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or("task".into());
             let t = self
                 .registry
                 .create_task(&name, &dir, Source::HumanUi)
@@ -279,7 +285,10 @@ impl App {
         // Own the complete alternate-screen viewport. Reset scroll margins and
         // origin mode, then disable auto-wrap because every TaskAI row paints
         // the terminal's final column explicitly.
-        write!(out, "\x1b[?1049h\x1b[?25l\x1b[?6l\x1b[r\x1b[?7l\x1b[2J\x1b[H")?;
+        write!(
+            out,
+            "\x1b[?1049h\x1b[?25l\x1b[?6l\x1b[r\x1b[?7l\x1b[2J\x1b[H"
+        )?;
         out.flush()?;
         let result = self.event_loop(&mut out);
         write!(out, "\x1b[?7h\x1b[?6l\x1b[r\x1b[?25h\x1b[?1049l\x1b[0m")?;
@@ -317,7 +326,11 @@ impl App {
                 .iter()
                 .map(|(sref, e)| {
                     let alive = e.pane.lock().unwrap().is_alive();
-                    (sref.clone(), alive, e.resumed && e.spawned.elapsed() < Duration::from_secs(15))
+                    (
+                        sref.clone(),
+                        alive,
+                        e.resumed && e.spawned.elapsed() < Duration::from_secs(15),
+                    )
                 })
                 .filter(|(_, alive, _)| !alive)
                 .map(|(sref, _, early_resume)| (sref, false, early_resume))
@@ -327,8 +340,9 @@ impl App {
                 self.served.panes.lock().unwrap().remove(&sref);
                 if early_resume {
                     let _ = self.registry.clear_provider(&sref);
-                    self.status =
-                        Some(format!("{sref}: native session was not resumable — Enter starts fresh"));
+                    self.status = Some(format!(
+                        "{sref}: native session was not resumable — Enter starts fresh"
+                    ));
                 }
                 if let Some(se) = self.registry.session(&sref) {
                     if se.state != SessionState::Complete {
@@ -356,7 +370,11 @@ impl App {
             out.flush()?;
 
             let mut waited = false;
-            while event::poll(if waited { Duration::ZERO } else { Duration::from_millis(100) })? {
+            while event::poll(if waited {
+                Duration::ZERO
+            } else {
+                Duration::from_millis(100)
+            })? {
                 waited = true;
                 if let Event::Key(k) = event::read()? {
                     if k.kind == KeyEventKind::Release {
@@ -380,7 +398,10 @@ impl App {
         let c = self.registry.hud_counts();
         Hud {
             items: vec![
-                (format!("{} LIVE", c.live), if c.live > 0 { ION } else { DIM }),
+                (
+                    format!("{} LIVE", c.live),
+                    if c.live > 0 { ION } else { DIM },
+                ),
                 (format!("{} QUEUED", c.queued), DIM),
                 (
                     format!(
@@ -420,11 +441,19 @@ impl App {
                     .iter()
                     .filter(|se| se.role == Role::Manager)
                     .map(|se| {
-                        (se.name.clone(), harness_title(&se.harness).to_string(), se.harness.clone())
+                        (
+                            se.name.clone(),
+                            harness_title(&se.harness).to_string(),
+                            se.harness.clone(),
+                        )
                     })
                     .collect();
                 let spark = if status == "WORKING" {
-                    home::spark_str(if i % 2 == 0 { &self.st.spark_t1 } else { &self.st.spark_t2 })
+                    home::spark_str(if i % 2 == 0 {
+                        &self.st.spark_t1
+                    } else {
+                        &self.st.spark_t2
+                    })
                 } else {
                     "▁".repeat(12)
                 };
@@ -454,7 +483,9 @@ impl App {
         let mut ready = 0;
         for hkey in HKEYS {
             let cap = self.probes.get(hkey);
-            let setup = cap.map(|c| c.mode == HarnessMode::Unsupported).unwrap_or(true);
+            let setup = cap
+                .map(|c| c.mode == HarnessMode::Unsupported)
+                .unwrap_or(true);
             if !setup {
                 ready += 1;
             }
@@ -475,7 +506,11 @@ impl App {
                     },
                     _ => "not found on PATH".into(),
                 },
-                sessions: if live > 0 { format!("{live} live") } else { "—".into() },
+                sessions: if live > 0 {
+                    format!("{live} live")
+                } else {
+                    "—".into()
+                },
                 conduit: cap
                     .filter(|c| c.mode != HarnessMode::Unsupported)
                     .map(|c| c.mode.label().to_string())
@@ -484,7 +519,12 @@ impl App {
             });
         }
         let c = self.registry.hud_counts();
-        let summary = format!("{ready} of {} ready · {} live · {} queued", HKEYS.len(), c.live, c.queued);
+        let summary = format!(
+            "{ready} of {} ready · {} live · {} queued",
+            HKEYS.len(),
+            c.live,
+            c.queued
+        );
         (rows, summary)
     }
 
@@ -570,10 +610,7 @@ impl App {
                     cmd: format!("taskai session prompt {sref} --stdin --wait"),
                 }
             } else {
-                PaneBody::Empty(format!(
-                    "Enter launches {} here",
-                    sessions[sel].harness
-                ))
+                PaneBody::Empty(format!("Enter launches {} here", sessions[sel].harness))
             }
         };
         Some(TaskView {
@@ -594,14 +631,22 @@ impl App {
         let mut frame = match &self.mode {
             Mode::Boot => {
                 let done = self.probes.len();
-                let ready =
-                    self.probes.values().filter(|c| c.mode != HarnessMode::Unsupported).count();
+                let ready = self
+                    .probes
+                    .values()
+                    .filter(|c| c.mode != HarnessMode::Unsupported)
+                    .count();
                 let meter = format!("{ready} of {done} harnesses ready");
                 boot::frame(&self.probe_rows(), &meter, self.st.boot_k, cols, rows)
             }
-            Mode::Home => {
-                home::frame(&self.home_rows(), &self.hud(), self.st.home_sel, cols, rows, &clock)
-            }
+            Mode::Home => home::frame(
+                &self.home_rows(),
+                &self.hud(),
+                self.st.home_sel,
+                cols,
+                rows,
+                &clock,
+            ),
             Mode::Harnesses => {
                 let (hrows, summary) = self.harness_rows();
                 harness::frame(&hrows, &summary, &self.hud(), cols, rows, &clock)
@@ -618,8 +663,7 @@ impl App {
             }
             Mode::NewTask(f) => {
                 if let Some(ex) = &f.explorer {
-                    let panel =
-                        explorer_panel(&tilde(&ex.cwd), &ex.entries, ex.sel);
+                    let panel = explorer_panel(&tilde(&ex.cwd), &ex.entries, ex.sel);
                     let base = home::frame(
                         &self.home_rows(),
                         &self.hud(),
@@ -743,7 +787,11 @@ impl App {
                         name: f.wname.clone(),
                     };
                     vec![
-                        vec![s("CODE WILL LIVE AT", Some(FT), Some(taskai_tui::color::GLASS))],
+                        vec![s(
+                            "CODE WILL LIVE AT",
+                            Some(FT),
+                            Some(taskai_tui::color::GLASS),
+                        )],
                         vec![s(
                             tilde(&preview(&choice, &repo)),
                             Some(DIM),
@@ -772,7 +820,11 @@ impl App {
                 }
             }
             Mode::Destroy(f) => {
-                let kept = ["Repository untouched", "Worktrees preserved", "Git history preserved"];
+                let kept = [
+                    "Repository untouched",
+                    "Worktrees preserved",
+                    "Git history preserved",
+                ];
                 let panel = destroy_panel_view(
                     self.st.blink,
                     &f.title,
@@ -781,7 +833,11 @@ impl App {
                     &f.expect,
                     &f.typed,
                 );
-                let prev = if f.back_home { PrevMode::FromHome } else { PrevMode::FromTask };
+                let prev = if f.back_home {
+                    PrevMode::FromHome
+                } else {
+                    PrevMode::FromTask
+                };
                 let base = self.base_frame(prev, cols, rows, &clock);
                 centered_overlay(&base, &panel, cols)
             }
@@ -797,9 +853,14 @@ impl App {
 
     fn base_frame(&mut self, prev: PrevMode, cols: usize, rows: usize, clock: &str) -> Vec<String> {
         match prev {
-            PrevMode::FromHome => {
-                home::frame(&self.home_rows(), &self.hud(), self.st.home_sel, cols, rows, clock)
-            }
+            PrevMode::FromHome => home::frame(
+                &self.home_rows(),
+                &self.hud(),
+                self.st.home_sel,
+                cols,
+                rows,
+                clock,
+            ),
             PrevMode::FromTask => match self.task_view(cols, rows) {
                 Some(view) => task::frame(&view, &self.hud(), &self.st, cols, rows, clock),
                 None => home::frame(&self.home_rows(), &self.hud(), 0, cols, rows, clock),
@@ -833,12 +894,12 @@ impl App {
             s(" Ctrl+G ", Some(TEXT), Some(KCAP)),
             s(" Return to TaskAI", Some(FT), Some(b)),
         ];
-        let gap1 = (cols as isize * 2 / 3 - seglen(&rib) as isize - seglen(&mid) as isize).max(0)
-            as usize;
+        let gap1 =
+            (cols as isize * 2 / 3 - seglen(&rib) as isize - seglen(&mid) as isize).max(0) as usize;
         rib.push(s(" ".repeat(gap1), None, Some(b)));
         rib.extend(mid);
-        let gap2 = (cols as isize - 3 - seglen(&rib) as isize - seglen(&tail) as isize).max(0)
-            as usize;
+        let gap2 =
+            (cols as isize - 3 - seglen(&rib) as isize - seglen(&tail) as isize).max(0) as usize;
         rib.push(s(" ".repeat(gap2), None, Some(b)));
         rib.extend(tail);
         let mut lines = vec![
@@ -886,7 +947,12 @@ impl App {
                 lines.push(row(&[], cols, CLI_BG, 0));
             }
         }
-        lines.push(row(&[s("▀".repeat(cols), Some(CLI_BG), Some(VOID))], cols, VOID, 0));
+        lines.push(row(
+            &[s("▀".repeat(cols), Some(CLI_BG), Some(VOID))],
+            cols,
+            VOID,
+            0,
+        ));
         let _ = format!("{}{}", bg(VOID), RESET);
         lines.truncate(rows);
         lines
@@ -919,72 +985,81 @@ impl App {
         if self.panes.contains_key(sref) {
             return Ok(());
         }
-        let sess = self.registry.session(sref).cloned().ok_or("unknown session")?;
+        let sess = self
+            .registry
+            .session(sref)
+            .cloned()
+            .ok_or("unknown session")?;
         let ws = sess.workspace.clone();
         let run = self.home_dir.join("run");
         let home_str = self.home_dir.display().to_string();
         let body_h = rows.saturating_sub(8).saturating_sub(3).max(10);
         let body_w = cols - task::RAIL_W - task::GAP;
-        let resume_id = sess.provider.as_ref().map(|p| p.provider_session_id.clone());
+        let resume_id = sess
+            .provider
+            .as_ref()
+            .map(|p| p.provider_session_id.clone());
 
-        let (prog, args, mut envs): (String, Vec<String>, Vec<(String, String)>) = match sess
-            .harness
-            .as_str()
-        {
-            "claude" => {
-                let events = install_hooks(&ws, &run).map_err(|e| e.to_string())?;
-                let _ = taskai_context::install_bootstrap(&ws);
-                if let Ok(exe) = std::env::current_exe() {
-                    let _ = install_context_hook(&ws, &exe);
-                }
-                let offset = std::fs::metadata(&events).map(|m| m.len()).unwrap_or(0);
-                let tx = self.bind_tx.clone();
-                let sref2 = sref.to_string();
-                std::thread::spawn(move || {
-                    if let Ok(ev) =
-                        wait_for_event(&events, "SessionStart", None, offset, Duration::from_secs(300))
-                    {
-                        if let Some(id) = ev.session_id {
-                            let _ = tx.send((sref2, id));
-                        }
+        let (prog, args, mut envs): (String, Vec<String>, Vec<(String, String)>) =
+            match sess.harness.as_str() {
+                "claude" => {
+                    let events = install_hooks(&ws, &run).map_err(|e| e.to_string())?;
+                    let _ = taskai_context::install_bootstrap(&ws);
+                    if let Ok(exe) = std::env::current_exe() {
+                        let _ = install_context_hook(&ws, &exe);
                     }
-                });
-                let args = match &resume_id {
-                    Some(id) => vec!["--resume".to_string(), id.clone()],
-                    None => Vec::new(),
-                };
-                ("claude".to_string(), args, Vec::new())
-            }
-            "codex" => {
-                let _ = taskai_context::install_bootstrap(&ws);
-                let args = match &resume_id {
-                    Some(id) => vec!["resume".to_string(), id.clone()],
-                    None => Vec::new(),
-                };
-                ("codex".to_string(), args, Vec::new())
-            }
-            "opencode" => {
-                let _ = taskai_context::install_bootstrap(&ws);
-                if !self.oc_servers.contains_key(&ws) {
-                    let server = OpenCodeConnector::default()
-                        .start_server(&ws)
-                        .map_err(|e| e.to_string())?;
-                    self.oc_servers.insert(ws.clone(), server);
+                    let offset = std::fs::metadata(&events).map(|m| m.len()).unwrap_or(0);
+                    let tx = self.bind_tx.clone();
+                    let sref2 = sref.to_string();
+                    std::thread::spawn(move || {
+                        if let Ok(ev) = wait_for_event(
+                            &events,
+                            "SessionStart",
+                            None,
+                            offset,
+                            Duration::from_secs(300),
+                        ) {
+                            if let Some(id) = ev.session_id {
+                                let _ = tx.send((sref2, id));
+                            }
+                        }
+                    });
+                    let args = match &resume_id {
+                        Some(id) => vec!["--resume".to_string(), id.clone()],
+                        None => Vec::new(),
+                    };
+                    ("claude".to_string(), args, Vec::new())
                 }
-                let server = &self.oc_servers[&ws];
-                let (prog, args, envs) = server.attach_command();
-                (prog, args, envs)
-            }
-            "grok" => {
-                let _ = taskai_context::install_bootstrap(&ws);
-                let args = match &resume_id {
-                    Some(id) => vec!["--resume".to_string(), id.clone()],
-                    None => Vec::new(),
-                };
-                ("grok".to_string(), args, Vec::new())
-            }
-            other => return Err(format!("no connector for {other}")),
-        };
+                "codex" => {
+                    let _ = taskai_context::install_bootstrap(&ws);
+                    let args = match &resume_id {
+                        Some(id) => vec!["resume".to_string(), id.clone()],
+                        None => Vec::new(),
+                    };
+                    ("codex".to_string(), args, Vec::new())
+                }
+                "opencode" => {
+                    let _ = taskai_context::install_bootstrap(&ws);
+                    if !self.oc_servers.contains_key(&ws) {
+                        let server = OpenCodeConnector::default()
+                            .start_server(&ws)
+                            .map_err(|e| e.to_string())?;
+                        self.oc_servers.insert(ws.clone(), server);
+                    }
+                    let server = &self.oc_servers[&ws];
+                    let (prog, args, envs) = server.attach_command();
+                    (prog, args, envs)
+                }
+                "grok" => {
+                    let _ = taskai_context::install_bootstrap(&ws);
+                    let args = match &resume_id {
+                        Some(id) => vec!["--resume".to_string(), id.clone()],
+                        None => Vec::new(),
+                    };
+                    ("grok".to_string(), args, Vec::new())
+                }
+                other => return Err(format!("no connector for {other}")),
+            };
         envs.push(("TASKAI_SESSION_REF".into(), sref.to_string()));
         envs.push(("TASKAI_HOME".into(), home_str));
         let envrefs: Vec<(&str, &str)> =
@@ -1001,8 +1076,16 @@ impl App {
                 resumed: resume_id.is_some(),
             },
         );
-        self.served.panes.lock().unwrap().insert(sref.to_string(), pane);
-        self.served.harnesses.lock().unwrap().insert(sref.to_string(), sess.harness.clone());
+        self.served
+            .panes
+            .lock()
+            .unwrap()
+            .insert(sref.to_string(), pane);
+        self.served
+            .harnesses
+            .lock()
+            .unwrap()
+            .insert(sref.to_string(), sess.harness.clone());
         let state = match sess.harness.as_str() {
             "grok" => SessionState::Handoff,
             "claude" => SessionState::Working, // Live lands when SessionStart binds
@@ -1014,9 +1097,18 @@ impl App {
 
     fn create_manager(&mut self, f: &ManagerForm) -> Result<String, String> {
         let task_ref = self.sel_task.clone().ok_or("no task selected")?;
-        let repo = self.registry.task(&task_ref).ok_or("task missing")?.repo.clone();
+        let repo = self
+            .registry
+            .task(&task_ref)
+            .ok_or("task missing")?
+            .repo
+            .clone();
         let hkey = f.ready.get(f.hsel).ok_or("no ready harness")?.clone();
-        let name = if f.name.trim().is_empty() { "Lead" } else { f.name.trim() };
+        let name = if f.name.trim().is_empty() {
+            "Lead"
+        } else {
+            f.name.trim()
+        };
         self.registry
             .create_session(&task_ref, None, name, &hkey, &repo, Source::HumanUi)
             .map_err(|e| e.to_string())
@@ -1024,7 +1116,12 @@ impl App {
 
     fn create_sub(&mut self, f: &SubForm) -> Result<String, String> {
         let task_ref = self.sel_task.clone().ok_or("no task selected")?;
-        let repo = self.registry.task(&task_ref).ok_or("task missing")?.repo.clone();
+        let repo = self
+            .registry
+            .task(&task_ref)
+            .ok_or("task missing")?
+            .repo
+            .clone();
         let hkey = f.ready.get(f.hsel).ok_or("no ready harness")?.clone();
         let choice = match f.ws_mode {
             0 => WorkspaceChoice::SameRepo,
@@ -1040,9 +1137,20 @@ impl App {
             _ => WorkspaceChoice::OtherRepo(PathBuf::from(f.other.clone())),
         };
         let ws = provision(&choice, &repo).map_err(|e| e.to_string())?;
-        let role = if f.role.trim().is_empty() { "Subordinate" } else { f.role.trim() };
+        let role = if f.role.trim().is_empty() {
+            "Subordinate"
+        } else {
+            f.role.trim()
+        };
         self.registry
-            .create_session(&task_ref, Some(&f.parent), role, &hkey, &ws, Source::HumanUi)
+            .create_session(
+                &task_ref,
+                Some(&f.parent),
+                role,
+                &hkey,
+                &ws,
+                Source::HumanUi,
+            )
             .map_err(|e| e.to_string())
     }
 
@@ -1097,17 +1205,23 @@ impl App {
                 if ctrl_c {
                     return false;
                 }
-                let rails = self.sel_task.as_ref().map(|t| self.rail_rows(t)).unwrap_or_default();
+                let rails = self
+                    .sel_task
+                    .as_ref()
+                    .map(|t| self.rail_rows(t))
+                    .unwrap_or_default();
                 match k.code {
                     KeyCode::Char('q') => return false,
                     KeyCode::Up => self.st.rail_sel = self.st.rail_sel.saturating_sub(1),
                     KeyCode::Down => {
-                        self.st.rail_sel =
-                            (self.st.rail_sel + 1).min(rails.len().saturating_sub(1))
+                        self.st.rail_sel = (self.st.rail_sel + 1).min(rails.len().saturating_sub(1))
                     }
                     KeyCode::Char('c') => {
-                        self.st.view =
-                            if self.st.view == View::Native { View::Acp } else { View::Native }
+                        self.st.view = if self.st.view == View::Native {
+                            View::Acp
+                        } else {
+                            View::Native
+                        }
                     }
                     KeyCode::Char('T') => self.mode = Mode::Home,
                     KeyCode::Char('h') => self.mode = Mode::Harnesses,
@@ -1156,8 +1270,7 @@ impl App {
                         if let Some(task_ref) = self.sel_task.clone() {
                             if let Some(t) = self.registry.task(&task_ref) {
                                 let title = format!("Destroy task — {}", t.name);
-                                let expect =
-                                    t.name.to_lowercase().replace(' ', "-");
+                                let expect = t.name.to_lowercase().replace(' ', "-");
                                 let blast = self
                                     .registry
                                     .blast(&Item::Task(task_ref.clone()))
@@ -1337,9 +1450,7 @@ impl App {
                                 self.mode = Mode::Task;
                                 if let Some(t) = self.sel_task.clone() {
                                     let rails = self.rail_rows(&t);
-                                    if let Some(i) =
-                                        rails.iter().position(|r| r.key == sref)
-                                    {
+                                    if let Some(i) = rails.iter().position(|r| r.key == sref) {
                                         self.st.rail_sel = i;
                                     }
                                 }
@@ -1349,7 +1460,8 @@ impl App {
                                             Some(format!("{sref} launched — Enter attaches"))
                                     }
                                     Err(e) => {
-                                        self.status = Some(format!("registered {sref}; launch failed: {e}"))
+                                        self.status =
+                                            Some(format!("registered {sref}; launch failed: {e}"))
                                     }
                                 }
                             }
@@ -1456,9 +1568,7 @@ impl App {
                                 self.mode = Mode::Task;
                                 if let Some(t) = self.sel_task.clone() {
                                     let rails = self.rail_rows(&t);
-                                    if let Some(i) =
-                                        rails.iter().position(|r| r.key == sref)
-                                    {
+                                    if let Some(i) = rails.iter().position(|r| r.key == sref) {
                                         self.st.rail_sel = i;
                                     }
                                 }
@@ -1468,7 +1578,8 @@ impl App {
                                             Some(format!("{sref} launched — Enter attaches"))
                                     }
                                     Err(e) => {
-                                        self.status = Some(format!("registered {sref}; launch failed: {e}"))
+                                        self.status =
+                                            Some(format!("registered {sref}; launch failed: {e}"))
                                     }
                                 }
                             }
@@ -1571,10 +1682,7 @@ mod tests {
         );
         assert_eq!(
             map_child_cursor(
-                CursorState {
-                    row: 40,
-                    ..child
-                },
+                CursorState { row: 40, ..child },
                 ATTACH_BODY_TOP,
                 40,
                 100,
@@ -1584,10 +1692,7 @@ mod tests {
         );
         assert_eq!(
             map_child_cursor(
-                CursorState {
-                    col: 100,
-                    ..child
-                },
+                CursorState { col: 100, ..child },
                 ATTACH_BODY_TOP,
                 40,
                 100,

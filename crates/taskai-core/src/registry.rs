@@ -137,7 +137,10 @@ impl Registry {
         } else {
             Data::default()
         };
-        Ok(Registry { dir: dir.to_path_buf(), data })
+        Ok(Registry {
+            dir: dir.to_path_buf(),
+            data,
+        })
     }
 
     fn persist(&self) -> Result<(), Error> {
@@ -150,10 +153,19 @@ impl Registry {
     }
 
     fn note(&mut self, action: &str, item: &str, source: Source) {
-        self.data.audit.push(Audit { action: action.into(), item: item.into(), source });
+        self.data.audit.push(Audit {
+            action: action.into(),
+            item: item.into(),
+            source,
+        });
     }
 
-    pub fn create_task(&mut self, name: &str, repo: &Path, source: Source) -> Result<String, Error> {
+    pub fn create_task(
+        &mut self,
+        name: &str,
+        repo: &Path,
+        source: Source,
+    ) -> Result<String, Error> {
         self.data.next_task += 1;
         let task_ref = format!("t{}", self.data.next_task);
         self.data.tasks.push(Task {
@@ -186,7 +198,10 @@ impl Registry {
                     .session(p)
                     .ok_or_else(|| Error::NotFound(format!("parent {p}")))?;
                 if ps.task_ref != task {
-                    return Err(Error::Invalid(format!("parent {p} belongs to {}", ps.task_ref)));
+                    return Err(Error::Invalid(format!(
+                        "parent {p} belongs to {}",
+                        ps.task_ref
+                    )));
                 }
                 if ps.role != Role::Manager {
                     return Err(Error::Invalid(format!("parent {p} is not a manager")));
@@ -226,7 +241,11 @@ impl Registry {
     }
 
     pub fn sessions_of(&self, task: &str) -> Vec<&Session> {
-        self.data.sessions.iter().filter(|s| s.task_ref == task).collect()
+        self.data
+            .sessions
+            .iter()
+            .filter(|s| s.task_ref == task)
+            .collect()
     }
 
     pub fn children_of(&self, session: &str) -> Vec<&Session> {
@@ -263,8 +282,7 @@ impl Registry {
             .iter()
             .filter(|t| {
                 let sessions = self.sessions_of(&t.task_ref);
-                !sessions.is_empty()
-                    && sessions.iter().any(|s| s.state != SessionState::Complete)
+                !sessions.is_empty() && sessions.iter().any(|s| s.state != SessionState::Complete)
             })
             .count();
         c
@@ -324,7 +342,9 @@ impl Registry {
     pub fn blast(&self, item: &Item) -> Result<Vec<String>, Error> {
         match item {
             Item::Session(r) => {
-                let s = self.session(r).ok_or_else(|| Error::NotFound(format!("session {r}")))?;
+                let s = self
+                    .session(r)
+                    .ok_or_else(|| Error::NotFound(format!("session {r}")))?;
                 let mut out = vec![s.session_ref.clone()];
                 out.extend(self.children_of(r).iter().map(|c| c.session_ref.clone()));
                 Ok(out)
@@ -337,7 +357,11 @@ impl Registry {
                 for s in self.sessions_of(r) {
                     if s.role == Role::Manager {
                         out.push(s.session_ref.clone());
-                        out.extend(self.children_of(&s.session_ref).iter().map(|c| c.session_ref.clone()));
+                        out.extend(
+                            self.children_of(&s.session_ref)
+                                .iter()
+                                .map(|c| c.session_ref.clone()),
+                        );
                     }
                 }
                 Ok(out)
@@ -349,7 +373,9 @@ impl Registry {
     /// Never touches repositories, worktrees, or provider-native history.
     pub fn destroy(&mut self, item: &Item, source: Source) -> Result<Vec<String>, Error> {
         let removed = self.blast(item)?;
-        self.data.sessions.retain(|s| !removed.contains(&s.session_ref));
+        self.data
+            .sessions
+            .retain(|s| !removed.contains(&s.session_ref));
         if let Item::Task(r) = item {
             self.data.tasks.retain(|t| t.task_ref != *r);
         }

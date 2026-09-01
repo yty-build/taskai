@@ -61,11 +61,18 @@ pub struct HandoffRow {
 /// What fills the working pane for the selected session.
 pub enum PaneBody {
     /// Demo feed with an animated spinner phrase (fixture world only).
-    Feed { entries: &'static [Feed], phrase: &'static str },
+    Feed {
+        entries: &'static [Feed],
+        phrase: &'static str,
+    },
     /// The real hosted CLI's grid.
     Cells(Vec<Vec<PaneCell>>),
     /// Handoff ledger: correspondence plus the queued marker and command hint.
-    Handoff { note: String, exchanges: Vec<HandoffRow>, cmd: String },
+    Handoff {
+        note: String,
+        exchanges: Vec<HandoffRow>,
+        cmd: String,
+    },
     /// Nothing attached yet.
     Empty(String),
 }

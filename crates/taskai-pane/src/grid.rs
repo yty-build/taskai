@@ -24,7 +24,9 @@ pub struct Grid {
 
 impl Grid {
     pub fn new(rows: usize, cols: usize) -> Grid {
-        Grid { parser: vt100::Parser::new(rows as u16, cols as u16, 0) }
+        Grid {
+            parser: vt100::Parser::new(rows as u16, cols as u16, 0),
+        }
     }
 
     pub fn process(&mut self, bytes: &[u8]) {
@@ -123,7 +125,11 @@ pub fn idx_rgb(i: u8) -> (u8, u8, u8) {
         16..=231 => {
             let v = [0u8, 95, 135, 175, 215, 255];
             let n = i - 16;
-            (v[(n / 36) as usize], v[((n % 36) / 6) as usize], v[(n % 6) as usize])
+            (
+                v[(n / 36) as usize],
+                v[((n % 36) / 6) as usize],
+                v[(n % 6) as usize],
+            )
         }
         _ => {
             let g = 8 + 10 * (i - 232);

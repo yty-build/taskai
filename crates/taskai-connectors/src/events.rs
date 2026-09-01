@@ -42,7 +42,12 @@ pub fn wait_for_event(
                     let k = v["hook_event_name"].as_str().unwrap_or("");
                     let sid = v["session_id"].as_str().map(str::to_string);
                     if k == kind && session_id.is_none_or(|want| sid.as_deref() == Some(want)) {
-                        return Ok(Event { kind: k.into(), session_id: sid, offset, raw: v });
+                        return Ok(Event {
+                            kind: k.into(),
+                            session_id: sid,
+                            offset,
+                            raw: v,
+                        });
                     }
                 }
             }

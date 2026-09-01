@@ -4,8 +4,8 @@
 use crate::chrome::{keybar, masthead, PAD};
 use crate::color::{harness_color, AMB, DIM, FT, GLASS, GLASS_HI, TEXT, VOID};
 use crate::fixture::KEYS_HARNESS;
-use crate::view::{HarnessRowView, Hud};
 use crate::seg::{row, s, sb, seglen, vrow, Seg};
+use crate::view::{HarnessRowView, Hud};
 
 fn pad(n: isize) -> String {
     " ".repeat(n.max(0) as usize)
@@ -24,7 +24,12 @@ pub fn frame(
     let mut lines = masthead(cols, "HARNESSES", &hud_items, hud.lamp.as_deref(), clock);
     lines.push(vrow(cols));
     let b = GLASS_HI;
-    lines.push(row(&[s("▄".repeat(cols), Some(GLASS), Some(VOID))], cols, VOID, 0));
+    lines.push(row(
+        &[s("▄".repeat(cols), Some(GLASS), Some(VOID))],
+        cols,
+        VOID,
+        0,
+    ));
     let head = vec![sb("Harness bay", Some(TEXT), Some(b))];
     let tail = vec![s(summary, Some(FT), Some(b))];
     let mut hrow = head;
@@ -65,14 +70,29 @@ pub fn frame(
             dot,
             s(h.name.as_str(), Some(TEXT), Some(fill)),
         ];
-        segs.push(s(pad(c2 as isize - seglen(&segs) as isize), None, Some(fill)));
+        segs.push(s(
+            pad(c2 as isize - seglen(&segs) as isize),
+            None,
+            Some(fill),
+        ));
         segs.push(s(h.bin.as_str(), Some(FT), Some(fill)));
-        segs.push(s(pad(c3 as isize - seglen(&segs) as isize), None, Some(fill)));
+        segs.push(s(
+            pad(c3 as isize - seglen(&segs) as isize),
+            None,
+            Some(fill),
+        ));
         segs.push(s(sess, Some(DIM), Some(fill)));
-        segs.push(s(pad(c4 as isize - seglen(&segs) as isize), None, Some(fill)));
+        segs.push(s(
+            pad(c4 as isize - seglen(&segs) as isize),
+            None,
+            Some(fill),
+        ));
         segs.push(s(h.conduit.as_str(), Some(FT), Some(fill)));
         segs.push(s(
-            pad(cols as isize - PAD as isize - seglen(&segs) as isize - state.chars().count() as isize),
+            pad(cols as isize
+                - PAD as isize
+                - seglen(&segs) as isize
+                - state.chars().count() as isize),
             None,
             Some(fill),
         ));
@@ -80,7 +100,12 @@ pub fn frame(
         lines.push(row(&segs, cols, fill, 0));
     }
     lines.push(row(&[], cols, GLASS, 0));
-    lines.push(row(&[s("▀".repeat(cols), Some(GLASS), Some(VOID))], cols, VOID, 0));
+    lines.push(row(
+        &[s("▀".repeat(cols), Some(GLASS), Some(VOID))],
+        cols,
+        VOID,
+        0,
+    ));
     while lines.len() < rows.saturating_sub(3) {
         lines.push(vrow(cols));
     }

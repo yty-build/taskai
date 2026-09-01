@@ -14,12 +14,32 @@ fn taskai() -> Command {
 
 fn seed(home: &Path) -> (String, String, String) {
     let mut reg = Registry::open(&home.join("state")).unwrap();
-    let t = reg.create_task("Repository evaluation", Path::new("/tmp/buzz"), Source::HumanUi).unwrap();
+    let t = reg
+        .create_task(
+            "Repository evaluation",
+            Path::new("/tmp/buzz"),
+            Source::HumanUi,
+        )
+        .unwrap();
     let lead = reg
-        .create_session(&t, None, "Lead", "claude", Path::new("/tmp/buzz"), Source::HumanUi)
+        .create_session(
+            &t,
+            None,
+            "Lead",
+            "claude",
+            Path::new("/tmp/buzz"),
+            Source::HumanUi,
+        )
         .unwrap();
     let arch = reg
-        .create_session(&t, Some(&lead), "Architecture", "opencode", Path::new("/tmp/wt"), Source::HumanUi)
+        .create_session(
+            &t,
+            Some(&lead),
+            "Architecture",
+            "opencode",
+            Path::new("/tmp/wt"),
+            Source::HumanUi,
+        )
         .unwrap();
     (t, lead, arch)
 }
@@ -78,7 +98,11 @@ fn context_tree_and_unknown_ref() {
     let tmp = tempfile::tempdir().unwrap();
     seed(tmp.path());
 
-    let out = taskai().env("TASKAI_HOME", tmp.path()).args(["context", "tree"]).output().unwrap();
+    let out = taskai()
+        .env("TASKAI_HOME", tmp.path())
+        .args(["context", "tree"])
+        .output()
+        .unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("Repository evaluation"), "{text}");
@@ -100,7 +124,11 @@ fn context_tree_and_unknown_ref() {
 #[test]
 fn inject_never_fails() {
     let tmp = tempfile::tempdir().unwrap();
-    let out = taskai().env("TASKAI_HOME", tmp.path()).args(["context", "inject"]).output().unwrap();
+    let out = taskai()
+        .env("TASKAI_HOME", tmp.path())
+        .args(["context", "inject"])
+        .output()
+        .unwrap();
     assert!(out.status.success());
     assert!(out.stdout.is_empty());
 

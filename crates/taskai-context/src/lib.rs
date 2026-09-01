@@ -20,7 +20,8 @@ Use TaskAI Context to understand who you are, why this session exists, your assi
 TaskAI Context informs your decisions; it does not make them for you.";
 
 fn find<'a>(reg: &'a Registry, r: &str) -> Result<&'a Session, Error> {
-    reg.session(r).ok_or_else(|| Error::NotFound(format!("session {r}")))
+    reg.session(r)
+        .ok_or_else(|| Error::NotFound(format!("session {r}")))
 }
 
 fn session_json(s: &Session) -> serde_json::Value {
@@ -42,8 +43,11 @@ pub fn snapshot(reg: &Registry, session_ref: &str) -> Result<serde_json::Value, 
         .ok_or_else(|| Error::NotFound(format!("task {}", me.task_ref)))?;
     let all = reg.sessions_of(&task.task_ref);
     let managers: Vec<&&Session> = all.iter().filter(|s| s.role == Role::Manager).collect();
-    let subordinates: Vec<String> =
-        reg.children_of(session_ref).iter().map(|s| s.session_ref.clone()).collect();
+    let subordinates: Vec<String> = reg
+        .children_of(session_ref)
+        .iter()
+        .map(|s| s.session_ref.clone())
+        .collect();
     let peers: Vec<String> = all
         .iter()
         .filter(|s| {
@@ -55,7 +59,10 @@ pub fn snapshot(reg: &Registry, session_ref: &str) -> Result<serde_json::Value, 
         })
         .map(|s| s.session_ref.clone())
         .collect();
-    let generated_at = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let generated_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     Ok(json!({
         "schema_version": SCHEMA_VERSION,
         "context_revision": reg.revision(),
@@ -182,7 +189,12 @@ pub fn tree_view(reg: &Registry, task_ref: Option<&str>) -> String {
         if task_ref.is_some_and(|t| t != task.task_ref) {
             continue;
         }
-        out.push(format!("Task {}: \"{}\" · {}", task.task_ref, task.name, task.repo.display()));
+        out.push(format!(
+            "Task {}: \"{}\" · {}",
+            task.task_ref,
+            task.name,
+            task.repo.display()
+        ));
         for s in reg.sessions_of(&task.task_ref) {
             if s.role == Role::Manager {
                 out.push(format!(
@@ -217,7 +229,11 @@ pub fn tree_view(reg: &Registry, task_ref: Option<&str>) -> String {
 pub fn install_bootstrap(workspace: &Path) -> Result<(), Error> {
     let path = workspace.join("AGENTS.md");
     let block = format!("{BEGIN}\n{BOOTSTRAP}\n{END}");
-    let body = if path.exists() { std::fs::read_to_string(&path)? } else { String::new() };
+    let body = if path.exists() {
+        std::fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
     let updated = match (body.find(BEGIN), body.find(END)) {
         (Some(start), Some(end)) => {
             format!("{}{}{}", &body[..start], block, &body[end + END.len()..])

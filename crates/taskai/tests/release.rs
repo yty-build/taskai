@@ -24,7 +24,11 @@ fn clean_home_works_offline() {
     assert!(out.status.success());
     assert!(!out.stdout.is_empty());
 
-    let out = taskai().env("TASKAI_HOME", tmp.path()).args(["context", "tree"]).output().unwrap();
+    let out = taskai()
+        .env("TASKAI_HOME", tmp.path())
+        .args(["context", "tree"])
+        .output()
+        .unwrap();
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("No tasks registered"));
 }
@@ -34,7 +38,11 @@ fn clean_home_works_offline() {
 #[test]
 fn runtime_dirs_are_owner_only() {
     let tmp = tempfile::tempdir().unwrap();
-    let out = taskai().env("TASKAI_HOME", tmp.path()).args(["context", "tree"]).output().unwrap();
+    let out = taskai()
+        .env("TASKAI_HOME", tmp.path())
+        .args(["context", "tree"])
+        .output()
+        .unwrap();
     assert!(out.status.success());
     let state = tmp.path().join("state");
     assert!(state.is_dir());

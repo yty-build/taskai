@@ -12,7 +12,9 @@ pub struct ClaudeConnector {
 
 impl Default for ClaudeConnector {
     fn default() -> Self {
-        ClaudeConnector { bin: "claude".into() }
+        ClaudeConnector {
+            bin: "claude".into(),
+        }
     }
 }
 
@@ -23,7 +25,11 @@ impl ClaudeConnector {
             Ok(out) if out.status.success() => {
                 let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 crate::gate_version(
-                    Capability { mode: Mode::OwnedTui, version: parse_version(&text), detail: text },
+                    Capability {
+                        mode: Mode::OwnedTui,
+                        version: parse_version(&text),
+                        detail: text,
+                    },
                     "2.0.0",
                 )
             }
@@ -32,7 +38,11 @@ impl ClaudeConnector {
                 version: None,
                 detail: String::from_utf8_lossy(&out.stderr).trim().to_string(),
             },
-            Err(e) => Capability { mode: Mode::Unsupported, version: None, detail: e.to_string() },
+            Err(e) => Capability {
+                mode: Mode::Unsupported,
+                version: None,
+                detail: e.to_string(),
+            },
         }
     }
 
@@ -55,7 +65,8 @@ impl ClaudeConnector {
 pub fn parse_version(s: &str) -> Option<String> {
     for token in s.split_whitespace() {
         let t = token.trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
-        if !t.is_empty() && t.chars().next().is_some_and(|c| c.is_ascii_digit()) && t.contains('.') {
+        if !t.is_empty() && t.chars().next().is_some_and(|c| c.is_ascii_digit()) && t.contains('.')
+        {
             return Some(t.to_string());
         }
     }
@@ -84,7 +95,9 @@ fn save_settings(path: &Path, cfg: &serde_json::Value) -> Result<(), Error> {
 /// Appends a hook entry for `event` unless one carrying `marker` is already present.
 fn upsert_hook(cfg: &mut serde_json::Value, event: &str, cmd: &str, marker: &str) {
     let mut arr = cfg["hooks"][event].as_array().cloned().unwrap_or_default();
-    let already = serde_json::to_string(&arr).unwrap_or_default().contains(marker);
+    let already = serde_json::to_string(&arr)
+        .unwrap_or_default()
+        .contains(marker);
     if !already {
         arr.push(serde_json::json!({"hooks": [{"type": "command", "command": cmd}]}));
     }

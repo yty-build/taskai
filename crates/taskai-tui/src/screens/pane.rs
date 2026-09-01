@@ -64,7 +64,10 @@ pub fn frame(
     let b = GLASS_HI;
     let head = vec![sb(title, Some(TEXT), Some(b))];
     let tail: Vec<Seg> = match focus {
-        Focus::Cli => vec![s("● ", Some(ION), Some(b)), s("CLI HAS FOCUS", Some(ION), Some(b))],
+        Focus::Cli => vec![
+            s("● ", Some(ION), Some(b)),
+            s("CLI HAS FOCUS", Some(ION), Some(b)),
+        ],
         Focus::Nav => vec![s("NAVIGATION", Some(FT), Some(b))],
     };
     let gap = (cols as isize - 2 * PAD as isize - seglen(&head) as isize - seglen(&tail) as isize)

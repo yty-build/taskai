@@ -12,11 +12,21 @@ pub struct Seg {
 }
 
 pub fn s(text: impl Into<String>, fg: Option<Rgb>, bg: Option<Rgb>) -> Seg {
-    Seg { text: text.into(), fg, bg, bold: false }
+    Seg {
+        text: text.into(),
+        fg,
+        bg,
+        bold: false,
+    }
 }
 
 pub fn sb(text: impl Into<String>, fg: Option<Rgb>, bg: Option<Rgb>) -> Seg {
-    Seg { text: text.into(), fg, bg, bold: true }
+    Seg {
+        text: text.into(),
+        fg,
+        bg,
+        bold: true,
+    }
 }
 
 fn chars(t: &str) -> usize {
@@ -81,7 +91,10 @@ pub fn clip_segs(segs: &[Seg], width: usize) -> Vec<Seg> {
             t = take_chars(&t, width.saturating_sub(used + 1)) + "…";
         }
         used += chars(&t);
-        out.push(Seg { text: t, ..g.clone() });
+        out.push(Seg {
+            text: t,
+            ..g.clone()
+        });
     }
     out
 }

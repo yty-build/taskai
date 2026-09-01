@@ -8,15 +8,42 @@ use taskai_core::registry::{Registry, SessionState, Source};
 
 fn seeded(dir: &Path) -> (Registry, String, String, String, String) {
     let mut reg = Registry::open(dir).unwrap();
-    let t = reg.create_task("Repository evaluation", Path::new("/tmp/buzz"), Source::HumanUi).unwrap();
+    let t = reg
+        .create_task(
+            "Repository evaluation",
+            Path::new("/tmp/buzz"),
+            Source::HumanUi,
+        )
+        .unwrap();
     let lead = reg
-        .create_session(&t, None, "Lead", "claude", Path::new("/tmp/buzz"), Source::HumanUi)
+        .create_session(
+            &t,
+            None,
+            "Lead",
+            "claude",
+            Path::new("/tmp/buzz"),
+            Source::HumanUi,
+        )
         .unwrap();
     let arch = reg
-        .create_session(&t, Some(&lead), "Architecture", "opencode", Path::new("/tmp/buzz-worktrees/auth-pass"), Source::HumanUi)
+        .create_session(
+            &t,
+            Some(&lead),
+            "Architecture",
+            "opencode",
+            Path::new("/tmp/buzz-worktrees/auth-pass"),
+            Source::HumanUi,
+        )
         .unwrap();
     let deliv = reg
-        .create_session(&t, None, "Delivery", "codex", Path::new("/tmp/buzz"), Source::HumanUi)
+        .create_session(
+            &t,
+            None,
+            "Delivery",
+            "codex",
+            Path::new("/tmp/buzz"),
+            Source::HumanUi,
+        )
         .unwrap();
     reg.set_state(&lead, SessionState::Live).unwrap();
     (reg, t, lead, arch, deliv)
@@ -40,7 +67,9 @@ fn snapshot_is_complete() {
     assert_eq!(snap["team_chain"]["parent"], lead.as_str());
     let sessions = snap["sessions"].as_array().unwrap();
     assert_eq!(sessions.len(), 3);
-    assert!(sessions.iter().any(|s| s["session_ref"] == lead.as_str() && s["state"] == "LIVE"));
+    assert!(sessions
+        .iter()
+        .any(|s| s["session_ref"] == lead.as_str() && s["state"] == "LIVE"));
 }
 
 // Expectation: the snapshot never carries credentials, pids, sockets, or transcript
@@ -62,10 +91,21 @@ fn snapshot_omits_secrets() {
 fn revision_is_monotonic() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut reg, t, lead, _arch, _deliv) = seeded(tmp.path());
-    let r1 = snapshot(&reg, &lead).unwrap()["context_revision"].as_u64().unwrap();
-    reg.create_session(&t, Some(&lead), "Verification", "grok", Path::new("/tmp/wt2"), Source::HumanUi)
+    let r1 = snapshot(&reg, &lead).unwrap()["context_revision"]
+        .as_u64()
         .unwrap();
-    let r2 = snapshot(&reg, &lead).unwrap()["context_revision"].as_u64().unwrap();
+    reg.create_session(
+        &t,
+        Some(&lead),
+        "Verification",
+        "grok",
+        Path::new("/tmp/wt2"),
+        Source::HumanUi,
+    )
+    .unwrap();
+    let r2 = snapshot(&reg, &lead).unwrap()["context_revision"]
+        .as_u64()
+        .unwrap();
     assert!(r2 > r1, "{r2} > {r1}");
 }
 
@@ -103,21 +143,35 @@ fn unknown_ref_errors() {
 fn bootstrap_installs_managed_block() {
     let tmp = tempfile::tempdir().unwrap();
     let ws = tmp.path();
-    std::fs::write(ws.join("AGENTS.md"), "# My project rules\nKeep tests green.\n").unwrap();
+    std::fs::write(
+        ws.join("AGENTS.md"),
+        "# My project rules\nKeep tests green.\n",
+    )
+    .unwrap();
 
     install_bootstrap(ws).unwrap();
     install_bootstrap(ws).unwrap();
 
     let body = std::fs::read_to_string(ws.join("AGENTS.md")).unwrap();
-    assert!(body.contains("# My project rules"), "user content preserved");
-    assert_eq!(body.matches("taskai:begin").count(), 1, "one managed block: {body}");
+    assert!(
+        body.contains("# My project rules"),
+        "user content preserved"
+    );
+    assert_eq!(
+        body.matches("taskai:begin").count(),
+        1,
+        "one managed block: {body}"
+    );
     assert!(body.contains("taskai context self"), "{body}");
     assert!(body.contains("taskai context tree"), "{body}");
 
     let claude = ws.join("CLAUDE.md");
     assert!(claude.exists());
     let meta = std::fs::symlink_metadata(&claude).unwrap();
-    assert!(meta.file_type().is_symlink(), "CLAUDE.md is a symlink to AGENTS.md");
+    assert!(
+        meta.file_type().is_symlink(),
+        "CLAUDE.md is a symlink to AGENTS.md"
+    );
 }
 
 // Expectation: an existing CLAUDE.md is never replaced. Why: never overwrite user
@@ -128,5 +182,8 @@ fn existing_claude_md_untouched() {
     let ws = tmp.path();
     std::fs::write(ws.join("CLAUDE.md"), "my own claude rules\n").unwrap();
     install_bootstrap(ws).unwrap();
-    assert_eq!(std::fs::read_to_string(ws.join("CLAUDE.md")).unwrap(), "my own claude rules\n");
+    assert_eq!(
+        std::fs::read_to_string(ws.join("CLAUDE.md")).unwrap(),
+        "my own claude rules\n"
+    );
 }

@@ -66,7 +66,13 @@ fn cli_focus_forwards_exact_bytes() {
 // focus worlds cannot bleed into each other.
 #[test]
 fn nav_focus_interprets() {
-    assert_eq!(route(Focus::Nav, key(KeyCode::Char('a'))), Route::Nav(key(KeyCode::Char('a'))));
+    assert_eq!(
+        route(Focus::Nav, key(KeyCode::Char('a'))),
+        Route::Nav(key(KeyCode::Char('a')))
+    );
     assert_eq!(route(Focus::Nav, ctrl('g')), Route::Boundary);
-    assert!(!matches!(route(Focus::Nav, key(KeyCode::Char('x'))), Route::Forward(_)));
+    assert!(!matches!(
+        route(Focus::Nav, key(KeyCode::Char('x'))),
+        Route::Forward(_)
+    ));
 }
