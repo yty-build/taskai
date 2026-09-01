@@ -3,3 +3,4 @@
 
 pub mod boot;
 pub mod home;
+pub mod pane;

@@ -3,5 +3,8 @@ name = "taskai-tui"
 version.workspace = true
 edition.workspace = true
 
+[dependencies]
+crossterm = "0.28"
+
 [dev-dependencies]
 vt100 = "0.15"

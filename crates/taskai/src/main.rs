@@ -4,11 +4,26 @@
 use std::io::{self, Write};
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
+use taskai_pane::Pane;
 use taskai_tui::color::set_truecolor;
+use taskai_tui::input::{route, Focus, Route};
 use taskai_tui::render::{dump, render};
+use taskai_tui::screens::pane as pane_screen;
 use taskai_tui::state::{advance, Screen, St};
+
+enum Mode {
+    Board,
+    Pane,
+}
+
+struct App {
+    st: St,
+    mode: Mode,
+    focus: Focus,
+    pane: Option<Pane>,
+}
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -71,20 +86,53 @@ fn run_tui() -> io::Result<()> {
 }
 
 fn event_loop(out: &mut impl Write) -> io::Result<()> {
-    let mut st = St::new();
+    let mut app = App { st: St::new(), mode: Mode::Board, focus: Focus::Cli, pane: None };
     loop {
-        advance(&mut st);
+        advance(&mut app.st);
         let (c, r) = terminal::size().unwrap_or((120, 40));
         let (cols, rows) = ((c as usize).max(110), (r as usize).max(30));
-        let frame = render(&st, cols, rows, &clock_now());
+        let frame = match app.mode {
+            Mode::Board => render(&app.st, cols, rows, &clock_now()),
+            Mode::Pane => {
+                let (br, bc) = pane_screen::body_size(cols, rows);
+                if let Some(p) = &mut app.pane {
+                    if p.size() != (br, bc) {
+                        let _ = p.resize(br as u16, bc as u16);
+                    }
+                }
+                let view: Vec<Vec<pane_screen::PaneCell>> = app
+                    .pane
+                    .as_ref()
+                    .map(|p| {
+                        p.cells()
+                            .into_iter()
+                            .map(|row| {
+                                row.into_iter()
+                                    .map(|c| pane_screen::PaneCell {
+                                        text: c.text,
+                                        fg: c.fg,
+                                        bg: c.bg,
+                                        bold: c.bold,
+                                    })
+                                    .collect()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                pane_screen::frame("Shell", &view, app.focus, cols, rows, &clock_now())
+            }
+        };
         write!(out, "\x1b[?2026h\x1b[H{}\x1b[?2026l", frame.join("\r\n"))?;
         out.flush()?;
-        if event::poll(Duration::from_millis(100))? {
+
+        let mut waited = false;
+        while event::poll(if waited { Duration::ZERO } else { Duration::from_millis(100) })? {
+            waited = true;
             if let Event::Key(k) = event::read()? {
                 if k.kind == KeyEventKind::Release {
                     continue;
                 }
-                if !handle(&mut st, k.code, k.modifiers) {
+                if !handle(&mut app, k, cols, rows) {
                     return Ok(());
                 }
             }
@@ -92,26 +140,58 @@ fn event_loop(out: &mut impl Write) -> io::Result<()> {
     }
 }
 
-fn handle(st: &mut St, code: KeyCode, mods: KeyModifiers) -> bool {
-    if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
-        return false;
-    }
-    match st.screen {
-        Screen::Boot => {
-            st.screen = Screen::Home;
+fn handle(app: &mut App, k: KeyEvent, cols: usize, rows: usize) -> bool {
+    match app.mode {
+        Mode::Board => {
+            if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+                return false;
+            }
+            match app.st.screen {
+                Screen::Boot => app.st.screen = Screen::Home,
+                Screen::Home => match k.code {
+                    KeyCode::Char('q') => return false,
+                    KeyCode::Up => app.st.home_sel = app.st.home_sel.saturating_sub(1),
+                    KeyCode::Down => app.st.home_sel = (app.st.home_sel + 1).min(3),
+                    KeyCode::Enter => {
+                        if app.pane.is_none() {
+                            let (br, bc) = pane_screen::body_size(cols, rows);
+                            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+                            let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
+                            if let Ok(p) = Pane::spawn(&shell, &[], &cwd, br as u16, bc as u16) {
+                                app.pane = Some(p);
+                            }
+                        }
+                        if app.pane.is_some() {
+                            app.mode = Mode::Pane;
+                            app.focus = Focus::Cli;
+                        }
+                    }
+                    _ => {}
+                },
+            }
             true
         }
-        Screen::Home => match code {
-            KeyCode::Char('q') => false,
-            KeyCode::Up => {
-                st.home_sel = st.home_sel.saturating_sub(1);
-                true
+        Mode::Pane => {
+            match route(app.focus, k) {
+                Route::Boundary => {
+                    app.focus = match app.focus {
+                        Focus::Cli => Focus::Nav,
+                        Focus::Nav => Focus::Cli,
+                    }
+                }
+                Route::Forward(bytes) => {
+                    if let Some(p) = &mut app.pane {
+                        let _ = p.write_bytes(&bytes);
+                    }
+                }
+                Route::Nav(ev) => match ev.code {
+                    KeyCode::Enter => app.focus = Focus::Cli,
+                    KeyCode::Char('q') => return false,
+                    KeyCode::Char('T') => app.mode = Mode::Board,
+                    _ => {}
+                },
             }
-            KeyCode::Down => {
-                st.home_sel = (st.home_sel + 1).min(3);
-                true
-            }
-            _ => true,
-        },
+            true
+        }
     }
 }

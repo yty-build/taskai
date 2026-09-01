@@ -2,3 +2,7 @@
 name = "taskai-pane"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+portable-pty = "0.8"
+vt100 = "0.15"
