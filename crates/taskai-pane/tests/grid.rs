@@ -53,6 +53,37 @@ fn grid_resizes() {
     assert_eq!(g.cells()[0].len(), 80);
 }
 
+// Expectation: the grid preserves the child terminal's zero-based cursor
+// coordinates and DECTCEM visibility state. Why: TaskAI redraws the child grid
+// into another terminal and must restore this metadata after painting cells.
+// Value: native Claude/Codex text input has a real visible caret.
+#[test]
+fn cursor_position_and_visibility_are_preserved() {
+    let mut g = Grid::new(10, 20);
+    g.process(b"abc");
+    assert_eq!(
+        g.cursor(),
+        taskai_pane::grid::CursorState {
+            row: 0,
+            col: 3,
+            visible: true,
+        }
+    );
+
+    g.process(b"\x1b[?25l\x1b[4;7H");
+    assert_eq!(
+        g.cursor(),
+        taskai_pane::grid::CursorState {
+            row: 3,
+            col: 6,
+            visible: false,
+        }
+    );
+
+    g.process(b"\x1b[?25h");
+    assert!(g.cursor().visible);
+}
+
 fn wait_for(pane: &Pane, needle: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

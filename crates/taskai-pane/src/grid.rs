@@ -9,6 +9,15 @@ pub struct Cell {
     pub width: usize,
 }
 
+/// Cursor state reported by the child terminal. Coordinates are zero-based and
+/// relative to the child's own grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CursorState {
+    pub row: usize,
+    pub col: usize,
+    pub visible: bool,
+}
+
 pub struct Grid {
     parser: vt100::Parser,
 }
@@ -29,6 +38,16 @@ impl Grid {
     pub fn size(&self) -> (usize, usize) {
         let (r, c) = self.parser.screen().size();
         (r as usize, c as usize)
+    }
+
+    pub fn cursor(&self) -> CursorState {
+        let screen = self.parser.screen();
+        let (row, col) = screen.cursor_position();
+        CursorState {
+            row: row as usize,
+            col: col as usize,
+            visible: !screen.hide_cursor(),
+        }
     }
 
     /// Resolved cells row by row; wide glyphs occupy one Cell with width 2 and their

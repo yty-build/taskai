@@ -9,9 +9,14 @@ use std::sync::{Arc, Mutex};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
-use grid::{Cell, Grid};
+use grid::{Cell, CursorState, Grid};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
+
+pub struct PaneSnapshot {
+    pub cells: Vec<Vec<Cell>>,
+    pub cursor: CursorState,
+}
 
 /// A real process in a real pty; its output feeds a terminal grid the TUI blits.
 pub struct Pane {
@@ -75,6 +80,16 @@ impl Pane {
 
     pub fn cells(&self) -> Vec<Vec<Cell>> {
         self.grid.lock().unwrap().cells()
+    }
+
+    /// Capture cells and cursor atomically from one parser state so the host
+    /// never displays a cursor from a different child frame.
+    pub fn snapshot(&self) -> PaneSnapshot {
+        let grid = self.grid.lock().unwrap();
+        PaneSnapshot {
+            cells: grid.cells(),
+            cursor: grid.cursor(),
+        }
     }
 
     pub fn text(&self) -> String {

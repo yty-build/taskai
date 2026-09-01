@@ -1,8 +1,9 @@
 // ABOUTME: Screen-frame tests — every rendered line of every screen is exactly `cols`
 // ABOUTME: cells at every size, and the chrome (masthead, keybar) sits where it must.
 
-use taskai_tui::color::set_truecolor;
-use taskai_tui::render::dump;
+use taskai_tui::color::{set_truecolor, CLI_BG};
+use taskai_tui::render::{dump, paint_frame, resize_frame};
+use taskai_tui::screens::pane::{cell_row, PaneCell};
 use taskai_tui::seg::{cell_count, strip_sgr};
 
 const SIZES: &[(usize, usize)] = &[(110, 30), (209, 51), (150, 42)];
@@ -39,6 +40,97 @@ fn every_line_exact_width() {
             }
         }
     }
+}
+
+// Expectation: the live painter addresses every row directly and never relies on
+// newline behavior after an exact-width row. Why: some terminals auto-wrap the
+// last cell before also processing CRLF, making each refresh creep down the
+// screen. Value: masthead, native pane, and overlays remain pinned indefinitely.
+#[test]
+fn frame_painter_is_stable_across_repeated_tall_redraws() {
+    set_truecolor(true);
+    let (cols, rows) = (209, 80);
+    let frame = dump("subordinate", cols, rows).unwrap();
+    let painted = paint_frame(&frame, None);
+
+    assert!(!painted.contains('\n'), "frame painter must not emit line feeds");
+    assert!(!painted.contains('\r'), "frame painter must not emit carriage returns");
+    for row_number in 1..=rows {
+        assert!(
+            painted.contains(&format!("\x1b[{row_number};1H")),
+            "missing absolute cursor address for row {row_number}"
+        );
+    }
+
+    let mut parser = vt100::Parser::new(rows as u16, cols as u16, 0);
+    for _ in 0..64 {
+        parser.process(painted.as_bytes());
+    }
+    let screen = parser.screen();
+    assert_eq!(screen.cell(1, 3).unwrap().contents(), "T");
+    assert!(screen.contents().contains("Add subordinate — under Lead"));
+    assert!(screen.contents().contains("Enter  Create"));
+}
+
+// Expectation: painting restores the requested host cursor after all cells and
+// hides it when navigation owns the keyboard. Why: the child CLI cursor is
+// terminal state, not a glyph in its grid. Value: focus and caret never lie.
+#[test]
+fn frame_painter_restores_or_hides_the_host_cursor() {
+    let frame = dump("attach", 110, 30).unwrap();
+
+    let mut visible = vt100::Parser::new(30, 110, 0);
+    visible.process(paint_frame(&frame, Some((12, 34))).as_bytes());
+    assert_eq!(visible.screen().cursor_position(), (12, 34));
+    assert!(!visible.screen().hide_cursor());
+
+    let mut hidden = vt100::Parser::new(30, 110, 0);
+    hidden.process(paint_frame(&frame, None).as_bytes());
+    assert!(hidden.screen().hide_cursor());
+}
+
+// Expectation: hosted CLI rows retain the parser's physical cell widths.
+// Why: an emoji is one Rust char but two terminal columns; counting chars adds
+// an extra padding cell and can reintroduce right-margin scrolling. Value:
+// native provider output and its cursor remain aligned.
+#[test]
+fn hosted_cli_rows_preserve_wide_cell_geometry() {
+    let cells = vec![
+        PaneCell {
+            text: "✨".into(),
+            fg: None,
+            bg: None,
+            bold: false,
+            width: 2,
+        },
+        PaneCell {
+            text: "X".into(),
+            fg: None,
+            bg: None,
+            bold: false,
+            width: 1,
+        },
+    ];
+    let rendered = cell_row(&cells, 4, CLI_BG);
+    let mut parser = vt100::Parser::new(1, 4, 0);
+    parser.process(rendered.as_bytes());
+    assert_eq!(parser.screen().cell(0, 0).unwrap().contents(), "✨");
+    assert!(parser.screen().cell(0, 1).unwrap().is_wide_continuation());
+    assert_eq!(parser.screen().cell(0, 2).unwrap().contents(), "X");
+}
+
+// Expectation: a compact physical terminal receives a compact frame, never a
+// fabricated 110x30 canvas. Why: oversized painting wraps before the user can
+// resize and can create the same bottom-anchored corruption. Value: resize is
+// recoverable without damaging live state.
+#[test]
+fn compact_terminal_uses_its_real_viewport() {
+    let frame = resize_frame(80, 20);
+    assert_eq!(frame.len(), 20);
+    assert!(frame.iter().all(|line| cell_count(line) == 80));
+    let text = frame.iter().map(|line| strip_sgr(line)).collect::<Vec<_>>().join("\n");
+    assert!(text.contains("TASKAI · RESIZE NEEDED"));
+    assert!(text.contains("Required  110 × 30"));
 }
 
 // Expectation: home opens with the three-row masthead — soft top, HUD strip with wordmark,

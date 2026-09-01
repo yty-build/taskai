@@ -2,7 +2,7 @@
 // ABOUTME: with a header strip and the focus-dependent keybar.
 
 use crate::chrome::{keybar, masthead, soft_bot, soft_top, PAD};
-use crate::color::{Rgb, CLI_BG, FT, GLASS_HI, ION, TEXT};
+use crate::color::{bg, fg, Rgb, BOLD, CLI_BG, FT, GLASS_HI, ION, RESET, TEXT};
 use crate::fixture::{HUD_HOME, LAMP};
 use crate::input::Focus;
 use crate::seg::{row, s, sb, seglen, vrow, Seg};
@@ -12,6 +12,37 @@ pub struct PaneCell {
     pub fg: Option<Rgb>,
     pub bg: Option<Rgb>,
     pub bold: bool,
+    pub width: usize,
+}
+
+/// Paint terminal cells using the physical width reported by the child parser.
+/// A character count is insufficient here: emoji and CJK glyphs occupy two
+/// columns, while combining sequences can contain multiple chars in one cell.
+pub fn cell_row(cells: &[PaneCell], width: usize, base: Rgb) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+    for cell in cells {
+        let cell_width = cell.width.max(1);
+        if used >= width || used + cell_width > width {
+            break;
+        }
+        out.push_str(&bg(cell.bg.unwrap_or(base)));
+        if let Some(color) = cell.fg {
+            out.push_str(&fg(color));
+        }
+        if cell.bold {
+            out.push_str(BOLD);
+        }
+        out.push_str(&cell.text);
+        out.push_str(RESET);
+        used += cell_width;
+    }
+    if used < width {
+        out.push_str(&bg(base));
+        out.push_str(&" ".repeat(width - used));
+    }
+    out.push_str(RESET);
+    out
 }
 
 /// The grid size the hosted CLI should run at for a terminal of (cols, rows).
@@ -47,25 +78,7 @@ pub fn frame(
     let (body_rows, _) = body_size(cols, rows);
     for r in 0..body_rows {
         match cells.get(r) {
-            Some(cr) => {
-                let mut segs: Vec<Seg> = Vec::new();
-                for c in cr {
-                    match segs.last_mut() {
-                        Some(last)
-                            if last.fg == c.fg && last.bg == c.bg && last.bold == c.bold =>
-                        {
-                            last.text.push_str(&c.text)
-                        }
-                        _ => segs.push(Seg {
-                            text: c.text.clone(),
-                            fg: c.fg,
-                            bg: c.bg,
-                            bold: c.bold,
-                        }),
-                    }
-                }
-                lines.push(row(&segs, cols, CLI_BG, 0));
-            }
+            Some(cr) => lines.push(cell_row(cr, cols, CLI_BG)),
             None => lines.push(row(&[], cols, CLI_BG, 0)),
         }
     }

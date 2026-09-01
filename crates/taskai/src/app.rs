@@ -18,13 +18,17 @@ use taskai_connectors::opencode::{OpenCodeConnector, Server as OcServer};
 use taskai_connectors::{Capability, Conduit, Mode as HarnessMode};
 use taskai_core::registry::{Item, ProviderMapping, Registry, Role, SessionState, Source};
 use taskai_core::workspace::{preview, provision, WorkspaceChoice};
+use taskai_pane::grid::CursorState;
 use taskai_pane::Pane;
 use taskai_tui::color::{bg, CLI_BG, DIM, FT, GLASS_IN, ION, KCAP, RESET, TEXT, VOID};
 use taskai_tui::input::{route, Focus, Route};
 use taskai_tui::overlay::{
-    destroy_panel_view, drawer_panel_view, explorer_panel, help_panel, overlay, DrawerView,
+    centered_overlay, destroy_panel_view, drawer_panel_view, explorer_panel, form_panel_width,
+    help_panel, DrawerView,
 };
+use taskai_tui::render::{paint_frame, resize_frame, MIN_COLS, MIN_ROWS};
 use taskai_tui::screens::{boot, harness, home, task};
+use taskai_tui::screens::pane::{cell_row, PaneCell};
 use taskai_tui::seg::{row, s, seglen, vrow, Seg};
 use taskai_tui::state::{advance, Screen as StScreen, St, View};
 use taskai_tui::view::{HarnessRowView, HomeTaskRow, Hud, PaneBody, ProbeRow, RailRow, TaskView};
@@ -32,6 +36,28 @@ use taskai_tui::view::{HarnessRowView, HomeTaskRow, Hud, PaneBody, ProbeRow, Rai
 use taskai_connectors::control;
 
 const HKEYS: [&str; 4] = ["claude", "codex", "opencode", "grok"];
+const ATTACH_BODY_TOP: usize = 4;
+
+fn map_child_cursor(
+    cursor: CursorState,
+    body_top: usize,
+    body_height: usize,
+    body_width: usize,
+    focused: bool,
+) -> Option<(usize, usize)> {
+    if !focused
+        || !cursor.visible
+        || cursor.row >= body_height
+        || body_width == 0
+        || cursor.col > body_width
+    {
+        return None;
+    }
+    // vt100 can report the cursor one cell past the final column while a wrap
+    // is pending. CUP cannot address that virtual position, so display it on
+    // the final physical cell until the child advances.
+    Some((body_top + cursor.row, cursor.col.min(body_width - 1)))
+}
 
 fn harness_title(hkey: &str) -> &'static str {
     match hkey {
@@ -162,6 +188,7 @@ pub struct App {
     served: control::Shared,
     sel_task: Option<String>,
     status: Option<String>,
+    host_cursor: Option<(usize, usize)>,
 }
 
 impl App {
@@ -226,6 +253,7 @@ impl App {
             served,
             sel_task: None,
             status: None,
+            host_cursor: None,
         })
     }
 
@@ -248,10 +276,13 @@ impl App {
         }
         let mut out = io::stdout();
         terminal::enable_raw_mode()?;
-        write!(out, "\x1b[?1049h\x1b[?25l\x1b[2J")?;
+        // Own the complete alternate-screen viewport. Reset scroll margins and
+        // origin mode, then disable auto-wrap because every TaskAI row paints
+        // the terminal's final column explicitly.
+        write!(out, "\x1b[?1049h\x1b[?25l\x1b[?6l\x1b[r\x1b[?7l\x1b[2J\x1b[H")?;
         out.flush()?;
         let result = self.event_loop(&mut out);
-        write!(out, "\x1b[?25h\x1b[?1049l\x1b[0m")?;
+        write!(out, "\x1b[?7h\x1b[?6l\x1b[r\x1b[?25h\x1b[?1049l\x1b[0m")?;
         out.flush()?;
         terminal::disable_raw_mode()?;
         result
@@ -314,9 +345,14 @@ impl App {
                 }
             }
             let (c, r) = terminal::size().unwrap_or((120, 40));
-            let (cols, rows) = ((c as usize).max(110), (r as usize).max(30));
-            let frame = self.frame(cols, rows);
-            write!(out, "\x1b[?2026h\x1b[H{}\x1b[?2026l", frame.join("\r\n"))?;
+            let (cols, rows) = (c as usize, r as usize);
+            let frame = if cols < MIN_COLS || rows < MIN_ROWS {
+                self.host_cursor = None;
+                resize_frame(cols, rows)
+            } else {
+                self.frame(cols, rows)
+            };
+            write!(out, "{}", paint_frame(&frame, self.host_cursor))?;
             out.flush()?;
 
             let mut waited = false;
@@ -521,6 +557,7 @@ impl App {
                                     fg: c.fg,
                                     bg: c.bg,
                                     bold: c.bold,
+                                    width: c.width,
                                 })
                                 .collect()
                         })
@@ -552,6 +589,7 @@ impl App {
     // ---- frame -----------------------------------------------------------
 
     fn frame(&mut self, cols: usize, rows: usize) -> Vec<String> {
+        self.host_cursor = None;
         let clock = self.clock();
         let mut frame = match &self.mode {
             Mode::Boot => {
@@ -576,7 +614,7 @@ impl App {
             Mode::Help(prev) => {
                 let prev = *prev;
                 let base = self.base_frame(prev, cols, rows, &clock);
-                overlay(&base, &help_panel(), cols, 6)
+                centered_overlay(&base, &help_panel(), cols)
             }
             Mode::NewTask(f) => {
                 if let Some(ex) = &f.explorer {
@@ -590,7 +628,7 @@ impl App {
                         rows,
                         &clock,
                     );
-                    overlay(&base, &panel, cols, 4)
+                    centered_overlay(&base, &panel, cols)
                 } else {
                     let d = DrawerView {
                         title: "New task".into(),
@@ -617,7 +655,11 @@ impl App {
                         rows,
                         &clock,
                     );
-                    overlay(&base, &drawer_panel_view(self.st.blink, &d, &note, 58), cols, 6)
+                    centered_overlay(
+                        &base,
+                        &drawer_panel_view(self.st.blink, &d, &note, form_panel_width(cols)),
+                        cols,
+                    )
                 }
             }
             Mode::Manager(f) => {
@@ -646,7 +688,11 @@ impl App {
                     ],
                 };
                 let base = self.base_frame(PrevMode::FromTask, cols, rows, &clock);
-                overlay(&base, &drawer_panel_view(self.st.blink, &d, &[], 58), cols, 6)
+                centered_overlay(
+                    &base,
+                    &drawer_panel_view(self.st.blink, &d, &[], form_panel_width(cols)),
+                    cols,
+                )
             }
             Mode::Sub(f) => {
                 let parent_name = self
@@ -715,10 +761,14 @@ impl App {
                 if let Some(ex) = &f.explorer {
                     let panel = explorer_panel(&tilde(&ex.cwd), &ex.entries, ex.sel);
                     let base = self.base_frame(PrevMode::FromTask, cols, rows, &clock);
-                    overlay(&base, &panel, cols, 4)
+                    centered_overlay(&base, &panel, cols)
                 } else {
                     let base = self.base_frame(PrevMode::FromTask, cols, rows, &clock);
-                    overlay(&base, &drawer_panel_view(self.st.blink, &d, &note, 58), cols, 5)
+                    centered_overlay(
+                        &base,
+                        &drawer_panel_view(self.st.blink, &d, &note, form_panel_width(cols)),
+                        cols,
+                    )
                 }
             }
             Mode::Destroy(f) => {
@@ -733,7 +783,7 @@ impl App {
                 );
                 let prev = if f.back_home { PrevMode::FromHome } else { PrevMode::FromTask };
                 let base = self.base_frame(prev, cols, rows, &clock);
-                overlay(&base, &panel, cols, 6)
+                centered_overlay(&base, &panel, cols)
             }
         };
         if let Some(msg) = &self.status {
@@ -803,28 +853,30 @@ impl App {
             if p.size() != (body_h, cols) {
                 let _ = p.resize(body_h as u16, cols as u16);
             }
-            let cells = p.cells();
+            let snapshot = p.snapshot();
             drop(p);
+            self.host_cursor = map_child_cursor(
+                snapshot.cursor,
+                ATTACH_BODY_TOP,
+                body_h,
+                cols,
+                self.focus == Focus::Cli,
+            );
+            let cells = snapshot.cells;
             for r in 0..body_h {
                 match cells.get(r) {
                     Some(cr) => {
-                        let mut segs: Vec<Seg> = Vec::new();
-                        for c in cr {
-                            match segs.last_mut() {
-                                Some(last)
-                                    if last.fg == c.fg && last.bg == c.bg && last.bold == c.bold =>
-                                {
-                                    last.text.push_str(&c.text)
-                                }
-                                _ => segs.push(Seg {
-                                    text: c.text.clone(),
-                                    fg: c.fg,
-                                    bg: c.bg,
-                                    bold: c.bold,
-                                }),
-                            }
-                        }
-                        lines.push(row(&segs, cols, CLI_BG, 0));
+                        let cells: Vec<PaneCell> = cr
+                            .iter()
+                            .map(|cell| PaneCell {
+                                text: cell.text.clone(),
+                                fg: cell.fg,
+                                bg: cell.bg,
+                                bold: cell.bold,
+                                width: cell.width,
+                            })
+                            .collect();
+                        lines.push(cell_row(&cells, cols, CLI_BG));
                     }
                     None => lines.push(row(&[], cols, CLI_BG, 0)),
                 }
@@ -1481,5 +1533,67 @@ impl App {
             focus: 0,
             explorer: None,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{map_child_cursor, ATTACH_BODY_TOP};
+    use taskai_pane::grid::CursorState;
+
+    #[test]
+    fn child_cursor_maps_into_attach_body_only_when_visible_and_focused() {
+        let child = CursorState {
+            row: 7,
+            col: 19,
+            visible: true,
+        };
+        assert_eq!(
+            map_child_cursor(child, ATTACH_BODY_TOP, 40, 100, true),
+            Some((11, 19))
+        );
+        assert_eq!(
+            map_child_cursor(child, ATTACH_BODY_TOP, 40, 100, false),
+            None
+        );
+        assert_eq!(
+            map_child_cursor(
+                CursorState {
+                    visible: false,
+                    ..child
+                },
+                ATTACH_BODY_TOP,
+                40,
+                100,
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            map_child_cursor(
+                CursorState {
+                    row: 40,
+                    ..child
+                },
+                ATTACH_BODY_TOP,
+                40,
+                100,
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            map_child_cursor(
+                CursorState {
+                    col: 100,
+                    ..child
+                },
+                ATTACH_BODY_TOP,
+                40,
+                100,
+                true,
+            ),
+            Some((11, 99))
+        );
     }
 }

@@ -122,14 +122,17 @@ pub fn panel_width(panel: &[String]) -> usize {
     panel.first().map(|l| strip_sgr(l).chars().count()).unwrap_or(0)
 }
 
-/// Dim the base and splice a floating panel over it, starting at `top`.
+/// Dim the base and splice a floating panel over it, starting no lower than
+/// the last position that leaves the status row visible.
 pub fn overlay(base: &[String], panel: &[String], cols: usize, top: usize) -> Vec<String> {
     let pw = panel_width(panel);
     let ind = cols.saturating_sub(pw) / 2;
     let mut out: Vec<String> = base.iter().map(|l| dim_line(l, 0.42)).collect();
+    let usable_rows = out.len().saturating_sub(1);
+    let top = top.min(usable_rows.saturating_sub(panel.len()));
     for (i, prow) in panel.iter().enumerate() {
         let r = top + i;
-        if r >= out.len() {
+        if r >= usable_rows {
             break;
         }
         out[r] = format!(
@@ -140,6 +143,22 @@ pub fn overlay(base: &[String], panel: &[String], cols: usize, top: usize) -> Ve
         );
     }
     out
+}
+
+/// Center a panel within the live terminal. `overlay` still clamps the result
+/// upward when a compact viewport needs the space to keep every panel row and
+/// the status line visible.
+pub fn centered_overlay(base: &[String], panel: &[String], cols: usize) -> Vec<String> {
+    let top = base.len().saturating_sub(panel.len()) / 2;
+    overlay(base, panel, cols, top)
+}
+
+/// Broad but bounded form width used by the live drawers. The compact minimum
+/// retains six cells of breathing room per side; ultrawide terminals cap the
+/// form so the input fields remain easy to scan.
+pub fn form_panel_width(cols: usize) -> usize {
+    let cap = if cols >= 280 { 132 } else { 120 };
+    cols.saturating_sub(12).min(cap)
 }
 
 fn keys_row(keys: &[(&str, &str)], pw: usize) -> String {

@@ -12,8 +12,11 @@ the CLI unchanged.
 
 ```sh
 cargo build --release
-cp target/release/taskai /usr/local/bin/   # or anywhere on PATH
+sudo install -m 0755 target/release/taskai /usr/local/bin/taskai
 ```
+
+Only the install step needs `sudo`. To run the build without installing it, use
+`./target/release/taskai`.
 
 A clean machine needs only this binary plus the provider CLIs you use, user-installed:
 `claude` (≥ 2.0), `codex` (≥ 0.100), `opencode` (≥ 1.18), `grok` (≥ 1.0). TaskAI never

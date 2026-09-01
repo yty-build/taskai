@@ -4,9 +4,64 @@
 use crate::fixture::{
     self, BOOT_METER, FIXED_CLOCK, HARNESS_SUMMARY,
 };
+use crate::color::{DIM, ION, VOID};
 use crate::overlay::{destroy_panel, help_panel, newtask_panel, overlay, sub_panel};
 use crate::screens::{attach, attention, boot, harness, home, task};
+use crate::seg::{row, s, vrow};
 use crate::state::{Screen, St};
+use std::fmt::Write as _;
+
+pub const MIN_COLS: usize = 110;
+pub const MIN_ROWS: usize = 30;
+
+/// Paint a complete frame without relying on terminal newline or auto-wrap
+/// behavior. Every rendered row already occupies exactly `cols` cells; joining
+/// those rows with CRLF can therefore scroll on terminals that advance both at
+/// the right margin and for the following newline. Absolute cursor addressing
+/// keeps repeated redraws pinned to the same viewport rows.
+pub fn paint_frame(frame: &[String], cursor: Option<(usize, usize)>) -> String {
+    let mut painted = String::from("\x1b[?2026h\x1b[?25l");
+    for (index, line) in frame.iter().enumerate() {
+        let _ = write!(painted, "\x1b[{};1H{}", index + 1, line);
+    }
+    match cursor {
+        Some((row, col)) => {
+            let _ = write!(painted, "\x1b[{};{}H\x1b[?25h", row + 1, col + 1);
+        }
+        None => painted.push_str("\x1b[?25l"),
+    }
+    painted.push_str("\x1b[?2026l");
+    painted
+}
+
+/// A truthful frame for terminals that cannot contain the application yet.
+/// It uses the physical viewport dimensions rather than rendering a larger
+/// virtual canvas that would wrap and scroll.
+pub fn resize_frame(cols: usize, rows: usize) -> Vec<String> {
+    let messages = [
+        "TASKAI · RESIZE NEEDED".to_string(),
+        format!("Current   {cols} × {rows}"),
+        format!("Required  {MIN_COLS} × {MIN_ROWS}"),
+        "Enlarge the terminal; live state is preserved.".to_string(),
+    ];
+    let mut frame = vec![vrow(cols); rows];
+    let top = rows.saturating_sub(messages.len()) / 2;
+    for (index, message) in messages.iter().enumerate() {
+        if let Some(target) = frame.get_mut(top + index) {
+            *target = row(
+                &[s(
+                    message,
+                    Some(if index == 0 { ION } else { DIM }),
+                    Some(VOID),
+                )],
+                cols,
+                VOID,
+                cols.saturating_sub(message.chars().count()) / 2,
+            );
+        }
+    }
+    frame
+}
 
 pub fn render(st: &St, cols: usize, rows: usize, clock: &str) -> Vec<String> {
     match st.screen {

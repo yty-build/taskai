@@ -7,6 +7,7 @@ use crate::color::{
     KCAP, OK, TEXT, VOID, RESET,
 };
 use crate::fixture::Feed;
+use crate::screens::pane::cell_row;
 use crate::seg::{clip_segs, row, s, sb, seglen, vrow, Seg};
 use crate::state::{St, View};
 use crate::view::{HandoffRow, Hud, PaneBody, TaskView};
@@ -375,27 +376,7 @@ pub fn pane_lines(view: &TaskView, st: &St, pw: usize, h: usize) -> Vec<String> 
             let body_h = (h as isize - lines.len() as isize - 1).max(0) as usize;
             for r in 0..body_h {
                 match cells.get(r) {
-                    Some(cr) => {
-                        let mut segs: Vec<Seg> = Vec::new();
-                        for c in cr {
-                            match segs.last_mut() {
-                                Some(last)
-                                    if last.fg == c.fg
-                                        && last.bg == c.bg
-                                        && last.bold == c.bold =>
-                                {
-                                    last.text.push_str(&c.text)
-                                }
-                                _ => segs.push(Seg {
-                                    text: c.text.clone(),
-                                    fg: c.fg,
-                                    bg: c.bg,
-                                    bold: c.bold,
-                                }),
-                            }
-                        }
-                        lines.push(row(&segs, pw, base, 0));
-                    }
+                    Some(cr) => lines.push(cell_row(cr, pw, base)),
                     None => lines.push(row(&[], pw, base, 0)),
                 }
             }
