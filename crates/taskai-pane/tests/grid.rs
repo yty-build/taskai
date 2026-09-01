@@ -70,7 +70,7 @@ fn wait_for(pane: &Pane, needle: &str) {
 #[test]
 fn real_process_renders_into_grid() {
     let cwd = std::env::current_dir().unwrap();
-    let pane = Pane::spawn("/bin/sh", &["-c", "printf 'taskai-pane-ok'; sleep 2"], &cwd, 24, 80).unwrap();
+    let pane = Pane::spawn("/bin/sh", &["-c", "printf 'taskai-pane-ok'; sleep 2"], &cwd, 24, 80, &[]).unwrap();
     wait_for(&pane, "taskai-pane-ok");
 }
 
@@ -79,7 +79,7 @@ fn real_process_renders_into_grid() {
 #[test]
 fn input_reaches_real_process() {
     let cwd = std::env::current_dir().unwrap();
-    let mut pane = Pane::spawn("/bin/cat", &[], &cwd, 24, 80).unwrap();
+    let mut pane = Pane::spawn("/bin/cat", &[], &cwd, 24, 80, &[]).unwrap();
     pane.write_bytes(b"hello-from-taskai\r").unwrap();
     wait_for(&pane, "hello-from-taskai");
 }

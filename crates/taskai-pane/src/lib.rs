@@ -22,13 +22,23 @@ pub struct Pane {
 }
 
 impl Pane {
-    pub fn spawn(prog: &str, args: &[&str], cwd: &Path, rows: u16, cols: u16) -> Result<Pane, Error> {
+    pub fn spawn(
+        prog: &str,
+        args: &[&str],
+        cwd: &Path,
+        rows: u16,
+        cols: u16,
+        envs: &[(&str, &str)],
+    ) -> Result<Pane, Error> {
         let pty = native_pty_system().openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
         let mut cmd = CommandBuilder::new(prog);
         cmd.args(args);
         cmd.cwd(cwd);
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM", "xterm-256color");
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
         let child = pty.slave.spawn_command(cmd)?;
         drop(pty.slave);
         let writer = pty.master.take_writer()?;

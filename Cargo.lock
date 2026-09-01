@@ -633,9 +633,11 @@ dependencies = [
  "crossterm",
  "serde_json",
  "taskai-connectors",
+ "taskai-context",
  "taskai-core",
  "taskai-pane",
  "taskai-tui",
+ "tempfile",
 ]
 
 [[package]]
@@ -651,6 +653,11 @@ dependencies = [
 [[package]]
 name = "taskai-context"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "taskai-core",
+ "tempfile",
+]
 
 [[package]]
 name = "taskai-core"

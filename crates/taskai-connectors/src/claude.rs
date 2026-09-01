@@ -59,31 +59,55 @@ pub fn parse_version(s: &str) -> Option<String> {
     None
 }
 
+fn load_settings(workspace: &Path) -> Result<(PathBuf, serde_json::Value), Error> {
+    let dir = workspace.join(".claude");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("settings.local.json");
+    let cfg = if path.exists() {
+        serde_json::from_str(&std::fs::read_to_string(&path)?)
+            .map_err(|e| Error::Invalid(format!("{}: {e}", path.display())))?
+    } else {
+        serde_json::json!({})
+    };
+    Ok((path, cfg))
+}
+
+fn save_settings(path: &Path, cfg: &serde_json::Value) -> Result<(), Error> {
+    let body = serde_json::to_string_pretty(cfg).map_err(|e| Error::Invalid(e.to_string()))?;
+    std::fs::write(path, body)?;
+    Ok(())
+}
+
+/// Appends a hook entry for `event` unless one carrying `marker` is already present.
+fn upsert_hook(cfg: &mut serde_json::Value, event: &str, cmd: &str, marker: &str) {
+    let mut arr = cfg["hooks"][event].as_array().cloned().unwrap_or_default();
+    let already = serde_json::to_string(&arr).unwrap_or_default().contains(marker);
+    if !already {
+        arr.push(serde_json::json!({"hooks": [{"type": "command", "command": cmd}]}));
+    }
+    cfg["hooks"][event] = serde_json::Value::Array(arr);
+}
+
 /// Installs the SessionStart and Stop hooks that append their payloads to the TaskAI
 /// events file. Merges into existing settings, never clobbers user content, idempotent.
 pub fn install_hooks(workspace: &Path, runtime_dir: &Path) -> Result<PathBuf, Error> {
     std::fs::create_dir_all(runtime_dir)?;
     let events = runtime_dir.join("claude-events.jsonl");
     let cmd = format!("cat >> '{0}' && printf '\\n' >> '{0}'", events.display());
-    let dir = workspace.join(".claude");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("settings.local.json");
-    let mut cfg: serde_json::Value = if path.exists() {
-        serde_json::from_str(&std::fs::read_to_string(&path)?)
-            .map_err(|e| Error::Invalid(format!("{}: {e}", path.display())))?
-    } else {
-        serde_json::json!({})
-    };
+    let (path, mut cfg) = load_settings(workspace)?;
     let marker = events.display().to_string();
     for event in ["SessionStart", "Stop"] {
-        let mut arr = cfg["hooks"][event].as_array().cloned().unwrap_or_default();
-        let already = serde_json::to_string(&arr).unwrap_or_default().contains(&marker);
-        if !already {
-            arr.push(serde_json::json!({"hooks": [{"type": "command", "command": cmd}]}));
-        }
-        cfg["hooks"][event] = serde_json::Value::Array(arr);
+        upsert_hook(&mut cfg, event, &cmd, &marker);
     }
-    let body = serde_json::to_string_pretty(&cfg).map_err(|e| Error::Invalid(e.to_string()))?;
-    std::fs::write(&path, body)?;
+    save_settings(&path, &cfg)?;
     Ok(events)
+}
+
+/// Installs the UserPromptSubmit hook that injects fresh TaskAI Context each user turn —
+/// exactly one delivery path per turn (backend §5).
+pub fn install_context_hook(workspace: &Path, taskai_bin: &Path) -> Result<(), Error> {
+    let cmd = format!("'{}' context inject", taskai_bin.display());
+    let (path, mut cfg) = load_settings(workspace)?;
+    upsert_hook(&mut cfg, "UserPromptSubmit", &cmd, "context inject");
+    save_settings(&path, &cfg)
 }

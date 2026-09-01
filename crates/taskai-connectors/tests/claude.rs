@@ -116,7 +116,7 @@ fn real_claude_renders_in_pane() {
     let c = ClaudeConnector::default();
     let (prog, args) = c.launch_command();
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    let pane = taskai_pane::Pane::spawn(&prog, &argv, &ws, 30, 100).unwrap();
+    let pane = taskai_pane::Pane::spawn(&prog, &argv, &ws, 30, 100, &[]).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         let text = pane.text();
@@ -145,7 +145,7 @@ fn live_claude_turn_renders_and_stops() {
     let c = ClaudeConnector::default();
     let (prog, args) = c.launch_command();
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    let mut pane = taskai_pane::Pane::spawn(&prog, &argv, &ws, 40, 120).unwrap();
+    let mut pane = taskai_pane::Pane::spawn(&prog, &argv, &ws, 40, 120, &[]).unwrap();
 
     let start = wait_for_event(&events, "SessionStart", None, offset, Duration::from_secs(120))
         .expect("SessionStart hook");

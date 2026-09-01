@@ -19,10 +19,34 @@ pub enum SessionState {
     Complete,
 }
 
+impl SessionState {
+    pub fn label(&self) -> &'static str {
+        match self {
+            SessionState::Setup => "SETUP",
+            SessionState::Ready => "READY",
+            SessionState::Queued => "QUEUED",
+            SessionState::Working => "WORKING",
+            SessionState::Live => "LIVE",
+            SessionState::Handoff => "HANDOFF",
+            SessionState::Attention => "ATTENTION",
+            SessionState::Complete => "COMPLETE",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
     Manager,
     Subordinate,
+}
+
+impl Role {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Role::Manager => "Manager",
+            Role::Subordinate => "Subordinate",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +231,11 @@ impl Registry {
 
     pub fn audit(&self) -> &[Audit] {
         &self.data.audit
+    }
+
+    /// Monotonic revision — rises with every attributed mutation.
+    pub fn revision(&self) -> u64 {
+        self.data.audit.len() as u64
     }
 
     pub fn set_state(&mut self, r: &str, state: SessionState) -> Result<(), Error> {

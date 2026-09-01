@@ -2,3 +2,10 @@
 name = "taskai-context"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+taskai-core = { path = "../taskai-core" }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
