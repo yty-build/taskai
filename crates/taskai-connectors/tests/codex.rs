@@ -13,10 +13,10 @@ use taskai_connectors::Mode;
 // Value: READY in the bay is earned, not assumed.
 #[test]
 fn probe_real_codex() {
-    if !harness::present("codex") {
+    let cap = CodexConnector::default().probe();
+    if !harness::ready("codex", &cap) {
         return;
     }
-    let cap = CodexConnector::default().probe();
     assert_eq!(cap.mode, Mode::SharedLive, "detail: {}", cap.detail);
     assert!(cap.version.is_some(), "detail: {}", cap.detail);
 }
@@ -26,7 +26,7 @@ fn probe_real_codex() {
 // proof it exists. Value: connectivity is verified before any billed work.
 #[test]
 fn app_server_initialize_handshake() {
-    if !harness::present("codex") {
+    if !harness::ready("codex", &CodexConnector::default().probe()) {
         return;
     }
     let c = CodexConnector::default();
@@ -41,7 +41,7 @@ fn app_server_initialize_handshake() {
 // Why: exact session identity is the §11 gate. Value: resolution is free to prove.
 #[test]
 fn app_server_lists_threads() {
-    if !harness::present("codex") {
+    if !harness::ready("codex", &CodexConnector::default().probe()) {
         return;
     }
     let c = CodexConnector::default();
@@ -57,7 +57,7 @@ fn app_server_lists_threads() {
 // protocol surface — errors must be observable. Value: failures are diagnosable.
 #[test]
 fn app_server_reports_unknown_method() {
-    if !harness::present("codex") {
+    if !harness::ready("codex", &CodexConnector::default().probe()) {
         return;
     }
     let c = CodexConnector::default();

@@ -12,10 +12,10 @@ use taskai_connectors::Mode;
 // Why: capability truth; 1.18.25 is the version-gated environment pin. Value: earned READY.
 #[test]
 fn probe_real_opencode() {
-    if !harness::present("opencode") {
+    let cap = OpenCodeConnector::default().probe();
+    if !harness::ready("opencode", &cap) {
         return;
     }
-    let cap = OpenCodeConnector::default().probe();
     assert_eq!(cap.mode, Mode::SharedLive, "detail: {}", cap.detail);
     assert!(cap.version.is_some(), "detail: {}", cap.detail);
 }
@@ -27,7 +27,7 @@ fn probe_real_opencode() {
 // substrate is proven free of model spend.
 #[test]
 fn server_is_authenticated_and_creates_sessions() {
-    if !harness::present("opencode") {
+    if !harness::ready("opencode", &OpenCodeConnector::default().probe()) {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -51,7 +51,7 @@ fn server_is_authenticated_and_creates_sessions() {
 // Value: the pane shows the exact native client, not a re-implementation.
 #[test]
 fn native_tui_attaches_to_shared_server() {
-    if !harness::present("opencode") {
+    if !harness::ready("opencode", &OpenCodeConnector::default().probe()) {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();

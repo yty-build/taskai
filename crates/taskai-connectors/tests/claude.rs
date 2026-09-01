@@ -24,10 +24,10 @@ fn parses_version_output() {
 // pins Claude Code in the environment matrix. Value: READY in the bay is earned.
 #[test]
 fn probe_real_claude() {
-    if !harness::present("claude") {
+    let cap = ClaudeConnector::default().probe();
+    if !harness::ready("claude", &cap) {
         return;
     }
-    let cap = ClaudeConnector::default().probe();
     assert_eq!(cap.mode, Mode::OwnedTui, "detail: {}", cap.detail);
     assert!(cap.version.is_some(), "detail: {}", cap.detail);
 }
@@ -115,7 +115,7 @@ fn conduit_refuses_second_writer() {
 // nothing. Value: the primary harness provably renders as itself. (Free: no prompt runs.)
 #[test]
 fn real_claude_renders_in_pane() {
-    if !harness::present("claude") {
+    if !harness::ready("claude", &ClaudeConnector::default().probe()) {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
