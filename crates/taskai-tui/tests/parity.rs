@@ -34,7 +34,7 @@ fn frames_match_prototype_fixtures() {
         for &(cols, rows) in SIZES {
             let path = format!("{fixture_dir}/{screen}-{cols}x{rows}.ans");
             let raw = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("fixture {path}: {e} — run tests/tools/capture_fixtures.py"));
+                .unwrap_or_else(|e| panic!("missing golden frame {path}: {e}"));
             let want_lines: Vec<String> = raw.split('\n').map(str::to_string).collect();
             let got_lines = dump(screen, cols, rows).unwrap();
             let want = grid(&want_lines, cols, rows);

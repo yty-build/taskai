@@ -130,7 +130,7 @@ fn real_claude_renders_in_pane() {
 
 // Expectation: one full billed turn — prompt submitted through the conduit renders in
 // the same displayed Claude PTY and terminates via the Stop hook with a bound session
-// id. Why: the M3 live proof (test_plan.md, approval protocol). Value: the owned-tui
+// id. Why: the M3 live proof (docs/test_plan.md, approval protocol). Value: the owned-tui
 // chain is proven end to end on real infrastructure.
 // Run only with T approval: TASKAI_LIVE_WS=<trusted workspace> cargo test -p taskai-connectors -- --ignored
 #[test]

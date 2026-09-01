@@ -8,8 +8,8 @@ use taskai_tui::color::{
 };
 use taskai_tui::seg::{cell_count, clip_segs, row, s, sb, seglen, strip_sgr};
 
-// Expectation: every token equals the value in prototype/fill_system.py and the prototype's
-// local constants. Why: the FILL chroma budget is the brand; a drifted token breaks parity
+// Expectation: every token equals the approved FILL palette the golden frames were
+// rendered from. Why: the FILL chroma budget is the brand; a drifted token breaks parity
 // silently. Value: parity failures point at layout, never at palette drift.
 #[test]
 fn tokens_match_prototype() {

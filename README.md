@@ -12,11 +12,12 @@ the CLI unchanged.
 
 ```sh
 cargo build --release
-sudo install -m 0755 target/release/taskai /usr/local/bin/taskai
+install -m 0755 target/release/taskai ~/.local/bin/taskai   # no sudo needed
 ```
 
-Only the install step needs `sudo`. To run the build without installing it, use
-`./target/release/taskai`.
+Use any directory on your `PATH`. `/usr/local/bin` is root-owned on macOS, so installing
+there needs `sudo install -m 0755 target/release/taskai /usr/local/bin/taskai`. To run the
+build without installing it at all, use `./target/release/taskai`.
 
 A clean machine needs only this binary plus the provider CLIs you use, user-installed:
 `claude` (≥ 2.0), `codex` (≥ 0.100), `opencode` (≥ 1.18), `grok` (≥ 1.0). TaskAI never
@@ -62,6 +63,9 @@ never prompt content. `TASKAI_HOME` overrides the location.
 ## Development
 
 `cargo test` runs the free tier: unit, real-CLI integration, and cell-exact parity
-against `prototype/taskai_tui.py` (the approved design). Billed live proofs are
-`#[ignore]`d and run only under the approval protocol in `test_plan.md`; results land
-in `tests/evidence/`.
+against `tests/fixtures/*.ans` — captured terminal frames that are the approved design's
+golden reference. Billed live proofs are `#[ignore]`d and run only under the approval
+protocol in `docs/test_plan.md`; results land in `tests/evidence/`.
+
+`docs/` holds the product vision, the backend communication contract, and the build and
+test plans. `feature-tmux.md` is the proposed durable-session specification.
