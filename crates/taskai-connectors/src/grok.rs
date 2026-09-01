@@ -25,7 +25,10 @@ impl GrokConnector {
         match Command::new(&self.bin).arg("--version").output() {
             Ok(out) if out.status.success() => {
                 let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                Capability { mode: Mode::HandoffResume, version: parse_version(&text), detail: text }
+                crate::gate_version(
+                    Capability { mode: Mode::HandoffResume, version: parse_version(&text), detail: text },
+                    "1.0.0",
+                )
             }
             Ok(out) => Capability {
                 mode: Mode::Unsupported,

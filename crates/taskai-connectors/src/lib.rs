@@ -39,6 +39,33 @@ pub struct Capability {
     pub detail: String,
 }
 
+/// Numeric dotted-version comparison against a connector's declared minimum.
+pub fn version_ok(version: &str, minimum: &str) -> bool {
+    let parse = |v: &str| -> Vec<u64> {
+        v.split('.').map(|c| c.trim().parse().unwrap_or(0)).collect()
+    };
+    let (v, m) = (parse(version), parse(minimum));
+    for i in 0..v.len().max(m.len()) {
+        let (a, b) = (v.get(i).copied().unwrap_or(0), m.get(i).copied().unwrap_or(0));
+        if a != b {
+            return a > b;
+        }
+    }
+    true
+}
+
+/// Downgrades a probed capability when the version sits below the declared minimum.
+pub fn gate_version(cap: Capability, minimum: &str) -> Capability {
+    match &cap.version {
+        Some(v) if !version_ok(v, minimum) => Capability {
+            mode: Mode::Unsupported,
+            version: cap.version.clone(),
+            detail: format!("{} — version {v} is below the supported minimum {minimum}", cap.detail),
+        },
+        _ => cap,
+    }
+}
+
 #[derive(Debug)]
 pub enum Error {
     Busy(String),

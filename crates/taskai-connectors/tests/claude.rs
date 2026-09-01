@@ -161,3 +161,18 @@ fn live_claude_turn_renders_and_stops() {
     assert_eq!(stop.session_id.as_deref(), Some(sid.as_str()));
     assert!(pane.text().contains("TASKAI-M3-OK"), "grid:\n{}", pane.text());
 }
+
+// Expectation: versions below the connector's declared minimum downgrade the capability
+// to Unsupported with a truthful detail — never a silent break. Why: backend §8 declares
+// version ranges; §11 gates on provider upgrades. Value: upgrades fail loudly.
+#[test]
+fn version_gate_downgrades_truthfully() {
+    use taskai_connectors::version_ok;
+    assert!(version_ok("2.1.226", "2.0.0"));
+    assert!(!version_ok("1.9.9", "2.0.0"));
+    assert!(version_ok("1.18.25", "1.18.0"));
+    assert!(!version_ok("1.17.9", "1.18.0"));
+    assert!(version_ok("0.150.1", "0.100.0"));
+    assert!(!version_ok("0.99.0", "0.100.0"));
+    assert!(version_ok("1.0.13", "1.0.0"));
+}
