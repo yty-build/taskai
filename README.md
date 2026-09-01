@@ -39,14 +39,19 @@ Boot probes the harnesses, then the portfolio opens. Keys while navigation has f
 | `Enter` | Open task / attach the selected session's CLI |
 | `n` | New task (name + repository, with an explorer) |
 | `m` | Add Manager · `a` Add Subordinate under the selected Manager |
-| `c` | Toggle native / ACP conduit view |
+| `c` | Toggle the pane label between the native and ACP conduit view |
 | `d` | Destroy (shows the exact blast radius; typed confirmation) |
 | `h` | Harness bay · `T` Home · `?` Help · `q` Quit |
 | `Ctrl+G` | Focus the CLI — and the only chord that returns |
 
 Destroy removes TaskAI sessions and records only: repositories, worktrees, and
-provider-native history are always preserved. Quitting TaskAI detaches the display;
-sessions reopen from the board, and bound provider sessions resume by exact ID.
+provider-native history are always preserved.
+
+**Sessions do not currently outlive TaskAI.** Quitting closes the panes TaskAI owns, so
+the provider processes in them stop. The board, the topology, and the provider session IDs
+all persist, so relaunching shows the same tree and `Enter` resumes a bound session by its
+exact ID — but in-flight work is interrupted, not continued. Making agents survive a quit
+is the subject of `feature-tmux.md`, which is a proposal, not shipped behavior.
 
 ## For agents and scripts
 
@@ -60,18 +65,31 @@ echo "prompt" | taskai session prompt <ref> --stdin --wait
 taskai session cancel <ref>
 ```
 
-State lives in `~/.taskai` (owner-only). The dispatch log records correlation only,
-never prompt content. `TASKAI_HOME` overrides the location.
+`session prompt` needs the TaskAI TUI running, and currently accepts only `owned-tui`
+(Claude Code) targets; a shared-live or handoff-resume target is refused with a message
+naming the reason rather than misrouted. The context commands work any time.
+
+State lives in `~/.taskai` (owner-only), overridable with `TASKAI_HOME`. The dispatch log
+records correlation only, never prompt content. TaskAI also writes into each session's
+workspace: a managed `AGENTS.md` block (with a `CLAUDE.md` symlink) so agents can discover
+themselves, and Claude Code hook entries in `.claude/settings.local.json`. Both merge into
+existing files and never overwrite your content.
 
 ## Development
 
-`cargo test` runs the free tier: unit, real-CLI integration, and cell-exact parity
-against `tests/fixtures/*.ans` — captured terminal frames that are the approved design's
-golden reference. Billed live proofs are `#[ignore]`d and run only under the approval
+`cargo test` runs the free tier: unit tests, integration against whichever provider CLIs
+are installed, and cell-exact parity against `tests/fixtures/*.ans` — captured terminal
+frames that are the approved design's golden reference. No test calls a model.
+
+A proof whose harness is absent prints `unproven: <cli> is not installed` and skips, so a
+clone without all four CLIs is still green. Run with `TASKAI_REQUIRE_HARNESSES=1` to turn
+every absent harness into a failure — that is how the release gate refuses to pass on
+unproven ground. Billed live proofs are `#[ignore]`d and run only under the approval
 protocol in `docs/test_plan.md`; results land in `tests/evidence/`.
 
-`docs/` holds the product vision, the backend communication contract, and the build and
-test plans. `feature-tmux.md` is the proposed durable-session specification.
+`docs/` holds the product vision and the build and test plans. `backend_communication.md`
+is the backend contract and `feature-tmux.md` the proposed durable-session specification;
+both sit at the repository root.
 
 ## License
 

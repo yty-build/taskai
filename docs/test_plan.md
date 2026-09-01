@@ -1,6 +1,6 @@
 # TaskAI test plan
 
-Verifies the build in `build_plan.md`, same milestone spine M0–M9. Ground truth: `backend_communication.md` §11 release gate, the UX vision journey, and `prototype/` frames.
+Verifies the build in `build_plan.md`, same milestone spine M0–M9. Ground truth: `backend_communication.md` §11 release gate, the UX vision journey, and the golden frames in `tests/fixtures/`.
 
 ## Philosophy
 

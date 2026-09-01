@@ -5,6 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.82"
 license = "Apache-2.0"
 description = "One terminal. Many tasks. Teams of native CLI agents working in parallel."
 repository = "https://github.com/yty-build/acp-gateway"

@@ -1,6 +1,8 @@
 // ABOUTME: Grok connector tests — probe the real CLI, ACP handshake over stdio with
 // ABOUTME: loadSession capability, exact-ID resume command, truthful mode label. All free.
 
+mod harness;
+
 use std::time::Duration;
 
 use taskai_connectors::grok::GrokConnector;
@@ -11,6 +13,9 @@ use taskai_connectors::Mode;
 // multi-client live rendering; truth over theater. Value: the one hard case never lies.
 #[test]
 fn probe_real_grok_is_handoff_resume() {
+    if !harness::present("grok") {
+        return;
+    }
     let cap = GrokConnector::default().probe();
     assert_eq!(cap.mode, Mode::HandoffResume, "detail: {}", cap.detail);
     assert_eq!(cap.mode.label(), "handoff-resume");
@@ -31,6 +36,9 @@ fn probe_missing_binary_is_unsupported() {
 // plumbing verified without model spend.
 #[test]
 fn acp_handshake_supports_load_session() {
+    if !harness::present("grok") {
+        return;
+    }
     let c = GrokConnector::default();
     let mut agent = c.spawn_acp().unwrap();
     let result = agent.initialize(Duration::from_secs(20)).unwrap();

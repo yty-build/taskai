@@ -1,6 +1,8 @@
 // ABOUTME: OpenCode connector tests — probe the real CLI, run a real authenticated
 // ABOUTME: loopback server, create a session over HTTP, attach the native TUI. All free.
 
+mod harness;
+
 use std::time::{Duration, Instant};
 
 use taskai_connectors::opencode::OpenCodeConnector;
@@ -10,6 +12,9 @@ use taskai_connectors::Mode;
 // Why: capability truth; 1.18.25 is the version-gated environment pin. Value: earned READY.
 #[test]
 fn probe_real_opencode() {
+    if !harness::present("opencode") {
+        return;
+    }
     let cap = OpenCodeConnector::default().probe();
     assert_eq!(cap.mode, Mode::SharedLive, "detail: {}", cap.detail);
     assert!(cap.version.is_some(), "detail: {}", cap.detail);
@@ -22,6 +27,9 @@ fn probe_real_opencode() {
 // substrate is proven free of model spend.
 #[test]
 fn server_is_authenticated_and_creates_sessions() {
+    if !harness::present("opencode") {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let c = OpenCodeConnector::default();
     let server = c.start_server(tmp.path()).unwrap();
@@ -43,6 +51,9 @@ fn server_is_authenticated_and_creates_sessions() {
 // Value: the pane shows the exact native client, not a re-implementation.
 #[test]
 fn native_tui_attaches_to_shared_server() {
+    if !harness::present("opencode") {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let c = OpenCodeConnector::default();
     let server = c.start_server(tmp.path()).unwrap();

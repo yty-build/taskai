@@ -1,6 +1,6 @@
 # TaskAI build plan
 
-Builds the production TaskAI: one terminal command center for Task → Manager → Subordinate teams of native CLI agents. Derived from three sources: `docs/UX_PRODUCT_VISION.md` (surface and journey), `backend_communication.md` (responsibilities, connector mechanics, safety, release gate), and `prototype/` (the approved UI contract). Companion: `test_plan.md` — identical milestone spine, tests written first at every step.
+Builds the production TaskAI: one terminal command center for Task → Manager → Subordinate teams of native CLI agents. Derived from three sources: `docs/UX_PRODUCT_VISION.md` (surface and journey), `backend_communication.md` (responsibilities, connector mechanics, safety, release gate), and the golden frames in `tests/fixtures/` (the approved UI contract). Companion: `test_plan.md` — identical milestone spine, tests written first at every step.
 
 ## Architecture
 
@@ -15,17 +15,17 @@ Rust workspace producing one installable binary, `taskai`, plus connector sideca
 | `taskai-tui` | FILL design tokens, screens, overlays, overlay compositor, focus model, key routing |
 | `taskai` (bin) | CLI surface: TUI launch, `context self|session <ref>|tree`, `session prompt <ref> --stdin --wait --format json` |
 
-Process model: the `taskai` binary spawns and owns its sidecars — bundled `codex-acp` against the shared Codex app-server, one authenticated loopback `opencode serve`, the displayed Claude PTY itself (owned-tui: the display *is* the session), and `grok agent stdio` only during a handoff window. Runtime state lives in an owner-only (0700) `~/.taskai/` directory: registry state, dispatch-correlation log, sockets, logs. Credentials never appear in argv, prompts, transcripts, or logs. No tmux dependency; no local model server.
+Process model: the `taskai` binary spawns and owns its sidecars — `codex app-server` over stdio against the shared Codex thread store, one authenticated loopback `opencode serve`, the displayed Claude PTY itself (owned-tui: the display *is* the session), and `grok agent stdio` only during a handoff window. Runtime state lives in an owner-only (0700) `~/.taskai/` directory: registry state, dispatch-correlation log, sockets, logs. Credentials never appear in argv, prompts, transcripts, or logs. No tmux dependency; no local model server.
 
-Prototype contract: `prototype/taskai_tui.py` and `prototype/fill_system.py` define what the product looks like and how it behaves. Mapping:
+Design contract: the approved terminal design is pinned by the golden frames in `tests/fixtures/*.ans`, captured from the interactive prototype that preceded this build. Mapping:
 
 | Prototype | Production |
 |---|---|
-| `fill_system.py` palette, slab/soft-edge primitives, keycap chips, masthead, keybar | `taskai-tui` fill module — same token names, same chroma budget (ION live/focus, AMB attention, RED destroy) |
-| `taskai_tui.py` renderers: boot, home, harness bay, rail, pane, attach, attention, drawers, destroy, help | `taskai-tui` screens, one module per screen |
-| `handle()` state machine, Ctrl+G boundary, native/ACP view toggle `c` | `taskai-tui` input router and focus model |
-| `dim_line` / `slice_cells` overlay compositing | `taskai-tui` overlay compositor over the rendered buffer |
-| `SESSIONS`/`FEEDS` demo world | No production counterpart — data comes from the `taskai-core` registry and live panes |
+| The palette, slab/soft-edge primitives, keycap chips, masthead, keybar | `taskai-tui` fill module — same token names, same chroma budget (ION live/focus, AMB attention, RED destroy) |
+| Renderers: boot, home, harness bay, rail, pane, attach, attention, drawers, destroy, help | `taskai-tui` screens, one module per screen |
+| The state machine, Ctrl+G boundary, native/ACP view toggle `c` | `taskai-tui` input router and focus model |
+| Overlay compositing | `taskai-tui` overlay compositor over the rendered buffer |
+| The demo world | No production counterpart — data comes from the `taskai-core` registry and live panes |
 
 ## Milestones
 

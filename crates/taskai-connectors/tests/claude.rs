@@ -1,6 +1,8 @@
 // ABOUTME: Claude connector tests — probe against the real CLI, hook installation that
 // ABOUTME: never clobbers user config, event watching, writer lock, and pane launch.
 
+mod harness;
+
 use std::time::Duration;
 
 use taskai_connectors::claude::{install_hooks, parse_version, ClaudeConnector};
@@ -22,6 +24,9 @@ fn parses_version_output() {
 // pins Claude Code in the environment matrix. Value: READY in the bay is earned.
 #[test]
 fn probe_real_claude() {
+    if !harness::present("claude") {
+        return;
+    }
     let cap = ClaudeConnector::default().probe();
     assert_eq!(cap.mode, Mode::OwnedTui, "detail: {}", cap.detail);
     assert!(cap.version.is_some(), "detail: {}", cap.detail);
@@ -110,6 +115,9 @@ fn conduit_refuses_second_writer() {
 // nothing. Value: the primary harness provably renders as itself. (Free: no prompt runs.)
 #[test]
 fn real_claude_renders_in_pane() {
+    if !harness::present("claude") {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let ws = tmp.path().join("ws");
     std::fs::create_dir_all(&ws).unwrap();

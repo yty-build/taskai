@@ -1,6 +1,8 @@
 // ABOUTME: Codex connector tests — probe the real CLI, spawn the real app-server sidecar,
 // ABOUTME: JSON-RPC handshake, thread listing, and honest protocol errors. All free.
 
+mod harness;
+
 use std::time::Duration;
 
 use taskai_connectors::codex::CodexConnector;
@@ -11,6 +13,9 @@ use taskai_connectors::Mode;
 // Value: READY in the bay is earned, not assumed.
 #[test]
 fn probe_real_codex() {
+    if !harness::present("codex") {
+        return;
+    }
     let cap = CodexConnector::default().probe();
     assert_eq!(cap.mode, Mode::SharedLive, "detail: {}", cap.detail);
     assert!(cap.version.is_some(), "detail: {}", cap.detail);
@@ -21,6 +26,9 @@ fn probe_real_codex() {
 // proof it exists. Value: connectivity is verified before any billed work.
 #[test]
 fn app_server_initialize_handshake() {
+    if !harness::present("codex") {
+        return;
+    }
     let c = CodexConnector::default();
     let mut server = c.spawn_app_server().unwrap();
     let result = server.initialize(Duration::from_secs(15)).unwrap();
@@ -33,6 +41,9 @@ fn app_server_initialize_handshake() {
 // Why: exact session identity is the §11 gate. Value: resolution is free to prove.
 #[test]
 fn app_server_lists_threads() {
+    if !harness::present("codex") {
+        return;
+    }
     let c = CodexConnector::default();
     let mut server = c.spawn_app_server().unwrap();
     server.initialize(Duration::from_secs(15)).unwrap();
@@ -46,6 +57,9 @@ fn app_server_lists_threads() {
 // protocol surface — errors must be observable. Value: failures are diagnosable.
 #[test]
 fn app_server_reports_unknown_method() {
+    if !harness::present("codex") {
+        return;
+    }
     let c = CodexConnector::default();
     let mut server = c.spawn_app_server().unwrap();
     server.initialize(Duration::from_secs(15)).unwrap();
