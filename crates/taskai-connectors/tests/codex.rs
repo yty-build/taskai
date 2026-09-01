@@ -89,7 +89,7 @@ fn live_codex_turn_completes() {
     let deadline = std::time::Instant::now() + Duration::from_secs(300);
     let mut completed = false;
     while std::time::Instant::now() < deadline {
-        if let Ok(n) = server.notifications.recv_timeout(Duration::from_secs(5)) {
+        if let Ok(n) = server.notifications().recv_timeout(Duration::from_secs(5)) {
             let s = n.to_string();
             if s.contains(&thread_id) && (s.contains("turn/completed") || s.contains("completed")) {
                 completed = true;

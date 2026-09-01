@@ -1,14 +1,11 @@
 // ABOUTME: Codex connector — shared-live: the native TUI and the TaskAI app-server
 // ABOUTME: sidecar share one thread store; JSON-RPC over stdio, threadId + turn correlation.
 
-use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::process::Command;
 use std::time::Duration;
 
 use crate::claude::parse_version;
+use crate::rpc::StdioRpc;
 use crate::{Capability, Error, Mode};
 
 pub struct CodexConnector {
@@ -46,42 +43,12 @@ impl CodexConnector {
     /// The TaskAI sidecar: `codex app-server` speaking JSON-RPC on stdio against the
     /// same thread store the visible TUI uses.
     pub fn spawn_app_server(&self) -> Result<AppServer, Error> {
-        let mut child = Command::new(&self.bin)
-            .arg("app-server")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
-        let stdin = child.stdin.take().ok_or_else(|| Error::Invalid("no stdin".into()))?;
-        let stdout = child.stdout.take().ok_or_else(|| Error::Invalid("no stdout".into()))?;
-        let pending: Arc<Mutex<HashMap<u64, Sender<serde_json::Value>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let (notif_tx, notif_rx) = channel();
-        let p2 = Arc::clone(&pending);
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
-                if let Some(id) = v["id"].as_u64() {
-                    if let Some(tx) = p2.lock().unwrap().remove(&id) {
-                        let _ = tx.send(v);
-                        continue;
-                    }
-                }
-                let _ = notif_tx.send(v);
-            }
-        });
-        Ok(AppServer { child, stdin, pending, notifications: notif_rx, next_id: 1 })
+        Ok(AppServer { rpc: StdioRpc::spawn(&self.bin, &["app-server"])? })
     }
 }
 
-/// JSON-RPC client over the sidecar's stdio: correlated requests plus a notification
-/// stream (thread/turn events arrive here).
 pub struct AppServer {
-    child: Child,
-    stdin: ChildStdin,
-    pending: Arc<Mutex<HashMap<u64, Sender<serde_json::Value>>>>,
-    pub notifications: Receiver<serde_json::Value>,
-    next_id: u64,
+    rpc: StdioRpc,
 }
 
 impl AppServer {
@@ -91,30 +58,11 @@ impl AppServer {
         params: serde_json::Value,
         timeout: Duration,
     ) -> Result<serde_json::Value, Error> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let (tx, rx) = channel();
-        self.pending.lock().unwrap().insert(id, tx);
-        writeln!(
-            self.stdin,
-            "{}",
-            serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
-        )?;
-        self.stdin.flush()?;
-        let v = rx
-            .recv_timeout(timeout)
-            .map_err(|_| Error::Timeout(format!("{method}: no response")))?;
-        if let Some(err) = v.get("error") {
-            return Err(Error::Invalid(format!(
-                "{method}: {}",
-                err["message"].as_str().unwrap_or("error")
-            )));
-        }
-        Ok(v["result"].clone())
+        self.rpc.request(method, params, timeout)
     }
 
     pub fn initialize(&mut self, timeout: Duration) -> Result<serde_json::Value, Error> {
-        let result = self.request(
+        let result = self.rpc.request(
             "initialize",
             serde_json::json!({"clientInfo": {
                 "name": "taskai",
@@ -123,14 +71,11 @@ impl AppServer {
             }}),
             timeout,
         )?;
-        writeln!(self.stdin, "{}", serde_json::json!({"jsonrpc": "2.0", "method": "initialized"}))?;
-        self.stdin.flush()?;
+        self.rpc.notify("initialized", serde_json::json!({}))?;
         Ok(result)
     }
-}
 
-impl Drop for AppServer {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
+    pub fn notifications(&self) -> &std::sync::mpsc::Receiver<serde_json::Value> {
+        self.rpc.notifications()
     }
 }

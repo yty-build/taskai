@@ -4,7 +4,9 @@
 pub mod claude;
 pub mod codex;
 pub mod events;
+pub mod grok;
 pub mod opencode;
+pub mod rpc;
 
 use std::collections::HashSet;
 use std::fmt;
