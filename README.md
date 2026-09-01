@@ -81,15 +81,16 @@ existing files and never overwrite your content.
 are installed, and cell-exact parity against `tests/fixtures/*.ans` — captured terminal
 frames that are the approved design's golden reference. No test calls a model.
 
-A proof whose harness is absent prints `unproven: <cli> is not installed` and skips, so a
-clone without all four CLIs is still green. Run with `TASKAI_REQUIRE_HARNESSES=1` to turn
-every absent harness into a failure — that is how the release gate refuses to pass on
-unproven ground. Billed live proofs are `#[ignore]`d and run only under the approval
-protocol in `docs/test_plan.md`; results land in `tests/evidence/`.
+A proof whose harness is absent — or whose version is below the connector's supported
+range — prints `unproven: <cli> is absent or unsupported (…)` and skips, so a clone
+without all four CLIs is still green. Run with `TASKAI_REQUIRE_HARNESSES=1` to turn that
+skip into a failure; that is how the release gate refuses to pass on unproven ground.
+Billed live proofs are `#[ignore]`d and run only under the approval protocol in
+[CONTRIBUTING.md](CONTRIBUTING.md); results land in `tests/evidence/`.
 
-`docs/` holds the product vision and the build and test plans. `backend_communication.md`
-is the backend contract and `feature-tmux.md` the proposed durable-session specification;
-both sit at the repository root.
+[CONTRIBUTING.md](CONTRIBUTING.md) covers the crate map and how to change the terminal
+design. `backend_communication.md` is the architecture contract, `docs/UX_PRODUCT_VISION.md`
+the product definition, and `feature-tmux.md` the proposed durable-session specification.
 
 ## License
 

@@ -101,8 +101,9 @@ Once approved, this specification supersedes these existing statements:
 
 - `backend_communication.md` section 1: "Production has no tmux dependency."
 - `backend_communication.md` section 11: tmux is evidence only, not production.
-- `docs/build_plan.md` process model and M9: no tmux dependency.
-- `docs/test_plan.md` T5 and Environments: tmux is a test driver only.
+- The build and test plans' "no tmux dependency" and "tmux is a test driver only"
+  statements. Those documents recorded the completed M0-M9 build and have been removed
+  from the repository; their operational parts now live in `CONTRIBUTING.md`.
 
 Sections 2–9 of `backend_communication.md` remain normative and are explicitly **not**
 superseded: connector modes, ACP/display conduit behavior, provider correlation,

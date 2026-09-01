@@ -1593,7 +1593,7 @@ impl App {
             Mode::Destroy(f) => {
                 match k.code {
                     KeyCode::Esc => {
-                        self.mode = if f.back_home { Mode::Task } else { Mode::Task };
+                        self.mode = Mode::Task;
                     }
                     KeyCode::Backspace => {
                         f.typed.pop();

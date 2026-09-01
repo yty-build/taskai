@@ -1,10 +1,6 @@
 target/
 .DS_Store
-.playwright-mcp/
-__pycache__/
-*.py[cod]
 
 # Local working notes and machine-specific agent config, never distributed.
 journal.md
 .claude/
-archive-do_not_read/
