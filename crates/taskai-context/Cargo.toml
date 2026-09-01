@@ -1,0 +1,4 @@
+[package]
+name = "taskai-context"
+version.workspace = true
+edition.workspace = true

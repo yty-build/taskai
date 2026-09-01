@@ -1,0 +1,7 @@
+[package]
+name = "taskai-tui"
+version.workspace = true
+edition.workspace = true
+
+[dev-dependencies]
+vt100 = "0.15"

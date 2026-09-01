@@ -1,0 +1,4 @@
+[package]
+name = "taskai-pane"
+version.workspace = true
+edition.workspace = true

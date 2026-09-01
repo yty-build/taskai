@@ -1,0 +1,9 @@
+[package]
+name = "taskai"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+taskai-tui = { path = "../taskai-tui" }
+crossterm = "0.28"
+chrono = "0.4"
