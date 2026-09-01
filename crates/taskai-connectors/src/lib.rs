@@ -2,7 +2,9 @@
 // ABOUTME: writer exclusion, dispatch correlation, cancel transport, reconciliation.
 
 pub mod claude;
+pub mod codex;
 pub mod events;
+pub mod opencode;
 
 use std::collections::HashSet;
 use std::fmt;
