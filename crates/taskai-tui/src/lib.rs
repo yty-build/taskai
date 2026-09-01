@@ -5,6 +5,7 @@ pub mod chrome;
 pub mod color;
 pub mod fixture;
 pub mod input;
+pub mod overlay;
 pub mod render;
 pub mod screens;
 pub mod seg;

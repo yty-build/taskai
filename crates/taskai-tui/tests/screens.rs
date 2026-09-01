@@ -6,7 +6,18 @@ use taskai_tui::render::dump;
 use taskai_tui::seg::{cell_count, strip_sgr};
 
 const SIZES: &[(usize, usize)] = &[(110, 30), (209, 51), (150, 42)];
-const SCREENS: &[&str] = &["boot", "home"];
+const SCREENS: &[&str] = &[
+    "boot",
+    "home",
+    "harnesses",
+    "task",
+    "attach",
+    "attention",
+    "newtask",
+    "subordinate",
+    "destroy",
+    "help",
+];
 
 // Expectation: for each screen at each size, the frame has exactly `rows` lines and every
 // line paints exactly `cols` cells. Why: the prototype's verify() caught every layout bug

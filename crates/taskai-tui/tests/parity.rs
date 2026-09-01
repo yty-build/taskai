@@ -19,7 +19,18 @@ fn grid(lines: &[String], cols: usize, rows: usize) -> vt100::Parser {
 fn frames_match_prototype_fixtures() {
     set_truecolor(true);
     let fixture_dir = format!("{}/../../tests/fixtures", env!("CARGO_MANIFEST_DIR"));
-    for screen in ["boot", "home"] {
+    for screen in [
+        "boot",
+        "home",
+        "harnesses",
+        "task",
+        "attach",
+        "attention",
+        "newtask",
+        "subordinate",
+        "destroy",
+        "help",
+    ] {
         for &(cols, rows) in SIZES {
             let path = format!("{fixture_dir}/{screen}-{cols}x{rows}.ans");
             let raw = std::fs::read_to_string(&path)
