@@ -3,6 +3,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod control;
 pub mod events;
 pub mod grok;
 pub mod opencode;

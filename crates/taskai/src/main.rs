@@ -2,7 +2,8 @@
 // ABOUTME: service CLI, and `--dump-frame` for tests and parity tooling.
 
 mod app;
-mod control;
+
+use taskai_connectors::control;
 
 use std::io::{self, Read};
 use std::path::PathBuf;
@@ -78,6 +79,27 @@ fn main() -> io::Result<()> {
 }
 
 fn session_cmd(args: &[String]) -> io::Result<()> {
+    if args.first().map(String::as_str) == Some("cancel") {
+        let Some(session_ref) = args.get(1) else {
+            eprintln!("usage: taskai session cancel <ref>");
+            std::process::exit(2);
+        };
+        let sock = control::sock_path(&taskai_home());
+        return match control::client_cancel(&sock, session_ref) {
+            Ok(resp) if resp["ok"] == serde_json::Value::Bool(true) => {
+                println!("cancel transported to {session_ref}");
+                Ok(())
+            }
+            Ok(resp) => {
+                eprintln!("error: {}", resp["error"].as_str().unwrap_or("unknown"));
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
+    }
     if args.first().map(String::as_str) != Some("prompt") {
         eprintln!("usage: taskai session prompt <ref> --stdin --wait [--format json]");
         std::process::exit(2);
@@ -110,7 +132,8 @@ fn session_cmd(args: &[String]) -> io::Result<()> {
     let mut text = String::new();
     io::stdin().read_to_string(&mut text)?;
     let sock = control::sock_path(&taskai_home());
-    match control::client_prompt(&sock, session_ref, text.trim_end(), wait) {
+    let source = std::env::var("TASKAI_SESSION_REF").ok();
+    match control::client_prompt(&sock, session_ref, text.trim_end(), wait, source.as_deref()) {
         Ok(resp) => {
             let ok = resp["ok"] == serde_json::Value::Bool(true);
             if format_json {

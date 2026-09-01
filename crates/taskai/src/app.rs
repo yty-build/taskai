@@ -29,7 +29,7 @@ use taskai_tui::seg::{row, s, seglen, vrow, Seg};
 use taskai_tui::state::{advance, Screen as StScreen, St, View};
 use taskai_tui::view::{HarnessRowView, HomeTaskRow, Hud, PaneBody, ProbeRow, RailRow, TaskView};
 
-use crate::control;
+use taskai_connectors::control;
 
 const HKEYS: [&str; 4] = ["claude", "codex", "opencode", "grok"];
 
@@ -202,7 +202,9 @@ impl App {
         let served = control::Shared {
             panes: Arc::new(Mutex::new(HashMap::new())),
             session_ids: Arc::new(Mutex::new(HashMap::new())),
+            harnesses: Arc::new(Mutex::new(HashMap::new())),
             events: run.join("claude-events.jsonl"),
+            log: run.join("dispatch.jsonl"),
             conduit: Arc::new(Conduit::new()),
         };
         control::serve(control::sock_path(&home_dir), served.clone())?;
@@ -947,9 +949,8 @@ impl App {
                 resumed: resume_id.is_some(),
             },
         );
-        if sess.harness == "claude" {
-            self.served.panes.lock().unwrap().insert(sref.to_string(), pane);
-        }
+        self.served.panes.lock().unwrap().insert(sref.to_string(), pane);
+        self.served.harnesses.lock().unwrap().insert(sref.to_string(), sess.harness.clone());
         let state = match sess.harness.as_str() {
             "grok" => SessionState::Handoff,
             "claude" => SessionState::Working, // Live lands when SessionStart binds
