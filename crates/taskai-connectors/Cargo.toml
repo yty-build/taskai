@@ -2,3 +2,11 @@
 name = "taskai-connectors"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+taskai-pane = { path = "../taskai-pane" }
