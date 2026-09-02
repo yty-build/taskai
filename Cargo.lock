@@ -673,6 +673,7 @@ name = "taskai-pane"
 version = "0.1.0"
 dependencies = [
  "portable-pty",
+ "tempfile",
  "vt100",
 ]
 
