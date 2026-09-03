@@ -98,6 +98,24 @@ fn nested_cells(cwd: &std::path::Path, conf: Option<&str>, label: &str) -> Vec<V
     cells
 }
 
+/// Rebuilds a row of measured cells back into an ANSI line, so what the attach client
+/// actually received can be looked at rather than only counted.
+fn render_row(cells: &[Cell]) -> String {
+    let mut out = String::new();
+    for c in cells.iter().take(40) {
+        out.push_str("\x1b[0m");
+        if let Some((r, g, b)) = c.fg {
+            out.push_str(&format!("\x1b[38;2;{r};{g};{b}m"));
+        }
+        if let Some((r, g, b)) = c.bg {
+            out.push_str(&format!("\x1b[48;2;{r};{g};{b}m"));
+        }
+        out.push_str(&c.text);
+    }
+    out.push_str("\x1b[0m");
+    out
+}
+
 fn diff(a: &[Vec<Cell>], b: &[Vec<Cell>], label: &str) -> usize {
     let mut diffs = 0;
     for r in 0..ROWS as usize {
@@ -165,6 +183,11 @@ fn nesting_preserves_cells_only_with_terminal_features() {
 
     println!("RESULT default-tmux differing cells: {bare_diffs}");
     println!("RESULT tuned-tmux differing cells: {tuned_diffs}");
+    println!();
+    println!("  what the attach client actually received:");
+    println!("  direct pty     {}", render_row(&direct[0]));
+    println!("  default tmux   {}", render_row(&bare[0]));
+    println!("  tuned tmux     {}", render_row(&tuned[0]));
     assert_eq!(
         tuned_diffs, 0,
         "tuned tmux must render identically to a direct pty; {tuned_diffs} cells differ"
