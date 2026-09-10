@@ -1,5 +1,5 @@
-// ABOUTME: Focus-model tests — Ctrl+G is the one boundary chord; with CLI focus every
-// ABOUTME: other key forwards as exact bytes; with navigation focus keys are interpreted.
+// ABOUTME: Focus-model tests — Ctrl+G owns navigation, Ctrl+F owns layout, and every
+// ABOUTME: other focused key forwards as exact bytes to the native CLI.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use taskai_tui::input::{route, Focus, Route};
@@ -12,15 +12,22 @@ fn ctrl(c: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
 }
 
+fn ctrl_alt(c: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
+
 fn shift(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::SHIFT)
 }
 
-// Expectation: with CLI focus, Ctrl+G returns to navigation and nothing else does.
-// Why: the vision reserves exactly one chord. Value: the boundary is provable.
+// Expectation: with CLI focus, Ctrl+G returns to navigation and Ctrl+F changes layout.
+// Why: each reserved chord has exactly one job. Value: the boundary is provable.
 #[test]
-fn ctrl_g_is_the_only_boundary() {
+fn focus_chords_have_distinct_routes() {
     assert_eq!(route(Focus::Cli, ctrl('g')), Route::Boundary);
+    assert_eq!(route(Focus::Cli, ctrl('f')), Route::Layout);
+    assert_eq!(route(Focus::Cli, ctrl('G')), Route::Boundary);
+    assert_eq!(route(Focus::Cli, ctrl('F')), Route::Layout);
     assert_ne!(route(Focus::Cli, ctrl('c')), Route::Boundary);
     assert_ne!(route(Focus::Cli, key(KeyCode::Esc)), Route::Boundary);
     assert_ne!(route(Focus::Cli, key(KeyCode::Char('g'))), Route::Boundary);
@@ -36,7 +43,9 @@ fn cli_focus_forwards_exact_bytes() {
         (key(KeyCode::Char('m')), b"m"),
         (key(KeyCode::Char('d')), b"d"),
         (key(KeyCode::Char('q')), b"q"),
-        (key(KeyCode::Char('T')), b"T"),
+        (key(KeyCode::Char('f')), b"f"),
+        (key(KeyCode::Char('g')), b"g"),
+        (key(KeyCode::Char('G')), b"G"),
         (key(KeyCode::Enter), b"\r"),
         (key(KeyCode::Backspace), b"\x7f"),
         (key(KeyCode::Tab), b"\t"),
@@ -51,6 +60,8 @@ fn cli_focus_forwards_exact_bytes() {
         (ctrl('c'), b"\x03"),
         (ctrl('d'), b"\x04"),
         (ctrl('r'), b"\x12"),
+        (ctrl_alt('f'), b"\x1b\x06"),
+        (ctrl_alt('g'), b"\x1b\x07"),
     ];
     for (ev, bytes) in cases {
         assert_eq!(
@@ -70,7 +81,8 @@ fn nav_focus_interprets() {
         route(Focus::Nav, key(KeyCode::Char('a'))),
         Route::Nav(key(KeyCode::Char('a')))
     );
-    assert_eq!(route(Focus::Nav, ctrl('g')), Route::Boundary);
+    assert_eq!(route(Focus::Nav, ctrl('g')), Route::Nav(ctrl('g')));
+    assert_eq!(route(Focus::Nav, ctrl('f')), Route::Nav(ctrl('f')));
     assert!(!matches!(
         route(Focus::Nav, key(KeyCode::Char('x'))),
         Route::Forward(_)

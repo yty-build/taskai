@@ -1,7 +1,7 @@
 // ABOUTME: Harness bay — the table of native CLIs: readiness, binary, live sessions,
 // ABOUTME: conduit mode; SETUP rows in amber, everything else quiet.
 
-use crate::chrome::{keybar, masthead, PAD};
+use crate::chrome::{masthead, navigation_keybar, PAD};
 use crate::color::{harness_color, AMB, DIM, FT, GLASS, GLASS_HI, TEXT, VOID};
 use crate::fixture::KEYS_HARNESS;
 use crate::seg::{row, s, sb, seglen, vrow, Seg};
@@ -109,7 +109,7 @@ pub fn frame(
     while lines.len() < rows.saturating_sub(3) {
         lines.push(vrow(cols));
     }
-    lines.extend(keybar(cols, KEYS_HARNESS));
+    lines.extend(navigation_keybar(cols, KEYS_HARNESS));
     lines.push(vrow(cols));
     lines.truncate(rows);
     lines

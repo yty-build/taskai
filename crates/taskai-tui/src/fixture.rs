@@ -107,9 +107,11 @@ pub const TASKS: &[TaskRow] = &[
 pub const KEYS_HOME: &[(&str, &str)] = &[
     ("Enter", "Open"),
     ("n", "New task"),
-    ("h", "Harnesses"),
+    ("s", "Settings"),
     ("/", "Find"),
+    ("F1", "Setup helper"),
     ("?", "Help"),
+    ("q", "Leave"),
 ];
 
 /// Spark levels matching the DEMO spark strings "▂▄▆▅▃▆▇▅▄▆▅▇" and "▂▃▂▄▃▂▃▄▂▃▂▂".
@@ -169,11 +171,16 @@ pub const HARNESSES: &[HarnessRow] = &[
 ];
 
 pub const KEYS_HARNESS: &[(&str, &str)] = &[
-    ("p", "Probe"),
-    ("c", "Configure"),
-    ("+", "Custom CLI"),
-    ("T", "Home"),
+    ("n", "Add server"),
+    ("e", "Edit"),
+    ("Enter", "Harness"),
+    ("F5", "Check"),
+    ("t", "Terminal"),
+    ("c", "Configure CLI"),
+    ("F1", "Setup helper"),
+    ("G", "Home"),
     ("?", "Help"),
+    ("q", "Leave"),
 ];
 
 pub struct SessionRow {
@@ -394,22 +401,27 @@ pub const DESTROY_KEPT: &[&str] = &[
 ];
 pub const DESTROY_CONFIRM: &str = "api-migration";
 
-pub const HELP_BOUNDARY: (&str, &str) = (
-    "Ctrl+G",
-    "The boundary — the only chord TaskAI reserves. Everything else belongs to your CLI.",
-);
-pub const HELP_GLOBAL: &[(&str, &str)] = &[
-    ("T", "Home"),
-    ("n", "New task"),
-    ("h", "Harnesses"),
-    ("/", "Find"),
-    ("?", "Help"),
+pub const HELP_CLI: &[(&str, &str)] = &[
+    ("Ctrl+F", "Toggle fullscreen / inline CLI"),
+    ("Ctrl+G", "Return to navigation"),
+];
+pub const HELP_NAVIGATION: &[(&str, &str)] = &[
+    ("G", "Home"),
+    ("s", "Settings"),
+    ("F1", "Setup helper"),
+    ("?", "Shortcut help"),
+    ("n", "New task (Home only)"),
+    ("/", "Find (Home only)"),
+    ("q", "Leave; sessions continue"),
 ];
 pub const HELP_TASK: &[(&str, &str)] = &[
-    ("Enter", "Attach"),
+    ("Enter", "Type in selected CLI"),
+    ("t", "Terminal"),
     ("a", "Add Subordinate"),
     ("m", "Add Manager"),
-    ("d", "Destroy"),
+    ("d", "Destroy agent"),
+    ("D", "Destroy task"),
+    ("Esc", "Back / cancel UI"),
 ];
 pub const HELP_CONDUITS: &[(&str, &str)] = &[
     (
@@ -552,6 +564,7 @@ pub fn task_view(rail_sel: usize) -> TaskView {
         crumb: TASK_CRUMB.into(),
         title: "Repository evaluation".into(),
         repo: "/Users/me/GitHub/buzz".into(),
+        connection: "<local>".into(),
         team_line: "4 sessions · 4 harnesses".into(),
         sessions,
         body,

@@ -1,14 +1,15 @@
 // ABOUTME: Task view — vertical session rail with manager/subordinate connectors beside
 // ABOUTME: the working pane: native CLI chrome by default, ACP conduit view on toggle.
 
-use crate::chrome::{keybar, masthead, PAD};
+use crate::chrome::{focus_edge, masthead, navigation_keybar, PAD};
 use crate::color::{
     harness_color, Rgb, AMB, AMB_GLASS, CLI_BG, CLI_EDGE, DIM, FT, GLASS, GLASS_HI, GLASS_IN, ION,
     KCAP, OK, RESET, TEXT, VOID,
 };
 use crate::fixture::Feed;
+use crate::input::Focus;
 use crate::screens::pane::cell_row;
-use crate::seg::{clip_segs, row, s, sb, seglen, vrow, Seg};
+use crate::seg::{clip_segs, row, s, sb, seglen, text_width, vrow, Seg};
 use crate::state::{St, View};
 use crate::view::{HandoffRow, Hud, PaneBody, TaskView};
 
@@ -17,13 +18,20 @@ pub const GAP: usize = 2;
 pub const SPIN_GLYPHS: &[&str] = &["✳", "✻", "✽", "✻"];
 
 pub fn ws_short(ws: &str, width: usize) -> String {
-    if ws.chars().count() <= width {
+    if width == 0 {
+        return String::new();
+    }
+    if text_width(ws) <= width {
         ws.to_string()
     } else {
+        let mut used = 0;
         let tail: String = ws
             .chars()
             .rev()
-            .take(width.saturating_sub(1))
+            .take_while(|ch| {
+                used += text_width(&ch.to_string());
+                used < width
+            })
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
@@ -37,26 +45,106 @@ fn pad(n: isize) -> String {
 }
 
 pub fn rail_lines(view: &TaskView, st: &St, h: usize) -> Vec<String> {
+    rail_lines_with_focus(view, st, Focus::Nav, h)
+}
+
+fn rail_lines_with_focus(view: &TaskView, st: &St, focus: Focus, h: usize) -> Vec<String> {
+    rail_layout(view, st, focus, h).0
+}
+
+/// Full-frame row hit test. Selection uses the exact same scrolling and entry
+/// spans as the renderer, including the separate Terminal utility.
+pub fn rail_at_row(view: &TaskView, st: &St, rows: usize, y: usize) -> Option<usize> {
+    let local = y.checked_sub(4)?;
+    rail_layout(view, st, Focus::Nav, rows.saturating_sub(8))
+        .1
+        .get(local)
+        .copied()
+        .flatten()
+}
+
+fn rail_layout(
+    view: &TaskView,
+    st: &St,
+    focus: Focus,
+    h: usize,
+) -> (Vec<String>, Vec<Option<usize>>) {
     let w = RAIL_W;
     let inner = w - 2;
     let rl = |segs: Vec<Seg>| row(&clip_segs(&segs, inner), w, GLASS, 2);
 
     let sel_i = st.rail_sel.min(view.sessions.len().saturating_sub(1));
-    let mut top = vec![row(
-        &[s("▄".repeat(w), Some(GLASS), Some(VOID))],
-        w,
-        VOID,
-        0,
-    )];
+    let mut top = vec![focus_edge(w, "NAVIGATION", focus == Focus::Nav)];
     top.push(rl(vec![sb(view.title.as_str(), Some(TEXT), None)]));
-    top.push(rl(vec![s(view.repo.as_str(), Some(FT), None)]));
-    top.push(rl(vec![]));
+    top.push(rl(vec![s(ws_short(&view.repo, inner), Some(FT), None)]));
+    top.push(rl(vec![
+        s("CONNECTION  ", Some(FT), None),
+        s(
+            ws_short(&view.connection, inner.saturating_sub(12)),
+            Some(DIM),
+            None,
+        ),
+    ]));
     top.push(rl(vec![s("TEAM", Some(FT), None)]));
-    top.push(rl(vec![]));
+    top.push(rl(if view.sessions.iter().all(|s| s.hkey == "terminal") {
+        vec![s("No managers yet · m to add", Some(DIM), None)]
+    } else {
+        vec![]
+    }));
+    let mut selected_top = 6;
+    let mut selected_end = 6;
+    let mut spans = Vec::new();
     for (i, sess) in view.sessions.iter().enumerate() {
         let sel = st.rail_sel == i;
-        let fill = if sel { GLASS_HI } else { GLASS };
+        let active = sel && focus == Focus::Nav;
+        let fill = if active {
+            GLASS_HI
+        } else if sel {
+            GLASS_IN
+        } else {
+            GLASS
+        };
         let live = sess.live;
+        if sess.hkey == "terminal" {
+            top.push(rl(vec![]));
+            if sel {
+                selected_top = top.len();
+            }
+            top.push(rl(vec![s("UTILITIES", Some(FT), None)]));
+            top.push(row(
+                &[
+                    s(if active { "▸ " } else { "  " }, Some(ION), Some(fill)),
+                    s(" t ", Some(TEXT), Some(KCAP)),
+                    Seg {
+                        text: " Terminal".into(),
+                        fg: Some(if active { ION } else { TEXT }),
+                        bg: Some(fill),
+                        bold: active,
+                    },
+                ],
+                w,
+                fill,
+                0,
+            ));
+            top.push(row(
+                &[s(
+                    format!("Shell · {}", sess.state_word.to_lowercase()),
+                    Some(DIM),
+                    Some(fill),
+                )],
+                w,
+                fill,
+                5,
+            ));
+            spans.push((i, top.len() - 2, top.len()));
+            if sel {
+                selected_end = top.len();
+            }
+            continue;
+        }
+        if sel {
+            selected_top = top.len();
+        }
         let dot = if sel && live {
             s("●", Some(ION), Some(fill))
         } else if live {
@@ -67,27 +155,28 @@ pub fn rail_lines(view: &TaskView, st: &St, h: usize) -> Vec<String> {
         if sess.depth == 0 && i > 0 {
             top.push(rl(vec![]));
         }
+        let item_top = top.len();
         let (name_row, h_ind) = if sess.depth == 0 {
             (
                 vec![
                     s("▌", Some(harness_color(&sess.hkey)), Some(fill)),
-                    s(" ", None, Some(fill)),
+                    s(if active { " ▸ " } else { "   " }, Some(ION), Some(fill)),
                     dot,
                     s(" ", None, Some(fill)),
                     Seg {
                         text: sess.name.clone(),
                         fg: Some(TEXT),
                         bg: Some(fill),
-                        bold: sel,
+                        bold: active,
                     },
                 ],
-                4usize,
+                6usize,
             )
         } else {
             (
                 vec![
                     s("▌", Some(harness_color(&sess.hkey)), Some(fill)),
-                    s("  ", None, Some(fill)),
+                    s(if active { " ▸  " } else { "    " }, Some(ION), Some(fill)),
                     s("└─ ", Some(FT), Some(fill)),
                     dot,
                     s(" ", None, Some(fill)),
@@ -95,10 +184,10 @@ pub fn rail_lines(view: &TaskView, st: &St, h: usize) -> Vec<String> {
                         text: sess.name.clone(),
                         fg: Some(TEXT),
                         bg: Some(fill),
-                        bold: sel,
+                        bold: active,
                     },
                 ],
-                7usize,
+                9usize,
             )
         };
         top.push(row(&name_row, w, fill, 0));
@@ -122,15 +211,63 @@ pub fn rail_lines(view: &TaskView, st: &St, h: usize) -> Vec<String> {
         ));
         sub.push(s(sword, Some(swcol), Some(fill)));
         top.push(row(&sub, w, fill, 0));
+        spans.push((i, item_top, top.len()));
+        if sel {
+            selected_end = top.len();
+        }
     }
     top.push(rl(vec![]));
-    top.push(rl(vec![
-        s(" a ", Some(TEXT), Some(KCAP)),
-        s(" subordinate   ", Some(FT), None),
-        s(" m ", Some(TEXT), Some(KCAP)),
-        s(" manager", Some(FT), None),
-    ]));
+    if focus == Focus::Cli {
+        top.push(rl(vec![]));
+    } else {
+        top.push(rl(vec![
+            s(" a ", Some(TEXT), Some(KCAP)),
+            s(" subordinate   ", Some(FT), None),
+            s(" m ", Some(TEXT), Some(KCAP)),
+            s(" manager", Some(FT), None),
+        ]));
+    }
 
+    let mut hits = vec![None; top.len()];
+    for (index, start, end) in spans {
+        hits[start..end].fill(Some(index));
+    }
+    // Scroll only the list: the task heading, focus cue and available actions
+    // remain anchored. The selection is always visible, with or without a
+    // Terminal utility, and mouse hit testing follows the very same slice.
+    if top.len() > h && h >= 12 {
+        let keep = h.saturating_sub(10);
+        let list_end = top.len() - 2;
+        let list_len = list_end.saturating_sub(6);
+        let start = selected_end
+            .saturating_sub(6 + keep)
+            .min(selected_top.saturating_sub(6))
+            .min(list_len.saturating_sub(keep));
+        let mut visible = top[..6].to_vec();
+        let mut visible_hits = hits[..6].to_vec();
+        visible.push(rl(vec![s(
+            if start > 0 { "↑ More team above" } else { "" },
+            Some(FT),
+            None,
+        )]));
+        visible_hits.push(None);
+        visible.extend(top.iter().skip(6 + start).take(keep).cloned());
+        visible_hits.extend(hits.iter().skip(6 + start).take(keep).copied());
+        visible.push(rl(vec![s(
+            if start + keep < list_len {
+                "↓ More team below"
+            } else {
+                ""
+            },
+            Some(FT),
+            None,
+        )]));
+        visible_hits.push(None);
+        visible.extend(top.into_iter().skip(list_end));
+        visible_hits.extend(hits.into_iter().skip(list_end));
+        top = visible;
+        hits = visible_hits;
+    }
     let mut bot = vec![rl(vec![])];
     let (sel_ws, sel_conduit) = view
         .sessions
@@ -148,14 +285,23 @@ pub fn rail_lines(view: &TaskView, st: &St, h: usize) -> Vec<String> {
         bot.push(rl(vec![]));
     }
     bot.push(rl(vec![
-        s(" Ctrl+G ", Some(TEXT), Some(KCAP)),
-        s(" focus CLI", Some(FT), None),
+        s(" Ctrl+F ", Some(TEXT), Some(KCAP)),
+        s(" full screen", Some(FT), None),
     ]));
     bot.push(rl(vec![]));
-    bot.push(rl(vec![
-        s(" d ", Some(TEXT), Some(KCAP)),
-        s(" destroy task", Some(FT), None),
-    ]));
+    if focus == Focus::Cli {
+        bot.push(rl(vec![
+            s(" Ctrl+G ", Some(TEXT), Some(KCAP)),
+            s(" navigation", Some(FT), None),
+        ]));
+    } else {
+        bot.push(rl(vec![
+            s(" d ", Some(TEXT), Some(KCAP)),
+            s(" selected   ", Some(FT), None),
+            s(" D ", Some(TEXT), Some(KCAP)),
+            s(" task", Some(FT), None),
+        ]));
+    }
     bot.push(rl(vec![]));
     bot.push(row(
         &[s("▀".repeat(w), Some(GLASS), Some(VOID))],
@@ -176,7 +322,10 @@ pub fn rail_lines(view: &TaskView, st: &St, h: usize) -> Vec<String> {
         let skip = bot.len().saturating_sub(keep);
         out.extend(bot.into_iter().skip(skip));
     }
-    out
+    out.truncate(h);
+    hits.resize(out.len(), None);
+    hits.truncate(out.len());
+    (out, hits)
 }
 
 pub fn feed_rows(entries: &[Feed], pw: usize, base: Rgb, accent: Rgb, native: bool) -> Vec<String> {
@@ -284,6 +433,16 @@ fn fit_body(
 }
 
 pub fn pane_lines(view: &TaskView, st: &St, pw: usize, h: usize) -> Vec<String> {
+    pane_lines_with_focus(view, st, Focus::Nav, pw, h)
+}
+
+fn pane_lines_with_focus(
+    view: &TaskView,
+    st: &St,
+    focus: Focus,
+    pw: usize,
+    h: usize,
+) -> Vec<String> {
     let sel_i = st.rail_sel.min(view.sessions.len().saturating_sub(1));
     let Some(sess) = view.sessions.get(sel_i) else {
         return empty_pane(pw, h, "No session attached — add the first Manager with  m");
@@ -299,35 +458,65 @@ pub fn pane_lines(view: &TaskView, st: &St, pw: usize, h: usize) -> Vec<String> 
         s(sess.conduit.as_str(), Some(FT), Some(b)),
         s("   ", None, Some(b)),
     ];
-    if sess.live {
+    if sess.hkey == "terminal" {
+        right.push(s(
+            sess.state_word.as_str(),
+            Some(if sess.live { ION } else { DIM }),
+            Some(b),
+        ));
+        right.push(s("   ", None, Some(b)));
+    } else if sess.live {
         right.push(s("● ", Some(ION), Some(b)));
         right.push(s("LIVE", Some(ION), Some(b)));
         right.push(s("   ", None, Some(b)));
     } else {
         right.push(s("◌ ", Some(AMB), Some(b)));
-        right.push(s("QUEUED", Some(AMB), Some(b)));
+        right.push(s(
+            sess.state_word.as_str(),
+            Some(if sess.state_word == "COMPLETE" {
+                OK
+            } else {
+                AMB
+            }),
+            Some(b),
+        ));
         right.push(s("   ", None, Some(b)));
     }
-    right.push(s("c ", Some(DIM), Some(b)));
-    right.push(s(
-        format!(
-            "view: {}",
-            if st.view == View::Native {
-                "NATIVE"
-            } else {
-                "ACP"
-            }
-        ),
-        Some(FT),
-        Some(b),
-    ));
+    if focus == Focus::Nav
+        && (sess.hkey == "terminal" || !matches!(&view.body, PaneBody::Feed { .. }))
+    {
+        right.push(s("Enter to type", Some(TEXT), Some(b)));
+    } else if focus == Focus::Nav {
+        right.push(s("c ", Some(DIM), Some(b)));
+        right.push(s(
+            format!(
+                "view: {}",
+                if st.view == View::Native {
+                    "NATIVE"
+                } else {
+                    "ACP"
+                }
+            ),
+            Some(FT),
+            Some(b),
+        ));
+    }
+    let head = clip_segs(&head, pw.saturating_sub(2 * PAD + seglen(&right) + 1));
     let gap = (pw as isize - 2 * PAD as isize - seglen(&head) as isize - seglen(&right) as isize)
         .max(1) as usize;
     let mut hrow = head;
     hrow.push(s(" ".repeat(gap), None, Some(b)));
     hrow.extend(right);
     let mut lines = vec![
-        row(&[s("▄".repeat(pw), Some(b), Some(VOID))], pw, VOID, 0),
+        focus_edge(
+            pw,
+            if focus == Focus::Cli {
+                "CLI INPUT"
+            } else {
+                "CONSOLE"
+            },
+            focus == Focus::Cli,
+        ),
         row(&hrow, pw, b, PAD),
     ];
 
@@ -589,13 +778,25 @@ pub fn frame(
     rows: usize,
     clock: &str,
 ) -> Vec<String> {
+    frame_with_focus(view, hud, st, Focus::Nav, cols, rows, clock)
+}
+
+pub fn frame_with_focus(
+    view: &TaskView,
+    hud: &Hud,
+    st: &St,
+    focus: Focus,
+    cols: usize,
+    rows: usize,
+    clock: &str,
+) -> Vec<String> {
     let hud_items: Vec<(&str, Rgb)> = hud.items.iter().map(|(t, c)| (t.as_str(), *c)).collect();
     let mut lines = masthead(cols, &view.crumb, &hud_items, hud.lamp.as_deref(), clock);
     lines.push(vrow(cols));
     let h = rows.saturating_sub(lines.len() + 4);
     let pw = cols - RAIL_W - GAP;
-    let rail = rail_lines(view, st, h);
-    let pane = pane_lines(view, st, pw, h);
+    let rail = rail_lines_with_focus(view, st, focus, h);
+    let pane = pane_lines_with_focus(view, st, focus, pw, h);
     let gap = format!("{}{}", crate::color::bg(VOID), " ".repeat(GAP));
     for i in 0..h {
         let r = rail
@@ -609,18 +810,37 @@ pub fn frame(
         lines.push(format!("{r}{gap}{p}{RESET}"));
     }
     lines.push(vrow(cols));
-    lines.extend(keybar(
-        cols,
+    let keys: &[(&str, &str)] = if focus == Focus::Cli {
+        &[("Ctrl+F", "Full screen"), ("Ctrl+G", "Navigation")]
+    } else {
         &[
-            ("Enter", "Attach"),
-            ("c", "Toggle view"),
-            ("a", "Add Subordinate"),
-            ("m", "Add Manager"),
-            ("d", "Destroy"),
-            ("T", "Home"),
-            ("Ctrl+G", "Focus CLI"),
-        ],
-    ));
+            ("Enter", "Type"),
+            ("Ctrl+F", "Full screen"),
+            ("c", "Demo view"),
+            ("a", "Add agent"),
+            ("m", "Add manager"),
+            ("t", "Terminal"),
+            ("d", "Destroy agent"),
+            ("D", "Destroy task"),
+            ("s", "Settings"),
+            ("F1", "Setup helper"),
+            ("G", "Home"),
+            ("Esc", "Back"),
+            ("?", "Help"),
+            ("q", "Leave"),
+        ]
+    };
+    let utility_selected = view
+        .sessions
+        .get(st.rail_sel)
+        .is_some_and(|session| session.hkey == "terminal");
+    let view_toggle_available = !utility_selected && matches!(&view.body, PaneBody::Feed { .. });
+    let keys: Vec<_> = keys
+        .iter()
+        .copied()
+        .filter(|(key, _)| *key != "c" || view_toggle_available)
+        .collect();
+    lines.extend(navigation_keybar(cols, &keys));
     lines.push(vrow(cols));
     lines.truncate(rows);
     lines

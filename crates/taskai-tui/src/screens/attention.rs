@@ -129,8 +129,8 @@ pub fn frame(st: &St, cols: usize, rows: usize, clock: &str) -> Vec<String> {
         &[
             ("y", "Approve"),
             ("n", "Decline"),
-            ("T", "Home"),
-            ("Ctrl+G", "Focus CLI"),
+            ("G", "Home"),
+            ("Ctrl+F", "Full screen"),
         ],
     ));
     lines.push(vrow(cols));

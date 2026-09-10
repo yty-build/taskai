@@ -1,7 +1,7 @@
 // ABOUTME: Attach screen — full-bleed hosted CLI with the return ribbon on top;
 // ABOUTME: the CLI owns everything below the ribbon.
 
-use crate::chrome::PAD;
+use crate::chrome::{focus_edge, PAD};
 use crate::color::{CLAUDE, CLI_BG, CLI_EDGE, DIM, FT, GLASS_IN, KCAP, TEXT, VOID};
 use crate::fixture::{ATTACH_COMPOSER, FEED_LEAD};
 use crate::screens::task::{feed_rows, SPIN_GLYPHS};
@@ -21,8 +21,10 @@ pub fn frame(st: &St, cols: usize, rows: usize) -> Vec<String> {
     ];
     let mid = vec![s("owned-tui", Some(FT), Some(b))];
     let tail = vec![
+        s(" Ctrl+F ", Some(TEXT), Some(KCAP)),
+        s(" Inline", Some(FT), Some(b)),
         s(" Ctrl+G ", Some(TEXT), Some(KCAP)),
-        s(" Return to TaskAI", Some(FT), Some(b)),
+        s(" Navigation", Some(FT), Some(b)),
     ];
     rib.push(s(
         pad(cols as isize * 2 / 3 - seglen(&rib) as isize - seglen(&mid) as isize),
@@ -37,7 +39,7 @@ pub fn frame(st: &St, cols: usize, rows: usize) -> Vec<String> {
     ));
     rib.extend(tail);
     let mut lines = vec![
-        row(&[s("▄".repeat(cols), Some(b), Some(VOID))], cols, VOID, 0),
+        focus_edge(cols, "CLI INPUT", true),
         row(&rib, cols, b, 0),
         row(&[s("▀".repeat(cols), Some(b), Some(VOID))], cols, VOID, 0),
         vrow(cols),

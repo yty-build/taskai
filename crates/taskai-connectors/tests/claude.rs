@@ -3,9 +3,13 @@
 
 mod harness;
 
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use taskai_connectors::claude::{install_hooks, parse_version, ClaudeConnector};
+use taskai_connectors::claude::{
+    install_hooks, parse_version, session_events_path, ClaudeConnector,
+};
 use taskai_connectors::events::wait_for_event;
 use taskai_connectors::{Conduit, Mode};
 
@@ -76,6 +80,35 @@ fn hooks_install_merges_and_is_idempotent() {
         .count();
     assert_eq!(ours, 1, "taskai stop hook installed exactly once: {all}");
     assert!(cfg["hooks"]["SessionStart"].is_array());
+
+    let command = stops
+        .iter()
+        .flat_map(|entry| entry["hooks"].as_array().into_iter().flatten())
+        .filter_map(|hook| hook["command"].as_str())
+        .find(|command| command.contains(events.to_str().unwrap()))
+        .unwrap();
+    let payload = r#"{"hook_event_name":"SessionStart","session_id":"recover-me"}"#;
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", command])
+        .env("TASKAI_SESSION_REF", "s42")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+    assert_eq!(
+        std::fs::read_to_string(&events).unwrap(),
+        format!("{payload}\n")
+    );
+    assert_eq!(
+        std::fs::read_to_string(session_events_path(tmp.path(), "s42")).unwrap(),
+        format!("{payload}\n")
+    );
 }
 
 // Expectation: the event watcher returns the first matching hook event appended after

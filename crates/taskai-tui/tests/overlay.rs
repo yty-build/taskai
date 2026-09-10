@@ -2,8 +2,10 @@
 // ABOUTME: screenshot-sized, and ultrawide terminal viewports.
 
 use taskai_tui::color::{set_truecolor, DIM, FT, GLASS};
-use taskai_tui::overlay::{centered_overlay, drawer_panel_view, form_panel_width, DrawerView};
-use taskai_tui::seg::{cell_count, s, strip_sgr, vrow};
+use taskai_tui::overlay::{
+    centered_overlay, drawer_panel_view, form_panel_width, slice_cells, DrawerView,
+};
+use taskai_tui::seg::{cell_count, row, s, strip_sgr, vrow};
 
 fn live_worktree_panel(cols: usize) -> Vec<String> {
     let drawer = DrawerView {
@@ -46,7 +48,7 @@ fn live_worktree_panel(cols: usize) -> Vec<String> {
 #[test]
 fn live_subordinate_form_is_centered_broad_and_complete() {
     set_truecolor(true);
-    for (cols, rows, expected_width) in [(110, 30, 98), (209, 51, 120), (364, 58, 132)] {
+    for (cols, rows, expected_width) in [(110, 30, 98), (209, 51, 144), (364, 58, 160)] {
         let panel = live_worktree_panel(cols);
         assert_eq!(panel.len(), 28);
         assert_eq!(form_panel_width(cols), expected_width);
@@ -105,4 +107,29 @@ fn live_subordinate_form_is_centered_broad_and_complete() {
             .collect();
         assert!(edge.chars().all(|ch| ch == '▀'));
     }
+}
+
+#[test]
+fn overlays_slice_wide_and_combining_cells_without_displacing_background() {
+    let source = row(&[s("A界e\u{301}界Z", Some(DIM), Some(GLASS))], 12, GLASS, 0);
+    for start in 0..12 {
+        for width in 0..=12 - start {
+            let sliced = slice_cells(&source, start, width);
+            assert_eq!(
+                cell_count(&sliced),
+                width,
+                "start {start}, width {width}: {sliced:?}"
+            );
+        }
+    }
+    assert_eq!(strip_sgr(&slice_cells(&source, 2, 4)), " e\u{301}界");
+    assert_eq!(strip_sgr(&slice_cells(&source, 0, 2)), "A ");
+    let base = vec![source; 8];
+    let panel = vec![row(&[s("弹窗", Some(DIM), Some(GLASS))], 6, GLASS, 0); 3];
+    let composed = centered_overlay(&base, &panel, 12);
+    assert!(composed.iter().all(|line| cell_count(line) == 12));
+    // A defensive clamp also keeps diagnostic/test callers safe when a panel
+    // is wider than the viewport, rather than underflowing the right slice.
+    let oversized = centered_overlay(&vec![vrow(4); 8], &panel, 4);
+    assert!(oversized.iter().all(|line| cell_count(line) == 4));
 }

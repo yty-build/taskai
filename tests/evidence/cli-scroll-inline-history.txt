@@ -1,0 +1,42 @@
+▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+   TASKAI   TASK · TASKAI-HELPER                                                                       0 LIVE · 0 QUEUED · 1 TASK ACTIVE   18:28:44
+▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+
+▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄  ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+  taskai-helper                        TaskAI Helper · Claude Code                                            OWNED-TUI   ◌ WORKING   CLI HAS FOCUS
+  …i-scroll-qa.kgXulH/state/helper  FALLBACK-LINE-201 | private CLI history; TaskAI chrome must not move                             18:27:25 [10/211]
+  CONNECTION  This computer         FALLBACK-LINE-202 | private CLI history; TaskAI chrome must not move
+  TEAM                              FALLBACK-LINE-203 | private CLI history; TaskAI chrome must not move
+                                    FALLBACK-LINE-204 | private CLI history; TaskAI chrome must not move
+▌ ○ TaskAI Helper                   FALLBACK-LINE-205 | private CLI history; TaskAI chrome must not move
+▌    Claude Code         WORKING    FALLBACK-LINE-206 | private CLI history; TaskAI chrome must not move
+                                    FALLBACK-LINE-207 | private CLI history; TaskAI chrome must not move
+  UTILITIES                         FALLBACK-LINE-208 | private CLI history; TaskAI chrome must not move
+   s  Terminal                      FALLBACK-LINE-209 | private CLI history; TaskAI chrome must not move
+     Shell · open                   FALLBACK-LINE-210 | private CLI history; TaskAI chrome must not move
+                                    FALLBACK-LINE-211 | private CLI history; TaskAI chrome must not move
+  ● CLI INPUT ACTIVE                FALLBACK-LINE-212 | private CLI history; TaskAI chrome must not move
+                                    FALLBACK-LINE-213 | private CLI history; TaskAI chrome must not move
+                                    FALLBACK-LINE-214 | private CLI history; TaskAI chrome must not move
+                                    FALLBACK-LINE-215 | private CLI history; TaskAI chrome must not move
+                                    FALLBACK-LINE-216 | private CLI history; TaskAI chrome must not move
+                                    FALLBACK-LINE-217 | private CLI history; TaskAI chrome must not move
+                                    FALLBACK-LINE-218 | private CLI history; TaskAI chrome must not move
+  WORKSPACE                         FALLBACK-LINE-219 | private CLI history; TaskAI chrome must not move
+  …-scroll-qa.kgXulH/state/helper   FALLBACK-LINE-220 | private CLI history; TaskAI chrome must not move
+                                    FALLBACK-LINE-221 | private CLI history; TaskAI chrome must not move
+  CONDUIT                           FALLBACK-LINE-222 | private CLI history; TaskAI chrome must not move
+  owned-tui                         FALLBACK-LINE-223 | private CLI history; TaskAI chrome must not move
+                                    FALLBACK-LINE-224 | private CLI history; TaskAI chrome must not move
+  TEAM                              FALLBACK-LINE-225 | private CLI history; TaskAI chrome must not move
+  1 session · 1 harness             FALLBACK-LINE-226 | private CLI history; TaskAI chrome must not move
+                                    FALLBACK-LINE-227 | private CLI history; TaskAI chrome must not move
+   Ctrl+F  full screen              FALLBACK-LINE-228 | private CLI history; TaskAI chrome must not move
+                                    FALLBACK-LINE-229 | private CLI history; TaskAI chrome must not move
+   Ctrl+G  navigation               FALLBACK-LINE-230 | private CLI history; TaskAI chrome must not move
+                                    FALLBACK-LINE-231 | private CLI history; TaskAI chrome must not move
+▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+                              Ctrl+F  Full screen     Ctrl+G  Navigation     Wheel  Scroll CLI     Esc/End  Leave history
+  s1 connected · Ctrl+G navigation

@@ -32,6 +32,46 @@ pub fn paint_frame(frame: &[String], cursor: Option<(usize, usize)>) -> String {
     painted
 }
 
+/// Paint only what changed since the previous terminal commit. Changed rows remain one
+/// synchronized update, while an already-visible cursor is repositioned without a
+/// hide/show cycle that would restart its blink.
+pub fn paint_update(
+    frame: &[String],
+    cursor: Option<(usize, usize)>,
+    previous_frame: Option<&[String]>,
+    previous_cursor: Option<(usize, usize)>,
+) -> String {
+    let Some(previous_frame) = previous_frame else {
+        return paint_frame(frame, cursor);
+    };
+    if previous_frame != frame {
+        let mut painted = String::from("\x1b[?2026h");
+        if previous_cursor.is_some() && cursor.is_none() {
+            painted.push_str("\x1b[?25l");
+        }
+        for (index, line) in frame.iter().enumerate() {
+            if previous_frame.get(index) != Some(line) {
+                let _ = write!(painted, "\x1b[{};1H{}", index + 1, line);
+            }
+        }
+        if let Some((row, col)) = cursor {
+            let _ = write!(painted, "\x1b[{};{}H", row + 1, col + 1);
+            if previous_cursor.is_none() {
+                painted.push_str("\x1b[?25h");
+            }
+        }
+        painted.push_str("\x1b[?2026l");
+        return painted;
+    }
+    match (previous_cursor, cursor) {
+        (None, None) => String::new(),
+        (Some(previous), Some(current)) if previous == current => String::new(),
+        (None, Some((row, col))) => format!("\x1b[{};{}H\x1b[?25h", row + 1, col + 1),
+        (Some(_), None) => "\x1b[?25l".to_string(),
+        (Some(_), Some((row, col))) => format!("\x1b[{};{}H", row + 1, col + 1),
+    }
+}
+
 /// A truthful frame for terminals that cannot contain the application yet.
 /// It uses the physical viewport dimensions rather than rendering a larger
 /// virtual canvas that would wrap and scroll.
@@ -40,6 +80,9 @@ pub fn resize_frame(cols: usize, rows: usize) -> Vec<String> {
         "TASKAI · RESIZE NEEDED".to_string(),
         format!("Current   {cols} × {rows}"),
         format!("Required  {MIN_COLS} × {MIN_ROWS}"),
+        "Esc Back/Cancel".to_string(),
+        "Ctrl+G Navigation".to_string(),
+        "q Leave (navigation)".to_string(),
         "Enlarge the terminal; live state is preserved.".to_string(),
     ];
     let mut frame = vec![vrow(cols); rows];

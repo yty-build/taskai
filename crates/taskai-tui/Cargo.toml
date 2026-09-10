@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 crossterm = "0.28"
+unicode-width = "0.1.14"
 
 [dev-dependencies]
 vt100 = "0.15"

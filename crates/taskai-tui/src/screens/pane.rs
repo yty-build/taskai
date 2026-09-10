@@ -12,6 +12,9 @@ pub struct PaneCell {
     pub fg: Option<Rgb>,
     pub bg: Option<Rgb>,
     pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub inverse: bool,
     pub width: usize,
 }
 
@@ -19,25 +22,50 @@ pub struct PaneCell {
 /// A character count is insufficient here: emoji and CJK glyphs occupy two
 /// columns, while combining sequences can contain multiple chars in one cell.
 pub fn cell_row(cells: &[PaneCell], width: usize, base: Rgb) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(width.saturating_add(48));
     let mut used = 0usize;
+    let mut previous_style = None;
     for cell in cells {
         let cell_width = cell.width.max(1);
-        if used >= width || used + cell_width > width {
+        if used >= width || cell_width > width - used {
             break;
         }
-        out.push_str(&bg(cell.bg.unwrap_or(base)));
-        if let Some(color) = cell.fg {
-            out.push_str(&fg(color));
-        }
-        if cell.bold {
-            out.push_str(BOLD);
+        let style = (
+            cell.fg,
+            cell.bg.unwrap_or(base),
+            cell.bold,
+            cell.italic,
+            cell.underline,
+            cell.inverse,
+        );
+        if previous_style != Some(style) {
+            // A row is self-contained, and a changed style fully resets omitted
+            // attributes/default foreground. Equal neighboring cells share one
+            // prefix instead of repainting color and reset codes per glyph.
+            out.push_str(RESET);
+            out.push_str(&bg(style.1));
+            if let Some(color) = cell.fg {
+                out.push_str(&fg(color));
+            }
+            if cell.bold {
+                out.push_str(BOLD);
+            }
+            if cell.italic {
+                out.push_str("\x1b[3m");
+            }
+            if cell.underline {
+                out.push_str("\x1b[4m");
+            }
+            if cell.inverse {
+                out.push_str("\x1b[7m");
+            }
+            previous_style = Some(style);
         }
         out.push_str(&cell.text);
-        out.push_str(RESET);
         used += cell_width;
     }
     if used < width {
+        out.push_str(RESET);
         out.push_str(&bg(base));
         out.push_str(&" ".repeat(width - used));
     }
@@ -88,8 +116,8 @@ pub fn frame(
     lines.push(soft_bot(CLI_BG, cols));
 
     let keys: &[(&str, &str)] = match focus {
-        Focus::Cli => &[("Ctrl+G", "TaskAI navigation")],
-        Focus::Nav => &[("Enter", "Focus CLI"), ("T", "Home"), ("q", "Quit")],
+        Focus::Cli => &[("Ctrl+F", "Change layout"), ("Ctrl+G", "Navigation")],
+        Focus::Nav => &[("Ctrl+F", "Full screen"), ("G", "Home"), ("q", "Leave")],
     };
     lines.extend(keybar(cols, keys));
     lines.push(vrow(cols));

@@ -13,7 +13,7 @@ pub struct ClaudeConnector {
 impl Default for ClaudeConnector {
     fn default() -> Self {
         ClaudeConnector {
-            bin: "claude".into(),
+            bin: std::env::var("TASKAI_CLAUDE_BIN").unwrap_or_else(|_| "claude".into()),
         }
     }
 }
@@ -104,16 +104,53 @@ fn upsert_hook(cfg: &mut serde_json::Value, event: &str, cmd: &str, marker: &str
     cfg["hooks"][event] = serde_json::Value::Array(arr);
 }
 
+fn replace_exact_hook(cfg: &mut serde_json::Value, event: &str, old: &str, new: &str) {
+    let mut arr = cfg["hooks"][event].as_array().cloned().unwrap_or_default();
+    arr.retain(|entry| {
+        !entry["hooks"].as_array().is_some_and(|hooks| {
+            hooks
+                .iter()
+                .any(|hook| hook["command"].as_str() == Some(old))
+        })
+    });
+    let already = arr.iter().any(|entry| {
+        entry["hooks"].as_array().is_some_and(|hooks| {
+            hooks
+                .iter()
+                .any(|hook| hook["command"].as_str() == Some(new))
+        })
+    });
+    if !already {
+        arr.push(serde_json::json!({"hooks": [{"type": "command", "command": new}]}));
+    }
+    cfg["hooks"][event] = serde_json::Value::Array(arr);
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+/// Session-specific copy of Claude hook events. The shared stream remains the conduit
+/// completion source; this copy lets a restarted TaskAI recover a SessionStart that
+/// arrived while its viewer was detached.
+pub fn session_events_path(runtime_dir: &Path, session_ref: &str) -> PathBuf {
+    runtime_dir.join(format!("claude-session-{session_ref}.jsonl"))
+}
+
 /// Installs the SessionStart and Stop hooks that append their payloads to the TaskAI
 /// events file. Merges into existing settings, never clobbers user content, idempotent.
 pub fn install_hooks(workspace: &Path, runtime_dir: &Path) -> Result<PathBuf, Error> {
     std::fs::create_dir_all(runtime_dir)?;
     let events = runtime_dir.join("claude-events.jsonl");
-    let cmd = format!("cat >> '{0}' && printf '\\n' >> '{0}'", events.display());
+    let legacy = format!("cat >> '{0}' && printf '\\n' >> '{0}'", events.display());
+    let events_path = shell_quote(&events.display().to_string());
+    let runtime_path = shell_quote(&runtime_dir.display().to_string());
+    let cmd = format!(
+        "payload=$(cat); printf '%s\\n' \"$payload\" >> {events_path}; if [ -n \"${{TASKAI_SESSION_REF:-}}\" ]; then printf '%s\\n' \"$payload\" >> {runtime_path}/claude-session-\"$TASKAI_SESSION_REF\".jsonl; fi"
+    );
     let (path, mut cfg) = load_settings(workspace)?;
-    let marker = events.display().to_string();
     for event in ["SessionStart", "Stop"] {
-        upsert_hook(&mut cfg, event, &cmd, &marker);
+        replace_exact_hook(&mut cfg, event, &legacy, &cmd);
     }
     save_settings(&path, &cfg)?;
     Ok(events)

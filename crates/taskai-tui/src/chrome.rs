@@ -1,11 +1,33 @@
 // ABOUTME: Shared TaskAI chrome — masthead HUD strip, keycap keybar, soft slab edges.
 // ABOUTME: Byte-for-byte port of the prototype's mh()/keys2()/soft edges.
 
-use crate::color::{Rgb, AMB, AMB_GLASS, FT, GLASS_HI, HAIR, KCAP, TEXT, VOID};
-use crate::seg::{row, s, sb, seglen, Seg};
+use crate::color::{Rgb, AMB, AMB_GLASS, FT, GLASS_HI, HAIR, ION, KCAP, TEXT, VOID};
+use crate::seg::{clip_segs, row, s, sb, seglen, Seg};
 
 /// Interior side padding — the rhythm unit.
 pub const PAD: usize = 3;
+
+/// A steady focus indicator in an existing chrome row, never in native cells.
+/// The arrow and label identify the input owner independently of its color.
+pub fn focus_edge(cols: usize, label: &str, active: bool) -> String {
+    let color = if active { ION } else { FT };
+    let mut segs = vec![
+        s(if active { "▸ " } else { "─ " }, Some(color), Some(VOID)),
+        Seg {
+            text: label.into(),
+            fg: Some(color),
+            bg: Some(VOID),
+            bold: active,
+        },
+        s(" ", Some(color), Some(VOID)),
+    ];
+    segs.push(s(
+        "─".repeat(cols.saturating_sub(seglen(&segs))),
+        Some(if active { ION } else { HAIR }),
+        Some(VOID),
+    ));
+    row(&segs, cols, VOID, 0)
+}
 
 /// Half-block upper edge: reads as a rounded slab top on the void.
 pub fn soft_top(fill: Rgb, width: usize) -> String {
@@ -54,6 +76,7 @@ pub fn masthead(
     }
     right.push(s("   ", None, Some(b)));
     right.push(s(clock, Some(TEXT), Some(b)));
+    left = clip_segs(&left, cols.saturating_sub(2 * PAD + seglen(&right) + 1));
     let gap = (cols as isize - 2 * PAD as isize - seglen(&left) as isize - seglen(&right) as isize)
         .max(1) as usize;
     left.push(s(" ".repeat(gap), None, Some(b)));
@@ -68,9 +91,21 @@ pub fn masthead(
 /// Hairline rule, then centered keycap chips: ` key ` on KCAP fill, label on the void.
 pub fn keybar(cols: usize, pairs: &[(&str, &str)]) -> Vec<String> {
     let mut segs: Vec<Seg> = Vec::new();
+    let labels_width: usize = pairs
+        .iter()
+        .map(|(k, l)| k.chars().count() + l.chars().count() + 3)
+        .sum();
+    let spacing = if pairs.len() > 1 {
+        cols.saturating_sub(labels_width)
+            .checked_div(pairs.len() - 1)
+            .unwrap_or(0)
+            .min(4)
+    } else {
+        0
+    };
     for (i, (key, label)) in pairs.iter().enumerate() {
         if i > 0 {
-            segs.push(s("    ", None, Some(VOID)));
+            segs.push(s(" ".repeat(spacing), None, Some(VOID)));
         }
         segs.push(s(format!(" {key} "), Some(TEXT), Some(KCAP)));
         segs.push(s(format!(" {label}"), Some(FT), Some(VOID)));
@@ -86,5 +121,32 @@ pub fn keybar(cols: usize, pairs: &[(&str, &str)]) -> Vec<String> {
             0,
         ),
         row(&centered, cols, VOID, 0),
+    ]
+}
+
+/// Keep the same two-row footer while making long navigation maps readable.
+/// Leave `keybar` itself unwrapped: modal/mouse-hit callers already arrange
+/// individual chip rows and rely on its stable rule-plus-chips contract.
+pub fn navigation_keybar(cols: usize, pairs: &[(&str, &str)]) -> Vec<String> {
+    let widths: Vec<_> = pairs
+        .iter()
+        .map(|(key, label)| key.chars().count() + label.chars().count() + 3)
+        .collect();
+    let total: usize = widths.iter().sum();
+    if total <= cols || pairs.len() < 2 {
+        return keybar(cols, pairs);
+    }
+    let mut prefix = 0usize;
+    let mut best = (usize::MAX, 1);
+    for (index, width) in widths.iter().enumerate().take(pairs.len() - 1) {
+        prefix += width;
+        let widest = prefix.max(total - prefix);
+        if widest < best.0 {
+            best = (widest, index + 1);
+        }
+    }
+    vec![
+        keybar(cols, &pairs[..best.1])[1].clone(),
+        keybar(cols, &pairs[best.1..])[1].clone(),
     ]
 }

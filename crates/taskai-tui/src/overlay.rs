@@ -5,11 +5,11 @@ use crate::color::{
     bg, dull, DIM, FT, GLASS, GLASS_HI, GLASS_IN, ION, KCAP, RED, RED_GLASS, RESET, TEXT, VOID,
 };
 use crate::fixture::{
-    Drawer, DESTROY_BLAST, DESTROY_CONFIRM, DESTROY_KEPT, DESTROY_TITLE, HELP_BOUNDARY,
-    HELP_CONDUITS, HELP_GLOBAL, HELP_TASK, NEWTASK, NEWTASK_NOTE, SUBORDINATE, SUBORDINATE_NOTE,
+    Drawer, DESTROY_BLAST, DESTROY_CONFIRM, DESTROY_KEPT, DESTROY_TITLE, HELP_CLI, HELP_CONDUITS,
+    HELP_NAVIGATION, HELP_TASK, NEWTASK, NEWTASK_NOTE, SUBORDINATE, SUBORDINATE_NOTE,
     SUBORDINATE_PREVIEW,
 };
-use crate::seg::{row, s, sb, seglen, strip_sgr, Seg};
+use crate::seg::{cell_count, char_width, row, s, sb, seglen, Seg};
 
 /// Regex-free port of the prototype's dim_line: every truecolor SGR component
 /// (38;2;r;g;b / 48;2;r;g;b) is pulled toward the void.
@@ -75,6 +75,8 @@ pub fn slice_cells(line: &str, start: usize, width: usize) -> String {
     let mut state = String::new();
     let mut col = 0usize;
     let mut emitting = false;
+    let mut complete_glyph = false;
+    let mut written = 0;
     let mut i = 0;
     while i < chars.len() {
         if chars[i] == '\u{1b}' && i + 1 < chars.len() && chars[i + 1] == '[' {
@@ -96,43 +98,57 @@ pub fn slice_cells(line: &str, start: usize, width: usize) -> String {
                 continue;
             }
         }
-        if col == start && !emitting {
-            emitting = true;
-            out.push_str(&state);
+        let glyph_width = char_width(chars[i]);
+        if glyph_width == 0 {
+            if emitting && complete_glyph {
+                out.push(chars[i]);
+            }
+            i += 1;
+            continue;
         }
         if col >= start + width {
             break;
         }
-        if emitting {
-            out.push(chars[i]);
+        let next = col + glyph_width;
+        let overlap = next.min(start + width).saturating_sub(col.max(start));
+        if overlap > 0 && !emitting {
+            emitting = true;
+            out.push_str(&state);
         }
-        col += 1;
+        complete_glyph = overlap == glyph_width;
+        if overlap > 0 {
+            if complete_glyph {
+                out.push(if chars[i].is_control() {
+                    '�'
+                } else {
+                    chars[i]
+                });
+            } else {
+                // An overlay edge may bisect a double-width glyph. Paint the
+                // uncovered half as a space rather than shifting every cell.
+                out.push_str(&" ".repeat(overlap));
+            }
+            written += overlap;
+        }
+        col = next;
         i += 1;
     }
-    let got = if emitting {
-        col.saturating_sub(start)
-    } else {
-        0
-    };
-    if got < width {
+    if written < width {
         out.push_str(&bg(VOID));
-        out.push_str(&" ".repeat(width - got));
+        out.push_str(&" ".repeat(width - written));
     }
     out.push_str(RESET);
     out
 }
 
 pub fn panel_width(panel: &[String]) -> usize {
-    panel
-        .first()
-        .map(|l| strip_sgr(l).chars().count())
-        .unwrap_or(0)
+    panel.first().map(|l| cell_count(l)).unwrap_or(0)
 }
 
 /// Dim the base and splice a floating panel over it, starting no lower than
 /// the last position that leaves the status row visible.
 pub fn overlay(base: &[String], panel: &[String], cols: usize, top: usize) -> Vec<String> {
-    let pw = panel_width(panel);
+    let pw = panel_width(panel).min(cols);
     let ind = cols.saturating_sub(pw) / 2;
     let mut out: Vec<String> = base.iter().map(|l| dim_line(l, 0.42)).collect();
     let usable_rows = out.len().saturating_sub(1);
@@ -145,7 +161,7 @@ pub fn overlay(base: &[String], panel: &[String], cols: usize, top: usize) -> Ve
         out[r] = format!(
             "{}{}{}",
             slice_cells(&out[r], 0, ind),
-            prow,
+            slice_cells(prow, 0, pw),
             slice_cells(&out[r], ind + pw, cols - ind - pw)
         );
     }
@@ -164,7 +180,7 @@ pub fn centered_overlay(base: &[String], panel: &[String], cols: usize) -> Vec<S
 /// retains six cells of breathing room per side; ultrawide terminals cap the
 /// form so the input fields remain easy to scan.
 pub fn form_panel_width(cols: usize) -> usize {
-    let cap = if cols >= 280 { 132 } else { 120 };
+    let cap = if cols >= 280 { 160 } else { 144 };
     cols.saturating_sub(12).min(cap)
 }
 
@@ -221,8 +237,10 @@ pub fn drawer_panel_view(blink: bool, d: &DrawerView, note: &[Vec<Seg>], pw: usi
         lines.push(row(segs, pw, GLASS, 2));
     }
     lines.push(row(&[], pw, GLASS, 0));
-    lines.push(keys_row(&d.keys, pw));
-    lines.push(row(&[], pw, GLASS, 0));
+    if !d.keys.is_empty() {
+        lines.push(keys_row(&d.keys, pw));
+        lines.push(row(&[], pw, GLASS, 0));
+    }
     lines.push(row(
         &[s("▀".repeat(pw), Some(GLASS), Some(VOID))],
         pw,
@@ -368,7 +386,15 @@ pub fn destroy_panel(blink: bool) -> Vec<String> {
 
 /// The repository explorer: navigate directories, choose one with Space.
 pub fn explorer_panel(cwd: &str, entries: &[(String, bool)], sel: usize) -> Vec<String> {
-    let pw = 66;
+    explorer_panel_width(cwd, entries, sel, 66)
+}
+
+pub fn explorer_panel_width(
+    cwd: &str,
+    entries: &[(String, bool)],
+    sel: usize,
+    pw: usize,
+) -> Vec<String> {
     let b = GLASS_HI;
     let mut lines = vec![row(&[s("▄".repeat(pw), Some(b), Some(VOID))], pw, VOID, 0)];
     lines.push(row(
@@ -459,34 +485,32 @@ pub fn help_panel() -> Vec<String> {
     let mut lines = vec![row(&[s("▄".repeat(pw), Some(b), Some(VOID))], pw, VOID, 0)];
     lines.push(row(&[sb("Help", Some(TEXT), Some(b))], pw, b, 2));
     lines.push(row(&[], pw, GLASS, 0));
-    let (key, desc) = HELP_BOUNDARY;
-    let head: String = desc.chars().take(56).collect();
-    let tail: String = desc.chars().skip(56).take(60).collect();
-    lines.push(row(
-        &[
-            sb(format!(" {key} "), Some(TEXT), Some(GLASS_IN)),
-            s(format!("  {head}"), Some(DIM), Some(GLASS)),
-        ],
-        pw,
-        GLASS,
-        2,
-    ));
-    lines.push(row(&[s(tail, Some(DIM), Some(GLASS))], pw, GLASS, 8));
+    for (key, description) in HELP_CLI {
+        lines.push(row(
+            &[
+                sb(format!(" {key} "), Some(TEXT), Some(GLASS_IN)),
+                s(format!("  {description}"), Some(DIM), Some(GLASS)),
+            ],
+            pw,
+            GLASS,
+            2,
+        ));
+    }
     lines.push(row(&[], pw, GLASS, 0));
     lines.push(row(
         &[
-            s("GLOBAL", Some(FT), Some(GLASS)),
-            s(" ".repeat(30 - 6), None, Some(GLASS)),
+            s("NAVIGATION", Some(FT), Some(GLASS)),
+            s(" ".repeat(30 - 10), None, Some(GLASS)),
             s("TASK", Some(FT), Some(GLASS)),
         ],
         pw,
         GLASS,
         4,
     ));
-    let rows_n = HELP_GLOBAL.len().max(HELP_TASK.len());
+    let rows_n = HELP_NAVIGATION.len().max(HELP_TASK.len());
     for i in 0..rows_n {
         let mut segs: Vec<Seg> = Vec::new();
-        if let Some((k, l)) = HELP_GLOBAL.get(i) {
+        if let Some((k, l)) = HELP_NAVIGATION.get(i) {
             segs.push(s(format!("{k:>5} "), Some(DIM), Some(GLASS)));
             segs.push(s(*l, Some(FT), Some(GLASS)));
         }

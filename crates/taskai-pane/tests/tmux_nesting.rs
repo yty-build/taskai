@@ -2,20 +2,30 @@
 // ABOUTME: rendered directly and through a tmux attach client must produce identical cells.
 
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use taskai_pane::grid::Cell;
 use taskai_pane::Pane;
 
-const SOCKET: &str = "taskai-nesting-proof";
 const ROWS: u16 = 24;
 const COLS: u16 = 80;
+static NEXT_SOCKET: AtomicU64 = AtomicU64::new(1);
+
+fn socket() -> String {
+    format!(
+        "taskai-nesting-proof-{}-{}",
+        std::process::id(),
+        NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+    )
+}
 
 /// Emits the things TaskAI's renderer actually depends on: exact FILL truecolor, bold,
 /// the ambiguous-width glyphs the journal records as hazardous, and a known cursor spot.
 const CHILD: &str = "\
 printf '\\033[38;2;124;214;255m\\033[48;2;17;24;38mION\\033[0m';\
 printf '\\033[1mBOLD\\033[0m';\
+printf '\\033[3;4;7mSTYLE\\033[0m';\
 printf '\\033[38;2;217;131;107m▌\\033[0m⏺ ⎿ ✳ ';\
 printf 'READY\\n';\
 printf '\\033[5;10H';\
@@ -33,9 +43,9 @@ fn tmux_present() -> bool {
     ok
 }
 
-fn kill_server() {
+fn kill_server(socket: &str) {
     let _ = Command::new("tmux")
-        .args(["-L", SOCKET, "kill-server"])
+        .args(["-L", socket, "kill-server"])
         .output();
 }
 
@@ -64,10 +74,15 @@ fn direct_cells(cwd: &std::path::Path) -> Vec<Vec<Cell>> {
 
 /// Renders the same child inside tmux and views it through an attach client, exactly as
 /// the proposal's `TaskAI pane -> portable PTY -> tmux attach -> native pane` chain would.
-fn nested_cells(cwd: &std::path::Path, conf: Option<&str>, label: &str) -> Vec<Vec<Cell>> {
-    kill_server();
+fn nested_cells(
+    cwd: &std::path::Path,
+    socket: &str,
+    conf: Option<&str>,
+    label: &str,
+) -> Vec<Vec<Cell>> {
+    kill_server(socket);
     let mut create = Command::new("tmux");
-    create.args(["-L", SOCKET]);
+    create.args(["-L", socket]);
     if let Some(path) = conf {
         create.args(["-f", path]);
     }
@@ -83,7 +98,7 @@ fn nested_cells(cwd: &std::path::Path, conf: Option<&str>, label: &str) -> Vec<V
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let mut args = vec!["-L", SOCKET];
+    let mut args = vec!["-L", socket];
     if let Some(path) = conf {
         args.push("-f");
         args.push(path);
@@ -93,7 +108,7 @@ fn nested_cells(cwd: &std::path::Path, conf: Option<&str>, label: &str) -> Vec<V
     let ok = settle(&pane, "READY");
     let cells = pane.cells();
     drop(pane);
-    kill_server();
+    kill_server(socket);
     assert!(ok, "{label}: nested child never rendered");
     cells
 }
@@ -129,7 +144,13 @@ fn diff(a: &[Vec<Cell>], b: &[Vec<Cell>], label: &str) -> usize {
             let cb = rb.and_then(|x| x.get(c));
             let same = match (ca, cb) {
                 (Some(x), Some(y)) => {
-                    x.text == y.text && x.fg == y.fg && x.bg == y.bg && x.bold == y.bold
+                    x.text == y.text
+                        && x.fg == y.fg
+                        && x.bg == y.bg
+                        && x.bold == y.bold
+                        && x.italic == y.italic
+                        && x.underline == y.underline
+                        && x.inverse == y.inverse
                 }
                 (None, None) => true,
                 _ => false,
@@ -162,10 +183,12 @@ fn nesting_preserves_cells_only_with_terminal_features() {
     }
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
+    let bare_socket = socket();
+    let tuned_socket = socket();
 
     let direct = direct_cells(cwd);
 
-    let bare = nested_cells(cwd, None, "default-tmux");
+    let bare = nested_cells(cwd, &bare_socket, None, "default-tmux");
 
     let conf = cwd.join("tmux.conf");
     std::fs::write(
@@ -176,7 +199,12 @@ fn nesting_preserves_cells_only_with_terminal_features() {
          set -as terminal-features \",tmux-256color:RGB\"\n",
     )
     .unwrap();
-    let tuned = nested_cells(cwd, Some(conf.to_str().unwrap()), "tuned-tmux");
+    let tuned = nested_cells(
+        cwd,
+        &tuned_socket,
+        Some(conf.to_str().unwrap()),
+        "tuned-tmux",
+    );
 
     let bare_diffs = diff(&direct, &bare, "default-tmux");
     let tuned_diffs = diff(&direct, &tuned, "tuned-tmux");
@@ -203,6 +231,7 @@ fn nesting_preserves_cursor_position() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
+    let socket = socket();
     let conf = tmp.path().join("tmux.conf");
     std::fs::write(
         &conf,
@@ -214,9 +243,9 @@ fn nesting_preserves_cursor_position() {
     assert!(settle(&direct, "READY"));
     let want = direct.snapshot().cursor;
 
-    kill_server();
+    kill_server(&socket);
     let out = Command::new("tmux")
-        .args(["-L", SOCKET, "-f", conf.to_str().unwrap()])
+        .args(["-L", &socket, "-f", conf.to_str().unwrap()])
         .args(["new-session", "-d", "-s", "cur"])
         .args(["-x", &COLS.to_string(), "-y", &ROWS.to_string()])
         .args(["/bin/sh", "-c", CHILD])
@@ -227,7 +256,7 @@ fn nesting_preserves_cursor_position() {
         "tmux",
         &[
             "-L",
-            SOCKET,
+            &socket,
             "-f",
             conf.to_str().unwrap(),
             "attach-session",
@@ -243,7 +272,7 @@ fn nesting_preserves_cursor_position() {
     assert!(settle(&pane, "READY"));
     let got = pane.snapshot().cursor;
     drop(pane);
-    kill_server();
+    kill_server(&socket);
 
     println!("RESULT cursor direct {want:?} · nested {got:?}");
     assert_eq!(
@@ -263,9 +292,10 @@ fn bracketed_paste_survives_nesting() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    kill_server();
+    let socket = socket();
+    kill_server(&socket);
     let out = Command::new("tmux")
-        .args(["-L", SOCKET, "new-session", "-d", "-s", "paste"])
+        .args(["-L", &socket, "new-session", "-d", "-s", "paste"])
         .args(["-x", &COLS.to_string(), "-y", &ROWS.to_string()])
         // a real provider enables bracketed-paste mode (DECSET 2004); tmux only forwards
         // the markers to an application that asked for them
@@ -276,7 +306,7 @@ fn bracketed_paste_survives_nesting() {
 
     let mut pane = Pane::spawn(
         "tmux",
-        &["-L", SOCKET, "attach-session", "-t", "paste"],
+        &["-L", &socket, "attach-session", "-t", "paste"],
         tmp.path(),
         ROWS,
         COLS,
@@ -290,7 +320,7 @@ fn bracketed_paste_survives_nesting() {
     let saw = settle(&pane, "taskai-paste-probe");
     let text = pane.text();
     drop(pane);
-    kill_server();
+    kill_server(&socket);
 
     assert!(saw, "paste never reached the child:\n{text}");
     let markers = text.contains("^[[200~") && text.contains("^[[201~");
@@ -307,14 +337,15 @@ fn child_survives_viewer_death() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
+    let socket = socket();
     let beat = tmp.path().join("beat");
-    kill_server();
+    kill_server(&socket);
     let script = format!(
         "while :; do printf x >> '{}'; sleep 0.2; done",
         beat.display()
     );
     let out = Command::new("tmux")
-        .args(["-L", SOCKET, "new-session", "-d", "-s", "durable"])
+        .args(["-L", &socket, "new-session", "-d", "-s", "durable"])
         .args(["/bin/sh", "-c", &script])
         .output()
         .unwrap();
@@ -323,7 +354,7 @@ fn child_survives_viewer_death() {
     {
         let pane = Pane::spawn(
             "tmux",
-            &["-L", SOCKET, "attach-session", "-t", "durable"],
+            &["-L", &socket, "attach-session", "-t", "durable"],
             tmp.path(),
             ROWS,
             COLS,
@@ -339,11 +370,11 @@ fn child_survives_viewer_death() {
     std::thread::sleep(Duration::from_millis(800));
     let after = std::fs::metadata(&beat).map(|m| m.len()).unwrap_or(0);
     let alive = Command::new("tmux")
-        .args(["-L", SOCKET, "has-session", "-t", "durable"])
+        .args(["-L", &socket, "has-session", "-t", "durable"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
-    kill_server();
+    kill_server(&socket);
 
     println!("RESULT after viewer death: session alive {alive}, heartbeat {before} -> {after}");
     assert!(alive, "tmux session died with the viewer");

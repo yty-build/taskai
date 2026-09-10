@@ -9,11 +9,15 @@ TaskAI provides context, stable session references, and a proven ACP-to-native-d
 - TaskAI describes registered topology and state. It does not choose work, delegation, targets, permissions, or next actions.
 - A human may focus and type directly into any displayed native Manager or Subordinate CLI, or explicitly send through the conduit to a selected session; any registered native session may also address another. TaskAI never autonomously originates a turn.
 - Provider-native history and UI remain authoritative. TaskAI never creates a transcript, semantic message model, or shadow conversation.
-- Provider sessions own their prompts, tools, questions, approvals, cancellations, and lifecycle. TaskAI may observe or relay structured events without deciding them.
+- Provider sessions own their prompts, tools, questions, approvals, cancellations, and
+  normal lifecycle. TaskAI may observe or relay structured events without deciding them;
+  only an explicitly confirmed, scoped Destroy may terminate a recorded tmux runtime.
 - TaskAI owns only its context service, session-reference registry, connector processes, and display conduit.
 - Minimal connector guards may reject a technically unsafe concurrent submission; this is collision protection, not delegation policy.
 - Detaching or removing TaskAI metadata never deletes a repository, worktree, or provider-native history.
-- Production has no tmux dependency and no local model server requirement.
+- Production uses tmux only to preserve each native process and terminal across TaskAI
+  viewer detach/reconnect. tmux does not change provider submission, correlation,
+  completion, cancellation, or handoff semantics. No local model server is required.
 
 ## 2. Complete TaskAI responsibility classification
 
@@ -179,7 +183,10 @@ TaskAI reports manifest support, handshake verification, and live-test status se
 - Safety state records only dispatch correlation, exact session references, connector/runtime identity, and native recovery locators—not conversation content.
 - Writer exclusion exists solely to prevent two clients from corrupting one provider session. It expires at the provider's proven terminal boundary.
 - TaskAI may stop or clean up its connector/shim processes. It does not automatically stop, restart, hibernate, or destroy native agent work.
-- A user-requested detach removes the conduit, not provider history or repositories. Any future native-process lifecycle feature requires separate approval under Section 10.
+- A user-requested detach removes the viewer and conduit, not the tmux-hosted provider,
+  provider history, or repositories. Scoped termination is defined only by the approved
+  lifecycle contract in `feature-tmux.md`; further lifecycle expansion still requires
+  separate approval under Section 10.
 
 ## 10. Explicitly excluded expansions
 
@@ -189,6 +196,8 @@ Adding any of these requires an explicit product decision, a new responsibility 
 
 ## 11. Release gate
 
-A clean install requires only TaskAI plus configured provider CLIs. Tests cover fresh native self-awareness, the full team chain, exact session references, correctly attributed UI/native initiation, same-session native rendering or truthful handoff, tools, native questions/approvals, cancel transport, writer collision, terminal detection, replay/reconnect deduplication, bridge failure, provider upgrades, exact resume, and repository/provider-history preservation.
+A clean local install requires TaskAI, tmux, and configured provider CLIs. Tests cover fresh native self-awareness, the full team chain, exact session references, correctly attributed UI/native initiation, same-session native rendering or truthful handoff, tools, native questions/approvals, cancel transport, writer collision, terminal detection, replay/reconnect deduplication, bridge failure, provider upgrades, exact resume, and repository/provider-history preservation.
 
-The retained tmux demo is evidence of the native rendering mechanisms only; it is not a production dependency or orchestration model.
+tmux is a production runtime dependency only for process and terminal lifetime. The
+retained tmux demo remains rendering evidence, not a provider communication protocol or
+an orchestration model.

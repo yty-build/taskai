@@ -1,12 +1,81 @@
-// ABOUTME: Registry tests — stable never-recycled refs, topology rules, attribution,
+// ABOUTME: Registry tests — stable refs, topology, local/SSH and runtime mappings,
 // ABOUTME: atomic persistence across restarts, blast radius, and destroy semantics.
 
 use std::path::Path;
 
-use taskai_core::registry::{Item, Registry, SessionState, Source};
+use taskai_core::registry::{
+    ConnectionTarget, Item, ProviderMapping, Registry, SessionState, Source,
+};
 
 fn open(dir: &Path) -> Registry {
     Registry::open(dir).expect("open registry")
+}
+
+#[test]
+fn terminal_is_one_task_owned_mapping_not_a_team_member() {
+    let root = tempfile::tempdir().unwrap();
+    let mut reg = open(root.path());
+    let task = reg
+        .create_task_on(
+            "Remote",
+            Path::new("/repo"),
+            ConnectionTarget::ssh("cruise4b").unwrap(),
+            Source::HumanUi,
+        )
+        .unwrap();
+    assert!(reg.task(&task).unwrap().terminal.is_none());
+    let counts = reg.hud_counts();
+    let terminal = reg.bind_terminal(&task, "taskai-test").unwrap();
+    assert_eq!(terminal.session, "t1-terminal");
+    assert_eq!(terminal.target, ConnectionTarget::ssh("cruise4b").unwrap());
+    assert_eq!(
+        reg.bind_terminal(&task, "another-server").unwrap(),
+        terminal
+    );
+    assert_eq!(reg.hud_counts(), counts);
+    assert!(reg.sessions_of(&task).is_empty());
+    let manager = reg
+        .create_session(
+            &task,
+            None,
+            "Lead",
+            "claude",
+            Path::new("/repo"),
+            Source::HumanUi,
+        )
+        .unwrap();
+    assert_eq!(manager, "s1", "utilities must not consume agent refs");
+    reg.destroy(&Item::Session(manager), Source::HumanUi)
+        .unwrap();
+    drop(reg);
+    let mut reg = open(root.path());
+    assert_eq!(reg.task(&task).unwrap().terminal.as_ref(), Some(&terminal));
+    reg.destroy(&Item::Task(task.clone()), Source::HumanUi)
+        .unwrap();
+    assert!(open(root.path()).task(&task).is_none());
+}
+
+#[test]
+fn terminal_mapping_cannot_point_to_a_different_task_or_host() {
+    let root = tempfile::tempdir().unwrap();
+    let mut reg = open(root.path());
+    let task = reg
+        .create_task("Task", Path::new("/repo"), Source::HumanUi)
+        .unwrap();
+    reg.bind_terminal(&task, "taskai-test").unwrap();
+    let state = root.path().join("state.json");
+    let original: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    for field in ["session", "target"] {
+        let mut value = original.clone();
+        value["tasks"][0]["terminal"][field] = if field == "session" {
+            serde_json::json!("t2-terminal")
+        } else {
+            serde_json::json!({"kind":"ssh","host":"cruise4b"})
+        };
+        std::fs::write(&state, serde_json::to_string(&value).unwrap()).unwrap();
+        assert!(Registry::open(root.path()).is_err());
+    }
 }
 
 // Expectation: refs increment monotonically and are never recycled, even after destroy
@@ -426,4 +495,185 @@ fn hud_counts_and_task_status() {
     assert_eq!(reg.task_status(&t2), "NEEDS ATTENTION");
     assert_eq!(reg.task_status(&t3), "COMPLETE");
     assert_eq!(reg.task_status(&t4), "READY");
+}
+
+// Expectation: an omitted connection remains local, while an SSH target stores only its
+// safe host alias and round-trips independently from the repository path. Why: existing
+// callers and state must remain local without migration, while remote paths are meaningful
+// only on their target. Value: the tracker says both where a repo is and how to reach it.
+#[test]
+fn connection_targets_round_trip_and_display() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (local, remote);
+    {
+        let mut reg = open(tmp.path());
+        local = reg
+            .create_task("Local", Path::new("/tmp/local-repo"), Source::HumanUi)
+            .unwrap();
+        remote = reg
+            .create_task_on(
+                "Remote",
+                Path::new("/srv/remote-repo"),
+                ConnectionTarget::ssh("cruise2").unwrap(),
+                Source::HumanUi,
+            )
+            .unwrap();
+
+        assert_eq!(reg.task(&local).unwrap().connection.to_string(), "<local>");
+        assert!(reg
+            .task(&local)
+            .unwrap()
+            .connection
+            .command_args()
+            .is_empty());
+        assert_eq!(
+            reg.task(&remote).unwrap().connection.command_args(),
+            vec!["ssh", "cruise2"]
+        );
+        assert_eq!(
+            reg.task(&remote).unwrap().connection.to_string(),
+            "ssh cruise2"
+        );
+    }
+
+    let reg = open(tmp.path());
+    assert_eq!(
+        reg.task(&local).unwrap().connection,
+        ConnectionTarget::Local
+    );
+    assert_eq!(
+        reg.task(&remote).unwrap().connection,
+        ConnectionTarget::Ssh {
+            host: "cruise2".into()
+        }
+    );
+    assert_eq!(
+        reg.task(&remote).unwrap().repo,
+        Path::new("/srv/remote-repo")
+    );
+
+    for unsafe_alias in ["", "-oProxyCommand=bad", "user@cruise2", "cruise 2"] {
+        assert!(ConnectionTarget::ssh(unsafe_alias).is_err());
+    }
+}
+
+// Expectation: both the current unversioned registry and a state file labeled schema v1
+// load without connection/runtime fields. Why: tmux persistence is additive. Value:
+// installing the new binary does not strand existing Tasks or provider sessions.
+#[test]
+fn legacy_state_defaults_to_local_without_runtime() {
+    for schema_version in [None, Some(1)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut body = serde_json::json!({
+            "next_task": 1,
+            "next_session": 1,
+            "tasks": [{
+                "task_ref": "t1",
+                "name": "Legacy task",
+                "repo": "/tmp/legacy",
+                "created_by": "HumanUi"
+            }],
+            "sessions": [{
+                "session_ref": "s1",
+                "task_ref": "t1",
+                "parent": null,
+                "role": "Manager",
+                "name": "Lead",
+                "harness": "claude",
+                "workspace": "/tmp/legacy",
+                "state": "Live",
+                "created_by": "HumanUi",
+                "provider": null
+            }],
+            "audit": []
+        });
+        if let Some(version) = schema_version {
+            body.as_object_mut()
+                .unwrap()
+                .insert("schema_version".into(), version.into());
+        }
+        std::fs::write(
+            tmp.path().join("state.json"),
+            serde_json::to_vec_pretty(&body).unwrap(),
+        )
+        .unwrap();
+
+        let reg = open(tmp.path());
+        assert_eq!(reg.task("t1").unwrap().connection, ConnectionTarget::Local);
+        assert!(reg.session("s1").unwrap().runtime.is_none());
+        assert_eq!(reg.session("s1").unwrap().state, SessionState::Live);
+    }
+}
+
+// Expectation: tmux identity and native provider identity persist independently. Why:
+// tmux locates a durable process but must never replace a Claude/Codex/etc session ID.
+// Value: detaching or repairing one mapping cannot silently erase the other identity.
+#[test]
+fn runtime_and_provider_identity_remain_separate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session_ref;
+    let provider = ProviderMapping {
+        provider: "claude".into(),
+        provider_session_id: "provider-session-42".into(),
+        runtime_id: "provider-runtime-9".into(),
+        connector_version: "1".into(),
+    };
+    {
+        let mut reg = open(tmp.path());
+        let task_ref = reg
+            .create_task_on(
+                "Remote evaluation",
+                Path::new("/srv/acp-gateway"),
+                ConnectionTarget::ssh("cruise2").unwrap(),
+                Source::HumanUi,
+            )
+            .unwrap();
+        session_ref = reg
+            .create_session(
+                &task_ref,
+                None,
+                "Lead",
+                "claude",
+                Path::new("/srv/acp-gateway"),
+                Source::HumanUi,
+            )
+            .unwrap();
+        reg.bind_provider(&session_ref, provider.clone()).unwrap();
+        reg.bind_runtime(&session_ref, "taskai-test-17").unwrap();
+
+        let session = reg.session(&session_ref).unwrap();
+        assert_eq!(session.provider.as_ref(), Some(&provider));
+        let runtime = session.runtime.as_ref().unwrap();
+        assert_eq!(runtime.session, session_ref);
+        assert_eq!(runtime.private_server, "taskai-test-17");
+        assert_eq!(
+            runtime.target,
+            ConnectionTarget::Ssh {
+                host: "cruise2".into()
+            }
+        );
+    }
+
+    let mut reg = open(tmp.path());
+    assert_eq!(
+        reg.session(&session_ref).unwrap().provider.as_ref(),
+        Some(&provider)
+    );
+    assert!(reg.session(&session_ref).unwrap().runtime.is_some());
+
+    reg.clear_runtime(&session_ref).unwrap();
+    assert!(reg.session(&session_ref).unwrap().runtime.is_none());
+    assert_eq!(
+        reg.session(&session_ref).unwrap().provider.as_ref(),
+        Some(&provider)
+    );
+
+    reg.bind_runtime(&session_ref, "taskai-test-17").unwrap();
+    reg.clear_provider(&session_ref).unwrap();
+    assert!(reg.session(&session_ref).unwrap().provider.is_none());
+    assert!(reg.session(&session_ref).unwrap().runtime.is_some());
+
+    assert!(reg.bind_runtime("s999", "taskai-test-17").is_err());
+    assert!(reg.bind_runtime(&session_ref, "-not-a-server").is_err());
+    assert!(reg.clear_runtime("s999").is_err());
 }

@@ -9,7 +9,7 @@ TaskAI is the command center around agent CLIs. It organizes work as `Task → M
 TaskAI owns the task board, hierarchy, status, creation flows, and navigation chrome. The entire working pane belongs to the selected session's actual native CLI.
 Harnesses can include Claude Code, Codex, Grok CLI, OpenCode, and any other compatible CLI. Managers and subordinates follow the same rule.
 The CLI owns its input, output, tools, approvals, colors, scrollback, and interaction model. TaskAI never substitutes a chat, composer, transcript, or tool renderer.
-`Ctrl+G` is the one reserved boundary chord that leaves the CLI and returns focus to TaskAI navigation. While the CLI is focused, every other keystroke passes through unchanged.
+While the CLI is focused, TaskAI reserves `Ctrl+F` to toggle full-screen and inline layouts and `Ctrl+G` to return focus to TaskAI navigation. Every other keystroke passes through unchanged.
 Single-letter TaskAI commands work only while navigation has focus, so typing `a`, `m`, `d`, or ordinary prose inside a CLI can never trigger TaskAI actions.
 
 ## The complete journey
@@ -52,17 +52,21 @@ This screen shows what TaskAI can launch and what is currently running. Executab
 
 ### 2. Add a Task
 
-From Home, `n` opens Task creation. The only typed field is the Task name; the repository is chosen with an explorer.
+From Home, `n` opens Task creation. Name, repository, and connection are separate fields.
+For a local Task, Connection stays empty and is displayed as `<local>`; an invalid local
+repository opens the directory explorer. For a remote Task, Connection is an SSH-config
+alias such as `ssh cruise2`, and Repository accepts an absolute remote path, `~`, or
+`~/path`.
 
 ```text
 ┌─ New Task ──────────────────────────────────────────────────────────┐
 │ Name        Repository evaluation                                  │
 │ Repository  /Users/me/Documents/GitHub/buzz                        │
-│             [Browse…]                                              │
+│ Connection  <local>                                                │
 │                                                                    │
 │                              [Create Task]                          │
 ├────────────────────────────────────────────────────────────────────┤
-│ [↑/↓] Move  [Enter] Select  [b] Browse  [Esc] Cancel              │
+│ [Enter] Create / Browse local  [Tab] Next field  [Esc] Cancel     │
 └────────────────────────────────────────────────────────────────────┘
 
 ┌─ Choose repository ─────────────────────────────────────────────────┐
@@ -77,7 +81,8 @@ From Home, `n` opens Task creation. The only typed field is the Task name; the r
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-The explorer starts at the current directory and remembers recent repositories. It shows the canonical path at all times, so users navigate instead of copying and pasting paths.
+The local explorer starts at the current directory and shows the canonical path at all
+times. Remote paths are validated and canonicalized on the recorded SSH host instead.
 After Create, the Task exists with no agents yet:
 
 ```text
@@ -88,7 +93,7 @@ After Create, the Task exists with no agents yet:
 │                                  │                                  │
 │        + Add first Manager       │                                  │
 ├──────────────────────────────────┴──────────────────────────────────┤
-│ [m] Add Manager  [e] Browse repository  [d] Destroy  [T] Home     │
+│ [m] Add Manager  [e] Browse repository  [d] Destroy  [G] Home     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -115,7 +120,8 @@ Custom CLI commands are added from Home → Harnesses, never during Task or agen
 
 ### 4. The Manager opens in its native CLI
 
-Create starts the Manager and immediately attaches its exact native harness:
+Create starts the Manager, selects it in Task navigation, and shows its exact native
+harness inline. `Ctrl+F` then gives the CLI focus full-screen:
 
 ```text
 ┌─ Repository evaluation ──────────┬─ Lead · Claude Code · ● Running ┐
@@ -125,11 +131,11 @@ Create starts the Manager and immediately attaches its exact native harness:
 │                                  │ TaskAI does not redraw, parse,   │
 │                                  │ or replace anything in this pane.│
 ├──────────────────────────────────┴──────────────────────────────────┤
-│ [Ctrl+G] TaskAI navigation                         CLI has focus    │
+│ [Ctrl+F] Full screen  [Ctrl+G] Navigation          CLI has focus    │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-The pane title always names the selected session, harness, and state. The focused pane has the highlighted border: navigation focus shows TaskAI commands, while CLI focus shows only the `Ctrl+G` escape chord.
+The pane title always names the selected session, harness, and state. The focused pane has the highlighted border: navigation focus shows TaskAI commands, while CLI focus shows only `Ctrl+F` for layout and `Ctrl+G` for navigation. From Task navigation, `Ctrl+F` enters full-screen CLI focus; while focused, it toggles full-screen and inline layouts without relaunching the session.
 
 ### 5. Add a Subordinate to that Manager
 
@@ -151,7 +157,7 @@ If the CLI has focus, press `Ctrl+G` once to return to navigation. Move the arro
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-After Create, the tree gains the child and its native CLI is attached:
+After Create, the tree gains the child and its native CLI is visible:
 
 ```text
 │ ● Lead · Claude Code             │ Architecture · OpenCode · ● Run │
@@ -160,7 +166,7 @@ After Create, the tree gains the child and its native CLI is attached:
 
 Workspace offers three arrow-selected choices: the Manager's repository, another repository, or a new git worktree.
 Another repository opens the same directory explorer used by Task creation. New worktree asks for base repository, base branch, and worktree name, previews the resulting path, then creates it before launching the Subordinate.
-When creation is confirmed, TaskAI creates the Subordinate session under the highlighted Manager in the chosen workspace and attaches its native CLI. The user can return to navigation, select Lead, and press `Enter` to reattach the still-running Manager CLI.
+When creation is confirmed, TaskAI creates the Subordinate session under the highlighted Manager in the chosen workspace and starts its native CLI. The user can return to navigation, select Lead, and press `Ctrl+F` to focus the still-running Manager CLI full-screen.
 Managers may also create Subordinates through orchestration; those sessions appear under the correct parent in the same tree.
 
 ### 6. Destroy a Task, Manager, or Subordinate
@@ -197,7 +203,7 @@ Return to navigation and press `m` anywhere at the Task root. Choose a configure
 │ ● Delivery · Codex               │                                  │
 │                                  │                                  │
 ├──────────────────────────────────┴──────────────────────────────────┤
-│ [Enter] Attach  [m] Add Manager  [a] Add Subordinate  [d] Destroy │
+│ [Ctrl+F] Full screen  [m] Add Manager  [a] Subordinate  [d] Destroy│
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -214,7 +220,7 @@ Select Delivery, press `a`, and the drawer identifies `Delivery · Codex` as Par
 │ ● Delivery · Codex               │                                  │
 │ └─ ● Verification · Grok CLI     │                                  │
 ├──────────────────────────────────┴──────────────────────────────────┤
-│ [Enter] Attach  [m] Add Manager  [a] Add Subordinate  [T] Home    │
+│ [Ctrl+F] Full screen  [m] Add Manager  [a] Subordinate  [G] Home  │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -222,13 +228,13 @@ Parent is always shown before confirmation, preventing a Subordinate from being 
 
 ### 9. Deploy and supervise multiple Tasks
 
-`T` returns Home without stopping the current team. The user creates another Task with `n` and repeats the same visible lifecycle.
+`G` returns Home without stopping the current team. The user creates another Task with `n` and repeats the same visible lifecycle.
 Task rows aggregate team state; expanding a Task reveals Managers, and expanding a Manager reveals Subordinates. Every row includes its harness.
-Attention rises through the hierarchy: a waiting Subordinate marks its Manager, and a waiting Manager marks its Task. Selecting it attaches that exact native CLI.
+Attention rises through the hierarchy: a waiting Subordinate marks its Manager, and a waiting Manager marks its Task. Selecting it reveals that exact native CLI; `Ctrl+F` focuses it.
 
 ### 10. Leave and resume
 
 Leaving TaskAI detaches the viewer but does not stop Tasks, Managers, or Subordinates. They continue independently and preserve their native sessions.
-Launching `taskai` again returns to the task board with the same hierarchy and current status. `Enter` reattaches the exact native CLI where the user left it.
+Launching `taskai` again returns to the task board with the same hierarchy and current status. `Ctrl+F` reattaches the exact native CLI where the user left it.
 
 TaskAI should feel like leading several teams from one calm portfolio—not operating a maze of terminals.

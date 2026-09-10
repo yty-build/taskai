@@ -2,7 +2,7 @@
 // ABOUTME: cells at every size, and the chrome (masthead, keybar) sits where it must.
 
 use taskai_tui::color::{set_truecolor, CLI_BG};
-use taskai_tui::render::{dump, paint_frame, resize_frame};
+use taskai_tui::render::{dump, paint_frame, paint_update, resize_frame};
 use taskai_tui::screens::pane::{cell_row, PaneCell};
 use taskai_tui::seg::{cell_count, strip_sgr};
 
@@ -95,6 +95,53 @@ fn frame_painter_restores_or_hides_the_host_cursor() {
     assert!(hidden.screen().hide_cursor());
 }
 
+// Expectation: an idle frame emits no terminal bytes, and a caret move does not
+// toggle visibility. Why: the live loop polls frequently even when the provider is
+// idle; repainting or hide/show on every poll makes native CLI cursors flicker.
+// Value: an idle or moving provider caret keeps the terminal's natural blink phase.
+#[test]
+fn frame_painter_skips_idle_frames_and_minimizes_cursor_only_changes() {
+    let frame = dump("attach", 110, 30).unwrap();
+
+    assert_eq!(
+        paint_update(&frame, None, None, None),
+        paint_frame(&frame, None)
+    );
+    assert_eq!(paint_update(&frame, None, Some(&frame), None), "");
+    assert_eq!(
+        paint_update(&frame, Some((12, 34)), Some(&frame), Some((12, 34))),
+        ""
+    );
+    assert_eq!(
+        paint_update(&frame, Some((12, 35)), Some(&frame), Some((12, 34))),
+        "\x1b[13;36H"
+    );
+    assert_eq!(
+        paint_update(&frame, None, Some(&frame), Some((12, 34))),
+        "\x1b[?25l"
+    );
+    assert_eq!(
+        paint_update(&frame, Some((12, 34)), Some(&frame), None),
+        "\x1b[13;35H\x1b[?25h"
+    );
+
+    let mut changed = frame.clone();
+    changed[0].push('x');
+    let repaint = paint_update(&changed, Some((12, 34)), Some(&frame), Some((12, 34)));
+    assert!(repaint.starts_with("\x1b[?2026h\x1b[1;1H"));
+    assert!(!repaint.contains("\x1b[2;1H"));
+    assert!(!repaint.contains("\x1b[?25l"));
+    assert!(!repaint.contains("\x1b[?25h"));
+    assert!(repaint.ends_with("\x1b[13;35H\x1b[?2026l"));
+
+    let hidden = paint_update(&changed, None, Some(&frame), Some((12, 34)));
+    assert!(hidden.starts_with("\x1b[?2026h\x1b[?25l"));
+
+    let shown = paint_update(&changed, Some((12, 34)), Some(&frame), None);
+    assert!(!shown.contains("\x1b[?25l"));
+    assert!(shown.ends_with("\x1b[13;35H\x1b[?25h\x1b[?2026l"));
+}
+
 // Expectation: hosted CLI rows retain the parser's physical cell widths.
 // Why: an emoji is one Rust char but two terminal columns; counting chars adds
 // an extra padding cell and can reintroduce right-margin scrolling. Value:
@@ -107,6 +154,9 @@ fn hosted_cli_rows_preserve_wide_cell_geometry() {
             fg: None,
             bg: None,
             bold: false,
+            italic: false,
+            underline: false,
+            inverse: false,
             width: 2,
         },
         PaneCell {
@@ -114,6 +164,9 @@ fn hosted_cli_rows_preserve_wide_cell_geometry() {
             fg: None,
             bg: None,
             bold: false,
+            italic: false,
+            underline: false,
+            inverse: false,
             width: 1,
         },
     ];
@@ -123,6 +176,33 @@ fn hosted_cli_rows_preserve_wide_cell_geometry() {
     assert_eq!(parser.screen().cell(0, 0).unwrap().contents(), "✨");
     assert!(parser.screen().cell(0, 1).unwrap().is_wide_continuation());
     assert_eq!(parser.screen().cell(0, 2).unwrap().contents(), "X");
+}
+
+#[test]
+fn hosted_cli_preserves_selection_and_text_attributes() {
+    let cells = vec![PaneCell {
+        text: "X".into(),
+        fg: Some((12, 34, 56)),
+        bg: Some((65, 43, 21)),
+        bold: true,
+        italic: true,
+        underline: true,
+        inverse: true,
+        width: 1,
+    }];
+    let rendered = cell_row(&cells, 3, CLI_BG);
+    let mut parser = vt100::Parser::new(1, 3, 0);
+    parser.process(rendered.as_bytes());
+    let cell = parser.screen().cell(0, 0).unwrap();
+    assert!(cell.bold());
+    assert!(cell.italic());
+    assert!(cell.underline());
+    assert!(cell.inverse());
+    let padding = parser.screen().cell(0, 1).unwrap();
+    assert!(!padding.bold());
+    assert!(!padding.inverse());
+    assert!(!padding.italic());
+    assert!(!padding.underline());
 }
 
 // Expectation: a compact physical terminal receives a compact frame, never a
@@ -141,6 +221,23 @@ fn compact_terminal_uses_its_real_viewport() {
         .join("\n");
     assert!(text.contains("TASKAI · RESIZE NEEDED"));
     assert!(text.contains("Required  110 × 30"));
+}
+
+#[test]
+fn resize_screen_keeps_escape_recovery_visible_even_at_twenty_columns() {
+    for (cols, rows) in [(20, 10), (40, 12), (80, 20)] {
+        let frame = resize_frame(cols, rows);
+        assert_eq!(frame.len(), rows);
+        assert!(frame.iter().all(|line| cell_count(line) == cols));
+        let text = frame
+            .iter()
+            .map(|line| strip_sgr(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Esc Back/Cancel"));
+        assert!(text.contains("Ctrl+G Navigation"));
+        assert!(text.contains("q Leave (navigation)"));
+    }
 }
 
 // Expectation: home opens with the three-row masthead — soft top, HUD strip with wordmark,
@@ -175,9 +272,13 @@ fn home_keybar_layout() {
         " Open",
         " n ",
         " New task",
-        " h ",
-        " Harnesses",
+        " s ",
+        " Settings",
+        " F1 ",
+        " Setup helper",
         " ? ",
+        " q ",
+        " Leave",
     ] {
         assert!(keys.contains(label), "missing {label:?} in {keys:?}");
     }

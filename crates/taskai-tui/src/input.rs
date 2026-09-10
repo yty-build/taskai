@@ -1,5 +1,5 @@
-// ABOUTME: Focus model and key routing — Ctrl+G is the boundary; CLI focus forwards
-// ABOUTME: exact terminal bytes; navigation focus interprets TaskAI keys.
+// ABOUTME: Focus model and key routing — Ctrl+G returns to navigation, Ctrl+F changes
+// ABOUTME: the focused CLI layout, and every other CLI key forwards as terminal bytes.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -12,16 +12,24 @@ pub enum Focus {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Route {
     Boundary,
+    Layout,
     Forward(Vec<u8>),
     Nav(KeyEvent),
 }
 
-/// Routes one key event: Ctrl+G is always the boundary; with CLI focus everything else
-/// forwards as the exact bytes a terminal would send; with navigation focus TaskAI
-/// interprets the key.
+/// Routes one key event: Ctrl+G is the navigation boundary and Ctrl+F changes the CLI
+/// layout. With CLI focus, every other key forwards as the exact bytes a terminal would
+/// send; with navigation focus TaskAI interprets the key.
 pub fn route(focus: Focus, ev: KeyEvent) -> Route {
-    if ev.code == KeyCode::Char('g') && ev.modifiers.contains(KeyModifiers::CONTROL) {
-        return Route::Boundary;
+    if focus == Focus::Cli
+        && ev.modifiers.contains(KeyModifiers::CONTROL)
+        && !ev.modifiers.contains(KeyModifiers::ALT)
+    {
+        match ev.code {
+            KeyCode::Char('g' | 'G') => return Route::Boundary,
+            KeyCode::Char('f' | 'F') => return Route::Layout,
+            _ => {}
+        }
     }
     match focus {
         Focus::Nav => Route::Nav(ev),

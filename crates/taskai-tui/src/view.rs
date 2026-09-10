@@ -81,6 +81,7 @@ pub struct TaskView {
     pub crumb: String,
     pub title: String,
     pub repo: String,
+    pub connection: String,
     pub team_line: String,
     pub sessions: Vec<RailRow>,
     pub body: PaneBody,

@@ -103,3 +103,32 @@ fn clip_appends_ellipsis_on_overflow() {
     let fits = clip_segs(&segs, 30);
     assert_eq!(seglen(&fits), 21);
 }
+
+#[test]
+fn unicode_user_text_obeys_terminal_cell_width_and_cannot_inject_controls() {
+    for text in [
+        "旅行计划",
+        "Cafe\u{301}",
+        "✨ release",
+        "hello\x1b[2J\r\n\0world",
+    ] {
+        for width in 1..20 {
+            let rendered = row(&[s(text, Some(TEXT), None)], width, VOID, 0);
+            assert_eq!(cell_count(&rendered), width, "{text:?} at {width}");
+            let plain = strip_sgr(&rendered);
+            assert!(!plain.chars().any(char::is_control));
+            let mut parser = vt100::Parser::new(2, width as u16, 0);
+            parser.process(rendered.as_bytes());
+            assert_eq!(
+                parser.screen().cursor_position().0,
+                0,
+                "row wrapped: {text:?}"
+            );
+        }
+    }
+    let clipped = clip_segs(&[s("ABC", None, None), s("DEF", None, None)], 3);
+    assert_eq!(
+        clipped.iter().map(|s| s.text.as_str()).collect::<String>(),
+        "AB…"
+    );
+}

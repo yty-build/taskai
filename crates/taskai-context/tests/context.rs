@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use taskai_context::{install_bootstrap, snapshot, text_view};
-use taskai_core::registry::{Registry, SessionState, Source};
+use taskai_core::registry::{ConnectionTarget, Registry, SessionState, Source};
 
 fn seeded(dir: &Path) -> (Registry, String, String, String, String) {
     let mut reg = Registry::open(dir).unwrap();
@@ -62,6 +62,7 @@ fn snapshot_is_complete() {
     assert!(snap["context_revision"].as_u64().unwrap() > 0);
     assert_eq!(snap["task"]["ref"], t.as_str());
     assert_eq!(snap["task"]["name"], "Repository evaluation");
+    assert_eq!(snap["task"]["connection"], "<local>");
     assert_eq!(snap["self"]["session_ref"], arch.as_str());
     assert_eq!(snap["self"]["role"], "Subordinate");
     assert_eq!(snap["team_chain"]["parent"], lead.as_str());
@@ -70,6 +71,39 @@ fn snapshot_is_complete() {
     assert!(sessions
         .iter()
         .any(|s| s["session_ref"] == lead.as_str() && s["state"] == "LIVE"));
+}
+
+// Expectation: remote repository paths remain paths while connection is a separate SSH
+// command. Why: a path on cruise2 must never be mistaken for a local directory. Value:
+// humans and agents can see both what repository they own and how it is reached.
+#[test]
+fn remote_context_names_repository_and_connection_separately() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut reg = Registry::open(tmp.path()).unwrap();
+    let task = reg
+        .create_task_on(
+            "Remote",
+            Path::new("/srv/acp-gateway"),
+            ConnectionTarget::ssh("cruise2").unwrap(),
+            Source::HumanUi,
+        )
+        .unwrap();
+    let session = reg
+        .create_session(
+            &task,
+            None,
+            "Lead",
+            "claude",
+            Path::new("/srv/acp-gateway"),
+            Source::HumanUi,
+        )
+        .unwrap();
+
+    let snap = snapshot(&reg, &session).unwrap();
+    assert_eq!(snap["task"]["repo"], "/srv/acp-gateway");
+    assert_eq!(snap["task"]["connection"], "ssh cruise2");
+    let text = text_view(&reg, &session).unwrap();
+    assert!(text.contains("/srv/acp-gateway via ssh cruise2"), "{text}");
 }
 
 // Expectation: the snapshot never carries credentials, pids, sockets, or transcript

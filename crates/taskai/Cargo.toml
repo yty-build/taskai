@@ -15,6 +15,8 @@ taskai-context = { path = "../taskai-context" }
 crossterm = "0.28"
 chrono = "0.4"
 serde_json = "1"
+unicode-width = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+portable-pty = "0.8"

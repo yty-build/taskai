@@ -67,7 +67,12 @@ pub fn snapshot(reg: &Registry, session_ref: &str) -> Result<serde_json::Value, 
         "schema_version": SCHEMA_VERSION,
         "context_revision": reg.revision(),
         "generated_at": generated_at,
-        "task": { "ref": task.task_ref, "name": task.name, "repo": task.repo },
+        "task": {
+            "ref": task.task_ref,
+            "name": task.name,
+            "repo": task.repo,
+            "connection": task.connection.to_string(),
+        },
         "self": session_json(me),
         "team_chain": {
             "parent": me.parent,
@@ -108,8 +113,9 @@ pub fn text_view(reg: &Registry, session_ref: &str) -> Result<String, Error> {
             ));
         }
         None => out.push(format!(
-            "You coordinate this task's work; the repository is {}.",
-            task.repo.display()
+            "You coordinate this task's work; the repository is {} via {}.",
+            task.repo.display(),
+            task.connection
         )),
     }
     out.push(format!(
@@ -190,10 +196,11 @@ pub fn tree_view(reg: &Registry, task_ref: Option<&str>) -> String {
             continue;
         }
         out.push(format!(
-            "Task {}: \"{}\" · {}",
+            "Task {}: \"{}\" · {} · {}",
             task.task_ref,
             task.name,
-            task.repo.display()
+            task.repo.display(),
+            task.connection
         ));
         for s in reg.sessions_of(&task.task_ref) {
             if s.role == Role::Manager {

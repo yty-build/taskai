@@ -1,7 +1,8 @@
 // ABOUTME: Segment/row engine — compose styled segments into width-exact painted ANSI rows.
-// ABOUTME: Widths count chars (terminal cells for this glyph set), matching the prototype.
+// ABOUTME: Widths use terminal cells so user names, repository paths and overlays can contain Unicode.
 
 use crate::color::{bg, fg, Rgb, BOLD, RESET, VOID};
+use unicode_width::UnicodeWidthChar;
 
 #[derive(Clone, Debug)]
 pub struct Seg {
@@ -29,16 +30,31 @@ pub fn sb(text: impl Into<String>, fg: Option<Rgb>, bg: Option<Rgb>) -> Seg {
     }
 }
 
-fn chars(t: &str) -> usize {
-    t.chars().count()
+pub fn text_width(t: &str) -> usize {
+    t.chars().map(char_width).sum()
 }
 
-fn take_chars(t: &str, n: usize) -> String {
-    t.chars().take(n).collect()
+pub fn char_width(ch: char) -> usize {
+    if ch.is_control() {
+        1
+    } else {
+        ch.width().unwrap_or(1)
+    }
+}
+
+pub fn take_cells(t: &str, n: usize) -> String {
+    let mut used = 0;
+    t.chars()
+        .take_while(|ch| {
+            used += char_width(*ch);
+            used <= n
+        })
+        .map(|ch| if ch.is_control() { '�' } else { ch })
+        .collect()
 }
 
 pub fn seglen(segs: &[Seg]) -> usize {
-    segs.iter().map(|g| chars(&g.text)).sum()
+    segs.iter().map(|g| text_width(&g.text)).sum()
 }
 
 /// Compose one full line: pad to width, paint base_bg under everything.
@@ -55,10 +71,8 @@ pub fn row(segs: &[Seg], width: usize, base_bg: Rgb, indent: usize) -> String {
         if used >= width {
             break;
         }
-        let mut t = g.text.clone();
-        if used + chars(&t) > width {
-            t = take_chars(&t, width - used);
-        }
+        // User-provided text is data, never terminal escape sequences.
+        let t = take_cells(&g.text, width - used);
         out.push_str(&bg(g.bg.unwrap_or(base_bg)));
         if let Some(f) = g.fg {
             out.push_str(&fg(f));
@@ -68,7 +82,7 @@ pub fn row(segs: &[Seg], width: usize, base_bg: Rgb, indent: usize) -> String {
         }
         out.push_str(&t);
         out.push_str(RESET);
-        used += chars(&t);
+        used += text_width(&t);
     }
     if used < width {
         out.push_str(&bg(base_bg));
@@ -80,21 +94,28 @@ pub fn row(segs: &[Seg], width: usize, base_bg: Rgb, indent: usize) -> String {
 
 /// Truncate a seg list to width cells, appending an ellipsis on overflow.
 pub fn clip_segs(segs: &[Seg], width: usize) -> Vec<Seg> {
+    if seglen(segs) <= width {
+        return segs.to_vec();
+    }
+    if width == 0 {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     let mut used = 0usize;
     for g in segs {
-        if used >= width {
-            break;
+        let mut t = take_cells(&g.text, width.saturating_sub(used + 1));
+        let clipped = text_width(&g.text) > text_width(&t);
+        used += text_width(&t);
+        if clipped || used == width - 1 {
+            t.push('…');
         }
-        let mut t = g.text.clone();
-        if used + chars(&t) > width {
-            t = take_chars(&t, width.saturating_sub(used + 1)) + "…";
-        }
-        used += chars(&t);
         out.push(Seg {
             text: t,
             ..g.clone()
         });
+        if clipped || used == width - 1 {
+            break;
+        }
     }
     out
 }
@@ -126,5 +147,5 @@ pub fn strip_sgr(line: &str) -> String {
 }
 
 pub fn cell_count(line: &str) -> usize {
-    strip_sgr(line).chars().count()
+    text_width(&strip_sgr(line))
 }

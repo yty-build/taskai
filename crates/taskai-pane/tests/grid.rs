@@ -24,6 +24,17 @@ fn colors_resolve_exactly() {
     assert_eq!(cells[0][13].bg, Some((0, 0, 238)));
 }
 
+#[test]
+fn native_selection_and_emphasis_attributes_are_preserved() {
+    let mut grid = Grid::new(3, 20);
+    grid.process(b"\x1b[3;4;7mselected\x1b[0m plain");
+    let cells = grid.cells();
+    let selected = &cells[0][0];
+    assert!(selected.italic && selected.underline && selected.inverse);
+    let plain = &cells[0][9];
+    assert!(!plain.italic && !plain.underline && !plain.inverse);
+}
+
 // Expectation: bold reaches the cell; carriage-return/line-feed move the cursor; content
 // past the bottom scrolls. Why: real CLIs live on these basics. Value: the grid is a
 // faithful terminal, not a line buffer.
@@ -84,6 +95,20 @@ fn cursor_position_and_visibility_are_preserved() {
     assert!(g.cursor().visible);
 }
 
+// Expectation: TaskAI can see whether the nested CLI requested bracketed paste. Why:
+// the outer terminal reports a paste as text, so TaskAI must restore DECSET 2004 markers
+// only when the focused child expects them. Value: multiline pastes keep native-CLI
+// submission semantics through the nested terminal.
+#[test]
+fn bracketed_paste_mode_is_preserved() {
+    let mut g = Grid::new(10, 20);
+    assert!(!g.bracketed_paste());
+    g.process(b"\x1b[?2004h");
+    assert!(g.bracketed_paste());
+    g.process(b"\x1b[?2004l");
+    assert!(!g.bracketed_paste());
+}
+
 fn wait_for(pane: &Pane, needle: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -125,4 +150,34 @@ fn input_reaches_real_process() {
     let mut pane = Pane::spawn("/bin/cat", &[], &cwd, 24, 80, &[]).unwrap();
     pane.write_bytes(b"hello-from-taskai\r").unwrap();
     wait_for(&pane, "hello-from-taskai");
+}
+
+#[test]
+fn repeated_pty_resizes_keep_the_parser_and_native_terminal_in_sync() {
+    let cwd = std::env::current_dir().unwrap();
+    let mut pane = Pane::spawn(
+        "/bin/sh",
+        &[
+            "-c",
+            "printf 'READY\\n'; while IFS= read -r line; do stty size; done",
+        ],
+        &cwd,
+        24,
+        80,
+        &[],
+    )
+    .unwrap();
+    wait_for(&pane, "READY");
+    for (rows, cols) in [(12, 34), (40, 110), (24, 80)] {
+        pane.resize(rows, cols).unwrap();
+        pane.resize(rows, cols).unwrap(); // unchanged geometry is a no-op
+        pane.write_bytes(b"size\r").unwrap();
+        wait_for(&pane, &format!("{rows} {cols}"));
+        let snapshot = pane.snapshot();
+        assert_eq!(snapshot.cells.len(), rows as usize);
+        assert!(snapshot
+            .cells
+            .iter()
+            .all(|row| row.iter().map(|cell| cell.width).sum::<usize>() == cols as usize));
+    }
 }

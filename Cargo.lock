@@ -631,6 +631,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "crossterm",
+ "portable-pty",
  "serde_json",
  "taskai-connectors",
  "taskai-context",
@@ -638,6 +639,7 @@ dependencies = [
  "taskai-pane",
  "taskai-tui",
  "tempfile",
+ "unicode-width",
 ]
 
 [[package]]
@@ -682,6 +684,7 @@ name = "taskai-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "unicode-width",
  "vt100",
 ]
 

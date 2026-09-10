@@ -1,0 +1,42 @@
+▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+▌  TaskAI Helper · Claude Code · s1                                                        OWNED-TUI              Ctrl+F  Inline Ctrl+G  Navigation
+▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+
+FALLBACK-LINE-200 | private CLI history; TaskAI chrome must not move                                                                  18:27:25 [5/205]
+FALLBACK-LINE-201 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-202 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-203 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-204 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-205 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-206 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-207 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-208 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-209 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-210 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-211 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-212 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-213 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-214 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-215 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-216 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-217 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-218 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-219 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-220 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-221 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-222 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-223 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-224 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-225 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-226 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-227 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-228 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-229 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-230 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-231 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-232 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-233 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-234 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-235 | private CLI history; TaskAI chrome must not move
+FALLBACK-LINE-236 | private CLI history; TaskAI chrome must not move
+Wheel  Scroll CLI · Esc / End  Leave tmux history · Ctrl+G  Navigation
