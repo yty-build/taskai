@@ -11,7 +11,23 @@ use std::{
 const BEGIN: &str = "<!-- taskai-helper:begin -->";
 const END: &str = "<!-- taskai-helper:end -->";
 
-const GUIDE: &str = r#"# TaskAI Helper — bundled setup guide v1
+const GAUNTLET_LOOP: &str = include_str!("skills/gauntlet-loop.md");
+const STAFF_OBJECTIVE: &str = include_str!("skills/taskai-staff-objective.md");
+
+const SKILL_FILES: &[(&str, &str)] = &[
+    (".claude/skills/gauntlet-loop/SKILL.md", GAUNTLET_LOOP),
+    (
+        ".claude/skills/taskai-staff-objective/SKILL.md",
+        STAFF_OBJECTIVE,
+    ),
+    (".grok/skills/gauntlet-loop/SKILL.md", GAUNTLET_LOOP),
+    (
+        ".grok/skills/taskai-staff-objective/SKILL.md",
+        STAFF_OBJECTIVE,
+    ),
+];
+
+const GUIDE: &str = r#"# TaskAI Helper — bundled setup guide v2
 
 You are an optional TaskAI setup helper, not an administrator or background
 automation service. Your dedicated `taskai-helper` task and local Manager are
@@ -93,6 +109,37 @@ pending request. The user reviews and submits the ordinary form themselves.
 Use real refs from context/status, not display names. A rejected or disconnected
 request is not success; explain the error and provide the manual shortcut.
 
+## Objectives, gauntlet staffing, and recommended teams
+
+When the user states a goal or asks you to create agents, follow
+`.claude/skills/taskai-staff-objective/SKILL.md` (Grok loads the same skill
+from `.grok/skills/`). Use `.claude/skills/gauntlet-loop/SKILL.md` for the
+quality bar. You still do not start the work yourself.
+
+Ask probing questions first. Do not write a paste prompt, pick harnesses, or
+queue UI requests until the user has answered enough to name a real bar.
+
+The paste-ready brief uses three headings and nothing else:
+
+The task
+what to build, for whom, and any named constraints
+
+The build method (How)
+builder and a separate harsh critic on each judgeable piece, looping until
+the critic wins blind; portable loop instructions for non-Claude leads
+
+The bar to hit (When)
+a named, fetchable, comparable reference; exit when the critic picks ours,
+never after a round count
+
+Recommend a Manager and Subordinates (Claude Code, Codex, Grok CLI, OpenCode)
+from `taskai helper status` readiness and the kind of work. The critic must
+be a different harness and session from the builder. Do not invent remaining
+usage or quota; if spend matters, ask. Do not create tasks or agents. After
+the user accepts the recommendation, queue one existing
+`taskai helper request ...` at a time and tell them to press Ctrl+G then F8.
+They paste the brief into the Lead themselves.
+
 ## Safety, native authentication, and approvals
 
 Do not read, copy, print, move, or edit credential stores, tokens, private SSH
@@ -119,7 +166,7 @@ install, authenticate, create work, or run models. Ask when authority or the exa
 target is unclear; do not silently improvise a broader action.
 "#;
 
-const AGENTS: &str = r#"# TaskAI Helper instructions v1
+const AGENTS: &str = r#"# TaskAI Helper instructions v2
 
 Read README.md's bundled TaskAI Helper setup guide before advising or acting.
 The newest injected TaskAI Context is current. At each turn without new context,
@@ -129,6 +176,11 @@ This is an ordinary optional local Manager. Do not read/copy credential stores,
 hand-edit live tracker JSON, or silently install/change configuration or models.
 Native provider authentication stays in the native CLI. A version check is not
 proof of login. Model calls and maintenance changes need explicit user approval.
+
+When the user states an objective, follow `.claude/skills/taskai-staff-objective/SKILL.md`.
+Ask probing questions before writing The task / The build method (How) / The bar to hit (When).
+Recommend Manager and Subordinate harnesses from helper status; do not invent quota.
+Do not create tasks or agents; queue one `taskai helper request ...` after they accept.
 
 `taskai helper guide` and `taskai helper status` are read-only. Supported
 `taskai helper request ...` commands only queue existing UI destinations. The
@@ -165,7 +217,7 @@ pub fn prepare_workspace(home: &Path) -> Result<PathBuf, String> {
         }
         Err(error) => return Err(format!("Read helper workspace: {error}")),
     }
-    let prepared = [("AGENTS.md", AGENTS), ("README.md", GUIDE)]
+    let mut prepared = [("AGENTS.md", AGENTS), ("README.md", GUIDE)]
         .into_iter()
         .map(|(name, content)| {
             let path = workspace.join(name);
@@ -174,6 +226,19 @@ pub fn prepare_workspace(home: &Path) -> Result<PathBuf, String> {
             Ok((path, previous, updated))
         })
         .collect::<Result<Vec<_>, String>>()?;
+    for (rel, content) in SKILL_FILES {
+        let path = workspace.join(rel);
+        let previous = read_owned_file(&path)?;
+        let updated = managed_content(&previous, content)?;
+        prepared.push((path, previous, updated));
+    }
+    for (path, previous, updated) in &prepared {
+        if previous != updated {
+            if let Some(parent) = path.parent() {
+                ensure_owned_dir(parent, &workspace)?;
+            }
+        }
+    }
     for (path, previous, updated) in prepared {
         if previous != updated {
             atomic_write(&path, updated.as_bytes())
@@ -183,6 +248,43 @@ pub fn prepare_workspace(home: &Path) -> Result<PathBuf, String> {
     workspace
         .canonicalize()
         .map_err(|error| format!("Resolve helper workspace: {error}"))
+}
+
+fn ensure_owned_dir(dir: &Path, workspace: &Path) -> Result<(), String> {
+    if dir == workspace {
+        return Ok(());
+    }
+    if let Some(parent) = dir.parent() {
+        ensure_owned_dir(parent, workspace)?;
+    }
+    match fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "Helper skill path must not be a symlink: {}",
+            dir.display()
+        )),
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(format!(
+            "Helper skill path must be a directory: {}",
+            dir.display()
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(dir).map_err(|error| {
+                format!("Create helper skill directory {}: {error}", dir.display())
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|error| {
+                    format!("Protect helper skill directory {}: {error}", dir.display())
+                })?;
+            }
+            Ok(())
+        }
+        Err(error) => Err(format!(
+            "Read helper skill directory {}: {error}",
+            dir.display()
+        )),
+    }
 }
 
 fn read_owned_file(path: &Path) -> Result<String, String> {
@@ -339,11 +441,70 @@ mod tests {
             "explicit approval",
             "Do not read, copy",
             "Do not hand-edit live TaskAI JSON",
+            "The task",
+            "The build method (How)",
+            "The bar to hit (When)",
+            "probing questions",
+            "Do not create tasks or agents",
+            "Recommend",
         ] {
             assert!(
                 guide().contains(required),
                 "missing guide safety/navigation: {required}"
             );
         }
+    }
+
+    #[test]
+    fn bundled_workspace_installs_gauntlet_and_staff_skills_for_claude_and_grok() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = prepare_workspace(root.path()).unwrap();
+        for rel in [
+            ".claude/skills/gauntlet-loop/SKILL.md",
+            ".claude/skills/taskai-staff-objective/SKILL.md",
+            ".grok/skills/gauntlet-loop/SKILL.md",
+            ".grok/skills/taskai-staff-objective/SKILL.md",
+        ] {
+            let path = workspace.join(rel);
+            let body = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("missing {}: {error}", path.display()));
+            assert!(
+                body.contains(BEGIN) && body.contains(END),
+                "{} must be a managed helper block",
+                path.display()
+            );
+        }
+        let gauntlet =
+            fs::read_to_string(workspace.join(".claude/skills/gauntlet-loop/SKILL.md")).unwrap();
+        assert!(gauntlet.contains("name: gauntlet-loop"));
+        assert!(gauntlet.contains("Named."));
+        assert!(gauntlet.contains("Fetchable."));
+        assert!(gauntlet.contains("Comparable."));
+        assert!(gauntlet.contains("Matt Shumer"));
+        assert!(gauntlet.contains("CC BY 4.0"));
+        let staff =
+            fs::read_to_string(workspace.join(".claude/skills/taskai-staff-objective/SKILL.md"))
+                .unwrap();
+        assert!(staff.contains("name: taskai-staff-objective"));
+        assert!(staff.contains("The task"));
+        assert!(staff.contains("The build method (How)"));
+        assert!(staff.contains("The bar to hit (When)"));
+        assert!(staff.contains("Do not create tasks or agents"));
+        assert!(staff.contains("taskai helper request"));
+        assert!(staff.contains("Claude Code"));
+        assert!(staff.contains("Codex"));
+        assert!(staff.contains("Grok CLI"));
+        assert!(staff.contains("OpenCode"));
+        assert!(
+            staff.contains("Never invent remaining usage"),
+            "must refuse invented provider quota"
+        );
+        let again =
+            fs::read_to_string(workspace.join(".claude/skills/gauntlet-loop/SKILL.md")).unwrap();
+        prepare_workspace(root.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace.join(".claude/skills/gauntlet-loop/SKILL.md")).unwrap(),
+            again
+        );
     }
 }

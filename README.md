@@ -168,10 +168,12 @@ any native trust/login step, then type your question. Helper prompts use your
 normal provider account and billing.
 
 Its private `$TASKAI_HOME/helper` workspace (default `~/.taskai/helper`) contains
-the bundled versioned setup guide in README.md and AGENTS.md. No new daemon or
-credential store is added. It can explain setup and queue existing UI forms;
-press `Ctrl+G`, then `F8` to review a requested destination. `Esc` in navigation
-dismisses a request. Existing drafts are not replaced; saving/creating still
+the bundled versioned setup guide in README.md and AGENTS.md, plus managed
+`gauntlet-loop` and `taskai-staff-objective` skills. Give it an objective and it
+asks probing questions, writes a Task / How / Bar brief, and recommends which
+Ready harnesses to use as Manager and Subordinates. It does not create them:
+queue the ordinary forms with `Ctrl+G` then `F8`. No new daemon or credential
+store is added. Existing drafts are not replaced; saving/creating still
 requires you to submit the ordinary form. A request is not permission to install,
 change configuration, authenticate, destroy work, or make model calls.
 

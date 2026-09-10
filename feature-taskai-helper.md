@@ -31,11 +31,21 @@ orphan task and consumes no task/session refs. The local server profile supplies
 new-agent executable/model defaults; existing sessions are not rewritten.
 
 The private `$TASKAI_HOME/helper` directory contains versioned bundled README.md
-and AGENTS.md guidance. Only TaskAI's marked guide blocks are updated; unrelated
-text/files are preserved. Malformed blocks and symlinked guide targets are
-rejected. Ordinary local context bootstrap makes the guide discoverable to the
-native agent. The newest injected TaskAI Context remains the source of current
-session/assignment information, not an old transcript or the static guide.
+and AGENTS.md guidance, plus managed copies of `gauntlet-loop` and
+`taskai-staff-objective` under `.claude/skills/` and `.grok/skills/`. Only
+TaskAI's marked blocks are updated; unrelated text/files are preserved.
+Malformed blocks and symlinked guide or skill targets are rejected. Ordinary
+local context bootstrap makes the guide discoverable to the native agent. The
+newest injected TaskAI Context remains the source of current session/assignment
+information, not an old transcript or the static guide.
+
+When the user states an objective, the helper asks probing questions first,
+offers named/fetchable/comparable gauntlet bars, writes a paste-ready brief
+(`The task`, `The build method (How)`, `The bar to hit (When)`), and recommends
+Manager/Subordinate harnesses from helper-status readiness and work type. It
+does not know remaining usage or quota. It still does not create tasks or
+agents: after the user accepts, it queues one existing `taskai helper request`
+at a time for Ctrl+G then F8 review.
 
 ## Reviewable UI handoff
 
@@ -90,8 +100,10 @@ does not gain a new sandbox or elevated OS privileges.
 1. Legacy/no-helper defaults; duplicate display names; exact ref/native identity
    reuse; local launch snapshots; disabled/persistence failure rollback; normal
    destroy and stale-ref recovery without ID reuse or unrelated-task changes.
-2. Guide installation is idempotent, preserves unrelated bytes, and refuses
-   malformed blocks/symlinks before changing the other guide file.
+2. Guide and skill installation is idempotent, preserves unrelated bytes, and
+   refuses malformed blocks/symlinks before changing the other managed files.
+   Bundled skills include gauntlet-loop (attributed, CC BY 4.0) and
+   taskai-staff-objective (probe first; recommend; do not create).
 3. Isolated real UI with explicitly fake providers: chooser cancellation, ordinary
    task/Manager counts, zero initial stdin, direct typing, Ctrl+F/Ctrl+G, and
    F1/Settings helper entry reuse. Check layout at supported terminal sizes.
