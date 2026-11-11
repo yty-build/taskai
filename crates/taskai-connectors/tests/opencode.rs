@@ -3,10 +3,17 @@
 
 mod harness;
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use taskai_connectors::opencode::OpenCodeConnector;
 use taskai_connectors::Mode;
+
+// These real servers use the same installed provider and its user-level state.
+// Keep their startup and teardown from contending across independent test cases.
+static SERVER_TEST: Mutex<()> = Mutex::new(());
 
 // Expectation: probing the installed OpenCode CLI reports shared-live with a version.
 // Why: capability truth; 1.18.25 is the version-gated environment pin. Value: earned READY.
@@ -27,6 +34,7 @@ fn probe_real_opencode() {
 // substrate is proven free of model spend.
 #[test]
 fn server_is_authenticated_and_creates_sessions() {
+    let _server_test = SERVER_TEST.lock().unwrap();
     if !harness::ready("opencode", &OpenCodeConnector::default().probe()) {
         return;
     }
@@ -53,6 +61,7 @@ fn server_is_authenticated_and_creates_sessions() {
 // Value: the pane shows the exact native client, not a re-implementation.
 #[test]
 fn native_tui_attaches_to_shared_server() {
+    let _server_test = SERVER_TEST.lock().unwrap();
     if !harness::ready("opencode", &OpenCodeConnector::default().probe()) {
         return;
     }
@@ -81,6 +90,7 @@ fn native_tui_attaches_to_shared_server() {
 #[test]
 #[ignore = "billed: one live OpenCode turn; requires T approval"]
 fn live_opencode_turn_correlates() {
+    let _server_test = SERVER_TEST.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let c = OpenCodeConnector::default();
     let server = c.start_server(tmp.path()).unwrap();

@@ -70,7 +70,8 @@ fn assert_startup_stop(signal_bridge: bool, delayed_reply: bool, hold_initialize
     if Command::new("tmux").arg("-V").output().is_err() {
         return;
     }
-    let root = TempDir::new().unwrap();
+    // The daemon's fixed socket suffix exceeds macOS SUN_LEN under its long TMPDIR.
+    let root = TempDir::new_in("/tmp").unwrap();
     let workspace = root.path().join("workspace");
     fs::create_dir(&workspace).unwrap();
     let codex_home = root.path().join("codex-home");

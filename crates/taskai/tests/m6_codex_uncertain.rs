@@ -52,7 +52,8 @@ fn lost_first_turn_ack_keeps_exact_thread_and_never_resumes_native_child() {
     if Command::new("tmux").arg("-V").output().is_err() {
         return;
     }
-    let root = TempDir::new().unwrap();
+    // The daemon's fixed socket suffix exceeds macOS SUN_LEN under its long TMPDIR.
+    let root = TempDir::new_in("/tmp").unwrap();
     let workspace = root.path().join("workspace");
     fs::create_dir(&workspace).unwrap();
     let codex_home = root.path().join("codex-home");
