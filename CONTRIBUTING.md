@@ -1,12 +1,14 @@
 # Contributing to TaskAI
 
-Thanks for looking. This file covers how to build it, how the tests are organized, and
-the one workflow that isn't obvious — changing the terminal design.
+This repository contains the current application, its tests, and maintained user and
+developer documentation. Historical feature plans, prototype code, and development
+captures are retained in Git history.
 
 ## Build and run
 
 ```sh
-cargo build --release
+cargo build --release --locked
+mkdir -p ~/.local/bin
 install -m 0755 target/release/taskai ~/.local/bin/taskai   # any directory on PATH
 taskai
 ```
@@ -26,18 +28,23 @@ Missing or out-of-range CLIs show as SETUP in the harness bay.
 | `taskai-tui` | The FILL design system, screen renderers, overlays, focus and key routing |
 | `taskai` | The binary: TUI, `context`, and `session` subcommands |
 
-`backend_communication.md` is the architecture contract — read it before touching a
-connector. It defines each harness's mode (`shared-live`, `owned-tui`, `handoff-resume`)
-and what TaskAI is and isn't allowed to do on a provider's behalf.
+Read the [architecture](docs/architecture.md) before changing a connector and
+[compatibility](docs/compatibility.md) before claiming support for a provider release.
+Agent-to-agent messaging and the older UI control path have different delivery
+mechanisms. Preserve exact provider-session identity and native approval behavior.
+
+User-facing behavior belongs in the [user guide](docs/user-guide.md). Keep the root
+README focused on the product and getting started. Build output, raw terminal
+captures, and milestone journals do not belong on `main`.
 
 ## Tests
 
 ```sh
-cargo test
+cargo test --all-features
 ```
 
-No test calls a model, so the suite is free to run. It covers real logic, real ptys, and
-real provider CLIs where they're installed.
+The default run makes no model calls. It covers real logic, real ptys, and real provider
+CLIs where they're installed.
 
 **Absent or outdated harnesses skip.** A proof whose CLI is missing — or whose version is
 below the connector's supported range — prints `unproven: <cli> …` and skips, so a clone
@@ -45,17 +52,20 @@ with none of the four CLIs is still green. That's deliberate: a skipped proof mu
 read as a passing one.
 
 ```sh
-TASKAI_REQUIRE_HARNESSES=1 cargo test    # absent harness becomes a failure
+TASKAI_REQUIRE_HARNESSES=1 cargo test --all-features
 ```
 
 Use that before claiming a release is verified.
 
 **Billed live proofs** are `#[ignore]`d and marked `billed:` in their ignore reason. They
-run one real model turn against a real provider. The protocol:
+make real model calls. The protocol:
 
 1. Propose the batch: which tests, which harnesses, expected turn count.
 2. Get explicit approval from the maintainer. No billed call runs without it.
 3. Record the result — pass/fail, provider session refs, date — under `tests/evidence/`.
+   Generated reports are ignored. Review and sanitize a report before publishing it
+   explicitly with `git add -f tests/evidence/<report>`; update the compatibility
+   status when the evidence changes.
 4. Re-run a failed proof only after a fix, under fresh approval.
 
 ## Changing the terminal design
@@ -80,8 +90,8 @@ diff; that is the one way to silently lose the design.
 ## Style
 
 ```sh
-cargo fmt
-cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 Both are enforced in CI. `clippy.toml` pins the MSRV so lints don't suggest APIs newer

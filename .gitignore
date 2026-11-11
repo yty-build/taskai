@@ -6,3 +6,12 @@ __pycache__/
 # Local working notes and machine-specific agent config, never distributed.
 journal.md
 .claude/
+
+# Generated acceptance reports stay local unless explicitly reviewed for publication.
+/tests/evidence/*
+!/tests/evidence/README.md
+
+# Files left by the fake-provider lifecycle tests.
+/crates/taskai/heartbeat
+/crates/taskai/launches
+/crates/taskai/pid
