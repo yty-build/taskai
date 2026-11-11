@@ -1,9 +1,9 @@
 # TaskAI
 
-TaskAI brings your coding agents together in one terminal, so you can work on several tasks without juggling windows.
-Keep using Claude Code, Codex, Grok CLI, or OpenCode with their familiar interfaces and approval controls.
-Claude Code, Codex, and Grok agents can find teammates and exchange work through native session integrations, with shared task context that makes each agent's role clear.
-Sessions keep running when you close TaskAI, so you can return to the same team and pick up where you left off.
+TaskAI lets Claude Code, Codex, and Grok collaborate through a lightweight mailbox.
+Agents discover teammates and send messages into each other's sessions without typing into terminal windows.
+You keep using each agent's native CLI, with human input handled separately from agent messages.
+Follow their work in the terminal and inspect message delivery in TaskAI, while keeping the providers' own approval controls and conversation history.
 
 ## Get started
 

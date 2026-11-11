@@ -4,6 +4,11 @@ TaskAI owns tasks, team context, session references, terminal viewers, and messa
 adapters. Provider CLIs own their conversations, model behavior, tools, and approvals.
 Humans and agents decide what work to do; TaskAI routes their requests.
 
+The core separation is between agent messages and human terminal input. Agents use
+discovery and messaging tools; their messages enter the recipient's native session
+through a provider adapter. Humans continue using that session's terminal directly.
+Provider scheduling and approvals still apply to the work delivered by either path.
+
 ## Tasks and sessions
 
 A task groups Manager and Subordinate sessions around a repository and a local or
@@ -49,8 +54,13 @@ interface; receiving into a live provider session is a separate integration.
 
 Codex tools are registered at `thread/start`; its bridge answers `item/tool/call`.
 Grok's MCP process forwards calls over a private bridge socket using the session's
-identity. Claude integration mirrors TaskAI sessions into its native peer registry.
-There is no dependency on a Claude session being present for Codex and Grok to message.
+identity. MCP is Grok's tool connection, not the common mailbox transport.
+
+Claude integration publishes bridge presence cards in `~/.claude/sessions` and
+speaks Claude's native peer protocol. The cards advertise session identity and
+socket addresses; message bodies travel through sockets rather than files in that
+folder. TaskAI owns the shared mailbox protocol, so Codex and Grok can message
+without a Claude session being present.
 
 An outbound tool call resolves a same-task recipient, passes a message through TaskAI's
 mailbox transport, and reaches the recipient's provider adapter. Agent-to-agent message
