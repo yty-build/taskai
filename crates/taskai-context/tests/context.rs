@@ -126,7 +126,7 @@ fn remote_context_names_repository_and_connection_separately() {
     let task = reg
         .create_task_on(
             "Remote",
-            Path::new("/srv/acp-gateway"),
+            Path::new("/srv/taskai"),
             ConnectionTarget::ssh("cruise2").unwrap(),
             Source::HumanUi,
         )
@@ -137,16 +137,16 @@ fn remote_context_names_repository_and_connection_separately() {
             None,
             "Lead",
             "claude",
-            Path::new("/srv/acp-gateway"),
+            Path::new("/srv/taskai"),
             Source::HumanUi,
         )
         .unwrap();
 
     let snap = snapshot(&reg, &session).unwrap();
-    assert_eq!(snap["task"]["repo"], "/srv/acp-gateway");
+    assert_eq!(snap["task"]["repo"], "/srv/taskai");
     assert_eq!(snap["task"]["connection"], "ssh cruise2");
     let text = text_view(&reg, &session).unwrap();
-    assert!(text.contains("/srv/acp-gateway via ssh cruise2"), "{text}");
+    assert!(text.contains("/srv/taskai via ssh cruise2"), "{text}");
 }
 
 // Expectation: the snapshot never carries credentials, pids, sockets, or transcript

@@ -29,7 +29,7 @@ fn live_worktree_panel(cols: usize) -> Vec<String> {
     let note = vec![
         vec![s("CODE WILL LIVE AT", Some(FT), Some(GLASS))],
         vec![s(
-            "~/Documents/GitHub/acp-gateway-worktrees/verification-pass",
+            "~/Documents/GitHub/taskai-worktrees/verification-pass",
             Some(DIM),
             Some(GLASS),
         )],

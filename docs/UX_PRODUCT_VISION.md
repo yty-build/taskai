@@ -73,7 +73,7 @@ alias such as `ssh cruise2`, and Repository accepts an absolute remote path, `~`
 │ Current path  /Users/me/Documents/GitHub                            │
 │                                                                    │
 │  ../                                                               │
-│  ▸ acp-gateway/                                                     │
+│  ▸ taskai/                                                          │
 │  ▸ buzz/                 ← selected repository                     │
 │  ▸ another-project/                                                │
 ├────────────────────────────────────────────────────────────────────┤

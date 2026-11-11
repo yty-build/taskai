@@ -19,8 +19,7 @@ The CLI can be focused either beside the session rail or full-screen. While it h
 focus, TaskAI reserves `Ctrl+F` to change that layout and `Ctrl+G` to return to
 navigation; every other keystroke passes through to the CLI unchanged.
 
-The project is TaskAI; the repository is named `acp-gateway` after the agent-conduit work
-it grew out of.
+Source: [yty-build/taskai](https://github.com/yty-build/taskai).
 
 ## Install
 

@@ -710,7 +710,7 @@ fn runtime_and_provider_identity_remain_separate() {
         let task_ref = reg
             .create_task_on(
                 "Remote evaluation",
-                Path::new("/srv/acp-gateway"),
+                Path::new("/srv/taskai"),
                 ConnectionTarget::ssh("cruise2").unwrap(),
                 Source::HumanUi,
             )
@@ -721,7 +721,7 @@ fn runtime_and_provider_identity_remain_separate() {
                 None,
                 "Lead",
                 "claude",
-                Path::new("/srv/acp-gateway"),
+                Path::new("/srv/taskai"),
                 Source::HumanUi,
             )
             .unwrap();

@@ -129,7 +129,7 @@ An illustrative remote record is:
     {
       "task_ref": "t1",
       "name": "Remote evaluation",
-      "repo": "/srv/acp-gateway",
+      "repo": "/srv/taskai",
       "connection": {
         "kind": "ssh",
         "host": "cruise2"
@@ -143,7 +143,7 @@ An illustrative remote record is:
       "parent": null,
       "role": "Manager",
       "harness": "claude",
-      "workspace": "/srv/acp-gateway",
+      "workspace": "/srv/taskai",
       "provider": {
         "provider": "claude",
         "provider_session_id": "provider-native-id",
