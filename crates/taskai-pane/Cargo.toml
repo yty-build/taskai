@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 portable-pty = "0.8"
+taskai-core = { path = "../taskai-core" }
 vt100 = "0.15"
 
 [dev-dependencies]

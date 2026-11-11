@@ -10,7 +10,9 @@ pub mod opencode;
 pub mod rpc;
 
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fmt;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +39,14 @@ pub struct Capability {
     pub mode: Mode,
     pub version: Option<String>,
     pub detail: String,
+}
+
+/// A command for `program` without the Claude messaging variables TaskAI inherited. Every connector
+/// child starts from one, and none sets such a variable itself.
+pub(crate) fn child_command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(program);
+    taskai_core::mail::strip_messaging_env(&mut command);
+    command
 }
 
 /// Numeric dotted-version comparison against a connector's declared minimum.
@@ -80,6 +90,7 @@ pub enum Error {
     Unsupported(String),
     NotAttached(String),
     Timeout(String),
+    Uncertain(String),
     Io(std::io::Error),
     Invalid(String),
 }
@@ -91,6 +102,7 @@ impl fmt::Display for Error {
             Error::Unsupported(m) => write!(f, "unsupported: {m}"),
             Error::NotAttached(m) => write!(f, "not attached: {m}"),
             Error::Timeout(m) => write!(f, "timeout: {m}"),
+            Error::Uncertain(m) => write!(f, "uncertain: {m}"),
             Error::Io(e) => write!(f, "io: {e}"),
             Error::Invalid(m) => write!(f, "invalid: {m}"),
         }

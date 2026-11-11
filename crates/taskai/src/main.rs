@@ -1,16 +1,22 @@
-// ABOUTME: taskai binary — the live TUI, `session prompt` conduit client, `context`
-// ABOUTME: service CLI, and `--dump-frame` for tests and parity tooling.
+// ABOUTME: taskai binary — the live TUI, `session prompt` conduit client, `session launch`, `context`
+// ABOUTME: service CLI, `mcp` stdio server, `doctor` readiness report, and `--dump-frame` for tests.
 
 mod app;
+mod bridge;
+mod doctor;
 mod forms;
+mod gate;
 mod helper;
 mod launch;
+mod messages;
+mod observer;
 mod remote_probes;
 mod server_settings;
 mod tmux;
 mod ui_events;
 
 use taskai_connectors::control;
+use taskai_connectors::grok::forward_mode_hook;
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -37,6 +43,24 @@ fn main() -> io::Result<()> {
     if args.first().map(String::as_str) == Some("__opencode-runtime") {
         return opencode_runtime();
     }
+    if args.first().map(String::as_str) == Some("observer") {
+        return match args.as_slice() {
+            [_, session_ref] => observer::run(&taskai_home(), session_ref).map_err(io_err),
+            _ => Err(io::Error::other("usage: taskai observer <session_ref>")),
+        };
+    }
+    if args.first().map(String::as_str) == Some("gate") {
+        return match args.as_slice() {
+            [_, session_ref] => gate::run(&taskai_home(), session_ref).map_err(io_err),
+            _ => Err(io::Error::other("usage: taskai gate <session_ref>")),
+        };
+    }
+    if args.first().map(String::as_str) == Some("bridge") {
+        return match args.as_slice() {
+            [_, session_ref] => bridge::run(&taskai_home(), session_ref).map_err(io_err),
+            _ => Err(io::Error::other("usage: taskai bridge <session_ref>")),
+        };
+    }
     if args.first().map(String::as_str) == Some("session") {
         return session_cmd(&args[1..]);
     }
@@ -45,6 +69,23 @@ fn main() -> io::Result<()> {
     }
     if args.first().map(String::as_str) == Some("helper") {
         return helper_cmd(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("mcp") {
+        return taskai_connectors::grok::run_mcp_stdio();
+    }
+    if args.first().map(String::as_str) == Some("grok-mode-hook") {
+        if args.len() != 1 {
+            return Err(io::Error::other("usage: taskai grok-mode-hook"));
+        }
+        // Native Grok owns the hook decision. This command only forwards evidence;
+        // even a failed forward produces no stdout decision for the native hook.
+        if let Err(reason) = grok_mode_hook(io::stdin().lock()) {
+            eprintln!("Grok mode evidence unavailable: {reason}");
+        }
+        return Ok(());
+    }
+    if args.first().map(String::as_str) == Some("doctor") {
+        return doctor::run(&taskai_home(), &args[1..]);
     }
     let mut screen: Option<String> = None;
     let mut attach: Option<PathBuf> = None;
@@ -93,6 +134,18 @@ fn main() -> io::Result<()> {
     }
 }
 
+fn grok_mode_hook(reader: impl Read) -> Result<(), String> {
+    let socket = std::env::var_os("TASKAI_MODE_SOCKET")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or("missing TASKAI_MODE_SOCKET")?;
+    let session_id = std::env::var("GROK_SESSION_ID")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .ok_or("missing GROK_SESSION_ID")?;
+    forward_mode_hook(reader, &socket, &session_id).map_err(|error| error.to_string())
+}
+
 /// Keeps OpenCode's already-approved serve + attach pair in the same durable tmux
 /// runtime. This is an internal launcher, not a resident TaskAI service.
 fn opencode_runtime() -> io::Result<()> {
@@ -110,7 +163,10 @@ fn opencode_runtime() -> io::Result<()> {
         &mut args,
         std::env::var("TASKAI_OPENCODE_SESSION_ID").ok().as_deref(),
     );
-    let status = Command::new(program).args(args).envs(envs).status()?;
+    let mut command = Command::new(program);
+    command.args(args).envs(envs);
+    taskai_core::mail::strip_messaging_env(&mut command);
+    let status = command.status()?;
     drop(server);
     if status.success() {
         Ok(())
@@ -209,6 +265,23 @@ fn session_cmd(args: &[String]) -> io::Result<()> {
             }
             Err(e) => {
                 eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
+    }
+    if args.first().map(String::as_str) == Some("launch") {
+        let [_, session_ref] = args else {
+            eprintln!("usage: taskai session launch <ref>");
+            std::process::exit(2);
+        };
+        let home = taskai_home();
+        return match launch::run_detached(&home, &app::private_server_name(&home), session_ref) {
+            Ok(report) => {
+                println!("{report}");
+                Ok(())
+            }
+            Err(error) => {
+                eprintln!("error: {error}");
                 std::process::exit(1);
             }
         };

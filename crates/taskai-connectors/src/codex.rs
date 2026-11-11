@@ -1,12 +1,13 @@
-// ABOUTME: Codex connector — shared-live: the native TUI and the TaskAI app-server
-// ABOUTME: sidecar share one thread store; JSON-RPC over stdio, threadId + turn correlation.
+// ABOUTME: Codex capability probe and existing stdio app-server helper.
+// ABOUTME: The daemon module owns TaskAI session messaging over the shared Unix WebSocket.
 
-use std::process::Command;
 use std::time::Duration;
 
 use crate::claude::parse_version;
 use crate::rpc::StdioRpc;
 use crate::{Capability, Error, Mode};
+
+pub mod daemon;
 
 pub struct CodexConnector {
     pub bin: String,
@@ -23,7 +24,7 @@ impl Default for CodexConnector {
 impl CodexConnector {
     /// Harmless handshake: reads the version, never creates a thread.
     pub fn probe(&self) -> Capability {
-        match Command::new(&self.bin).arg("--version").output() {
+        match crate::child_command(&self.bin).arg("--version").output() {
             Ok(out) if out.status.success() => {
                 let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 crate::gate_version(

@@ -15,6 +15,8 @@ pub enum Screen {
     Subordinate,
     Destroy,
     Help,
+    Pulse,
+    Messages,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

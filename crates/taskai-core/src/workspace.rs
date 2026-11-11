@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
-use crate::Error;
+use crate::{mail::strip_messaging_env, Error};
 
 #[derive(Clone, Debug)]
 pub enum WorkspaceChoice {
@@ -23,7 +23,7 @@ pub enum WorkspaceChoice {
 /// branches and preserved worktree directories from earlier agents.
 pub fn suggest_worktree(repo: &Path) -> Option<(String, String)> {
     resolve_commit(repo, "HEAD").ok()?;
-    let symbolic = Command::new("git")
+    let symbolic = git()
         .arg("-C")
         .arg(repo)
         .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
@@ -34,7 +34,7 @@ pub fn suggest_worktree(repo: &Path) -> Option<(String, String)> {
     } else {
         "HEAD".into()
     };
-    let refs = Command::new("git")
+    let refs = git()
         .arg("-C")
         .arg(repo)
         .args(["for-each-ref", "--format=%(refname:short)", "refs/heads/"])
@@ -79,7 +79,7 @@ fn resolve_commit(repo: &Path, revision: &str) -> Result<String, Error> {
             "choose a base branch or commit first".into(),
         ));
     }
-    let output = Command::new("git")
+    let output = git()
         .arg("-C")
         .arg(repo)
         .args(["rev-parse", "--verify", "--quiet", "--end-of-options"])
@@ -105,7 +105,7 @@ fn validate_worktree(base: &Path, branch: &str, name: &str, path: &Path) -> Resu
                 .into(),
         ));
     }
-    let valid_name = Command::new("git")
+    let valid_name = git()
         .args(["check-ref-format", "--branch", name])
         .output()?;
     if !valid_name.status.success() {
@@ -120,7 +120,7 @@ fn validate_worktree(base: &Path, branch: &str, name: &str, path: &Path) -> Resu
             path.display()
         )));
     }
-    let existing = Command::new("git")
+    let existing = git()
         .arg("-C")
         .arg(base)
         .args(["show-ref", "--verify", "--quiet"])
@@ -136,7 +136,7 @@ fn validate_worktree(base: &Path, branch: &str, name: &str, path: &Path) -> Resu
             String::from_utf8_lossy(&existing.stderr).trim().to_string(),
         ));
     }
-    let descendants = Command::new("git")
+    let descendants = git()
         .arg("-C")
         .arg(base)
         .args(["for-each-ref", "--format=%(refname)"])
@@ -195,7 +195,7 @@ pub fn provision(choice: &WorkspaceChoice, manager_repo: &Path) -> Result<PathBu
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let out = Command::new("git")
+            let out = git()
                 .arg("-C")
                 .arg(base)
                 .args(["worktree", "add", "-b", name, "--"])
@@ -210,4 +210,12 @@ pub fn provision(choice: &WorkspaceChoice, manager_repo: &Path) -> Result<PathBu
             Ok(path)
         }
     }
+}
+
+/// git, without the Claude messaging variables TaskAI inherited; these calls set no variables of
+/// their own.
+fn git() -> Command {
+    let mut git = Command::new("git");
+    strip_messaging_env(&mut git);
+    git
 }

@@ -19,7 +19,7 @@ Missing or out-of-range CLIs show as SETUP in the harness bay.
 
 | Crate | Owns |
 |---|---|
-| `taskai-core` | Domain model and Registry: tasks, sessions, stable refs, topology, states, persistence, workspace provisioning, destroy semantics |
+| `taskai-core` | Domain model, Registry, and session mailboxes: tasks, sessions, stable refs, topology, states, persistence, workspace provisioning, destroy semantics, mail protocol and delivery accounting |
 | `taskai-context` | Context snapshots (`self`/`session`/`tree`), the `AGENTS.md` bootstrap installer, per-harness context delivery |
 | `taskai-connectors` | The connector contract, the four harness connectors, and the conduit: writer exclusion, dispatch correlation, cancel transport |
 | `taskai-pane` | portable-pty spawn/resize/io and the vt100 grid the working pane blits |

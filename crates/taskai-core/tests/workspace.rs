@@ -1,19 +1,19 @@
 // ABOUTME: Workspace provisioning tests against a real git repository — worktree preview
 // ABOUTME: matches creation, and destroy preserves the repository and worktrees entirely.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use taskai_core::mail::{inherited_messaging_env_names, strip_messaging_env};
 use taskai_core::registry::{Item, Registry, Source};
 use taskai_core::workspace::{preview, provision, suggest_worktree, WorkspaceChoice};
 
 fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .expect("run git");
+    let mut git = Command::new("git");
+    git.arg("-C").arg(dir).args(args);
+    strip_messaging_env(&mut git);
+    let out = git.output().expect("run git");
     assert!(
         out.status.success(),
         "git {args:?} failed: {}",
@@ -240,4 +240,107 @@ fn existing_branches_and_folders_are_preserved_on_validation_failure() {
         "do not touch"
     );
     assert!(!git(&repo, &["branch", "--list", "agent-2"]).contains("agent-2"));
+}
+
+/// A `git` that records each call's subcommand and whether a Claude messaging variable reached it,
+/// judged by name only, then runs the real git.
+const GIT_RECORDER: &str = r#"#!/bin/sh
+verdict=$(LC_ALL=C awk 'BEGIN { for (name in ENVIRON) if (name ~ /^CLAUDE_CODE_MESSAGING_/) found = 1; print (found ? "messaging=true" : "messaging=false") }')
+skip=
+for arg in "$@"; do
+  if [ -n "$skip" ]; then skip=; continue; fi
+  case "$arg" in
+    -C) skip=1 ;;
+    -*) ;;
+    *) printf '%s %s\n' "$verdict" "$arg" >> "$TASKAI_GIT_VERDICTS"; break ;;
+  esac
+done
+exec "$TASKAI_REAL_GIT" "$@"
+"#;
+
+// Expectation: every git command workspace provisioning runs (the suggestion's rev-parse,
+// symbolic-ref and branch listing, and a worktree's name check, branch checks and worktree add)
+// inherits no CLAUDE_CODE_MESSAGING_* variable from TaskAI. Why: TaskAI is often started from a
+// Claude session, and git runs hooks and helpers that would inherit its socket and token. Value:
+// nothing a workspace operation starts can speak as the person's Claude session. A copy of this
+// test binary inherits a fake variable, and a git placed first on its PATH records, by name only,
+// whether one reached it.
+#[test]
+fn workspace_git_commands_inherit_no_claude_messaging_variables() {
+    if let Some(repo) = std::env::var_os("TASKAI_WORKSPACE_ENV_REPO") {
+        let repo = PathBuf::from(repo);
+        println!("inherited={}", !inherited_messaging_env_names().is_empty());
+        let (branch, name) = suggest_worktree(&repo).expect("a worktree suggestion");
+        let choice = WorkspaceChoice::Worktree {
+            base: repo.clone(),
+            branch,
+            name,
+        };
+        println!("provisioned={}", provision(&choice, &repo).is_ok());
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(root.path());
+    let recorder_dir = root.path().join("bin");
+    std::fs::create_dir(&recorder_dir).unwrap();
+    let recorder = recorder_dir.join("git");
+    std::fs::write(&recorder, GIT_RECORDER).unwrap();
+    std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let search = std::env::var_os("PATH").unwrap();
+    let real_git = std::env::split_paths(&search)
+        .map(|dir| dir.join("git"))
+        .find(|candidate| candidate.is_file())
+        .expect("git on PATH");
+    let path =
+        std::env::join_paths(std::iter::once(recorder_dir).chain(std::env::split_paths(&search)))
+            .unwrap();
+    let verdicts = root.path().join("git-verdicts");
+    let mut copy = Command::new(std::env::current_exe().unwrap());
+    strip_messaging_env(&mut copy);
+    let output = copy
+        .args([
+            "--exact",
+            "workspace_git_commands_inherit_no_claude_messaging_variables",
+            "--nocapture",
+        ])
+        .env("TASKAI_WORKSPACE_ENV_REPO", &repo)
+        .env("CLAUDE_CODE_MESSAGING_SITE_PROBE", "fake")
+        .env("PATH", path)
+        .env("TASKAI_REAL_GIT", real_git)
+        .env("TASKAI_GIT_VERDICTS", &verdicts)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let printed = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        printed.lines().any(|line| line == "inherited=true"),
+        "the copy inherits the fake variable"
+    );
+    assert!(printed.lines().any(|line| line == "provisioned=true"));
+    let recorded = std::fs::read_to_string(&verdicts).unwrap();
+    let clean = |subcommand: &str| {
+        recorded
+            .lines()
+            .filter(|line| *line == format!("messaging=false {subcommand}"))
+            .count()
+    };
+    for subcommand in [
+        "rev-parse",
+        "symbolic-ref",
+        "check-ref-format",
+        "show-ref",
+        "worktree",
+    ] {
+        assert!(clean(subcommand) >= 1, "{subcommand} ran without one");
+    }
+    assert!(
+        clean("for-each-ref") >= 2,
+        "both branch listings ran without one"
+    );
+    assert!(
+        recorded
+            .lines()
+            .all(|line| line.starts_with("messaging=false ")),
+        "no git command saw a messaging variable"
+    );
 }

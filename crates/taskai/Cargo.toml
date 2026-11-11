@@ -14,9 +14,13 @@ taskai-connectors = { path = "../taskai-connectors" }
 taskai-context = { path = "../taskai-context" }
 crossterm = "0.28"
 chrono = "0.4"
+libc = "0.2"
 serde_json = "1"
+signal-hook = "0.3"
+toml_edit = "0.22"
 unicode-width = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
 portable-pty = "0.8"
+tungstenite = "0.24"

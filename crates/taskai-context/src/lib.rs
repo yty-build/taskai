@@ -1,10 +1,11 @@
-// ABOUTME: Context service — revisioned self/session/tree snapshots, the explanatory text
-// ABOUTME: view, and the AGENTS.md managed-block bootstrap installer.
+// ABOUTME: Context service — revisioned self/session/tree snapshots with messaging addresses and
+// ABOUTME: status, the explanatory text view, and the AGENTS.md managed-block bootstrap installer.
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
+use taskai_core::mail::Activity;
 use taskai_core::registry::{Registry, Role, Session};
 use taskai_core::Error;
 
@@ -24,7 +25,32 @@ fn find<'a>(reg: &'a Registry, r: &str) -> Result<&'a Session, Error> {
         .ok_or_else(|| Error::NotFound(format!("session {r}")))
 }
 
+/// How a session can be messaged now: its live mailbox's status, or `no mailbox`.
+fn messaging_label(s: &Session) -> String {
+    let Some(entry) = s.live_mailbox() else {
+        return "no mailbox".into();
+    };
+    match (entry.status, &entry.waiting_for) {
+        (Activity::Waiting, Some(what)) => format!("waiting: {what}"),
+        (Activity::Waiting, None) => "waiting".into(),
+        (Activity::Busy, _) => "busy".into(),
+        (Activity::Idle, _) => "idle".into(),
+    }
+}
+
+/// `address <address> · <messaging status>`, which ends every line naming a session.
+fn reach(s: &Session) -> String {
+    format!("address {} · {}", s.address, messaging_label(s))
+}
+
 fn session_json(s: &Session) -> serde_json::Value {
+    let messaging = s.live_mailbox().map(|entry| {
+        let mut messaging = json!({ "status": entry.status });
+        if let Some(what) = &entry.waiting_for {
+            messaging["waitingFor"] = json!(what);
+        }
+        messaging
+    });
     json!({
         "session_ref": s.session_ref,
         "role": s.role.label(),
@@ -32,6 +58,8 @@ fn session_json(s: &Session) -> serde_json::Value {
         "harness": s.harness,
         "workspace": s.workspace,
         "state": s.state.label(),
+        "address": s.address,
+        "messaging": messaging,
     })
 }
 
@@ -99,6 +127,7 @@ pub fn text_view(reg: &Registry, session_ref: &str) -> Result<String, Error> {
         task.task_ref,
         task.name
     ));
+    out.push(format!("Your messaging address is {}.", me.address));
     match &me.parent {
         Some(p) => {
             let parent = find(reg, p)?;
@@ -125,12 +154,13 @@ pub fn text_view(reg: &Registry, session_ref: &str) -> Result<String, Error> {
     ));
     for c in reg.children_of(session_ref) {
         out.push(format!(
-            "Your subordinate {} ({}) · {} · {} runs in {}.",
+            "Your subordinate {} ({}) · {} · {} runs in {} · {}.",
             c.name,
             c.session_ref,
             c.harness,
             c.state.label(),
-            c.workspace.display()
+            c.workspace.display(),
+            reach(c)
         ));
     }
     for s in reg.sessions_of(&task.task_ref) {
@@ -141,13 +171,13 @@ pub fn text_view(reg: &Registry, session_ref: &str) -> Result<String, Error> {
             };
         if peer {
             out.push(format!(
-                "Peer {} ({}) · {} · {} works in {} and can be reached as session {}.",
+                "Peer {} ({}) · {} · {} works in {} · {}.",
                 s.name,
                 s.session_ref,
                 s.harness,
                 s.state.label(),
                 s.workspace.display(),
-                s.session_ref
+                reach(s)
             ));
         }
     }
@@ -176,7 +206,7 @@ pub fn session_view(reg: &Registry, session_ref: &str) -> Result<String, Error> 
         None => "at the task root".to_string(),
     };
     Ok(format!(
-        "{} ({}) is a {} on Task {}: \"{}\" {chain}.\nHarness {} · state {} · workspace {}.",
+        "{} ({}) is a {} on Task {}: \"{}\" {chain}.\nHarness {} · state {} · workspace {} · {}.",
         s.name,
         s.session_ref,
         s.role.label(),
@@ -184,7 +214,8 @@ pub fn session_view(reg: &Registry, session_ref: &str) -> Result<String, Error> 
         task.name,
         s.harness,
         s.state.label(),
-        s.workspace.display()
+        s.workspace.display(),
+        reach(s)
     ))
 }
 
@@ -205,21 +236,23 @@ pub fn tree_view(reg: &Registry, task_ref: Option<&str>) -> String {
         for s in reg.sessions_of(&task.task_ref) {
             if s.role == Role::Manager {
                 out.push(format!(
-                    "  {} ({}) · {} · {} · {}",
+                    "  {} ({}) · {} · {} · {} · {}",
                     s.name,
                     s.session_ref,
                     s.harness,
                     s.state.label(),
-                    s.workspace.display()
+                    s.workspace.display(),
+                    reach(s)
                 ));
                 for c in reg.children_of(&s.session_ref) {
                     out.push(format!(
-                        "    └─ {} ({}) · {} · {} · {}",
+                        "    └─ {} ({}) · {} · {} · {} · {}",
                         c.name,
                         c.session_ref,
                         c.harness,
                         c.state.label(),
-                        c.workspace.display()
+                        c.workspace.display(),
+                        reach(c)
                     ));
                 }
             }

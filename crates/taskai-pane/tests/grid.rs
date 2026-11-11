@@ -1,8 +1,10 @@
 // ABOUTME: Pane tests — the vt100 grid resolves real byte streams to styled cells, and a
 // ABOUTME: real process in a real pty renders into (and receives input through) the pane.
 
+use std::process::Command;
 use std::time::{Duration, Instant};
 
+use taskai_core::mail::{inherited_messaging_env_names, strip_messaging_env};
 use taskai_pane::grid::Grid;
 use taskai_pane::Pane;
 
@@ -140,6 +142,61 @@ fn real_process_renders_into_grid() {
     )
     .unwrap();
     wait_for(&pane, "taskai-pane-ok");
+}
+
+/// Shell that prints, judging names only, whether any Claude messaging variable and the kept
+/// explicit variable reached it.
+const PANE_VERDICT: &str = r#"LC_ALL=C awk 'BEGIN { for (name in ENVIRON) { if (name ~ /^CLAUDE_CODE_MESSAGING_/) found = 1; if (name == "TASKAI_KEEP_EXPLICIT") kept = 1 } print "verdict messaging=" (found ? "true" : "false") " kept=" (kept ? "true" : "false") " end" }'; sleep 1"#;
+
+// Expectation: a pane's process inherits no CLAUDE_CODE_MESSAGING_* variable from TaskAI and gets
+// none passed to the pane explicitly, while other explicit variables still arrive. Why:
+// portable-pty copies TaskAI's whole environment into the child, and a pane runs the provider CLI
+// the person drives. Value: no pane can speak as the person's Claude session. A copy of this test
+// binary inherits a fake variable, and the pane's process reports by name only.
+#[test]
+fn pane_processes_get_no_claude_messaging_variables() {
+    if std::env::var_os("TASKAI_PANE_ENV_COPY").is_none() {
+        let mut copy = Command::new(std::env::current_exe().unwrap());
+        strip_messaging_env(&mut copy);
+        let output = copy
+            .args([
+                "--exact",
+                "pane_processes_get_no_claude_messaging_variables",
+                "--nocapture",
+            ])
+            .env("TASKAI_PANE_ENV_COPY", "1")
+            .env("CLAUDE_CODE_MESSAGING_SITE_PROBE", "fake")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let printed = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            printed.lines().any(|line| line == "inherited=true"),
+            "the copy inherits the fake variable"
+        );
+        assert!(printed
+            .lines()
+            .any(|line| line == "verdict messaging=false kept=true end"));
+        return;
+    }
+    println!("inherited={}", !inherited_messaging_env_names().is_empty());
+    let cwd = std::env::current_dir().unwrap();
+    let pane = Pane::spawn(
+        "/bin/sh",
+        &["-c", PANE_VERDICT],
+        &cwd,
+        5,
+        80,
+        &[
+            ("CLAUDE_CODE_MESSAGING_EXPLICIT", "set-on-the-pane"),
+            ("TASKAI_KEEP_EXPLICIT", "kept"),
+        ],
+    )
+    .unwrap();
+    wait_for(&pane, " end");
+    let text = pane.text();
+    let verdict = text.lines().find(|line| line.starts_with("verdict "));
+    println!("{}", verdict.unwrap_or_default().trim_end());
 }
 
 // Expectation: bytes written to the pane reach the child's stdin (echoed by the pty).

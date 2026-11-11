@@ -1,0 +1,212 @@
+{
+  "cleanup": {
+    "approval_probe_file_created": false,
+    "cc_socks_added": [],
+    "cc_socks_as_before": true,
+    "claude_cards_added": [],
+    "claude_cards_as_before": true,
+    "deliveries_started_by_teardown": 0,
+    "how": "each runtime ended by exact tmux kill-session and the task record destroyed through the registry, the two steps TaskAI's destroy runs; the UI's own destroy is covered by app tests",
+    "private_tmux_server_gone": true,
+    "private_tmux_socket_file_removed": true,
+    "records_removed": true,
+    "runtimes_ended": true,
+    "socket_files_left_under_the_private_run_folder": []
+  },
+  "cost_note": "model turns counted as prompts typed plus letters, notices and receipts delivered: {\"claude\": 0, \"codex\": 0, \"grok\": 0}; total 0 of cap 0; 0 more started during teardown; wall time 20s",
+  "date": "2026-11-10",
+  "driver": "taskai session launch <ref>; no UI process; prompts typed only into exact native panes",
+  "installed": [
+    {
+      "executable": "claude",
+      "hkey": "claude",
+      "launch": {
+        "available": true,
+        "reason": null
+      },
+      "messaging": {
+        "detail": "Claude Code 2.1.322 is the tested release and the sample envelope round-trips; checked here: version and envelope grammar only; each session's own card is validated by its observer and mirror at launch",
+        "status": "ready"
+      },
+      "sign_in": "signed in",
+      "title": "Claude Code",
+      "version": "2.1.322"
+    },
+    {
+      "executable": "codex",
+      "hkey": "codex",
+      "launch": {
+        "available": true,
+        "reason": null
+      },
+      "messaging": {
+        "detail": "daemon codex-tui/0.167.1 answered initialize and its User-Agent names the tested daemon version; checked here: the handshake only, no thread, turn or interrupt",
+        "status": "ready"
+      },
+      "sign_in": "signed in",
+      "title": "Codex",
+      "version": "0.167.0"
+    },
+    {
+      "executable": "grok",
+      "hkey": "grok",
+      "launch": {
+        "available": true,
+        "reason": null
+      },
+      "messaging": {
+        "detail": "Grok 1.0.77 is the tested release; each session's leader must register TaskAI's client with yolo_mode=false, enforced at launch; each workspace must be trusted by Grok (doctor --workspace checks one)",
+        "status": "ready"
+      },
+      "sign_in": "credentials present",
+      "title": "Grok CLI",
+      "version": "1.0.77"
+    }
+  ],
+  "launch_environment_names": [
+    "HOME",
+    "PATH",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "TMPDIR",
+    "CODEX_HOME",
+    "GROK_HOME",
+    "CLAUDE_CONFIG_DIR"
+  ],
+  "milestone": "M9 release proof",
+  "mode": "dry run: zero prompts typed",
+  "residual": [
+    "Codex thread Some(\"01a1c994-a946-7a83-b118-c2803805acf6\") was created for the proof and never given a turn",
+    "Grok keeps the record of the proof's Grok session in its own history (not swept)",
+    "Grok's trust entry for the proof workspace predates the proof and is unchanged",
+    "TaskAI's bootstrap, hook and MCP files written into the proof workspace by launch stay there",
+    "no native card, key, door or leader socket of a foreign session was touched"
+  ],
+  "scenarios": [
+    {
+      "criterion": "3",
+      "evidence": {
+        "claude_messaging_with_wrapper": {
+          "detail": "Claude Code 2.1.288 is not the tested 2.1.322",
+          "remedy": "Install Claude Code 2.1.322, or re-verify the Claude adapter against the installed version before enabling it",
+          "status": "not ready"
+        },
+        "codex_and_grok_ready_with_wrapper": true,
+        "codex_messaging": "daemon codex-tui/0.167.1 answered initialize and its User-Agent names the tested daemon version; checked here: the handshake only, no thread, turn or interrupt",
+        "installed_doctor_green": true,
+        "note": "the installed CLIs were not altered; the override is the product's configured-executable setting; each adapter's other fail-closed gates are covered offline by doctor::tests",
+        "with_drift_wrapper_doctor_green": false,
+        "workspace_trust": [
+          {
+            "detail": "Grok trusts /private/tmp/claude-501/-Users-trinath-Documents-GitHub-acp-gateway/60934fc5-2ccf-4641-b7e6-7e63dd0f954d/scratchpad/e2e/grok-work",
+            "hkey": "grok",
+            "status": "ready"
+          }
+        ]
+      },
+      "outcome": "pass"
+    },
+    {
+      "criterion": "launch",
+      "evidence": {
+        "codex_bridge_declares_mode": "prompting",
+        "codex_bridge_said": "Claude mirror unavailable: Not ready · Claude Code 2.1.288 is not the tested 2.1.322 · Install Claude Code 2.1.322, or re-verify the Claude adapter against the installed version before enabling it",
+        "codex_bridge_window": true,
+        "codex_first_human_gate_shown": true,
+        "codex_mailbox_live_before_any_turn": true,
+        "codex_one_thread_recorded": true,
+        "codex_status_at_rest": "idle",
+        "grok_bridge_said": "Claude mirror unavailable: Not ready · Claude Code 2.1.288 is not the tested 2.1.322 · Install Claude Code 2.1.322, or re-verify the Claude adapter against the installed version before enabling it",
+        "grok_bridge_window": true,
+        "grok_join_required_yolo_mode_false": true,
+        "grok_mailbox_live": true,
+        "grok_registry_mode_unknown": true,
+        "grok_status_at_rest": "idle",
+        "note": "the Grok bridge publishes a mailbox only after the leader logs its client with yolo_mode=false"
+      },
+      "outcome": "pass"
+    },
+    {
+      "criterion": "14",
+      "evidence": {
+        "bridge_windows_killed": true,
+        "bridges_killed_and_relaunched": [
+          "grok"
+        ],
+        "bridges_returned_with_new_processes": true,
+        "codex_bridge_in_a_rehearsal": "not recreated: the Codex daemon cannot resume a thread that has no turn, so a Codex bridge that stops before the first human message cannot return",
+        "killed_bridges_closed_their_mailboxes": true,
+        "mailboxes_live_after_relaunch": true,
+        "native_panes_survived": true,
+        "relaunch_restarted_no_native_pane": true,
+        "what_the_returned_bridges_said": []
+      },
+      "outcome": "pass"
+    },
+    {
+      "criterion": "claude-mirror",
+      "evidence": {
+        "bridges": [
+          "grok"
+        ],
+        "each_returned_bridge_published_a_claude_card": true
+      },
+      "outcome": "pass"
+    },
+    {
+      "criterion": "claude-launch",
+      "evidence": {
+        "claude_addressable_in_the_registry": true,
+        "claude_card_published": true,
+        "claude_pane_asks_the_person_to_trust_the_folder": false,
+        "claude_screen_when_not_addressable": "",
+        "observer_said": "",
+        "observer_window": true
+      },
+      "outcome": "pass"
+    },
+    {
+      "criterion": "mode-parity",
+      "evidence": {
+        "claude_addressable": true,
+        "claude_footer": "❯ Try \"how does <filepath> work?\"\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n  🤖 Fable 5.2 | 📊 0/0% | 💰 $0.0000 ⏱ 0m | 📁 grok-work                                                                                   ◐ medium · /effort\n  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent",
+        "claude_footer_names_bypass_or_plan": false,
+        "codex_bridge_declares": "prompting",
+        "grok_pane_started_with_permission_mode": "default",
+        "note": "Claude Code 2.1.322 counts a session as bypass in bypassPermissions mode, or in plan mode with bypass available, and as prompting otherwise; it accepts a letter whose sender declares its own class and holds any other for the person"
+      },
+      "outcome": "pass"
+    },
+    {
+      "criterion": "4",
+      "evidence": {
+        "approval_probe_file_created": false,
+        "cc_socks_added": [],
+        "cc_socks_as_before": true,
+        "claude_cards_added": [],
+        "claude_cards_as_before": true,
+        "deliveries_started_by_teardown": 0,
+        "how": "each runtime ended by exact tmux kill-session and the task record destroyed through the registry, the two steps TaskAI's destroy runs; the UI's own destroy is covered by app tests",
+        "private_tmux_server_gone": true,
+        "private_tmux_socket_file_removed": true,
+        "records_removed": true,
+        "runtimes_ended": true,
+        "socket_files_left_under_the_private_run_folder": []
+      },
+      "outcome": "pass"
+    }
+  ],
+  "tested_commit": "5a30542546f3eaffd2b4d4df3668f98060d9a2d8",
+  "turn_cap": 0,
+  "turns": {
+    "claude": 0,
+    "codex": 0,
+    "grok": 0
+  },
+  "uncommitted_changes": ""
+}

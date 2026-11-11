@@ -11,7 +11,7 @@ use crate::input::Focus;
 use crate::screens::pane::cell_row;
 use crate::seg::{clip_segs, row, s, sb, seglen, text_width, vrow, Seg};
 use crate::state::{St, View};
-use crate::view::{HandoffRow, Hud, PaneBody, TaskView};
+use crate::view::{HandoffRow, Hud, PaneBody, RailRow, TaskView};
 
 pub const RAIL_W: usize = 34;
 pub const GAP: usize = 2;
@@ -61,6 +61,25 @@ pub fn rail_at_row(view: &TaskView, st: &St, rows: usize, y: usize) -> Option<us
         .get(local)
         .copied()
         .flatten()
+}
+
+/// The session is waiting on a person: an approval or an answer.
+fn waiting(sess: &RailRow) -> bool {
+    sess.status.as_deref() == Some("waiting")
+}
+
+/// The word at the right of a session's row: its lifecycle state, then what its mailbox
+/// reports. A waiting session names what it waits for, so a stuck session is never read as
+/// a working one.
+pub fn status_word(sess: &RailRow) -> String {
+    match sess.status.as_deref() {
+        Some("waiting") => format!(
+            "WAITING · {}",
+            sess.waiting_for.as_deref().unwrap_or("input")
+        ),
+        Some(status) => format!("{} · {status}", sess.state_word),
+        None => sess.state_word.clone(),
+    }
 }
 
 fn rail_layout(
@@ -191,8 +210,11 @@ fn rail_layout(
             )
         };
         top.push(row(&name_row, w, fill, 0));
-        let sword = sess.state_word.as_str();
-        let swcol = if sel && live {
+        let sword = status_word(sess);
+        let sword = sword.as_str();
+        let swcol = if waiting(sess) {
+            AMB
+        } else if sel && live {
             ION
         } else if live {
             FT
@@ -465,9 +487,13 @@ fn pane_lines_with_focus(
             Some(b),
         ));
         right.push(s("   ", None, Some(b)));
+    } else if waiting(sess) {
+        right.push(s("◌ ", Some(AMB), Some(b)));
+        right.push(s(status_word(sess), Some(AMB), Some(b)));
+        right.push(s("   ", None, Some(b)));
     } else if sess.live {
         right.push(s("● ", Some(ION), Some(b)));
-        right.push(s("LIVE", Some(ION), Some(b)));
+        right.push(s(status_word(sess), Some(ION), Some(b)));
         right.push(s("   ", None, Some(b)));
     } else {
         right.push(s("◌ ", Some(AMB), Some(b)));
@@ -820,6 +846,7 @@ pub fn frame_with_focus(
             ("a", "Add agent"),
             ("m", "Add manager"),
             ("t", "Terminal"),
+            ("l", "Message log"),
             ("d", "Destroy agent"),
             ("D", "Destroy task"),
             ("s", "Settings"),

@@ -1,10 +1,20 @@
 # TaskAI
 
-One terminal. Many tasks. Teams of native CLI agents working in parallel.
+One terminal. Many tasks. Teams of native CLI agents that work in parallel and talk to
+each other.
 
-TaskAI is the command center around agent CLIs. It owns the task board, hierarchy,
-status, creation flows, and navigation chrome; the entire working pane belongs to the
-selected session's actual native CLI — Claude Code, Codex, OpenCode, or Grok CLI.
+TaskAI is a terminal-first harness for agent teams. Every agent is the actual native CLI
+— Claude Code, Codex, OpenCode, or Grok CLI — in its own durable tmux session, and TaskAI
+is the command center around them: it owns the task board, hierarchy, status, creation
+flows, and navigation chrome, while the entire working pane belongs to the selected
+session's CLI.
+
+Agents reach each other through TaskAI's messaging service, not by typing into each
+other's tmux panes. Each Claude Code, Codex, and Grok session has a name and a mailbox in
+one address book, so an agent can list its teammates, hand one a piece of work, and learn
+the outcome, whichever of those CLIs either runs in. See
+[Session messaging](#session-messaging).
+
 The CLI can be focused either beside the session rail or full-screen. While it has
 focus, TaskAI reserves `Ctrl+F` to change that layout and `Ctrl+G` to return to
 navigation; every other keystroke passes through to the CLI unchanged.
@@ -114,6 +124,77 @@ and attach client exit too, preventing a retained dead pane from appearing `LIVE
 Destroy stops only the tmux sessions in the confirmed Subordinate, Manager, or Task
 scope, then removes those TaskAI records. Repositories, worktrees, branches, files, and
 provider-native history are always preserved.
+
+## Session messaging
+
+Agents in the same task find and message each other by name. A letter arrives in the
+recipient's own CLI as ordinary input, and the recipient answers the same way. Nothing is
+typed into a pane with `tmux send-keys`, so a message cannot land in the wrong window and
+the sender is never left guessing whether it arrived.
+
+| An agent can | With |
+|---|---|
+| See its teammates and whether each is busy, idle, or waiting on an approval | `list_sessions` |
+| Hand a teammate a piece of work | `send_message` |
+| Be told once when that teammate finishes or exits | `send_message` with `notify_when_idle` |
+
+The sender always learns the outcome: a reply, the idle notice it asked for, or a delivery
+notice saying its letter was dropped and why.
+
+| CLI | Sends with | Receives as | Tested release |
+|---|---|---|---|
+| Codex | `taskai` tools on its thread | a new turn | daemon 0.167.1 |
+| Grok CLI | `taskai` MCP tools | a new prompt | 1.0.77 |
+| Claude Code | its own `SendMessage` and `ListAgents`; TaskAI's sessions appear in its agent list | its own cross-session message | 2.1.322 |
+| OpenCode | no adapter | — | — |
+
+An address is `<harness>-<agent name>`, for example `codex-lead`. Only sessions TaskAI
+launched on this computer take part, within one task. Each agent's messaging helper runs
+in a second window of that agent's tmux session and ends with it.
+
+### Start using it
+
+1. Run `taskai doctor --workspace <repository>`. It must end with `doctor: green`. It checks
+   each CLI's release and sign-in and that Grok trusts the folder, and sends no model
+   prompt. Settings shows the same result as a **Messaging** line per harness.
+2. Create a task in that repository and add two agents, for example a Codex Manager `lead`
+   and a Grok Subordinate `verification`.
+3. A Codex agent opens with `TaskAI: type your first message to start this Codex thread.`
+   Type your request there, for example: *ask the Grok agent in this task to review the
+   last commit, and tell me when it is idle.*
+4. Watch it work: the session rail shows each agent's status, and `l` in task navigation
+   opens the **Message log** with every letter, notice and receipt.
+
+A CLI may ask you to trust the folder the first time it opens there. Answer in that CLI;
+TaskAI never answers for you.
+
+### Rules and limits
+
+- TaskAI never answers an approval and never changes a session's permission mode. Every
+  letter declares its sender's real name and mode.
+- Each adapter works with exactly its tested release. When a CLI updates, that adapter
+  reports **Not ready** with the reason and stays off until it is re-verified; the others
+  keep messaging.
+- TaskAI puts no limit on how long agents work together or how many letters a session
+  receives. Claude Code applies its own loop limit to letters it receives: by default a
+  chain of 28 hops, or 10 passes through the same session, with no prompt from you in
+  between. The sender is told, and a message sent in a later turn starts a new chain.
+- Claude Code holds a letter from a session in a different permission mode for your review.
+- A Codex agent's messaging starts with its first message from you. If its helper stops
+  before that message, destroy the agent and add it again.
+- In Claude's own agent list a TaskAI-launched Claude session appears under the name
+  Claude gives it; Codex and Grok agents reach it by its TaskAI address.
+
+### What is proven
+
+| | Evidence |
+|---|---|
+| Mailbox, address book, the three adapters, helper lifetime, `doctor`, rail status, message log | The offline suite |
+| Launch, registration, Claude's agent list, restart of Grok's helper, and teardown on the installed tested releases | Live with no model call: [rehearsal](tests/evidence/session-messaging-m9-dry-run-2026-11-11.json) |
+| Letters exchanged between the real CLIs | A prototype, live; on this build the billed proof (`release_messaging`) has not run |
+
+The design, protocol and acceptance table are in
+[feature-session-registry.md](feature-session-registry.md).
 
 ## Local and SSH tasks
 
@@ -257,6 +338,10 @@ echo "prompt" | taskai session prompt <ref> --stdin --wait
 taskai session cancel <ref>
 ```
 
+From your own shell, `taskai doctor [--json] [--workspace <path>]` reports messaging
+readiness without a model prompt, and `taskai session launch <ref>` starts or reconciles
+one session without the UI. `session launch` is refused inside a managed session.
+
 `session prompt` needs the TaskAI TUI running, and currently accepts only local
 `owned-tui` (Claude Code) targets; a shared-live, handoff-resume, or remote target is
 refused with a message naming the reason rather than misrouted. Local context commands
@@ -270,14 +355,17 @@ paths, local/SSH targets, provider session IDs, agent/utility tmux locators, and
 the optional helper's preferred harness and exact task/Manager refs. Saved-login
 probe results and raw authentication output are not persisted in this tracker.
 Provider identity and tmux identity remain
-separate. The dispatch log records correlation only, never prompt content.
+separate. The dispatch log records correlation only, never prompt content. Each task's
+message log, `~/.taskai/state/messages/<task_ref>.jsonl` (owner-only), records every letter
+with its text.
 
 TaskAI adds no daemon, resident TaskAI server, queue, or database. The normal tmux server
 keeps provider processes alive after `q`; the existing TUI control-socket listener runs
 only while TaskAI is open. TaskAI also writes into each local session's workspace: a
 managed `AGENTS.md` block (with a `CLAUDE.md` symlink) so agents can discover
-themselves, and Claude Code hook entries in `.claude/settings.local.json`. Both merge
-into existing files and never overwrite your content.
+themselves, Claude Code hook entries in `.claude/settings.local.json`, and for Grok a
+`taskai` tool entry and a hook under `.grok/`. All merge into existing files and never
+overwrite your content.
 
 ## Development
 

@@ -2,14 +2,17 @@
 // ABOUTME: SGR-preserving cell slicer and splices drawers, destroy, and help over it.
 
 use crate::color::{
-    bg, dull, DIM, FT, GLASS, GLASS_HI, GLASS_IN, ION, KCAP, RED, RED_GLASS, RESET, TEXT, VOID,
+    bg, dull, AMB, DIM, FT, GLASS, GLASS_HI, GLASS_IN, ION, KCAP, RED, RED_GLASS, RESET, TEXT, VOID,
 };
 use crate::fixture::{
     Drawer, DESTROY_BLAST, DESTROY_CONFIRM, DESTROY_KEPT, DESTROY_TITLE, HELP_CLI, HELP_CONDUITS,
     HELP_NAVIGATION, HELP_TASK, NEWTASK, NEWTASK_NOTE, SUBORDINATE, SUBORDINATE_NOTE,
     SUBORDINATE_PREVIEW,
 };
-use crate::seg::{cell_count, char_width, row, s, sb, seglen, Seg};
+use crate::seg::{
+    cell_count, char_width, clip_segs, row, s, sb, seglen, take_cells, text_width, Seg,
+};
+use crate::view::{MessageLog, MessageRow};
 
 /// Regex-free port of the prototype's dim_line: every truecolor SGR component
 /// (38;2;r;g;b / 48;2;r;g;b) is pulled toward the void.
@@ -535,6 +538,131 @@ pub fn help_panel() -> Vec<String> {
             GLASS,
             2,
         ));
+    }
+    lines.push(row(&[], pw, GLASS, 0));
+    lines.push(row(
+        &[
+            s(" Esc ", Some(TEXT), Some(KCAP)),
+            s(" Close", Some(FT), Some(GLASS)),
+        ],
+        pw,
+        GLASS,
+        2,
+    ));
+    lines.push(row(&[], pw, GLASS, 0));
+    lines.push(row(
+        &[s("▀".repeat(pw), Some(GLASS), Some(VOID))],
+        pw,
+        VOID,
+        0,
+    ));
+    lines
+}
+
+/// Outcomes that mean a letter did not reach its reader, or a session went away.
+fn failed_outcome(outcome: &str) -> bool {
+    [
+        "dropped",
+        "refused",
+        "not delivered",
+        "failed",
+        "unavailable",
+        "uncertain",
+        "exited",
+        "unknown",
+    ]
+    .iter()
+    .any(|word| outcome.contains(word))
+}
+
+/// The task's message log as a floating panel: one line per logged letter, receipt or
+/// notice, oldest first, each as time · sender → recipient · outcome · first line of the
+/// body. Failed outcomes and a permission-mode mismatch are amber. When the log is longer
+/// than the frame, the newest lines stay and the exact count of hidden ones is shown, as is
+/// history the reader left unread; a log that could not be read shows the reason instead.
+pub fn messages_panel(title: &str, log: &MessageLog, cols: usize, height: usize) -> Vec<String> {
+    let rows = &log.rows;
+    let pw = cols.saturating_sub(12).clamp(60, 136);
+    let inner = pw - 4;
+    let widest = |width: fn(&MessageRow) -> usize, floor: usize, cap: usize| {
+        rows.iter()
+            .map(width)
+            .max()
+            .unwrap_or(floor)
+            .clamp(floor, cap)
+    };
+    let route_w = widest(|m| text_width(&m.from) + text_width(&m.to) + 3, 12, 36);
+    let outcome_w = widest(|m| text_width(&m.outcome), 8, 22);
+    let b = GLASS_HI;
+    let mut lines = vec![row(&[s("▄".repeat(pw), Some(b), Some(VOID))], pw, VOID, 0)];
+    lines.push(row(
+        &[sb(format!("Message log · {title}"), Some(TEXT), Some(b))],
+        pw,
+        b,
+        2,
+    ));
+    lines.push(row(&[], pw, GLASS, 0));
+    if let Some(reason) = &log.unavailable {
+        lines.push(row(
+            &clip_segs(
+                &[s(
+                    format!("Log unavailable · {reason}"),
+                    Some(AMB),
+                    Some(GLASS),
+                )],
+                inner,
+            ),
+            pw,
+            GLASS,
+            2,
+        ));
+    } else if rows.is_empty() && !log.truncated {
+        lines.push(row(
+            &[s("No messages yet", Some(DIM), Some(GLASS))],
+            pw,
+            GLASS,
+            2,
+        ));
+    }
+    let capacity = height.saturating_sub(10).max(3);
+    let indicator = log.unavailable.is_none() && (rows.len() > capacity || log.truncated);
+    let shown = rows.len().min(capacity - usize::from(indicator));
+    let hidden = rows.len() - shown;
+    if indicator {
+        let label = match (hidden, log.truncated) {
+            (0, _) => "↑ older history not loaded".to_string(),
+            (n, false) => format!("↑ {n} earlier"),
+            (n, true) => format!("↑ {n} earlier · older history not loaded"),
+        };
+        lines.push(row(&[s(label, Some(FT), Some(GLASS))], pw, GLASS, 2));
+    }
+    let marker = " · mode mismatch";
+    for m in rows.iter().skip(hidden) {
+        let route = format!("{} → {}", m.from, m.to);
+        let mut segs = vec![
+            s(
+                format!("{:<8}  ", take_cells(&m.ts, 8)),
+                Some(FT),
+                Some(GLASS),
+            ),
+            s(
+                format!("{:<route_w$}  ", take_cells(&route, route_w)),
+                Some(TEXT),
+                Some(GLASS),
+            ),
+            s(
+                format!("{:<outcome_w$}  ", take_cells(&m.outcome, outcome_w)),
+                Some(if failed_outcome(&m.outcome) { AMB } else { DIM }),
+                Some(GLASS),
+            ),
+        ];
+        let reserve = if m.mismatch { text_width(marker) } else { 0 };
+        let room = inner.saturating_sub(seglen(&segs) + reserve);
+        segs.push(s(take_cells(&m.text, room), Some(DIM), Some(GLASS)));
+        if m.mismatch {
+            segs.push(s(marker, Some(AMB), Some(GLASS)));
+        }
+        lines.push(row(&clip_segs(&segs, inner), pw, GLASS, 2));
     }
     lines.push(row(&[], pw, GLASS, 0));
     lines.push(row(

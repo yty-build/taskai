@@ -4,6 +4,7 @@
 use std::{
     fmt,
     io::Read,
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::mpsc,
@@ -68,6 +69,15 @@ pub enum RuntimeStatus {
         rows: u16,
     },
     Missing,
+}
+
+/// Exact native pane identity from the private tmux server, with an OS-verified
+/// process start. A bridge window cannot satisfy this identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeIdentity {
+    pub pane_id: String,
+    pub pid: u32,
+    pub proc_start: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -283,7 +293,233 @@ pub fn create(
     rows: u16,
     cols: u16,
 ) -> Result<(), Error> {
+    // A private server retained from an older TaskAI process may still carry
+    // inherited Claude identity keys. Remove only matching names before tmux
+    // creates a new provider pane.
+    scrub_private_environment(locator, false)?;
     create_with_runner(locator, program, args, cwd, env, rows, cols, &run)
+}
+
+/// One detached TaskAI process beside the native pane. The sidecar occupies
+/// fixed window 1; a live or unexpected window there is never replaced.
+pub fn create_sidecar(
+    locator: &TmuxRuntimeLocator,
+    name: &str,
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    env: &[(String, String)],
+) -> Result<(), Error> {
+    validate_locator(locator)?;
+    if locator.target != ConnectionTarget::Local {
+        return Err(Error::InvalidInput(
+            "sidecar requires a local runtime".into(),
+        ));
+    }
+    if !matches!(name, "bridge" | "observer") || program.is_empty() {
+        return Err(Error::InvalidInput(
+            "invalid sidecar name or program".into(),
+        ));
+    }
+    let cwd = cwd
+        .to_str()
+        .ok_or_else(|| Error::InvalidInput("sidecar path must be valid UTF-8".into()))?;
+    if !matches!(inspect(locator)?, RuntimeStatus::Live { .. }) {
+        return Err(Error::InvalidInput("native pane is not live".into()));
+    }
+    if !matches!(inspect_sidecar(locator, name)?, RuntimeStatus::Missing) {
+        return Err(Error::InvalidInput("sidecar window already exists".into()));
+    }
+    for (key, _) in env {
+        validate_environment_name(key)?;
+        if taskai_core::mail::is_messaging_env_name(std::ffi::OsStr::new(key)) {
+            return Err(Error::InvalidInput(
+                "sidecar may not set Claude messaging identity".into(),
+            ));
+        }
+    }
+    scrub_private_environment(locator, true)?;
+    let mut command = tmux_prefix(locator);
+    command.extend([
+        "new-window".into(),
+        "-d".into(),
+        "-t".into(),
+        sidecar_window_target(locator),
+        "-n".into(),
+        name.into(),
+        "-c".into(),
+        cwd.into(),
+    ]);
+    for (key, value) in env {
+        command.extend(["-e".into(), format!("{key}={value}")]);
+    }
+    command.extend(["--".into(), program.into()]);
+    command.extend(args.iter().cloned());
+    command.extend([
+        ";".into(),
+        "select-window".into(),
+        "-t".into(),
+        native_window_target(locator),
+    ]);
+    let invocation = target_invocation(&locator.target, &command)?;
+    require_success(run(&invocation, "create sidecar")?, "create sidecar")?;
+    Ok(())
+}
+
+pub fn inspect_sidecar(locator: &TmuxRuntimeLocator, name: &str) -> Result<RuntimeStatus, Error> {
+    validate_locator(locator)?;
+    if !matches!(name, "bridge" | "observer") {
+        return Err(Error::InvalidInput("invalid sidecar name".into()));
+    }
+    let mut command = tmux_prefix(locator);
+    command.extend([
+        "list-panes".into(),
+        "-t".into(),
+        sidecar_pane_target(locator),
+        "-F".into(),
+        "#{window_name}\t#{pane_dead}\t#{pane_pid}\t#{pane_dead_status}\t#{window_width}\t#{window_height}".into(),
+    ]);
+    let invocation = target_invocation(&locator.target, &command)?;
+    let output = run(&invocation, "inspect sidecar")?;
+    if output_means_missing(&output) {
+        return Ok(RuntimeStatus::Missing);
+    }
+    let output = require_success(output, "inspect sidecar")?;
+    let prefix = format!("{name}\t");
+    let bytes = output
+        .stdout
+        .strip_prefix(prefix.as_bytes())
+        .ok_or_else(|| Error::InvalidOutput("sidecar window has an unexpected name".into()))?;
+    parse_inspection(bytes)
+}
+
+pub fn kill_sidecar(locator: &TmuxRuntimeLocator, name: &str) -> Result<bool, Error> {
+    match inspect_sidecar(locator, name)? {
+        RuntimeStatus::Missing => return Ok(false),
+        RuntimeStatus::Live { .. } | RuntimeStatus::Dead { .. } => {}
+    }
+    let mut command = tmux_prefix(locator);
+    command.extend([
+        "kill-window".into(),
+        "-t".into(),
+        sidecar_window_target(locator),
+    ]);
+    optional_success_with_runner(locator, command, "kill sidecar", &run)
+}
+
+fn scrub_private_environment(
+    locator: &TmuxRuntimeLocator,
+    session_exists: bool,
+) -> Result<(), Error> {
+    validate_locator(locator)?;
+    if locator.target != ConnectionTarget::Local {
+        return Ok(());
+    }
+    for global in [true, false]
+        .into_iter()
+        .take(if session_exists { 2 } else { 1 })
+    {
+        let mut command = tmux_prefix(locator);
+        command.push("show-environment".into());
+        if global {
+            command.push("-g".into());
+        } else {
+            command.extend(["-t".into(), exact_session(&locator.session)]);
+        }
+        let invocation = target_invocation(&locator.target, &command)?;
+        let output = run(&invocation, "inspect private environment")?;
+        if output_means_missing(&output) && !session_exists {
+            return Ok(());
+        }
+        let output = require_success(output, "inspect private environment")?;
+        for line in output.stdout.split(|byte| *byte == b'\n') {
+            let displayed = line.split(|byte| *byte == b'=').next().unwrap_or_default();
+            if !displayed.starts_with(b"CLAUDE_CODE_MESSAGING_") {
+                continue;
+            }
+            let name = decode_tmux_environment_name(displayed)?;
+            if !taskai_core::mail::is_messaging_env_name(std::ffi::OsStr::from_bytes(&name)) {
+                continue;
+            }
+            let mut unset = Command::new("tmux");
+            unset.args([
+                "-f",
+                "/dev/null",
+                "-L",
+                &locator.private_server,
+                "set-environment",
+                "-u",
+            ]);
+            if global {
+                unset.arg("-g");
+            } else {
+                unset.args(["-t", &exact_session(&locator.session)]);
+            }
+            unset.arg(std::ffi::OsStr::from_bytes(&name));
+            require_success(
+                run_command_with_limits(
+                    unset,
+                    "scrub private environment",
+                    CONTROL_TIMEOUT,
+                    MAX_CONTROL_OUTPUT,
+                )?,
+                "scrub private environment",
+            )?;
+        }
+        // show-environment is a human rendering, not a reversible wire format:
+        // literal backslashes may look like octal escapes and control bytes may
+        // be printed literally. Never create a pane while any apparent matching
+        // name remains, even if that means declining an ambiguous server state.
+        let after = run(&invocation, "verify private environment")?;
+        let after = require_success(after, "verify private environment")?;
+        if after
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .any(|line| line.starts_with(b"CLAUDE_CODE_MESSAGING_"))
+        {
+            return Err(Error::InvalidOutput(
+                "private tmux environment could not be safely scrubbed".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Decode the octal form tmux can use for non-ASCII name bytes. Its display
+/// format is ambiguous for some literal backslashes and controls, so callers
+/// must verify that no matching rendered name remains before spawning a pane.
+/// Values are never inspected.
+fn decode_tmux_environment_name(displayed: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut decoded = Vec::with_capacity(displayed.len());
+    let mut index = 0;
+    while index < displayed.len() {
+        if displayed[index] != b'\\' {
+            decoded.push(displayed[index]);
+            index += 1;
+            continue;
+        }
+        if displayed.get(index + 1) == Some(&b'\\') {
+            decoded.push(b'\\');
+            index += 2;
+            continue;
+        }
+        let digits = displayed.get(index + 1..index + 4).ok_or_else(|| {
+            Error::InvalidOutput("private environment name has an invalid escape".into())
+        })?;
+        if !digits.iter().all(|byte| (b'0'..=b'7').contains(byte)) {
+            return Err(Error::InvalidOutput(
+                "private environment name has an invalid escape".into(),
+            ));
+        }
+        let value = u16::from(digits[0] - b'0') * 64
+            + u16::from(digits[1] - b'0') * 8
+            + u16::from(digits[2] - b'0');
+        decoded.push(u8::try_from(value).map_err(|_| {
+            Error::InvalidOutput("private environment name has an invalid escape".into())
+        })?);
+        index += 4;
+    }
+    Ok(decoded)
 }
 
 /// Use the target account's ordinary login shell, never the local machine's
@@ -342,6 +578,11 @@ where
             return Err(Error::InvalidInput(format!(
                 "runtime environment may not override {name}"
             )));
+        }
+        if taskai_core::mail::is_messaging_env_name(std::ffi::OsStr::new(name)) {
+            return Err(Error::InvalidInput(
+                "runtime may not set Claude messaging identity".into(),
+            ));
         }
     }
 
@@ -606,6 +847,62 @@ pub fn inspect(locator: &TmuxRuntimeLocator) -> Result<RuntimeStatus, Error> {
     inspect_with_runner(locator, &run)
 }
 
+pub fn native_identity(locator: &TmuxRuntimeLocator) -> Result<Option<NativeIdentity>, Error> {
+    validate_locator(locator)?;
+    if locator.target != ConnectionTarget::Local {
+        return Err(Error::InvalidInput(
+            "native identity requires a local runtime".into(),
+        ));
+    }
+    let mut command = tmux_prefix(locator);
+    command.extend([
+        "list-panes".into(),
+        "-t".into(),
+        native_pane_target(locator),
+        "-F".into(),
+        "#{pane_id}\t#{pane_pid}\t#{pane_dead}".into(),
+    ]);
+    let invocation = target_invocation(&locator.target, &command)?;
+    let output = run(&invocation, "native identity")?;
+    if output_means_missing(&output) {
+        return Ok(None);
+    }
+    let output = require_success(output, "native identity")?;
+    let line = std::str::from_utf8(&output.stdout)
+        .map_err(|_| Error::InvalidOutput("native identity is not UTF-8".into()))?
+        .trim_end_matches('\n');
+    let mut fields = line.split('\t');
+    let pane_id = fields.next().unwrap_or_default();
+    let pid = fields
+        .next()
+        .unwrap_or_default()
+        .parse::<u32>()
+        .map_err(|_| Error::InvalidOutput("native pane has no numeric process ID".into()))?;
+    let dead = fields.next().unwrap_or_default();
+    if fields.next().is_some() || !pane_id.starts_with('%') || pane_id[1..].parse::<u32>().is_err()
+    {
+        return Err(Error::InvalidOutput(
+            "native pane has malformed identity".into(),
+        ));
+    }
+    if dead == "1" {
+        return Ok(None);
+    }
+    if dead != "0" {
+        return Err(Error::InvalidOutput(
+            "native pane has malformed liveness".into(),
+        ));
+    }
+    let Some(proc_start) = taskai_core::mail::proc_start(pid) else {
+        return Ok(None);
+    };
+    Ok(Some(NativeIdentity {
+        pane_id: pane_id.into(),
+        pid,
+        proc_start,
+    }))
+}
+
 #[cfg(test)]
 pub fn capture_test_terminal(locator: &TmuxRuntimeLocator) -> Result<String, Error> {
     validate_locator(locator)?;
@@ -614,9 +911,7 @@ pub fn capture_test_terminal(locator: &TmuxRuntimeLocator) -> Result<String, Err
         "capture-pane".into(),
         "-p".into(),
         "-t".into(),
-        // capture-pane accepts a pane target, not a session target. The colon
-        // explicitly scopes the active pane to this exact saved session.
-        format!("{}:", exact_session(&locator.session)),
+        native_pane_target(locator),
     ]);
     let invocation = target_invocation(&locator.target, &command)?;
     let output = require_success(
@@ -670,7 +965,7 @@ where
     tmux.extend([
         "list-panes".into(),
         "-t".into(),
-        exact_session(&locator.session),
+        native_pane_target(locator),
         "-F".into(),
         "#{pane_dead}\t#{pane_pid}\t#{pane_dead_status}\t#{window_width}\t#{window_height}".into(),
     ]);
@@ -735,7 +1030,7 @@ pub fn attach_command(locator: &TmuxRuntimeLocator) -> Result<AttachCommand, Err
         "-f".into(),
         "ignore-size".into(),
         "-t".into(),
-        exact_session(&locator.session),
+        native_window_target(locator),
     ]);
 
     let mut owned_args = env_unset_args();
@@ -781,7 +1076,7 @@ pub fn resize(locator: &TmuxRuntimeLocator, rows: u16, cols: u16) -> Result<bool
     tmux.extend([
         "resize-window".into(),
         "-t".into(),
-        exact_session(&locator.session),
+        native_window_target(locator),
         "-x".into(),
         cols.to_string(),
         "-y".into(),
@@ -855,6 +1150,22 @@ fn tmux_prefix(locator: &TmuxRuntimeLocator) -> Vec<String> {
     ]
 }
 
+fn native_window_target(locator: &TmuxRuntimeLocator) -> String {
+    format!("{}:0", exact_session(&locator.session))
+}
+
+fn native_pane_target(locator: &TmuxRuntimeLocator) -> String {
+    format!("{}:0.0", exact_session(&locator.session))
+}
+
+fn sidecar_window_target(locator: &TmuxRuntimeLocator) -> String {
+    format!("{}:1", exact_session(&locator.session))
+}
+
+fn sidecar_pane_target(locator: &TmuxRuntimeLocator) -> String {
+    format!("{}:1.0", exact_session(&locator.session))
+}
+
 fn target_invocation(target: &ConnectionTarget, command: &[String]) -> Result<Invocation, Error> {
     validate_target(target)?;
     match target {
@@ -896,9 +1207,19 @@ fn run_with_limits(
 ) -> Result<Output, Error> {
     let mut command = Command::new(&invocation.program);
     command.args(&invocation.args);
+    run_command_with_limits(command, operation, timeout, max_output)
+}
+
+fn run_command_with_limits(
+    mut command: Command,
+    operation: &'static str,
+    timeout: Duration,
+    max_output: usize,
+) -> Result<Output, Error> {
     for name in STRIPPED_TMUX_ENV {
         command.env_remove(name);
     }
+    taskai_core::mail::strip_messaging_env(&mut command);
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1160,6 +1481,7 @@ mod tests {
         cell::RefCell,
         collections::VecDeque,
         env, fs,
+        os::unix::ffi::OsStringExt,
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
         thread,
@@ -1767,7 +2089,7 @@ exec /bin/sh -c "$taskai_test_script" "$@"
             .args
             .last()
             .unwrap()
-            .contains("'list-panes' '-t' '=s42'"));
+            .contains("'list-panes' '-t' '=s42:0.0'"));
         assert!(calls[2]
             .1
             .args
@@ -1799,7 +2121,7 @@ exec /bin/sh -c "$taskai_test_script" "$@"
             .args
             .last()
             .unwrap()
-            .contains("'attach-session' '-E' '-f' 'ignore-size' '-t' '=s42'"));
+            .contains("'attach-session' '-E' '-f' 'ignore-size' '-t' '=s42:0'"));
 
         let local = local_locator("taskai-at09-local", "s9");
         let local_runner = RecordingRunner::with_outputs([
@@ -1911,7 +2233,7 @@ exec /bin/sh -c "$taskai_test_script" "$@"
             assert_eq!(calls[0].0, "inspect");
             assert_eq!(calls[0].1.program, "ssh", "must not fall back locally");
             let remote_command = calls[0].1.args.last().unwrap();
-            assert!(remote_command.contains("'list-panes' '-t' '=s1'"));
+            assert!(remote_command.contains("'list-panes' '-t' '=s1:0.0'"));
             assert!(!remote_command.contains("'new-session'"));
         }
 
@@ -1943,7 +2265,7 @@ exec /bin/sh -c "$taskai_test_script" "$@"
                 .args
                 .last()
                 .unwrap()
-                .contains("'list-panes' '-t' '=s1'"));
+                .contains("'list-panes' '-t' '=s1:0.0'"));
             let mut count = calls.borrow_mut();
             *count += 1;
             if *count == 1 {
@@ -2249,6 +2571,359 @@ exec /bin/sh -c "$taskai_test_script" "$@"
     }
 
     #[test]
+    fn native_operations_ignore_a_selected_bridge_window() {
+        if !tmux_available() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let locator = local_locator(&namespace(), "s42");
+        let _guard = RuntimeGuard(locator.clone());
+        create(
+            &locator,
+            "/bin/sh",
+            &[
+                "-c".into(),
+                "printf 'NATIVE_MARKER\\n'; while :; do sleep 1; done".into(),
+            ],
+            temp.path(),
+            &[],
+            24,
+            80,
+        )
+        .unwrap();
+        let native_pid = match inspect(&locator).unwrap() {
+            RuntimeStatus::Live { pid, .. } => pid,
+            status => panic!("unexpected native status: {status:?}"),
+        };
+        test_private_command(
+            &locator,
+            &[
+                "new-window",
+                "-d",
+                "-t",
+                "=s42",
+                "-n",
+                "bridge",
+                "--",
+                "/bin/sh",
+                "-c",
+                "while :; do sleep 1; done",
+            ],
+        );
+        test_private_command(&locator, &["select-window", "-t", "=s42:1"]);
+        assert!(matches!(
+            inspect(&locator).unwrap(),
+            RuntimeStatus::Live { pid, .. } if pid == native_pid
+        ));
+        assert!(eventually(|| capture_test_terminal(&locator)
+            .unwrap()
+            .contains("NATIVE_MARKER")));
+        assert_eq!(
+            attach_command(&locator).unwrap().args.last().unwrap(),
+            "=s42:0"
+        );
+        assert!(resize(&locator, 31, 99).unwrap());
+        assert!(eventually(|| matches!(
+            inspect(&locator),
+            Ok(RuntimeStatus::Live { pid, cols: 99, rows: 31 }) if pid == native_pid
+        )));
+    }
+
+    #[test]
+    fn bridge_window_uses_exact_slot_and_scrubs_private_tmux_environments() {
+        if !tmux_available() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let locator = local_locator(&namespace(), "s42");
+        let _guard = RuntimeGuard(locator.clone());
+        create(
+            &locator,
+            "/bin/sh",
+            &["-c".into(), "while :; do sleep 1; done".into()],
+            temp.path(),
+            &[],
+            24,
+            80,
+        )
+        .unwrap();
+        test_private_command(
+            &locator,
+            &[
+                "set-environment",
+                "-g",
+                "CLAUDE_CODE_MESSAGING_POISON",
+                "synthetic",
+            ],
+        );
+        test_private_command(
+            &locator,
+            &[
+                "set-environment",
+                "-t",
+                "=s42",
+                "CLAUDE_CODE_MESSAGING_OTHER",
+                "synthetic",
+            ],
+        );
+        test_private_command(
+            &locator,
+            &[
+                "set-environment",
+                "-t",
+                "=s42",
+                "TASKAI_TEST_UNRELATED",
+                "kept",
+            ],
+        );
+        let script = "if [ -n \"${CLAUDE_CODE_MESSAGING_POISON+x}\" ] || [ -n \"${CLAUDE_CODE_MESSAGING_OTHER+x}\" ]; then printf present > poison; else printf absent > poison; fi; printf '%s' \"$TASKAI_TEST_UNRELATED\" > unrelated; while :; do sleep 1; done";
+        create_sidecar(
+            &locator,
+            "bridge",
+            "/bin/sh",
+            &["-c".into(), script.into()],
+            temp.path(),
+            &[],
+        )
+        .unwrap();
+        assert!(eventually(|| temp.path().join("poison").exists()));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("poison")).unwrap(),
+            "absent"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("unrelated")).unwrap(),
+            "kept"
+        );
+        assert!(matches!(
+            inspect_sidecar(&locator, "bridge").unwrap(),
+            RuntimeStatus::Live { .. }
+        ));
+        assert!(matches!(
+            inspect(&locator).unwrap(),
+            RuntimeStatus::Live { .. }
+        ));
+        assert_eq!(
+            test_private_command(
+                &locator,
+                &["display-message", "-p", "-t", "=s42:0", "#{window_active}"]
+            ),
+            "1"
+        );
+        let identity = native_identity(&locator).unwrap().unwrap();
+        assert_eq!(
+            identity.pid,
+            match inspect(&locator).unwrap() {
+                RuntimeStatus::Live { pid, .. } => pid,
+                _ => unreachable!(),
+            }
+        );
+        assert!(identity.pane_id.starts_with('%'));
+        assert!(taskai_core::mail::is_live(
+            identity.pid,
+            &identity.proc_start
+        ));
+        test_private_command(&locator, &["kill-pane", "-t", "=s42:0.0"]);
+        assert!(eventually(|| matches!(
+            inspect(&locator),
+            Ok(RuntimeStatus::Missing)
+        )));
+        assert!(native_identity(&locator).unwrap().is_none());
+        assert!(matches!(
+            inspect_sidecar(&locator, "bridge").unwrap(),
+            RuntimeStatus::Live { .. }
+        ));
+    }
+
+    #[test]
+    fn retained_private_tmux_scrubs_non_utf8_messaging_name() {
+        if !tmux_available() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let locator = local_locator(&namespace(), "s42");
+        let _guard = RuntimeGuard(locator.clone());
+        create(
+            &locator,
+            "/bin/sh",
+            &["-c".into(), "while :; do sleep 1; done".into()],
+            temp.path(),
+            &[],
+            24,
+            80,
+        )
+        .unwrap();
+        let raw_name = std::ffi::OsString::from_vec(b"CLAUDE_CODE_MESSAGING_\xff".to_vec());
+        let output = Command::new("tmux")
+            .args([
+                "-f",
+                "/dev/null",
+                "-L",
+                &locator.private_server,
+                "set-environment",
+                "-g",
+            ])
+            .arg(&raw_name)
+            .arg("synthetic")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "private tmux rejected raw environment name"
+        );
+        create_sidecar(
+            &locator,
+            "bridge",
+            "/bin/sh",
+            &["-c".into(), "if env | LC_ALL=C grep -q '^CLAUDE_CODE_MESSAGING_'; then printf present > raw; else printf absent > raw; fi; while :; do sleep 1; done".into()],
+            temp.path(),
+            &[],
+        )
+        .unwrap();
+        assert!(eventually(|| temp.path().join("raw").exists()));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("raw")).unwrap(),
+            "absent"
+        );
+    }
+
+    #[test]
+    fn ambiguous_retained_name_fails_closed_before_sidecar_spawn() {
+        if !tmux_available() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let locator = local_locator(&namespace(), "s42");
+        let _guard = RuntimeGuard(locator.clone());
+        create(
+            &locator,
+            "/bin/sh",
+            &["-c".into(), "while :; do sleep 1; done".into()],
+            temp.path(),
+            &[],
+            24,
+            80,
+        )
+        .unwrap();
+        for raw_name in [
+            b"CLAUDE_CODE_MESSAGING_\xff".as_slice(),
+            b"CLAUDE_CODE_MESSAGING_\\377".as_slice(),
+        ] {
+            let name = std::ffi::OsString::from_vec(raw_name.to_vec());
+            let output = Command::new("tmux")
+                .args([
+                    "-f",
+                    "/dev/null",
+                    "-L",
+                    &locator.private_server,
+                    "set-environment",
+                    "-g",
+                ])
+                .arg(name)
+                .arg("synthetic")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "private fixture rejected a name");
+        }
+        let error = create_sidecar(
+            &locator,
+            "bridge",
+            "/bin/sh",
+            &[
+                "-c".into(),
+                "printf spawned > spawned; while :; do sleep 1; done".into(),
+            ],
+            temp.path(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("could not be safely scrubbed"));
+        assert!(!temp.path().join("spawned").exists());
+        assert!(matches!(
+            inspect_sidecar(&locator, "bridge").unwrap(),
+            RuntimeStatus::Missing
+        ));
+    }
+
+    #[test]
+    fn control_suffix_retained_name_fails_closed_before_sidecar_spawn() {
+        if !tmux_available() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let locator = local_locator(&namespace(), "s42");
+        let _guard = RuntimeGuard(locator.clone());
+        create(
+            &locator,
+            "/bin/sh",
+            &["-c".into(), "while :; do sleep 1; done".into()],
+            temp.path(),
+            &[],
+            24,
+            80,
+        )
+        .unwrap();
+        let name = std::ffi::OsString::from_vec(b"CLAUDE_CODE_MESSAGING_\nSUFFIX".to_vec());
+        let output = Command::new("tmux")
+            .args([
+                "-f",
+                "/dev/null",
+                "-L",
+                &locator.private_server,
+                "set-environment",
+                "-t",
+                "=s42",
+            ])
+            .arg(name)
+            .arg("synthetic")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "private fixture rejected a control name"
+        );
+        let error = create_sidecar(
+            &locator,
+            "bridge",
+            "/bin/sh",
+            &[
+                "-c".into(),
+                "printf spawned > spawned; while :; do sleep 1; done".into(),
+            ],
+            temp.path(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("could not be safely scrubbed"));
+        assert!(!temp.path().join("spawned").exists());
+        assert!(matches!(
+            inspect_sidecar(&locator, "bridge").unwrap(),
+            RuntimeStatus::Missing
+        ));
+    }
+
+    #[test]
+    fn native_create_rejects_explicit_messaging_environment() {
+        if !tmux_available() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let locator = local_locator(&namespace(), "s42");
+        let error = create(
+            &locator,
+            "/bin/sh",
+            &["-c".into(), "while :; do sleep 1; done".into()],
+            temp.path(),
+            &[("CLAUDE_CODE_MESSAGING_POISON".into(), "synthetic".into())],
+            24,
+            80,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Claude messaging identity"));
+        assert!(matches!(inspect(&locator).unwrap(), RuntimeStatus::Missing));
+    }
+
+    #[test]
     fn provider_exit_removes_session_so_the_viewer_cannot_look_live() {
         if !tmux_available() {
             return;
@@ -2420,7 +3095,7 @@ exec /bin/sh -c "$taskai_test_script" "$@"
                 "-f",
                 "ignore-size",
                 "-t",
-                "=s42"
+                "=s42:0"
             ]
         );
         assert_eq!(&settings[..5], ["set-option", "-t", "=s42:", "mouse", "on"]);

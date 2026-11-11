@@ -2,8 +2,10 @@
 // ABOUTME: and the demo; the live app calls the screen renderers with registry views.
 
 use crate::color::{DIM, ION, VOID};
-use crate::fixture::{self, BOOT_METER, FIXED_CLOCK, HARNESS_SUMMARY};
-use crate::overlay::{destroy_panel, help_panel, newtask_panel, overlay, sub_panel};
+use crate::fixture::{self, BOOT_METER, FIXED_CLOCK, HARNESS_SUMMARY, TASK_TITLE};
+use crate::overlay::{
+    destroy_panel, help_panel, messages_panel, newtask_panel, overlay, sub_panel,
+};
 use crate::screens::{attach, attention, boot, harness, home, task};
 use crate::seg::{row, s, vrow};
 use crate::state::{Screen, St};
@@ -131,6 +133,26 @@ pub fn render(st: &St, cols: usize, rows: usize, clock: &str) -> Vec<String> {
             rows,
             clock,
         ),
+        Screen::Pulse => task::frame(
+            &fixture::task_view_pulse(st.rail_sel),
+            &fixture::hud(),
+            st,
+            cols,
+            rows,
+            clock,
+        ),
+        Screen::Messages => {
+            let base = task::frame(
+                &fixture::task_view(st.rail_sel),
+                &fixture::hud(),
+                st,
+                cols,
+                rows,
+                clock,
+            );
+            let panel = messages_panel(TASK_TITLE, &fixture::message_log(), cols, rows);
+            overlay(&base, &panel, cols, 6)
+        }
         Screen::Attach => attach::frame(st, cols, rows),
         Screen::Attention => attention::frame(st, cols, rows, clock),
         Screen::NewTask | Screen::Subordinate | Screen::Destroy | Screen::Help => {
@@ -189,6 +211,14 @@ pub fn dump(screen: &str, cols: usize, rows: usize) -> Option<Vec<String>> {
         "help" => {
             st.screen = Screen::Help;
             st.prev = Screen::Home;
+        }
+        "pulse" => {
+            st.screen = Screen::Pulse;
+            st.rail_sel = 2;
+        }
+        "messages" => {
+            st.screen = Screen::Messages;
+            st.prev = Screen::Task;
         }
         _ => return None,
     }

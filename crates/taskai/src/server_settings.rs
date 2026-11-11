@@ -938,6 +938,22 @@ impl Settings {
             GLASS,
             2,
         ));
+        let messaging = messaging_status(hkey, profile, check, found, width);
+        let (first, rest) = messaging.split_first().expect("wrap yields a line");
+        lines.push(row(
+            &[s(format!("Messaging   {first}"), Some(DIM), None)],
+            width,
+            GLASS,
+            2,
+        ));
+        for text in rest {
+            lines.push(row(
+                &[s(format!("            {text}"), Some(DIM), None)],
+                width,
+                GLASS,
+                2,
+            ));
+        }
         for text in wrap(
             "Model access isn't tested here; sign-in alone doesn't prove access.",
             width - 4,
@@ -1093,6 +1109,31 @@ impl Settings {
 
 fn optional(value: &str) -> Option<String> {
     (!value.trim().is_empty()).then(|| value.trim().to_string())
+}
+
+/// The messaging adapter's gate for the selected harness, wrapped to the details width. It is
+/// separate from launch status: a native provider launches whether or not messaging is ready.
+fn messaging_status(
+    hkey: &str,
+    profile: &ServerProfile,
+    check: Option<&ServerCheck>,
+    found: Option<&HarnessAvailability>,
+    width: usize,
+) -> Vec<String> {
+    let text = if profile.target != ConnectionTarget::Local {
+        "Local servers only".to_string()
+    } else if hkey == "opencode" {
+        "No adapter for OpenCode".to_string()
+    } else if check.is_some_and(|check| check.checking) {
+        "Checking…".to_string()
+    } else {
+        match found.and_then(|found| found.messaging.as_ref()) {
+            Some(gate) => gate.label(),
+            None => "Not checked · F5 checks".to_string(),
+        }
+    };
+    // The label follows a 12-cell caption inside the 2-cell padded details column.
+    wrap(&text, width.saturating_sub(16).max(20))
 }
 
 fn provider_status(
@@ -1403,6 +1444,7 @@ mod tests {
                     version: Some("2.1.226".into()),
                     unavailable: None,
                     auth: AuthState::Unknown,
+                    messaging: None,
                 })
                 .collect(),
             checking: false,
@@ -1427,6 +1469,7 @@ mod tests {
                 "VERSION",
                 "Couldn't verify",
                 "Sign-in",
+                "Messaging   Not checked · F5 checks",
                 "Native default",
                 "F5",
                 "Configure CLI",
@@ -1459,6 +1502,71 @@ mod tests {
         }
     }
 
+    // Expectation: the details show the messaging gate's own line — its reason and remedy
+    // wrapped, `No adapter` for OpenCode — while the table keeps the launch status, so a drifted
+    // Claude still reads Ready to launch. Why: build-model M7 — Settings shows the same readiness
+    // result as doctor, and a failed check disables one adapter, not the provider. Value: the
+    // person sees exactly what to do without losing native launches.
+    #[test]
+    fn messaging_line_shows_the_gate_without_changing_launch_status() {
+        use crate::doctor::Check;
+        let root = tempfile::tempdir().unwrap();
+        let registry = Registry::open(root.path()).unwrap();
+        let check = ServerCheck {
+            choices: vec![
+                HarnessAvailability {
+                    hkey: "claude".into(),
+                    version: Some("2.1.288".into()),
+                    unavailable: None,
+                    auth: AuthState::SignedIn,
+                    messaging: Some(Check::NotReady {
+                        reason: "Claude Code 2.1.288 is not the tested 2.1.289".into(),
+                        remedy: "Install Claude Code 2.1.289 before enabling it".into(),
+                    }),
+                },
+                HarnessAvailability {
+                    hkey: "opencode".into(),
+                    version: Some("1.18.0".into()),
+                    unavailable: None,
+                    auth: AuthState::Unknown,
+                    messaging: None,
+                },
+            ],
+            checking: false,
+            error: None,
+        };
+        for (cols, rows) in [(110, 30), (150, 42), (209, 51)] {
+            let mut settings = Settings::new();
+            let frame = settings.frame(&registry, Some(&check), cols, rows);
+            assert!(frame.iter().all(|line| cell_count(line) == cols));
+            let text = plain(&frame);
+            assert!(
+                text.lines().any(|line| line.contains("Claude Code")
+                    && line.contains("Ready")
+                    && line.contains("2.1.288")),
+                "launch status must stay Ready at {cols}x{rows}:\n{text}"
+            );
+            assert!(
+                text.contains("Messaging   Not ready · Claude Code 2.1.288 is not the tested"),
+                "{text}"
+            );
+            assert!(text.contains("Install Claude Code 2.1.289"), "{text}");
+            settings.harness = 2;
+            let text = plain(&settings.frame(&registry, Some(&check), cols, rows));
+            assert!(
+                text.contains("Messaging   No adapter for OpenCode"),
+                "{text}"
+            );
+        }
+        let checking = ServerCheck {
+            checking: true,
+            ..ServerCheck::default()
+        };
+        let mut settings = Settings::new();
+        let text = plain(&settings.frame(&registry, Some(&checking), 110, 30));
+        assert!(text.contains("Messaging   Checking…"), "{text}");
+    }
+
     #[test]
     fn provider_state_overrides_do_not_reuse_stale_ready_claims() {
         let checking = ServerCheck {
@@ -1481,6 +1589,7 @@ mod tests {
             version: Some("2.1.226".into()),
             unavailable: None,
             auth: AuthState::SignedIn,
+            messaging: None,
         };
         assert_eq!(provider_status(true, None, Some(&known_ready)), "Ready");
         assert_eq!(
@@ -1508,6 +1617,7 @@ mod tests {
                 version: Some("2.1.226".into()),
                 unavailable: None,
                 auth,
+                messaging: None,
             };
             assert!(
                 choice.is_ready(),
@@ -1549,6 +1659,7 @@ mod tests {
                     version: Some(version.into()),
                     unavailable: Some(detail.into()),
                     auth: AuthState::SignedIn,
+                    messaging: None,
                 }],
                 checking: false,
                 error: None,

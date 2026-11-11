@@ -2,6 +2,7 @@
 // ABOUTME: It owns no registry state; locators must be persisted before calling it.
 
 use std::{
+    io::Read,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -9,14 +10,19 @@ use std::{
 use taskai_connectors::{
     claude::{install_context_hook, install_hooks, session_events_path, ClaudeConnector},
     codex::CodexConnector,
-    grok::GrokConnector,
+    grok::{self, GrokConnector, PermissionMode as GrokPermissionMode},
 };
 use taskai_core::registry::{
-    ConnectionTarget, LaunchSettings, ServerProfile, Session, TmuxRuntimeLocator,
+    ConnectionTarget, LaunchSettings, ProviderMapping, Registry, ServerProfile, Session,
+    TmuxRuntimeLocator,
 };
 use taskai_pane::Pane;
 
-use crate::tmux::{self, RuntimeStatus};
+use crate::{
+    bridge::codex_intent::{CodexIntents, SavedCreationPlan},
+    doctor::{self, Paths},
+    tmux::{self, RuntimeStatus},
+};
 
 pub struct Request {
     /// None opens the task's utility shell, never a provider or agent record.
@@ -34,6 +40,163 @@ pub struct Outcome {
     pub created: bool,
     /// The UI starts its existing session-binding watcher at this byte offset.
     pub claude_events: Option<(PathBuf, u64)>,
+    /// A passive adapter may fail without preventing the native CLI from opening.
+    pub messaging_warning: Option<String>,
+}
+
+/// Save the exact native Grok session before any process can be spawned. Reopening always
+/// reuses this ID; a stale or foreign mapping is an error, never a replacement session.
+pub(crate) fn ensure_grok_mapping(
+    registry: &mut Registry,
+    session_ref: &str,
+) -> Result<ProviderMapping, String> {
+    registry.reload().map_err(|error| error.to_string())?;
+    let session = registry
+        .session(session_ref)
+        .ok_or("Grok session is not in the registry")?;
+    if session.harness != "grok" {
+        return Err("provider binding requires a Grok session".into());
+    }
+    let runtime = session
+        .runtime
+        .as_ref()
+        .ok_or("Grok has no saved runtime")?;
+    if runtime.target != ConnectionTarget::Local {
+        return Err("provider binding requires a local Grok runtime".into());
+    }
+    let runtime_id = format!("tmux:{}:{}", runtime.private_server, runtime.session);
+    let chosen = registry
+        .bind_provider_if_absent(
+            session_ref,
+            ProviderMapping {
+                provider: "grok".into(),
+                provider_session_id: fresh_grok_session_id()?,
+                runtime_id,
+                // This records the adapter's prelaunch binding, not a probed CLI version.
+                connector_version: "taskai-grok-m6/prelaunch-unverified".into(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    if !is_grok_session_id(&chosen.provider_session_id) {
+        return Err("Grok saved session ID is not a UUID".into());
+    }
+    Ok(chosen)
+}
+
+fn fresh_grok_session_id() -> Result<String, String> {
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .map_err(|error| format!("Could not allocate Grok session ID: {error}"))?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+    ))
+}
+
+pub(crate) fn is_grok_session_id(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+/// Give a session what its first launch needs and describe that launch: a tmux mapping on
+/// `private_server` when none is saved and, for local Grok, its saved native session ID.
+pub(crate) fn session_request(
+    registry: &mut Registry,
+    home_dir: &Path,
+    private_server: &str,
+    session_ref: &str,
+    rows: u16,
+    cols: u16,
+) -> Result<Request, String> {
+    let session = registry
+        .session(session_ref)
+        .cloned()
+        .ok_or("unknown session")?;
+    if session.runtime.is_none() {
+        registry
+            .bind_runtime(session_ref, private_server)
+            .map_err(|error| error.to_string())?;
+    }
+    let grok_mapping = if session.harness == "grok"
+        && registry
+            .session(session_ref)
+            .and_then(|saved| saved.runtime.as_ref())
+            .is_some_and(|runtime| runtime.target == ConnectionTarget::Local)
+    {
+        Some(ensure_grok_mapping(registry, session_ref)?)
+    } else {
+        None
+    };
+    let mut session = registry
+        .session(session_ref)
+        .cloned()
+        .ok_or("session missing")?;
+    if let Some(mapping) = grok_mapping {
+        session.provider = Some(mapping);
+    }
+    let runtime = session.runtime.clone().ok_or("runtime mapping missing")?;
+    let repo = session.workspace.clone();
+    Ok(Request {
+        session: Some(session),
+        runtime,
+        home_dir: home_dir.to_path_buf(),
+        repo,
+        rows,
+        cols,
+    })
+}
+
+/// Window size of a runtime started with no viewer; the first viewer to attach resizes it.
+const DETACHED_ROWS: u16 = 40;
+const DETACHED_COLS: u16 = 160;
+
+/// Start one session's durable runtime and messaging sidecar and leave no viewer attached, or
+/// put back a missing sidecar beside a runtime that is already live. Nothing is typed into the
+/// native pane. An agent inside a managed session may not start its teammates this way.
+pub fn run_detached(
+    home_dir: &Path,
+    private_server: &str,
+    session_ref: &str,
+) -> Result<serde_json::Value, String> {
+    if std::env::var_os("TASKAI_SESSION_REF").is_some() {
+        return Err(
+            "session launch is for the person's shell; it is refused inside a TaskAI session"
+                .into(),
+        );
+    }
+    let mut registry =
+        Registry::open(&home_dir.join("state")).map_err(|error| error.to_string())?;
+    let mut request = session_request(
+        &mut registry,
+        home_dir,
+        private_server,
+        session_ref,
+        DETACHED_ROWS,
+        DETACHED_COLS,
+    )?;
+    // A runtime that is already live keeps the size its last viewer gave it.
+    if let RuntimeStatus::Live { rows, cols, .. } =
+        tmux::inspect(&request.runtime).map_err(|error| error.to_string())?
+    {
+        (request.rows, request.cols) = (rows, cols);
+    }
+    let outcome = run(request)?;
+    // Dropping the outcome ends only its disposable viewer; the tmux runtime stays.
+    Ok(serde_json::json!({
+        "session": session_ref,
+        "created": outcome.created,
+        "messaging_warning": outcome.messaging_warning,
+    }))
 }
 
 type Recipe = (String, Vec<String>, Vec<(String, String)>);
@@ -63,6 +226,8 @@ pub fn run(request: Request) -> Result<Outcome, String> {
     let status = tmux::inspect(&runtime).map_err(|error| error.to_string())?;
     let created = !matches!(status, RuntimeStatus::Live { .. });
     let mut claude_events = None;
+    let mut messaging_warning = None;
+    let mut codex_plan = None;
     let run_dir = home_dir.join("run");
     if created {
         // A tmux -c path that no longer exists can fall back to the home
@@ -80,6 +245,17 @@ pub fn run(request: Request) -> Result<Outcome, String> {
             .as_ref()
             .map(|session| recipe(session, &runtime, &home_dir))
             .transpose()?;
+        if let Some(session) = session
+            .as_ref()
+            .filter(|session| local && session.harness == "codex" && session.provider.is_some())
+        {
+            let id = &session.provider.as_ref().unwrap().provider_session_id;
+            let plan = CodexIntents::saved_creation_plan(&home_dir, &session.session_ref, id)?;
+            if plan == SavedCreationPlan::FirstHumanGate {
+                CodexIntents::stage_gate_adoption(&home_dir, &session.session_ref, id)?;
+            }
+            codex_plan = Some(plan);
+        }
         if let Some(session) = &session {
             if local {
                 if session.harness == "claude" {
@@ -92,6 +268,16 @@ pub fn run(request: Request) -> Result<Outcome, String> {
                     if let Ok(exe) = std::env::current_exe() {
                         let _ = install_context_hook(&resolved, &exe);
                     }
+                }
+                if session.harness == "grok" {
+                    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+                    grok::install_mcp(&resolved, &exe).map_err(|error| error.to_string())?;
+                    grok::install_mode_hook(&resolved, &exe).map_err(|error| error.to_string())?;
+                    grok::ensure_leader_socket_dir(&grok::leader_socket_path(
+                        &run_dir,
+                        &session.session_ref,
+                    ))
+                    .map_err(|error| error.to_string())?;
                 }
                 let _ = taskai_context::install_bootstrap(&resolved);
             }
@@ -110,9 +296,49 @@ pub fn run(request: Request) -> Result<Outcome, String> {
             &runtime,
             session.as_ref().map_or("Terminal", |s| s.harness.as_str()),
         )?;
+        if let Some(session) = session.as_ref().filter(|session| {
+            local
+                && session.harness == "codex"
+                && session.provider.is_some()
+                && codex_plan != Some(SavedCreationPlan::FirstHumanGate)
+        }) {
+            if let Err(error) = record_codex_direct_resume(&home_dir, session, &runtime) {
+                messaging_warning =
+                    Some(format!("Codex native resume identity unavailable: {error}"));
+            }
+        }
     } else if let Some(session) = &session {
         if local && session.harness == "claude" && session.provider.is_none() {
             claude_events = Some((session_events_path(&run_dir, &session.session_ref), 0));
+        }
+    }
+    if let Some(session) = &session {
+        if local && session.harness == "grok" {
+            if let Err(reason) = grok_messaging_gate(session, &repo, &Paths::from_env()) {
+                messaging_warning = Some(reason);
+            }
+        }
+        if local
+            && session.harness == "claude"
+            && ensure_observer(session, &runtime, &home_dir).is_err()
+        {
+            messaging_warning = Some(
+                "Claude messaging observer unavailable; reopen this native session to retry".into(),
+            );
+        }
+        if local
+            && (session.harness == "codex" || session.harness == "grok")
+            && messaging_warning.is_none()
+            && ensure_bridge(session, &runtime, &home_dir).is_err()
+        {
+            messaging_warning = Some(format!(
+                "{} messaging bridge unavailable; reopen this native session to retry",
+                if session.harness == "grok" {
+                    "Grok"
+                } else {
+                    "Codex"
+                }
+            ));
         }
     }
     if let RuntimeStatus::Live {
@@ -144,7 +370,129 @@ pub fn run(request: Request) -> Result<Outcome, String> {
         runtime,
         created,
         claude_events,
+        messaging_warning,
     })
+}
+
+pub(crate) fn grok_messaging_gate(
+    session: &Session,
+    workspace: &Path,
+    paths: &Paths,
+) -> Result<(), String> {
+    let executable = doctor::configured_executable("grok", session.launch.executable.as_deref());
+    let availability = doctor::check_harness("grok", &executable, paths);
+    if let Some(reason) = availability.unavailable {
+        return Err(format!("Grok messaging unavailable: {reason}"));
+    }
+    let check = availability
+        .messaging
+        .ok_or("Grok messaging check is missing")?;
+    if !check.is_ready() {
+        return Err(format!("Grok messaging unavailable: {}", check.label()));
+    }
+    let trust = doctor::workspace_check("grok", workspace, paths)
+        .ok_or("Grok workspace trust check is missing")?;
+    if !trust.is_ready() {
+        return Err(format!("Grok messaging unavailable: {}", trust.label()));
+    }
+    Ok(())
+}
+
+fn record_codex_direct_resume(
+    home: &Path,
+    session: &Session,
+    runtime: &TmuxRuntimeLocator,
+) -> Result<(), String> {
+    let mapping = session
+        .provider
+        .as_ref()
+        .ok_or("Codex has no saved thread ID")?;
+    let runtime_id = format!("tmux:{}:{}", runtime.private_server, runtime.session);
+    if mapping.provider != "codex"
+        || mapping.provider_session_id.is_empty()
+        || mapping.runtime_id != runtime_id
+    {
+        return Err("Codex saved provider mapping is invalid".into());
+    }
+    let native = tmux::native_identity(runtime)
+        .map_err(|error| error.to_string())?
+        .ok_or("Codex direct resume has no live native pane")?;
+    CodexIntents::new(home, &session.session_ref, native)?
+        .record_direct_resume(&mapping.provider_session_id)
+}
+
+fn ensure_observer(
+    session: &Session,
+    runtime: &TmuxRuntimeLocator,
+    home_dir: &Path,
+) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    ensure_observer_with_exe(session, runtime, home_dir, &exe)
+}
+
+fn ensure_bridge(
+    session: &Session,
+    runtime: &TmuxRuntimeLocator,
+    home_dir: &Path,
+) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    ensure_bridge_with_exe(session, runtime, home_dir, &exe)
+}
+
+fn ensure_bridge_with_exe(
+    session: &Session,
+    runtime: &TmuxRuntimeLocator,
+    home_dir: &Path,
+    exe: &Path,
+) -> Result<(), String> {
+    match tmux::inspect_sidecar(runtime, "bridge").map_err(|error| error.to_string())? {
+        RuntimeStatus::Live { .. } => return Ok(()),
+        RuntimeStatus::Dead { .. } => {
+            tmux::kill_sidecar(runtime, "bridge").map_err(|error| error.to_string())?;
+        }
+        RuntimeStatus::Missing => {}
+    }
+    let exe = exe.to_str().ok_or("TaskAI executable path is not UTF-8")?;
+    tmux::create_sidecar(
+        runtime,
+        "bridge",
+        exe,
+        &["bridge".into(), session.session_ref.clone()],
+        home_dir,
+        &[
+            ("TASKAI_HOME".into(), home_dir.display().to_string()),
+            ("TASKAI_SESSION_REF".into(), session.session_ref.clone()),
+        ],
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn ensure_observer_with_exe(
+    session: &Session,
+    runtime: &TmuxRuntimeLocator,
+    home_dir: &Path,
+    exe: &Path,
+) -> Result<(), String> {
+    match tmux::inspect_sidecar(runtime, "observer").map_err(|error| error.to_string())? {
+        RuntimeStatus::Live { .. } => return Ok(()),
+        RuntimeStatus::Dead { .. } => {
+            tmux::kill_sidecar(runtime, "observer").map_err(|error| error.to_string())?;
+        }
+        RuntimeStatus::Missing => {}
+    }
+    let exe = exe.to_str().ok_or("TaskAI executable path is not UTF-8")?;
+    tmux::create_sidecar(
+        runtime,
+        "observer",
+        exe,
+        &["observer".into(), session.session_ref.clone()],
+        home_dir,
+        &[
+            ("TASKAI_HOME".into(), home_dir.display().to_string()),
+            ("TASKAI_SESSION_REF".into(), session.session_ref.clone()),
+        ],
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn recipe(
@@ -157,8 +505,23 @@ fn recipe(
         .provider
         .as_ref()
         .map(|provider| provider.provider_session_id.as_str());
+    let cold_gate = if session.harness == "codex" && local {
+        resume_id
+            .map(|id| CodexIntents::saved_creation_plan(home_dir, &session.session_ref, id))
+            .transpose()?
+            == Some(SavedCreationPlan::FirstHumanGate)
+    } else {
+        false
+    };
     let mut env = vec![("TASKAI_SESSION_REF".into(), session.session_ref.clone())];
     let (program, args) = match session.harness.as_str() {
+        "codex" if local && (resume_id.is_none() || cold_gate) => (
+            std::env::current_exe()
+                .map_err(|error| error.to_string())?
+                .display()
+                .to_string(),
+            vec!["gate".into(), session.session_ref.clone()],
+        ),
         "opencode" if local => (
             {
                 validate_model("opencode", &session.launch)?;
@@ -171,6 +534,44 @@ fn recipe(
             vec!["__opencode-runtime".into()],
         ),
         "opencode" => return Err("remote OpenCode needs TaskAI installed on that host; other harnesses support remote tmux persistence".into()),
+        "grok" if local => {
+            validate_model("grok", &session.launch)?;
+            let mapping = session.provider.as_ref().ok_or("Grok has no saved native session ID")?;
+            let runtime_id = format!("tmux:{}:{}", runtime.private_server, runtime.session);
+            if mapping.provider != "grok"
+                || mapping.runtime_id != runtime_id
+                || !is_grok_session_id(&mapping.provider_session_id)
+            {
+                return Err("Grok saved session ID is not for this exact runtime".into());
+            }
+            let leader_socket = grok::leader_socket_path(&home_dir.join("run"), &session.session_ref);
+            let tool_socket = grok::tool_socket_path(&home_dir.join("run"), &session.session_ref);
+            let mode_socket = grok::mode_socket_path(&home_dir.join("run"), &session.session_ref);
+            if [
+                leader_socket.as_path(),
+                tool_socket.as_path(),
+                mode_socket.as_path(),
+            ]
+            .iter()
+            .any(|path| path.to_str().is_none())
+            {
+                return Err("Grok private socket path is not UTF-8".into());
+            }
+            env.extend(grok::pane_env(&mapping.provider_session_id, &tool_socket));
+            env.push(("TASKAI_MODE_SOCKET".into(), mode_socket.display().to_string()));
+            let connector = GrokConnector {
+                bin: doctor::configured_executable("grok", session.launch.executable.as_deref()),
+            };
+            if connector.bin.trim().is_empty() {
+                return Err("Grok executable override is empty".into());
+            }
+            connector.pane_command(
+                &leader_socket,
+                &mapping.provider_session_id,
+                GrokPermissionMode::Prompting,
+                session.launch.model.as_deref(),
+            )
+        }
         other => configured_native_command(&runtime.target, other, &session.launch, resume_id)?,
     };
     if local {
@@ -312,7 +713,10 @@ pub fn confirm_runtime_started(runtime: &TmuxRuntimeLocator, harness: &str) -> R
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
+    use crate::bridge::codex_intent::SavedThreadOrigin;
     use taskai_core::registry::{ProviderMapping, Registry, Source};
 
     struct RuntimeGuard(TmuxRuntimeLocator);
@@ -320,6 +724,64 @@ mod tests {
         fn drop(&mut self) {
             let _ = tmux::kill(&self.0);
         }
+    }
+
+    #[test]
+    fn missing_claude_observer_recreates_without_restarting_native_pane() {
+        if tmux::probe(&ConnectionTarget::Local).is_err() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let mut registry = Registry::open(&root.path().join("state")).unwrap();
+        let task = registry
+            .create_task("Task", &workspace, Source::HumanUi)
+            .unwrap();
+        let session_ref = registry
+            .create_session(&task, None, "Claude", "claude", &workspace, Source::HumanUi)
+            .unwrap();
+        registry
+            .bind_runtime(
+                &session_ref,
+                &format!("taskai-observer-{}", std::process::id()),
+            )
+            .unwrap();
+        let session = registry.session(&session_ref).unwrap().clone();
+        let runtime = session.runtime.clone().unwrap();
+        let _guard = RuntimeGuard(runtime.clone());
+        tmux::create(
+            &runtime,
+            "/bin/sh",
+            &["-c".into(), "while :; do sleep 1; done".into()],
+            &workspace,
+            &[],
+            24,
+            80,
+        )
+        .unwrap();
+        let native = tmux::native_identity(&runtime).unwrap().unwrap();
+        let fake = root.path().join("fake-observer");
+        std::fs::write(&fake, "#!/bin/sh\nwhile :; do sleep 1; done\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_observer_with_exe(&session, &runtime, root.path(), &fake).unwrap();
+        let first = match tmux::inspect_sidecar(&runtime, "observer").unwrap() {
+            RuntimeStatus::Live { pid, .. } => pid,
+            other => panic!("unexpected observer status: {other:?}"),
+        };
+        ensure_observer_with_exe(&session, &runtime, root.path(), &fake).unwrap();
+        assert!(matches!(
+            tmux::inspect_sidecar(&runtime, "observer").unwrap(),
+            RuntimeStatus::Live { pid, .. } if pid == first
+        ));
+        assert!(tmux::kill_sidecar(&runtime, "observer").unwrap());
+        ensure_observer_with_exe(&session, &runtime, root.path(), &fake).unwrap();
+        assert!(matches!(
+            tmux::inspect_sidecar(&runtime, "observer").unwrap(),
+            RuntimeStatus::Live { pid, .. } if pid != first
+        ));
+        assert_eq!(tmux::native_identity(&runtime).unwrap().unwrap(), native);
     }
 
     #[test]
@@ -447,6 +909,105 @@ mod tests {
     }
 
     #[test]
+    fn grok_workspace_gate_reports_native_trust_remedy_from_private_paths() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::under(root.path());
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let home = paths.grok_home.as_ref().unwrap();
+        std::fs::create_dir_all(home).unwrap();
+        let executable = root.path().join("fake-grok");
+        std::fs::write(&executable, "#!/bin/sh\nprintf 'grok 1.0.77\\n'\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut registry = Registry::open(&root.path().join("state")).unwrap();
+        let task = registry
+            .create_task("Task", &workspace, Source::HumanUi)
+            .unwrap();
+        let key = registry
+            .create_session(&task, None, "Grok", "grok", &workspace, Source::HumanUi)
+            .unwrap();
+        let mut session = registry.session(&key).unwrap().clone();
+        session.launch.executable = Some(executable.display().to_string());
+        let reason = grok_messaging_gate(&session, &workspace, &paths).unwrap_err();
+        assert!(reason.contains("workspace not trusted by Grok"), "{reason}");
+        assert!(reason.contains("accept its trust prompt"), "{reason}");
+        std::fs::write(
+            home.join("trusted_folders.toml"),
+            format!("[folders.\"{}\"]\ntrusted = true\n", workspace.display()),
+        )
+        .unwrap();
+        grok_messaging_gate(&session, &workspace, &paths).unwrap();
+    }
+
+    #[test]
+    fn grok_mapping_is_persisted_once_before_launch_and_reused_on_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let mut registry = Registry::open(&root.path().join("state")).unwrap();
+        let task = registry
+            .create_task("Grok", root.path(), Source::HumanUi)
+            .unwrap();
+        let key = registry
+            .create_session(&task, None, "Grok", "grok", root.path(), Source::HumanUi)
+            .unwrap();
+        registry.bind_runtime(&key, "taskai-grok-mapping").unwrap();
+        let mut stale = Registry::open(&root.path().join("state")).unwrap();
+        let first = ensure_grok_mapping(&mut registry, &key).unwrap();
+        assert!(is_grok_session_id(&first.provider_session_id));
+        assert!(!first.connector_version.is_empty());
+        assert_eq!(ensure_grok_mapping(&mut stale, &key).unwrap(), first);
+        assert_eq!(ensure_grok_mapping(&mut registry, &key).unwrap(), first);
+        assert_eq!(
+            registry.session(&key).unwrap().provider.as_ref(),
+            Some(&first)
+        );
+        let mut reopened = Registry::open(&root.path().join("state")).unwrap();
+        assert_eq!(ensure_grok_mapping(&mut reopened, &key).unwrap(), first);
+        assert_eq!(
+            reopened.session(&key).unwrap().provider.as_ref(),
+            Some(&first)
+        );
+    }
+
+    #[test]
+    fn local_grok_requires_saved_exact_id_and_routes_both_private_sockets() {
+        let root = tempfile::tempdir().unwrap();
+        let mut registry = Registry::open(&root.path().join("state")).unwrap();
+        let task = registry
+            .create_task("Grok", root.path(), Source::HumanUi)
+            .unwrap();
+        let key = registry
+            .create_session(&task, None, "Grok", "grok", root.path(), Source::HumanUi)
+            .unwrap();
+        registry.bind_runtime(&key, "taskai-grok-recipe").unwrap();
+        let mut session = registry.session(&key).unwrap().clone();
+        let runtime = session.runtime.clone().unwrap();
+        assert!(recipe(&session, &runtime, root.path()).is_err());
+        session.provider = Some(ProviderMapping {
+            provider: "grok".into(),
+            provider_session_id: "01234567-89ab-4cde-8fab-0123456789ab".into(),
+            runtime_id: format!("tmux:{}:{}", runtime.private_server, runtime.session),
+            connector_version: "1.0.77".into(),
+        });
+        let (_, args, env) = recipe(&session, &runtime, root.path()).unwrap();
+        assert!(args.contains(&"--leader".into()));
+        assert!(args.contains(&"01234567-89ab-4cde-8fab-0123456789ab".into()));
+        assert!(env.contains(&(
+            "GROK_SESSION_ID".into(),
+            "01234567-89ab-4cde-8fab-0123456789ab".into()
+        )));
+        assert!(env
+            .iter()
+            .any(|(key, value)| key == "TASKAI_MODE_SOCKET" && value.ends_with(".mode.sock")));
+        assert!(env
+            .iter()
+            .any(|(key, value)| key == "TASKAI_TOOL_SOCKET" && value.ends_with(".tools.sock")));
+        session.provider.as_mut().unwrap().runtime_id = "other-runtime".into();
+        assert!(recipe(&session, &runtime, root.path()).is_err());
+    }
+
+    #[test]
     fn launch_recipes_preserve_exact_provider_identity_and_remote_context_boundary() {
         let temp = tempfile::tempdir().unwrap();
         let mut registry = Registry::open(&temp.path().join("state")).unwrap();
@@ -504,6 +1065,186 @@ mod tests {
         append_opencode_session(&mut args, None);
         append_opencode_session(&mut args, Some(""));
         assert_eq!(args.len(), 4);
+    }
+
+    #[test]
+    fn new_local_codex_uses_a_gate_and_saved_id_resumes_exactly() {
+        let root = tempfile::tempdir().unwrap();
+        let mut registry = Registry::open(&root.path().join("state")).unwrap();
+        let task = registry
+            .create_task("Task", root.path(), Source::HumanUi)
+            .unwrap();
+        let session_ref = registry
+            .create_session(&task, None, "Codex", "codex", root.path(), Source::HumanUi)
+            .unwrap();
+        registry
+            .bind_runtime(&session_ref, "taskai-codex-gate-test")
+            .unwrap();
+        let session = registry.session(&session_ref).unwrap();
+        let runtime = session.runtime.as_ref().unwrap();
+        let (program, args, env) = recipe(session, runtime, root.path()).unwrap();
+        assert_eq!(
+            program,
+            std::env::current_exe().unwrap().display().to_string()
+        );
+        assert_eq!(args, ["gate", session_ref.as_str()]);
+        assert!(env.contains(&("TASKAI_SESSION_REF".into(), session_ref.clone())));
+        assert!(env.iter().any(|(key, _)| key == "TASKAI_HOME"));
+        let mut restored = session.clone();
+        restored.provider = Some(ProviderMapping {
+            provider: "codex".into(),
+            provider_session_id: "owned exact id".into(),
+            runtime_id: "tmux:taskai-codex-gate-test:s1".into(),
+            connector_version: "test".into(),
+        });
+        let (program, args, _) = recipe(&restored, runtime, root.path()).unwrap();
+        assert_eq!(program, "codex");
+        assert_eq!(args, ["resume", "owned exact id"]);
+    }
+
+    #[test]
+    fn restored_codex_launch_records_only_its_exact_live_direct_resume() {
+        if tmux::probe(&ConnectionTarget::Local).is_err() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let fake = root.path().join("fake-codex");
+        std::fs::write(&fake, "#!/bin/sh\n[ \"$1\" = resume ] && [ \"$2\" = owned-thread ] || exit 3\nexec sleep 10\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut registry = Registry::open(&root.path().join("state")).unwrap();
+        registry
+            .set_server_harness(
+                "local",
+                "codex",
+                taskai_core::registry::HarnessSettings {
+                    enabled: true,
+                    executable: Some(fake.display().to_string()),
+                    model: None,
+                },
+                Source::HumanUi,
+            )
+            .unwrap();
+        let task = registry
+            .create_task("Task", &workspace, Source::HumanUi)
+            .unwrap();
+        let session_ref = registry
+            .create_session(&task, None, "Codex", "codex", &workspace, Source::HumanUi)
+            .unwrap();
+        registry
+            .bind_runtime(
+                &session_ref,
+                &format!("taskai-resume-test-{}", std::process::id()),
+            )
+            .unwrap();
+        let runtime = registry
+            .session(&session_ref)
+            .unwrap()
+            .runtime
+            .clone()
+            .unwrap();
+        let _guard = RuntimeGuard(runtime.clone());
+        registry
+            .bind_provider(
+                &session_ref,
+                ProviderMapping {
+                    provider: "codex".into(),
+                    provider_session_id: "owned-thread".into(),
+                    runtime_id: format!("tmux:{}:{}", runtime.private_server, runtime.session),
+                    connector_version: "fixture".into(),
+                },
+            )
+            .unwrap();
+        let request = || Request {
+            session: Some(registry.session(&session_ref).unwrap().clone()),
+            runtime: runtime.clone(),
+            home_dir: root.path().into(),
+            repo: workspace.clone(),
+            rows: 24,
+            cols: 80,
+        };
+        let first = run(request()).unwrap();
+        assert!(first.created);
+        let native = tmux::native_identity(&runtime).unwrap().unwrap();
+        let intents = CodexIntents::new(root.path(), &session_ref, native.clone()).unwrap();
+        assert_eq!(
+            intents.saved_thread_origin("owned-thread").unwrap(),
+            SavedThreadOrigin::DirectResume
+        );
+        assert!(!intents.human_established("owned-thread").unwrap());
+        drop(first);
+        let second = run(request()).unwrap();
+        assert!(!second.created);
+        assert_eq!(tmux::native_identity(&runtime).unwrap().unwrap(), native);
+        drop(second);
+    }
+
+    #[test]
+    fn saved_unattempted_codex_thread_reopens_at_human_gate_not_empty_tui_resume() {
+        let root = tempfile::tempdir().unwrap();
+        let mut registry = Registry::open(&root.path().join("state")).unwrap();
+        let task = registry
+            .create_task("Task", root.path(), Source::HumanUi)
+            .unwrap();
+        let session_ref = registry
+            .create_session(&task, None, "Codex", "codex", root.path(), Source::HumanUi)
+            .unwrap();
+        registry
+            .bind_runtime(&session_ref, "taskai-cold-reopen-test")
+            .unwrap();
+        let runtime = registry
+            .session(&session_ref)
+            .unwrap()
+            .runtime
+            .clone()
+            .unwrap();
+        registry
+            .bind_provider(
+                &session_ref,
+                ProviderMapping {
+                    provider: "codex".into(),
+                    provider_session_id: "owned-thread".into(),
+                    runtime_id: format!("tmux:{}:{}", runtime.private_server, runtime.session),
+                    connector_version: "fixture".into(),
+                },
+            )
+            .unwrap();
+        let old = crate::tmux::NativeIdentity {
+            pane_id: "%77".into(),
+            pid: 999_999,
+            proc_start: "old-gate".into(),
+        };
+        let intents = CodexIntents::new(root.path(), &session_ref, old.clone()).unwrap();
+        intents.begin_creation().unwrap();
+        intents.record_created("owned-thread").unwrap();
+        std::fs::write(
+            root.path().join("run/codex/s1.gate.json"),
+            serde_json::json!({
+                "sessionRef":"s1", "paneId":old.pane_id, "pid":old.pid,
+                "procStart":old.proc_start,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let saved = registry.session(&session_ref).unwrap();
+        let (program, args, _) = recipe(saved, &runtime, root.path()).unwrap();
+        assert_eq!(
+            program,
+            std::env::current_exe().unwrap().display().to_string()
+        );
+        assert_eq!(args, ["gate", "s1"]);
+        CodexIntents::stage_gate_adoption(root.path(), &session_ref, "owned-thread").unwrap();
+        assert!(root.path().join("run/codex/s1.adoption.json").exists());
+        intents.begin_first_turn("owned-thread").unwrap();
+        assert!(
+            recipe(saved, &runtime, root.path()).is_err(),
+            "an uncertain first turn cannot reopen the gate"
+        );
+        intents.record_first_turn_accepted("owned-thread").unwrap();
+        let (program, args, _) = recipe(saved, &runtime, root.path()).unwrap();
+        assert_eq!(program, "codex");
+        assert_eq!(args, ["resume", "owned-thread"]);
     }
 
     #[test]

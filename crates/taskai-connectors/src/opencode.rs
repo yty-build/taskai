@@ -4,7 +4,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::claude::parse_version;
@@ -25,7 +25,7 @@ impl Default for OpenCodeConnector {
 impl OpenCodeConnector {
     /// Harmless handshake: reads the version, never creates a session.
     pub fn probe(&self) -> Capability {
-        match Command::new(&self.bin).arg("--version").output() {
+        match crate::child_command(&self.bin).arg("--version").output() {
             Ok(out) if out.status.success() => {
                 let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 crate::gate_version(
@@ -54,7 +54,7 @@ impl OpenCodeConnector {
     pub fn start_server(&self, dir: &Path) -> Result<Server, Error> {
         let port = free_port()?;
         let password = format!("taskai-{}", random_hex());
-        let child = Command::new(&self.bin)
+        let child = crate::child_command(&self.bin)
             .args([
                 "serve",
                 "--port",

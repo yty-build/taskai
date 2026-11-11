@@ -49,6 +49,34 @@ pub struct RailRow {
     pub conduit: String,
     pub state_word: String,
     pub ws: String,
+    /// What the session's mailbox reports: `busy`, `idle` or `waiting`; None when it has none.
+    pub status: Option<String>,
+    /// What a waiting session waits for, such as `approval` or `input`.
+    pub waiting_for: Option<String>,
+}
+
+/// One line of a task's message log: a letter, receipt or notice between two sessions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageRow {
+    pub ts: String,
+    pub from: String,
+    pub to: String,
+    pub outcome: String,
+    /// First line of the body, or the log's note when the line carried no body.
+    pub text: String,
+    /// The letter crossed permission modes between sender and recipient.
+    pub mismatch: bool,
+}
+
+/// What the message log view shows: the recent records, whether older history was left
+/// unread, and why the log could not be read when it could not.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MessageLog {
+    pub rows: Vec<MessageRow>,
+    /// Records older than the ones read exist in the file.
+    pub truncated: bool,
+    /// The log exists but could not be read; the reason, for the person.
+    pub unavailable: Option<String>,
 }
 
 #[derive(Clone)]

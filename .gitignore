@@ -1,5 +1,7 @@
 target/
 .DS_Store
+__pycache__/
+*.pyc
 
 # Local working notes and machine-specific agent config, never distributed.
 journal.md

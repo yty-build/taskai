@@ -17,6 +17,8 @@ const SCREENS: &[&str] = &[
     "subordinate",
     "destroy",
     "help",
+    "pulse",
+    "messages",
 ];
 
 fn grid(lines: &[String], cols: usize, rows: usize) -> vt100::Parser {

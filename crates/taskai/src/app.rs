@@ -8,6 +8,8 @@ use std::sync::mpsc::{channel, sync_channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use crate::messages;
+
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -30,17 +32,18 @@ use taskai_tui::color::{bg, CLI_BG, DIM, FT, GLASS_IN, ION, KCAP, RESET, TEXT, V
 use taskai_tui::input::{route, Focus, Route};
 use taskai_tui::overlay::{
     centered_overlay, destroy_panel_view, drawer_panel_view, explorer_panel_width,
-    form_panel_width, help_panel, DrawerView,
+    form_panel_width, help_panel, messages_panel, DrawerView,
 };
 use taskai_tui::render::{paint_update, resize_frame, MIN_COLS, MIN_ROWS};
 use taskai_tui::screens::pane::{cell_row, PaneCell};
 use taskai_tui::screens::{boot, home, task};
 use taskai_tui::seg::{clip_segs, row, s, seglen, vrow, Seg};
 use taskai_tui::state::{advance, Screen as StScreen, St, View};
-use taskai_tui::view::{HomeTaskRow, Hud, PaneBody, ProbeRow, RailRow, TaskView};
+use taskai_tui::view::{HomeTaskRow, Hud, MessageLog, PaneBody, ProbeRow, RailRow, TaskView};
 
 use taskai_connectors::control;
 
+use crate::doctor::Paths;
 use crate::forms::{self, Editor};
 #[cfg(test)]
 use crate::launch::confirm_runtime_started;
@@ -103,6 +106,12 @@ const EXPLORER_KEYS: &[(&str, &str)] = &[
 ];
 const DESTROY_KEYS: &[(&str, &str)] = &[("Enter", "Destroy"), ("Esc", "Cancel")];
 const HELP_KEYS: &[(&str, &str)] = &[("Esc", "Close")];
+/// How often the registry is re-read and each bridge's liveness checked for the rail. Each
+/// check of a session with a mailbox spawns one `ps`, so this is slower than the UI tick.
+const MAILBOX_REFRESH: Duration = Duration::from_secs(1);
+/// Prefix of the status-line message while the registry on disk cannot be re-read; the message
+/// clears on the first successful re-read.
+const REGISTRY_FAULT: &str = "registry not re-read: ";
 
 const RESTORE_TERMINAL: &str =
     "\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?7h\x1b[?6l\x1b[r\x1b[?25h\x1b[?1049l\x1b[0m";
@@ -279,7 +288,7 @@ fn terminal_paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     bytes
 }
 
-fn harness_title(hkey: &str) -> &'static str {
+pub(crate) fn harness_title(hkey: &str) -> &'static str {
     match hkey {
         "claude" => "Claude Code",
         "codex" => "Codex",
@@ -308,7 +317,7 @@ fn tilde(p: &Path) -> String {
     }
 }
 
-fn private_server_name(home_dir: &Path) -> String {
+pub(crate) fn private_server_name(home_dir: &Path) -> String {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in home_dir.as_os_str().as_encoded_bytes() {
         hash ^= u64::from(*byte);
@@ -661,6 +670,7 @@ enum Mode {
     TaskCli,
     Attach,
     Help(PrevMode),
+    Messages { title: String, log: MessageLog },
     NewTask(NewTaskForm),
     Manager(ManagerForm),
     Sub(SubForm),
@@ -789,6 +799,9 @@ pub struct App {
     buffered_input: HashMap<String, Vec<BufferedInput>>,
     disconnected: HashMap<String, PendingInspection>,
     terminal_states: HashMap<String, &'static str>,
+    /// Status and reason each live bridge published for the selected task's sessions, by
+    /// session ref, validated at the mailbox refresh cadence and rendered from here.
+    mailbox_status: HashMap<String, (String, Option<String>)>,
     resize_tx: Sender<ResizeRequest>,
     served: control::Shared,
     sel_task: Option<String>,
@@ -904,6 +917,12 @@ impl App {
         if probe_harnesses {
             probe_local_harnesses(ptx);
         }
+        // Tests never stat the real home or dial the real Codex daemon.
+        let probe_paths = if probe_harnesses {
+            Paths::from_env()
+        } else {
+            Paths::under(&home_dir)
+        };
         let (bind_tx, bind_rx) = channel();
         let served = control::Shared {
             panes: Arc::new(Mutex::new(HashMap::new())),
@@ -925,7 +944,7 @@ impl App {
             home_dir,
             registry,
             probes: HashMap::new(),
-            remote_probes: RemoteProbes::default(),
+            remote_probes: RemoteProbes::new(probe_paths),
             pending_harness_action: None,
             probe_rx,
             bind_rx,
@@ -935,6 +954,7 @@ impl App {
             buffered_input: HashMap::new(),
             disconnected,
             terminal_states,
+            mailbox_status: HashMap::new(),
             resize_tx: resize_worker(),
             served,
             sel_task: None,
@@ -1045,6 +1065,7 @@ impl App {
         let mut painted_revision = None;
         let mut dirty = true;
         let mut next_tick = Instant::now();
+        let mut next_mailbox_refresh = Instant::now();
         let mut pacer = FramePacer::new(next_tick);
         let (c, r) = terminal::size().unwrap_or((120, 40));
         let (mut cols, mut rows) = (c as usize, r as usize);
@@ -1115,6 +1136,10 @@ impl App {
             if now >= next_tick {
                 next_tick = now + UI_TICK;
                 dirty = true;
+                if now >= next_mailbox_refresh {
+                    next_mailbox_refresh = now + MAILBOX_REFRESH;
+                    self.refresh_mailbox_status();
+                }
                 self.poll_helper_requests();
                 self.poll_new_task();
                 self.poll_settings();
@@ -1375,6 +1400,7 @@ impl App {
 
     fn open_task(&mut self, task_ref: String, cols: usize, rows: usize) {
         self.sel_task = Some(task_ref.clone());
+        self.refresh_mailbox_status();
         if let Some(profile) = self.selected_profile() {
             self.remote_probes.request_profile(&profile);
         }
@@ -1420,6 +1446,58 @@ impl App {
         self.mode = Mode::Home;
     }
 
+    /// Re-reads the registry and caches, for the selected task, the status each session's
+    /// bridge published, keeping only entries whose bridge process is still the one that
+    /// registered them. Rows render from the cache, so no row and no frame spawns anything.
+    fn refresh_mailbox_status(&mut self) {
+        self.mailbox_status.clear();
+        let Some(task_ref) = self.sel_task.clone() else {
+            return;
+        };
+        match self.registry.reload() {
+            Ok(()) => {
+                if self
+                    .status
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with(REGISTRY_FAULT))
+                {
+                    self.status = None;
+                }
+            }
+            Err(error) => {
+                self.status = Some(format!("{REGISTRY_FAULT}{error}"));
+                return;
+            }
+        }
+        for session in self.registry.sessions_of(&task_ref) {
+            if let Some(entry) = session.live_mailbox() {
+                let status = serde_json::to_value(entry.status)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .unwrap_or_default();
+                self.mailbox_status.insert(
+                    session.session_ref.clone(),
+                    (status, entry.waiting_for.clone()),
+                );
+            }
+        }
+    }
+
+    /// The task's message log as an overlay, so the person reads who asked whom for what
+    /// without opening any session.
+    fn open_messages(&mut self) {
+        let Some(task_ref) = self.sel_task.clone() else {
+            return;
+        };
+        let title = self
+            .registry
+            .task(&task_ref)
+            .map(|t| t.name.clone())
+            .unwrap_or_else(|| task_ref.clone());
+        let log = messages::read_log(&messages::log_path(&self.home_dir.join("state"), &task_ref));
+        self.mode = Mode::Messages { title, log };
+    }
+
     fn rail_rows(&self, task_ref: &str) -> Vec<RailRow> {
         let sessions = self.registry.sessions_of(task_ref);
         let mut ordered: Vec<&taskai_core::registry::Session> = Vec::new();
@@ -1433,6 +1511,11 @@ impl App {
             .into_iter()
             .map(|se| {
                 let mode = harness_mode(&se.harness);
+                let (status, waiting_for) = self
+                    .mailbox_status
+                    .get(&se.session_ref)
+                    .map(|(status, waiting_for)| (Some(status.clone()), waiting_for.clone()))
+                    .unwrap_or((None, None));
                 RailRow {
                     key: se.session_ref.clone(),
                     name: se.name.clone(),
@@ -1443,6 +1526,8 @@ impl App {
                     conduit: mode.label().to_uppercase(),
                     state_word: se.state.label().into(),
                     ws: tilde(&se.workspace),
+                    status,
+                    waiting_for,
                 }
             })
             .collect();
@@ -1463,6 +1548,8 @@ impl App {
                 } else {
                     task.repo.display().to_string()
                 },
+                status: None,
+                waiting_for: None,
             });
         }
         rows
@@ -1733,6 +1820,11 @@ impl App {
                     HELP_KEYS,
                 )
             }
+            Mode::Messages { title, log } => {
+                let panel = messages_panel(title, log, cols, rows);
+                let base = self.base_frame(PrevMode::Task, cols, rows, &clock);
+                modal_keybar(centered_overlay(&base, &panel, cols), cols, HELP_KEYS)
+            }
             Mode::NewTask(f) => {
                 if let Some(ex) = &f.explorer {
                     let panel = live_explorer_panel(ex, cols);
@@ -1953,6 +2045,7 @@ impl App {
                     ("a", "Add agent"),
                     ("m", "Add manager"),
                     ("t", "Terminal"),
+                    ("l", "Message log"),
                     ("d", "Destroy agent"),
                     ("D", "Destroy task"),
                     ("s", "Settings"),
@@ -2218,6 +2311,7 @@ impl App {
                     .iter()
                     .map(|h| HarnessAvailability {
                         auth: crate::remote_probes::AuthState::Unknown,
+                        messaging: None,
                         hkey: (*h).into(),
                         version: None,
                         unavailable: Some(match result {
@@ -2244,6 +2338,7 @@ impl App {
                 });
                 HarnessAvailability {
                     auth: crate::remote_probes::AuthState::Unknown,
+                    messaging: None,
                     hkey: (*h).into(),
                     version: cap.and_then(|c| c.version.clone()),
                     unavailable: configured.or_else(|| match cap {
@@ -2426,43 +2521,39 @@ impl App {
             .cloned()
             .ok_or("task missing")?;
         let server = private_server_name(&self.home_dir);
-        let (session, runtime, repo) = if sref == terminal_ref(&task_ref) {
-            let runtime = self
-                .registry
-                .bind_terminal(&task_ref, &server)
-                .map_err(|e| e.to_string())?;
-            self.terminal_states.insert(sref.into(), "CONNECTING");
-            (None, runtime, task.repo)
-        } else {
-            let session = self
+        let rows = rows.saturating_sub(11).max(10) as u16;
+        let cols = cols.saturating_sub(TASK_PANE_BODY_LEFT).max(1) as u16;
+        if sref != terminal_ref(&task_ref) {
+            let in_task = self
                 .registry
                 .session(sref)
-                .cloned()
-                .ok_or("unknown session")?;
-            if session.task_ref != task_ref {
+                .ok_or("unknown session")?
+                .task_ref
+                == task_ref;
+            if !in_task {
                 return Err("session is not in this task".into());
             }
-            if session.runtime.is_none() {
-                self.registry
-                    .bind_runtime(sref, &server)
-                    .map_err(|e| e.to_string())?;
-            }
-            let session = self
-                .registry
-                .session(sref)
-                .cloned()
-                .ok_or("session missing")?;
-            let runtime = session.runtime.clone().ok_or("runtime mapping missing")?;
-            let repo = session.workspace.clone();
-            (Some(session), runtime, repo)
-        };
+            return launch::session_request(
+                &mut self.registry,
+                &self.home_dir,
+                &server,
+                sref,
+                rows,
+                cols,
+            );
+        }
+        let runtime = self
+            .registry
+            .bind_terminal(&task_ref, &server)
+            .map_err(|e| e.to_string())?;
+        self.terminal_states.insert(sref.into(), "CONNECTING");
         Ok(launch::Request {
-            session,
+            session: None,
             runtime,
             home_dir: self.home_dir.clone(),
-            repo,
-            rows: rows.saturating_sub(11).max(10) as u16,
-            cols: cols.saturating_sub(TASK_PANE_BODY_LEFT).max(1) as u16,
+            repo: task.repo,
+            rows,
+            cols,
         })
     }
 
@@ -2529,13 +2620,17 @@ impl App {
             let pending = self.pending_launches.remove(&key).unwrap();
             match result {
                 Ok(outcome) => {
+                    let messaging_warning = outcome.messaging_warning.clone();
                     self.accept_launch(&key, outcome);
                     self.buffered_input
                         .entry(key.clone())
                         .or_default()
                         .extend(pending.input);
                     if self.selected_pane().is_some_and(|p| p.key == key) {
-                        self.status = Some(format!("{key} connected · Ctrl+G navigation"));
+                        self.status = Some(
+                            messaging_warning
+                                .unwrap_or_else(|| format!("{key} connected · Ctrl+G navigation")),
+                        );
                     }
                 }
                 Err(error) => {
@@ -2929,7 +3024,11 @@ impl App {
                 && k.code == KeyCode::Char('q')
                 && (matches!(
                     self.mode,
-                    Mode::Home | Mode::Task | Mode::Helper { .. } | Mode::Help(_)
+                    Mode::Home
+                        | Mode::Task
+                        | Mode::Helper { .. }
+                        | Mode::Help(_)
+                        | Mode::Messages { .. }
                 ) || matches!(self.mode, Mode::Settings) && !self.settings.has_dialog())
             {
                 return false;
@@ -3639,6 +3738,7 @@ impl App {
                     }
                     KeyCode::Char('s' | 'h') => self.open_settings(),
                     KeyCode::Char('?') => self.mode = Mode::Help(PrevMode::Task),
+                    KeyCode::Char('l') => self.open_messages(),
                     KeyCode::Char('m') => {
                         if self.wait_for_remote_harnesses('m') {
                             return true;
@@ -3798,6 +3898,15 @@ impl App {
                         }
                     }
                     Route::Nav(_) => {}
+                }
+                true
+            }
+            Mode::Messages { .. } => {
+                if k.code == KeyCode::Char('q') && k.modifiers.is_empty() {
+                    return false;
+                }
+                if matches!(k.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('l')) {
+                    self.mode = Mode::Task;
                 }
                 true
             }
@@ -4331,6 +4440,7 @@ impl App {
                 version: None,
                 unavailable: Some(reason.clone()),
                 auth: crate::remote_probes::AuthState::Unknown,
+                messaging: None,
             })
             .collect()
     }
@@ -4358,9 +4468,9 @@ impl App {
         let selection = preferred
             .and_then(|key| HKEYS.iter().position(|k| *k == key))
             .or_else(|| {
-                choices.iter().position(|c| {
-                    c.is_ready() && c.auth == crate::remote_probes::AuthState::SignedIn
-                })
+                choices
+                    .iter()
+                    .position(|c| c.is_ready() && c.auth.saved_login())
             })
             .or_else(|| choices.iter().position(HarnessAvailability::is_ready))
             .unwrap_or(0);
@@ -5680,6 +5790,7 @@ mod tests {
                 runtime,
                 created: true,
                 claude_events: None,
+                messaging_warning: None,
             },
         );
         app.handle(
@@ -5843,6 +5954,7 @@ mod tests {
             version: Some("2.1.226".into()),
             unavailable: None,
             auth: crate::remote_probes::AuthState::SignedIn,
+            messaging: None,
         }]);
         assert_eq!(
             App::helper_choices_from_result(Some(&ready)),
@@ -6187,6 +6299,7 @@ mod tests {
             for label in [
                 "s  Settings",
                 "t  Terminal",
+                "l  Message log",
                 "?  Help",
                 "G  Home",
                 "Esc  Back",
@@ -6201,6 +6314,207 @@ mod tests {
                 );
             }
         }
+    }
+
+    // Expectation: `l` on a task opens the message log overlay with the task's name and the
+    // letters from its log, and Esc returns to the task. Why: the log is the person's pulse
+    // on who asked whom for what. Value: one key, no session opened, no file to find.
+    #[test]
+    fn message_log_opens_from_task_and_closes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = App::new_test(root.path().join("home")).unwrap();
+        let task = app
+            .registry
+            .create_task("Gate review", root.path(), Source::HumanUi)
+            .unwrap();
+        let log = crate::messages::log_path(&root.path().join("home").join("state"), &task);
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(
+            &log,
+            concat!(
+                r#"{"ts":"2026-11-06T01:02:03Z","msg_id":"m1","from":"claude-lead","to":"codex-delivery","direction":"out","outcome":"delivered","body":"Land the branch."}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        app.sel_task = Some(task);
+        app.mode = Mode::Task;
+        app.handle(
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            150,
+            42,
+        );
+        assert!(matches!(&app.mode, Mode::Messages { log, .. } if log.rows.len() == 1));
+        let text = app
+            .frame(150, 42)
+            .iter()
+            .map(|r| strip_sgr(r))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Message log · Gate review"), "{text}");
+        assert!(text.contains("claude-lead → codex-delivery"), "{text}");
+        assert!(text.contains("Land the branch."), "{text}");
+        app.handle(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 150, 42);
+        assert!(matches!(app.mode, Mode::Task));
+    }
+
+    fn peer(
+        session: &taskai_core::registry::Session,
+        pid: u32,
+        proc_start: &str,
+        status: taskai_core::mail::Activity,
+        waiting_for: Option<&str>,
+    ) -> taskai_core::mail::MailPeer {
+        taskai_core::mail::MailPeer {
+            session_ref: session.session_ref.clone(),
+            task_ref: session.task_ref.clone(),
+            name: session.address.clone(),
+            harness: session.harness.clone(),
+            workspace: session.workspace.clone(),
+            pid,
+            proc_start: proc_start.into(),
+            status,
+            waiting_for: waiting_for.map(str::to_string),
+            mailbox: session.workspace.join("mail.sock"),
+            features: vec!["notify_idle".into()],
+            mode: Some(taskai_core::mail::PermissionMode::Prompting),
+        }
+    }
+
+    // Expectation: after a refresh, a session whose bridge registered a mailbox and published
+    // "waiting · approval" shows that in its rail row and frame, while a session whose
+    // registered bridge process is gone shows no status, although its entry is still in the
+    // registry. Why: a stale "waiting" or "busy" from a dead bridge sends the person chasing
+    // a ghost. Value: only a live bridge colours a row, and it does so without the row
+    // spawning anything.
+    #[test]
+    fn rail_shows_mailbox_status_only_while_its_bridge_lives() {
+        use taskai_core::mail::{proc_start, Activity, Directory};
+        use taskai_core::registry::AddressBook;
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let mut app = App::new_test(home.clone()).unwrap();
+        let task = app
+            .registry
+            .create_task("Gate review", root.path(), Source::HumanUi)
+            .unwrap();
+        let live = app
+            .registry
+            .create_session(&task, None, "Lead", "claude", root.path(), Source::HumanUi)
+            .unwrap();
+        let dead = app
+            .registry
+            .create_session(
+                &task,
+                None,
+                "Delivery",
+                "codex",
+                root.path(),
+                Source::HumanUi,
+            )
+            .unwrap();
+        let book = AddressBook::new(home.join("state"), task.clone());
+        let me = std::process::id();
+        let started = proc_start(me).expect("own start time");
+        book.register(&peer(
+            app.registry.session(&live).unwrap(),
+            me,
+            &started,
+            Activity::Waiting,
+            Some("approval"),
+        ))
+        .unwrap();
+        book.register(&peer(
+            app.registry.session(&dead).unwrap(),
+            4_000_000,
+            "Thu Jan  1 00:00:00 UTC 1970",
+            Activity::Busy,
+            None,
+        ))
+        .unwrap();
+        app.sel_task = Some(task.clone());
+        app.mode = Mode::Task;
+        app.refresh_mailbox_status();
+        let rows = app.rail_rows(&task);
+        let row = |key: &str| rows.iter().find(|r| r.key == key).unwrap();
+        assert_eq!(row(&live).status.as_deref(), Some("waiting"));
+        assert_eq!(row(&live).waiting_for.as_deref(), Some("approval"));
+        assert_eq!(row(&dead).status, None);
+        assert_eq!(row(&dead).waiting_for, None);
+        let text = app
+            .frame(150, 42)
+            .iter()
+            .map(|r| strip_sgr(r))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("WAITING · approval"), "{text}");
+    }
+
+    // Expectation: when the registry on disk cannot be re-read, the rail loses its mailbox
+    // statuses, the status line names the fault, and the last good topology stays; once the
+    // file is good again, the statuses return and the fault message clears. Why: a silent
+    // reload failure would either freeze stale pulses or hide the fault. Value: the person
+    // sees the fault, and sees it end.
+    #[test]
+    fn registry_reload_fault_is_shown_and_clears_on_recovery() {
+        use taskai_core::mail::{proc_start, Activity, Directory};
+        use taskai_core::registry::AddressBook;
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let mut app = App::new_test(home.clone()).unwrap();
+        let task = app
+            .registry
+            .create_task("Gate review", root.path(), Source::HumanUi)
+            .unwrap();
+        let lead = app
+            .registry
+            .create_session(&task, None, "Lead", "claude", root.path(), Source::HumanUi)
+            .unwrap();
+        let book = AddressBook::new(home.join("state"), task.clone());
+        let me = std::process::id();
+        let started = proc_start(me).expect("own start time");
+        book.register(&peer(
+            app.registry.session(&lead).unwrap(),
+            me,
+            &started,
+            Activity::Waiting,
+            Some("approval"),
+        ))
+        .unwrap();
+        app.sel_task = Some(task.clone());
+        app.mode = Mode::Task;
+        app.refresh_mailbox_status();
+        let waiting = |app: &App| {
+            app.rail_rows(&task)
+                .iter()
+                .find(|r| r.key == lead)
+                .map(|r| r.status.clone())
+                .unwrap()
+        };
+        assert_eq!(waiting(&app).as_deref(), Some("waiting"));
+        assert_eq!(app.status, None);
+
+        let state = home.join("state").join("state.json");
+        let good = std::fs::read(&state).unwrap();
+        std::fs::write(&state, b"{ not json").unwrap();
+        app.refresh_mailbox_status();
+        assert_eq!(waiting(&app), None, "stale pulses are cleared");
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|s| s.contains("registry")),
+            "{:?}",
+            app.status
+        );
+        assert!(
+            app.rail_rows(&task).iter().any(|r| r.key == lead),
+            "the last good topology stays"
+        );
+
+        std::fs::write(&state, good).unwrap();
+        app.refresh_mailbox_status();
+        assert_eq!(waiting(&app).as_deref(), Some("waiting"));
+        assert_eq!(app.status, None, "the fault message clears on recovery");
     }
 
     #[test]
@@ -7719,6 +8033,7 @@ printf '%s\n' "$version"
             name: "Lead".into(),
             choices: vec![HarnessAvailability {
                 auth: crate::remote_probes::AuthState::Unknown,
+                messaging: None,
                 hkey: "claude".into(),
                 version: Some("2.1.0".into()),
                 unavailable: None,
@@ -7753,6 +8068,7 @@ printf '%s\n' "$version"
             role: "Research".into(),
             choices: vec![HarnessAvailability {
                 auth: crate::remote_probes::AuthState::Unknown,
+                messaging: None,
                 hkey: "claude".into(),
                 version: Some("2.1.0".into()),
                 unavailable: None,
@@ -8584,6 +8900,7 @@ printf '%s\n' "$version"
                     .iter()
                     .map(|h| HarnessAvailability {
                         auth: crate::remote_probes::AuthState::Unknown,
+                        messaging: None,
                         hkey: (*h).into(),
                         version: Some(if *h == "grok" { "0.2.117" } else { "2.1.0" }.into()),
                         unavailable: (*h == "grok")

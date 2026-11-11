@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,7 +20,7 @@ pub struct StdioRpc {
 
 impl StdioRpc {
     pub fn spawn(prog: &str, args: &[&str]) -> Result<StdioRpc, Error> {
-        let mut child = Command::new(prog)
+        let mut child = crate::child_command(prog)
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

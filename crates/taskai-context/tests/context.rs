@@ -1,10 +1,53 @@
 // ABOUTME: Context service tests — snapshot completeness, revision monotonicity, secret
 // ABOUTME: omission, the explanatory text view, and the AGENTS.md bootstrap installer.
 
-use std::path::Path;
+use std::{path::Path, process::Command};
 
-use taskai_context::{install_bootstrap, snapshot, text_view};
-use taskai_core::registry::{ConnectionTarget, Registry, SessionState, Source};
+use taskai_context::{install_bootstrap, session_view, snapshot, text_view, tree_view};
+use taskai_core::{
+    mail::{proc_start, strip_messaging_env, Activity, Directory, MailPeer, PermissionMode},
+    registry::{AddressBook, ConnectionTarget, Registry, SessionState, Source},
+};
+
+/// Registers a mailbox for `session_ref` as a bridge in process `pid`, started at `started`.
+fn register(dir: &Path, reg: &Registry, session_ref: &str, pid: u32, started: &str) {
+    let session = reg.session(session_ref).unwrap();
+    AddressBook::new(dir, &session.task_ref)
+        .register(&MailPeer {
+            session_ref: session.session_ref.clone(),
+            task_ref: session.task_ref.clone(),
+            name: session.address.clone(),
+            harness: session.harness.clone(),
+            workspace: session.workspace.clone(),
+            pid,
+            proc_start: started.into(),
+            status: Activity::Idle,
+            waiting_for: None,
+            mailbox: format!("/run/mail/{session_ref}.sock").into(),
+            features: vec!["notify_idle".into()],
+            mode: Some(PermissionMode::Prompting),
+        })
+        .unwrap();
+}
+
+/// A seeded registry where Lead's bridge is live and waiting on an approval, and Delivery's bridge
+/// has exited without unregistering; Architecture never had one.
+fn seeded_with_mailboxes(dir: &Path) -> (Registry, String, String, String, String) {
+    let (mut reg, t, lead, arch, deliv) = seeded(dir);
+    let me = std::process::id();
+    register(dir, &reg, &lead, me, &proc_start(me).unwrap());
+    let mut exited = Command::new("true");
+    strip_messaging_env(&mut exited);
+    let mut exited = exited.spawn().unwrap();
+    let gone = exited.id();
+    exited.wait().unwrap();
+    register(dir, &reg, &deliv, gone, "Thu Jan  1 00:00:00 1970");
+    AddressBook::new(dir, &t)
+        .set_status(&lead, Activity::Waiting, Some("approval"))
+        .unwrap();
+    reg.reload().unwrap();
+    (reg, t, lead, arch, deliv)
+}
 
 fn seeded(dir: &Path) -> (Registry, String, String, String, String) {
     let mut reg = Registry::open(dir).unwrap();
@@ -219,5 +262,118 @@ fn existing_claude_md_untouched() {
     assert_eq!(
         std::fs::read_to_string(ws.join("CLAUDE.md")).unwrap(),
         "my own claude rules\n"
+    );
+}
+
+// Expectation: each session in a snapshot names its messaging address and, while its bridge is
+// live, its messaging status and what it waits for; a session whose bridge exited or never ran
+// shows no messaging, and no pid or socket appears. Why: agents choose whom to message from the
+// snapshot. Value: an agent addresses a teammate exactly and sees whether it is free.
+#[test]
+fn snapshot_names_each_sessions_address_and_live_messaging_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (reg, _t, lead, arch, deliv) = seeded_with_mailboxes(tmp.path());
+    let snap = snapshot(&reg, &arch).unwrap();
+    let session = |r: &str| {
+        snap["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["session_ref"] == r)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(session(&lead)["address"], "claude-lead");
+    assert_eq!(
+        session(&lead)["messaging"],
+        serde_json::json!({"status": "waiting", "waitingFor": "approval"})
+    );
+    assert_eq!(session(&arch)["address"], "opencode-architecture");
+    assert!(session(&arch)["messaging"].is_null());
+    assert!(session(&deliv)["messaging"].is_null(), "an exited bridge");
+    assert_eq!(snap["self"]["address"], "opencode-architecture");
+    let body = snap.to_string().to_lowercase();
+    for banned in ["pid", "sock", "/run/mail"] {
+        assert!(!body.contains(banned), "snapshot leaks {banned:?}: {body}");
+    }
+}
+
+// Expectation: every tree line ends with the session's address and messaging status: busy,
+// idle, `waiting: <what>`, or `no mailbox` when no live bridge holds one. Why: agents run
+// `taskai context tree` before delegating. Value: the tree says whom to message and whether
+// they can take a letter now.
+#[test]
+fn tree_shows_each_sessions_address_and_messaging_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut reg, t, lead, arch, deliv) = seeded_with_mailboxes(tmp.path());
+    let tree = tree_view(&reg, Some(&t));
+    let lines: Vec<&str> = tree.lines().collect();
+    assert_eq!(
+        lines[1],
+        format!(
+            "  Lead ({lead}) · claude · LIVE · /tmp/buzz · address claude-lead · waiting: approval"
+        )
+    );
+    assert_eq!(
+        lines[2],
+        format!(
+            "    └─ Architecture ({arch}) · opencode · QUEUED · /tmp/buzz-worktrees/auth-pass · address opencode-architecture · no mailbox"
+        )
+    );
+    assert_eq!(
+        lines[3],
+        format!("  Delivery ({deliv}) · codex · QUEUED · /tmp/buzz · address codex-delivery · no mailbox")
+    );
+    AddressBook::new(tmp.path(), &t)
+        .set_status(&lead, Activity::Busy, None)
+        .unwrap();
+    reg.reload().unwrap();
+    assert!(
+        tree_view(&reg, Some(&t))
+            .lines()
+            .nth(1)
+            .unwrap()
+            .ends_with("· address claude-lead · busy"),
+        "{}",
+        tree_view(&reg, Some(&t))
+    );
+}
+
+// Expectation: the text view tells a session its own address and names each subordinate's and
+// peer's address and messaging status; the session view does the same for the session it
+// describes. Why: these are the prose views agents read each turn. Value: the reply address and
+// availability are in the words an agent already reads.
+#[test]
+fn text_and_session_views_name_addresses_and_messaging_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (reg, _t, lead, arch, deliv) = seeded_with_mailboxes(tmp.path());
+    let lead_text = text_view(&reg, &lead).unwrap();
+    assert!(
+        lead_text.contains("Your messaging address is claude-lead."),
+        "{lead_text}"
+    );
+    assert!(
+        lead_text.contains(&format!(
+            "Your subordinate Architecture ({arch}) · opencode · QUEUED runs in /tmp/buzz-worktrees/auth-pass · address opencode-architecture · no mailbox."
+        )),
+        "{lead_text}"
+    );
+    assert!(
+        lead_text.contains(&format!(
+            "Peer Delivery ({deliv}) · codex · QUEUED works in /tmp/buzz · address codex-delivery · no mailbox."
+        )),
+        "{lead_text}"
+    );
+    let delivery_text = text_view(&reg, &deliv).unwrap();
+    assert!(
+        delivery_text.contains(&format!(
+            "Peer Lead ({lead}) · claude · LIVE works in /tmp/buzz · address claude-lead · waiting: approval."
+        )),
+        "{delivery_text}"
+    );
+    let view = session_view(&reg, &lead).unwrap();
+    assert!(
+        view.ends_with("Harness claude · state LIVE · workspace /tmp/buzz · address claude-lead · waiting: approval."),
+        "{view}"
     );
 }

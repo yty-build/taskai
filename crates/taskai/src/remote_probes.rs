@@ -7,15 +7,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use taskai_connectors::{
-    claude::{parse_version, ClaudeConnector},
-    codex::CodexConnector,
-    grok::GrokConnector,
-    opencode::OpenCodeConnector,
-    version_ok,
-};
+use taskai_connectors::{claude::parse_version, version_ok};
 use taskai_core::registry::{ConnectionTarget, ServerProfile};
 
+use crate::doctor::{self, Check, Paths};
 use crate::tmux;
 
 const DISABLED_REASON: &str = "Disabled in this server profile";
@@ -29,8 +24,17 @@ const OPENCODE_MODEL_REASON: &str =
 pub enum AuthState {
     SignedIn,
     SignedOut,
+    /// A saved credentials file exists; only its metadata was read (Grok).
+    CredentialsPresent,
     #[default]
     Unknown,
+}
+
+impl AuthState {
+    /// A saved login of either strength: native status or a credentials file.
+    pub fn saved_login(self) -> bool {
+        matches!(self, AuthState::SignedIn | AuthState::CredentialsPresent)
+    }
 }
 
 /// Every configured provider stays visible, including unavailable providers.
@@ -41,6 +45,9 @@ pub struct HarnessAvailability {
     pub version: Option<String>,
     pub unavailable: Option<String>,
     pub auth: AuthState,
+    /// The messaging adapter's gate on this machine; None on remote targets, for OpenCode and
+    /// before a check ran. Launch availability never depends on it.
+    pub messaging: Option<Check>,
 }
 
 impl HarnessAvailability {
@@ -52,6 +59,7 @@ impl HarnessAvailability {
         match self.auth {
             AuthState::SignedIn => "CLI reports signed in",
             AuthState::SignedOut => "Sign in needed",
+            AuthState::CredentialsPresent => "Saved credentials present · not verified",
             AuthState::Unknown => "Couldn't verify",
         }
     }
@@ -82,7 +90,7 @@ impl HarnessAvailability {
             return "Couldn't verify";
         }
         match self.auth {
-            AuthState::SignedIn => "Ready",
+            AuthState::SignedIn | AuthState::CredentialsPresent => "Ready",
             AuthState::SignedOut => "Sign in needed",
             AuthState::Unknown => "Couldn't verify",
         }
@@ -101,6 +109,7 @@ impl HarnessAvailability {
         }
         match self.auth {
             AuthState::SignedIn => "Compatible CLI and saved sign-in found. Model access and quota have not been tested.".into(),
+            AuthState::CredentialsPresent => "Compatible CLI and a saved credentials file found; the file was not opened. Token validity, model access and quota have not been tested.".into(),
             AuthState::SignedOut => "The CLI reports no saved sign-in. Open Configure to sign in, then return to check again.".into(),
             AuthState::Unknown => "Authentication could not be verified safely. Open Configure to inspect native settings; no model-access test was run.".into(),
         }
@@ -125,23 +134,18 @@ impl ProbeSpec {
     fn target(target: &ConnectionTarget) -> Self {
         Self {
             target: target.clone(),
-            candidates: [
-                (
-                    "claude",
-                    if *target == ConnectionTarget::Local {
-                        ClaudeConnector::default().bin
+            // Launch and doctor resolve the same executable; a remote host runs the plain name.
+            candidates: ["claude", "codex", "opencode", "grok"]
+                .into_iter()
+                .map(|key| {
+                    let program = if *target == ConnectionTarget::Local {
+                        doctor::configured_executable(key, None)
                     } else {
-                        "claude".into()
-                    },
-                    "2.0.0",
-                ),
-                ("codex", CodexConnector::default().bin, "0.100.0"),
-                ("opencode", OpenCodeConnector::default().bin, "1.18.0"),
-                ("grok", GrokConnector::default().bin, "1.0.0"),
-            ]
-            .into_iter()
-            .map(|(key, program, minimum)| (key.into(), program, minimum.into(), true, None))
-            .collect(),
+                        key.into()
+                    };
+                    (key.into(), program, minimum_version(key).into(), true, None)
+                })
+                .collect(),
         }
     }
 
@@ -170,35 +174,51 @@ pub struct RemoteProbes {
     entries: HashMap<String, Entry>,
     sender: Sender<(String, ProbeResult)>,
     receiver: Receiver<(String, ProbeResult)>,
+    paths: Paths,
 }
 
 impl Default for RemoteProbes {
     fn default() -> Self {
+        Self::new(Paths::from_env())
+    }
+}
+
+impl RemoteProbes {
+    /// Local messaging checks stat and dial only `paths`; tests keep them private.
+    pub fn new(paths: Paths) -> Self {
         let (sender, receiver) = mpsc::channel();
         Self {
             entries: HashMap::new(),
             sender,
             receiver,
+            paths,
         }
     }
-}
 
-impl RemoteProbes {
     /// Explicit refresh bypasses completed cache entries, but never creates a
     /// second in-flight probe or blocks input while the target is being checked.
     pub fn refresh(&mut self, target: &ConnectionTarget) -> bool {
         if *target == ConnectionTarget::Local {
             return false;
         }
-        self.request_spec(ProbeSpec::target(target), true, probe_ready)
+        let paths = self.paths.clone();
+        self.request_spec(ProbeSpec::target(target), true, move |spec| {
+            probe_ready(spec, &paths)
+        })
     }
 
     pub fn request_profile(&mut self, profile: &ServerProfile) -> bool {
-        self.request_spec(ProbeSpec::profile(profile), false, probe_ready)
+        let paths = self.paths.clone();
+        self.request_spec(ProbeSpec::profile(profile), false, move |spec| {
+            probe_ready(spec, &paths)
+        })
     }
 
     pub fn refresh_profile(&mut self, profile: &ServerProfile) -> bool {
-        self.request_spec(ProbeSpec::profile(profile), true, probe_ready)
+        let paths = self.paths.clone();
+        self.request_spec(ProbeSpec::profile(profile), true, move |spec| {
+            probe_ready(spec, &paths)
+        })
     }
 
     pub fn get_profile(&self, profile: &ServerProfile) -> Option<&ProbeResult> {
@@ -324,10 +344,69 @@ fn availability_on_target(
         version,
         unavailable,
         auth: AuthState::Unknown,
+        messaging: None,
     }
 }
 
-fn probe_ready(spec: ProbeSpec) -> ProbeResult {
+/// Version, saved sign-in and, on this machine, the messaging gate of one configured harness.
+/// Every step is bounded; the gate never changes launch availability.
+pub(crate) fn check_local(hkey: &str, executable: &str, paths: &Paths) -> HarnessAvailability {
+    check_candidate(
+        &ConnectionTarget::Local,
+        hkey,
+        executable,
+        minimum_version(hkey),
+        true,
+        None,
+        paths,
+    )
+}
+
+fn minimum_version(hkey: &str) -> &'static str {
+    match hkey {
+        "claude" => "2.0.0",
+        "codex" => "0.100.0",
+        "opencode" => "1.18.0",
+        _ => "1.0.0",
+    }
+}
+
+fn check_candidate(
+    target: &ConnectionTarget,
+    harness: &str,
+    program: &str,
+    minimum: &str,
+    enabled: bool,
+    model: Option<&str>,
+    paths: &Paths,
+) -> HarnessAvailability {
+    let mut available = availability_on_target(
+        target,
+        harness,
+        minimum,
+        tmux::probe_program(target, program).map_err(|error| error.to_string()),
+    );
+    if !enabled {
+        available.unavailable = Some(DISABLED_REASON.into());
+    } else if harness == "opencode" && model.is_some() {
+        available.unavailable = Some(OPENCODE_MODEL_REASON.into());
+    }
+    if available.version.is_some() {
+        available.auth = probe_auth(target, harness, program);
+    }
+    if *target == ConnectionTarget::Local {
+        if harness == "grok" && available.version.is_some() {
+            available.auth = match &paths.grok_home {
+                Ok(home) => doctor::grok_saved_login(home),
+                Err(_) => AuthState::Unknown,
+            };
+        }
+        available.messaging = doctor::messaging_check(harness, available.version.as_deref(), paths);
+    }
+    available
+}
+
+fn probe_ready(spec: ProbeSpec, paths: &Paths) -> ProbeResult {
     let target = spec.target;
     let results = std::thread::scope(|scope| {
         spec.candidates
@@ -335,21 +414,15 @@ fn probe_ready(spec: ProbeSpec) -> ProbeResult {
             .map(|(harness, program, minimum, enabled, model)| {
                 let target = &target;
                 scope.spawn(move || {
-                    let mut available = availability_on_target(
+                    check_candidate(
                         target,
                         &harness,
+                        &program,
                         &minimum,
-                        tmux::probe_program(target, &program).map_err(|error| error.to_string()),
-                    );
-                    if !enabled {
-                        available.unavailable = Some(DISABLED_REASON.into());
-                    } else if harness == "opencode" && model.is_some() {
-                        available.unavailable = Some(OPENCODE_MODEL_REASON.into());
-                    }
-                    if available.version.is_some() {
-                        available.auth = probe_auth(target, &harness, &program);
-                    }
-                    available
+                        enabled,
+                        model.as_deref(),
+                        paths,
+                    )
                 })
             })
             .collect::<Vec<_>>()
@@ -384,7 +457,8 @@ where
             .collect(),
         "codex" => ["login", "status"].into_iter().map(String::from).collect(),
         // OpenCode's list is a credential inventory, not a supported model-login
-        // proof. Grok exposes no dedicated read-only native status command.
+        // proof. Grok exposes no dedicated read-only native status command; on this
+        // machine doctor::grok_saved_login reads its credentials file's metadata.
         _ => return AuthState::Unknown,
     };
     match probe(target, program, &args) {
@@ -567,7 +641,7 @@ mod tests {
                 },
             );
         }
-        let mut cache = RemoteProbes::default();
+        let mut cache = RemoteProbes::new(Paths::under(temp.path()));
         assert!(cache.request_profile(&profile));
         wait_for_profile(&mut cache, &profile);
         let catalogue = cache.get_profile(&profile).unwrap().as_ref().unwrap();
@@ -576,7 +650,26 @@ mod tests {
             .all(|entry| entry.version.as_deref() == Some("2.5.0")));
         assert!(catalogue
             .iter()
+            .filter(|entry| entry.hkey != "grok")
             .all(|entry| entry.authentication_status() == "Couldn't verify"));
+        // The messaging gate is reported for every adapter on this machine from private paths
+        // only: nothing is installed at 2.5.0, so each fails closed, and OpenCode has no gate.
+        for entry in catalogue {
+            match entry.hkey.as_str() {
+                "opencode" => assert_eq!(entry.messaging, None),
+                _ => assert!(
+                    matches!(entry.messaging, Some(Check::NotReady { .. })),
+                    "{}: {:?}",
+                    entry.hkey,
+                    entry.messaging
+                ),
+            }
+        }
+        assert_eq!(
+            catalogue.iter().find(|e| e.hkey == "grok").unwrap().auth,
+            AuthState::SignedOut,
+            "no credentials file under the private Grok home"
+        );
         assert!(catalogue
             .iter()
             .find(|entry| entry.hkey == "opencode")
@@ -613,6 +706,7 @@ mod tests {
             version: Some("2.1.0".into()),
             unavailable: None,
             auth: AuthState::Unknown,
+            messaging: None,
         }
     }
 
@@ -701,6 +795,24 @@ mod tests {
                 AuthState::Unknown
             );
         }
+    }
+
+    // Expectation: a stat-only credentials file is a saved login for launch readiness but is
+    // worded as unverified metadata, never as a native status report. Why: the lead's review —
+    // Grok's evidence is weaker than `claude auth status`. Value: no row overclaims sign-in.
+    #[test]
+    fn credentials_file_state_is_a_saved_login_worded_as_unverified() {
+        let mut entry = ready("grok");
+        entry.auth = AuthState::CredentialsPresent;
+        assert!(entry.auth.saved_login());
+        assert!(!AuthState::SignedOut.saved_login());
+        assert_eq!(entry.status_label(), "Ready");
+        assert_eq!(
+            entry.authentication_status(),
+            "Saved credentials present · not verified"
+        );
+        assert!(entry.actionable_status().contains("was not opened"));
+        assert!(!entry.actionable_status().contains("CLI reports"));
     }
 
     #[test]

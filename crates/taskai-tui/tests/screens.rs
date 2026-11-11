@@ -1,7 +1,7 @@
 // ABOUTME: Screen-frame tests — every rendered line of every screen is exactly `cols`
 // ABOUTME: cells at every size, and the chrome (masthead, keybar) sits where it must.
 
-use taskai_tui::color::{set_truecolor, CLI_BG};
+use taskai_tui::color::{set_truecolor, AMB, CLI_BG};
 use taskai_tui::render::{dump, paint_frame, paint_update, resize_frame};
 use taskai_tui::screens::pane::{cell_row, PaneCell};
 use taskai_tui::seg::{cell_count, strip_sgr};
@@ -18,6 +18,8 @@ const SCREENS: &[&str] = &[
     "subordinate",
     "destroy",
     "help",
+    "pulse",
+    "messages",
 ];
 
 // Expectation: for each screen at each size, the frame has exactly `rows` lines and every
@@ -345,4 +347,99 @@ fn boot_slab_content() {
 #[test]
 fn dump_rejects_unknown_screen() {
     assert!(dump("nope", 110, 30).is_none());
+}
+
+fn screen_grid(frame: &[String], cols: usize, rows: usize) -> vt100::Parser {
+    let mut parser = vt100::Parser::new(rows as u16, cols as u16, 0);
+    parser.process(frame.join("\r\n").as_bytes());
+    parser
+}
+
+/// Foreground colour of the first cell of every occurrence of `needle` in the painted frame.
+fn fg_of(frame: &[String], cols: usize, rows: usize, needle: &str) -> Vec<vt100::Color> {
+    let parser = screen_grid(frame, cols, rows);
+    let screen = parser.screen();
+    let mut found = Vec::new();
+    for r in 0..rows as u16 {
+        let text: String = (0..cols as u16)
+            .map(|c| {
+                let cell = screen.cell(r, c).expect("cell");
+                let glyph = cell.contents();
+                if glyph.is_empty() {
+                    ' '
+                } else {
+                    glyph.chars().next().unwrap()
+                }
+            })
+            .collect();
+        let mut from = 0;
+        while let Some(at) = text[from..].find(needle) {
+            let col = text[..from + at].chars().count() as u16;
+            found.push(screen.cell(r, col).expect("cell").fgcolor());
+            from += at + needle.len();
+        }
+    }
+    found
+}
+
+fn amber() -> vt100::Color {
+    vt100::Color::Rgb(AMB.0, AMB.1, AMB.2)
+}
+
+// Expectation: in the pulse frame, the session waiting on an approval reads
+// "WAITING · approval" in amber, in the rail and in the pane header, while the busy
+// session's "LIVE · busy" and the idle session's "LIVE · idle" are not amber. Why: an
+// approval nobody can see is a hang. Value: working and stuck are told apart at a glance,
+// without opening the pane.
+#[test]
+fn waiting_session_is_amber_and_distinct_from_busy() {
+    set_truecolor(true);
+    let (cols, rows) = (150, 42);
+    let frame = dump("pulse", cols, rows).expect("pulse");
+    let waiting = fg_of(&frame, cols, rows, "WAITING · approval");
+    assert_eq!(waiting.len(), 2, "rail and pane header both show the wait");
+    assert!(waiting.iter().all(|c| *c == amber()), "{waiting:?}");
+    let busy = fg_of(&frame, cols, rows, "LIVE · busy");
+    assert_eq!(
+        busy.len(),
+        1,
+        "the busy session shows its activity once, in the rail"
+    );
+    assert!(busy.iter().all(|c| *c != amber()), "{busy:?}");
+    let idle = fg_of(&frame, cols, rows, "LIVE · idle");
+    assert_eq!(idle.len(), 1);
+    assert!(idle.iter().all(|c| *c != amber()), "{idle:?}");
+}
+
+// Expectation: the message log overlay names the task, lists each logged letter as time,
+// sender → recipient, outcome and the first line of its body, and marks a permission-mode
+// mismatch in amber. Why: a log nobody can read is not a pulse. Value: who asked whom for
+// what, and which letter crossed modes, is visible without opening any session.
+#[test]
+fn message_log_overlay_lists_letters_and_marks_mode_mismatch() {
+    set_truecolor(true);
+    let (cols, rows) = (150, 42);
+    let frame = dump("messages", cols, rows).expect("messages");
+    let text = frame
+        .iter()
+        .map(|l| strip_sgr(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for needle in [
+        "Message log · Repository evaluation",
+        "17:02:11",
+        "claude-lead → codex-delivery",
+        "delivered",
+        "Land the retry/backoff branch behind the release gate.",
+        "grok-verification → claude-lead",
+        "dropped hop-runaway",
+        "mode mismatch",
+        "Esc",
+        "Close",
+    ] {
+        assert!(text.contains(needle), "missing {needle:?} in\n{text}");
+    }
+    let marks = fg_of(&frame, cols, rows, "mode mismatch");
+    assert_eq!(marks.len(), 1, "one letter crossed modes");
+    assert_eq!(marks[0], amber());
 }

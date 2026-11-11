@@ -417,6 +417,7 @@ pub const HELP_NAVIGATION: &[(&str, &str)] = &[
 pub const HELP_TASK: &[(&str, &str)] = &[
     ("Enter", "Type in selected CLI"),
     ("t", "Terminal"),
+    ("l", "Message log"),
     ("a", "Add Subordinate"),
     ("m", "Add Manager"),
     ("d", "Destroy agent"),
@@ -538,6 +539,8 @@ pub fn task_view(rail_sel: usize) -> TaskView {
             conduit: s.conduit.into(),
             state_word: s.state_word.into(),
             ws: s.ws.into(),
+            status: None,
+            waiting_for: None,
         })
         .collect::<Vec<_>>();
     let sel = rail_sel.min(SESSIONS.len() - 1);
@@ -562,11 +565,116 @@ pub fn task_view(rail_sel: usize) -> TaskView {
     };
     TaskView {
         crumb: TASK_CRUMB.into(),
-        title: "Repository evaluation".into(),
+        title: TASK_TITLE.into(),
         repo: "/Users/me/GitHub/buzz".into(),
         connection: "<local>".into(),
         team_line: "4 sessions · 4 harnesses".into(),
         sessions,
         body,
+    }
+}
+
+pub const TASK_TITLE: &str = "Repository evaluation";
+
+/// Mailbox statuses layered over the fixture team for the pulse frame: session key, status,
+/// and what a waiting session waits for.
+pub const PULSE: &[(&str, &str, &str)] = &[
+    ("lead", "busy", ""),
+    ("arch", "idle", ""),
+    ("deliv", "waiting", "approval"),
+];
+
+/// The task frame with every session's mailbox status shown.
+pub fn task_view_pulse(rail_sel: usize) -> TaskView {
+    let mut view = task_view(rail_sel);
+    for sess in &mut view.sessions {
+        if let Some((_, status, waiting_for)) = PULSE.iter().find(|(key, _, _)| *key == sess.key) {
+            sess.status = Some((*status).into());
+            sess.waiting_for = (!waiting_for.is_empty()).then(|| (*waiting_for).into());
+        }
+    }
+    view
+}
+
+pub struct Message {
+    pub ts: &'static str,
+    pub from: &'static str,
+    pub to: &'static str,
+    pub outcome: &'static str,
+    pub text: &'static str,
+    pub mismatch: bool,
+}
+
+/// The task's message log: each letter appears twice, once as sent and once as admitted,
+/// because every session's mailbox writes to the same task log.
+pub const MESSAGES: &[Message] = &[
+    Message {
+        ts: "17:02:11",
+        from: "claude-lead",
+        to: "codex-delivery",
+        outcome: "delivered",
+        text: "Land the retry/backoff branch behind the release gate.",
+        mismatch: false,
+    },
+    Message {
+        ts: "17:02:11",
+        from: "claude-lead",
+        to: "codex-delivery",
+        outcome: "admitted",
+        text: "Land the retry/backoff branch behind the release gate.",
+        mismatch: false,
+    },
+    Message {
+        ts: "17:09:40",
+        from: "codex-delivery",
+        to: "claude-lead",
+        outcome: "delivered",
+        text: "Branch is green — staging the gate PR.",
+        mismatch: false,
+    },
+    Message {
+        ts: "17:31:05",
+        from: "claude-lead",
+        to: "grok-verification",
+        outcome: "admitted",
+        text: "Re-check rollback gate after the staging dry run.",
+        mismatch: true,
+    },
+    Message {
+        ts: "17:38:52",
+        from: "grok-verification",
+        to: "claude-lead",
+        outcome: "idle notice idle",
+        text: "Rollback gate: dry run passed.",
+        mismatch: false,
+    },
+    Message {
+        ts: "17:40:00",
+        from: "codex-delivery",
+        to: "claude-lead",
+        outcome: "dropped hop-runaway",
+        text: "Please confirm the gate PR is merged.",
+        mismatch: false,
+    },
+];
+
+pub fn message_rows() -> Vec<crate::view::MessageRow> {
+    MESSAGES
+        .iter()
+        .map(|m| crate::view::MessageRow {
+            ts: m.ts.into(),
+            from: m.from.into(),
+            to: m.to.into(),
+            outcome: m.outcome.into(),
+            text: m.text.into(),
+            mismatch: m.mismatch,
+        })
+        .collect()
+}
+
+pub fn message_log() -> crate::view::MessageLog {
+    crate::view::MessageLog {
+        rows: message_rows(),
+        ..Default::default()
     }
 }

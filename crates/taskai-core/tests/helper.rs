@@ -193,7 +193,10 @@ fn failed_persistence_leaves_helper_and_registry_unchanged() {
     let state = root.path().join("state");
     let mut registry = Registry::open(&state).unwrap();
     let before = std::fs::read(state.join("state.json")).unwrap();
-    std::fs::create_dir(state.join("state.json.tmp")).unwrap();
+    // A directory where this process stages its save fails the save, as a full disk would:
+    // unlinking a directory is refused even to root.
+    let staging = state.join(format!(".state.json.{}.tmp", std::process::id()));
+    std::fs::create_dir(&staging).unwrap();
     assert!(registry
         .ensure_helper("codex", root.path(), Source::HumanUi)
         .is_err());
@@ -201,7 +204,7 @@ fn failed_persistence_leaves_helper_and_registry_unchanged() {
     assert!(registry.audit().is_empty());
     assert_eq!(registry.helper(), &HelperSettings::default());
     assert_eq!(std::fs::read(state.join("state.json")).unwrap(), before);
-    std::fs::remove_dir(state.join("state.json.tmp")).unwrap();
+    std::fs::remove_dir(&staging).unwrap();
     assert_eq!(
         registry
             .ensure_helper("codex", root.path(), Source::HumanUi)

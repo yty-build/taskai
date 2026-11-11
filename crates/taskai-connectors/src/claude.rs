@@ -1,8 +1,12 @@
 // ABOUTME: Claude Code connector — owned-tui: the one TaskAI-connected native PTY is the
 // ABOUTME: session; probe, launch command, hook installation, atomic prompt bytes.
 
+pub mod drift;
+pub mod envelope;
+pub mod mirror;
+pub mod peer;
+
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::{Capability, Error, Mode};
 
@@ -21,7 +25,7 @@ impl Default for ClaudeConnector {
 impl ClaudeConnector {
     /// Harmless handshake: reads the version, never creates a session.
     pub fn probe(&self) -> Capability {
-        match Command::new(&self.bin).arg("--version").output() {
+        match crate::child_command(&self.bin).arg("--version").output() {
             Ok(out) if out.status.success() => {
                 let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 crate::gate_version(

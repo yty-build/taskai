@@ -1,0 +1,77 @@
+{
+  "milestone": "M5",
+  "date": "2026-11-06",
+  "tested_commit": "e1337e2de87010c901bb3b059b6945f417626b8f",
+  "commands": [
+    "cargo test",
+    "cargo fmt --check",
+    "cargo clippy --offline --all-targets -- -D warnings"
+  ],
+  "runs": [
+    {
+      "start_utc": "2026-11-06T23:22:43.330089+00:00",
+      "end_utc": "2026-11-06T23:23:41.987230+00:00",
+      "exit_code": 101,
+      "targets": 17,
+      "passed": 265,
+      "failed": 1,
+      "ignored": 7,
+      "child_env_has_messaging_names": false
+    },
+    {
+      "start_utc": "2026-11-06T23:24:06.161849+00:00",
+      "end_utc": "2026-11-06T23:24:48.743247+00:00",
+      "exit_code": 101,
+      "targets": 17,
+      "passed": 265,
+      "failed": 1,
+      "ignored": 7,
+      "child_env_has_messaging_names": false
+    },
+    {
+      "start_utc": "2026-11-06T23:26:54.022433+00:00",
+      "end_utc": "2026-11-06T23:27:23.481536+00:00",
+      "exit_code": 0,
+      "targets": 45,
+      "passed": 459,
+      "failed": 0,
+      "ignored": 7,
+      "child_env_has_messaging_names": false
+    }
+  ],
+  "failure": "First two unchanged runs stopped at existing OpenCode native_tui_attaches_to_shared_server: opencode serve never became ready (30-second wait). No source/test/timeout change.",
+  "isolated_existing_test": {
+    "name": "native_tui_attaches_to_shared_server",
+    "passed": true,
+    "seconds": 4.18
+  },
+  "failure_cause": "Unproven; existing startup discards provider stderr. Final unchanged full run passed.",
+  "format_check_exit": 0,
+  "all_target_clippy_exit": 0,
+  "ignored": "Four existing billed tests, two existing SSH tests, one new explicitly gated Grok inheritance probe.",
+  "cleanup": {
+    "claude_keys_removed": 2,
+    "claude_sockets_removed": 2,
+    "private_tmux_sockets_removed": 50,
+    "fake_agent_files_removed": 3,
+    "native_file_contents_read": false,
+    "claude_pids_observed_as_test_descendants": [
+      31425,
+      37652
+    ],
+    "claude_pids_gone": true,
+    "sockets_refused_connection": true,
+    "owned_inodes_unchanged_before_remove": true,
+    "open_file_holders": false,
+    "recorded_surviving_test_descendants": 0,
+    "final_native_metadata_matches_baseline": true,
+    "provider_database_history": "untouched",
+    "private_tmp_roots_removed": [
+      "/tmp/mts.eff14la7",
+      "/tmp/mts._vnyoxzr",
+      "/tmp/mts.60dbs8sf"
+    ]
+  },
+  "additional_live_probes": false,
+  "new_model_turns": 0
+}

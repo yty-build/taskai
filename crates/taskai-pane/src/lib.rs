@@ -3,6 +3,7 @@
 
 pub mod grid;
 
+use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -10,6 +11,7 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use taskai_core::mail::{inherited_messaging_env_names, is_messaging_env_name};
 
 use grid::{Cell, CursorState, Grid};
 pub use grid::{MouseProtocolEncoding, MouseProtocolMode, MouseState};
@@ -52,6 +54,8 @@ pub struct Pane {
 }
 
 impl Pane {
+    /// Runs `prog` with `args` in `cwd` on a new `rows` x `cols` pty. The child gets TaskAI's
+    /// environment and `envs`, without any Claude messaging variable from either.
     pub fn spawn(
         prog: &str,
         args: &[&str],
@@ -67,12 +71,17 @@ impl Pane {
             pixel_height: 0,
         })?;
         let mut cmd = CommandBuilder::new(prog);
+        for name in inherited_messaging_env_names() {
+            cmd.env_remove(name);
+        }
         cmd.args(args);
         cmd.cwd(cwd);
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM", "xterm-256color");
         for (k, v) in envs {
-            cmd.env(k, v);
+            if !is_messaging_env_name(OsStr::new(k)) {
+                cmd.env(k, v);
+            }
         }
         let child = pty.slave.spawn_command(cmd)?;
         drop(pty.slave);

@@ -1,15 +1,24 @@
-// ABOUTME: The Registry — one truth for tasks, sessions, stable never-recycled refs,
-// ABOUTME: local/SSH targets, provider/tmux mappings, state, and atomic persistence.
+// ABOUTME: The Registry — one truth for tasks, sessions, stable never-recycled refs, messaging
+// ABOUTME: addresses and mailboxes, provider/tmux mappings, state, and locked atomic persistence.
 
 use std::{
     collections::BTreeMap,
     fmt,
+    fs::{self, OpenOptions},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 
+use rustix::{
+    fs::{flock, FlockOperation},
+    io::Errno,
+};
 use serde::{Deserialize, Serialize};
 
-use crate::Error;
+use crate::{
+    mail::{is_address, is_live, Activity, Directory, MailPeer, PermissionMode, MAX_ADDRESS_CHARS},
+    write_private, Error,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionState {
@@ -243,6 +252,45 @@ pub struct Session {
     pub runtime: Option<TmuxRuntimeLocator>,
     #[serde(default)]
     pub launch: LaunchSettings,
+    /// The session's messaging address: assigned once, unique in its task, and a plain address
+    /// (`mail::is_address`). `name` stays the person's display label.
+    #[serde(default)]
+    pub address: String,
+    /// The mailbox a bridge registered for this session, while it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messaging: Option<MessagingEntry>,
+}
+
+/// What a bridge registered for its session's mailbox. Kept apart from `runtime` (the tmux
+/// locator) and `provider` (the native identity): `pid` and `proc_start` are the bridge's own.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagingEntry {
+    pub pid: u32,
+    /// The bridge's start time as `ps -o lstart` prints it in UTC.
+    pub proc_start: String,
+    /// The mailbox socket.
+    pub mailbox: PathBuf,
+    pub features: Vec<String>,
+    /// Observed permission mode, if the native peer reports it. This is not a wire assertion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<PermissionMode>,
+    pub status: Activity,
+    /// What a waiting session waits for; set only while waiting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_for: Option<String>,
+}
+
+impl Session {
+    /// The mailbox its bridge registered, while it can be routed to: the address is plain, the
+    /// mailbox path is absolute, and the bridge still runs with its recorded start time.
+    pub fn live_mailbox(&self) -> Option<&MessagingEntry> {
+        let entry = self.messaging.as_ref()?;
+        let routable = is_address(&self.address)
+            && entry.mailbox.is_absolute()
+            && is_live(entry.pid, &entry.proc_start);
+        routable.then_some(entry)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -265,6 +313,9 @@ struct Data {
     tasks: Vec<Task>,
     sessions: Vec<Session>,
     audit: Vec<Audit>,
+    /// Top-level settings this build does not know, kept as they are.
+    #[serde(flatten)]
+    other_settings: serde_json::Map<String, serde_json::Value>,
 }
 
 pub struct Registry {
@@ -273,7 +324,7 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// Opens (or creates) the registry in an owner-only directory.
+    /// Opens (or creates) the registry in an owner-only directory, bringing its state up to date.
     pub fn open(dir: &Path) -> Result<Self, Error> {
         std::fs::create_dir_all(dir)?;
         #[cfg(unix)]
@@ -281,66 +332,113 @@ impl Registry {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
         }
-        let state = dir.join("state.json");
-        let original = if state.exists() {
-            serde_json::from_str(&std::fs::read_to_string(&state)?)
-                .map_err(|e| Error::Invalid(format!("state.json: {e}")))?
-        } else {
-            serde_json::json!({})
+        let _held = RegistryLock::take(dir)?;
+        // Only a directory with nothing at state.json starts a new registry; anything there must
+        // read as one.
+        let (registry, on_disk) = match fs::symlink_metadata(dir.join("state.json")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (Self::up_to_date(dir, Data::default())?, None)
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => {
+                let (registry, on_disk) = Self::read(dir)?;
+                (registry, Some(on_disk))
+            }
         };
-        let data = if state.exists() {
-            let data: Data = serde_json::from_value(original.clone())
-                .map_err(|e| Error::Invalid(format!("state.json: {e}")))?;
-            for task in &data.tasks {
-                task.connection.validate()?;
-                if let Some(terminal) = &task.terminal {
-                    validate_internal_name(&terminal.private_server, "terminal tmux server")?;
-                    if terminal.target != task.connection
-                        || terminal.session != terminal_ref(&task.task_ref)
-                    {
-                        return Err(Error::Invalid(format!(
-                            "terminal locator does not belong to {}",
-                            task.task_ref
-                        )));
-                    }
+        registry.save(on_disk.as_deref())?;
+        Ok(registry)
+    }
+
+    /// Re-reads the registry as it is on disk, picking up other processes' changes. On failure the
+    /// handle keeps its last good view.
+    pub fn reload(&mut self) -> Result<(), Error> {
+        self.data = Self::read(&self.dir)?.0.data;
+        Ok(())
+    }
+
+    /// The registry as `state.json` holds it now, validated and brought up to date in memory,
+    /// with the file's text, so a save can tell whether it changes anything. A missing or
+    /// dangling state file is an error: only `open` starts a registry.
+    fn read(dir: &Path) -> Result<(Self, String), Error> {
+        let on_disk =
+            fs::read_to_string(dir.join("state.json")).map_err(|error| match error.kind() {
+                std::io::ErrorKind::NotFound => {
+                    Error::NotFound(format!("no TaskAI registry at {}", dir.display()))
+                }
+                _ => error.into(),
+            })?;
+        let data: Data = serde_json::from_str(&on_disk)
+            .map_err(|e| Error::Invalid(format!("state.json: {e}")))?;
+        for task in &data.tasks {
+            task.connection.validate()?;
+            if let Some(terminal) = &task.terminal {
+                validate_internal_name(&terminal.private_server, "terminal tmux server")?;
+                if terminal.target != task.connection
+                    || terminal.session != terminal_ref(&task.task_ref)
+                {
+                    return Err(Error::Invalid(format!(
+                        "terminal locator does not belong to {}",
+                        task.task_ref
+                    )));
                 }
             }
-            for session in &data.sessions {
-                if let Some(runtime) = &session.runtime {
-                    runtime.target.validate()?;
-                    validate_internal_name(&runtime.private_server, "tmux private server")?;
-                    if runtime.session != session.session_ref {
-                        return Err(Error::Invalid(format!(
-                            "tmux session for {} must use its internal ref",
-                            session.session_ref
-                        )));
-                    }
+        }
+        for session in &data.sessions {
+            if let Some(runtime) = &session.runtime {
+                runtime.target.validate()?;
+                validate_internal_name(&runtime.private_server, "tmux private server")?;
+                if runtime.session != session.session_ref {
+                    return Err(Error::Invalid(format!(
+                        "tmux session for {} must use its internal ref",
+                        session.session_ref
+                    )));
                 }
             }
-            data
-        } else {
-            Data::default()
-        };
+        }
+        Ok((Self::up_to_date(dir, data)?, on_disk))
+    }
+
+    /// The registry `data` describes, brought up to date: server profiles, helper refs and
+    /// session addresses.
+    fn up_to_date(dir: &Path, data: Data) -> Result<Self, Error> {
         let mut registry = Registry {
             dir: dir.to_path_buf(),
             data,
         };
-        let mut migrated = registry.migrate_servers()?;
+        registry.migrate_servers();
         registry.validate_servers()?;
-        migrated |= registry.heal_helper();
-        if migrated {
-            registry.persist()?;
-        }
+        registry.heal_helper();
+        registry.assign_addresses();
         Ok(registry)
     }
 
-    fn persist(&self) -> Result<(), Error> {
-        let tmp = self.dir.join("state.json.tmp");
+    /// Saves the state, owner-only and atomically, unless the file already holds exactly it.
+    fn save(&self, on_disk: Option<&str>) -> Result<(), Error> {
         let body = serde_json::to_string_pretty(&self.data)
             .map_err(|e| Error::Invalid(format!("serialize: {e}")))?;
-        std::fs::write(&tmp, body)?;
-        std::fs::rename(&tmp, self.dir.join("state.json"))?;
-        Ok(())
+        if on_disk == Some(body.as_str()) {
+            return Ok(());
+        }
+        write_private(&self.dir.join("state.json"), &body)
+    }
+
+    /// Applies `change` to the registry as it is on disk now, under the registry's lock, and
+    /// saves the result, so no process's change is lost to another's stale copy. The handle's
+    /// view becomes that state; a failed change saves nothing.
+    fn transact<T>(
+        &mut self,
+        change: impl FnOnce(&mut Self) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let _held = RegistryLock::take(&self.dir)?;
+        let (fresh, on_disk) = Self::read(&self.dir)?;
+        self.data = fresh.data;
+        let before = self.data.clone();
+        let changed = change(self);
+        let outcome = changed.and_then(|value| self.save(Some(&on_disk)).map(|()| value));
+        if outcome.is_err() {
+            self.data = before;
+        }
+        outcome
     }
 
     fn note(&mut self, action: &str, item: &str, source: Source) {
@@ -368,7 +466,7 @@ impl Registry {
 
     /// Creates or reopens the dedicated local helper using only its saved refs.
     /// Existing managers retain their harness, launch snapshot, and native IDs.
-    /// New records are staged and persisted together, so a disabled harness or
+    /// New records are saved together in one transaction, so a disabled harness or
     /// persistence failure cannot leave an orphan task or consume visible refs.
     pub fn ensure_helper(
         &mut self,
@@ -383,52 +481,42 @@ impl Registry {
                 "helper workspace must be an absolute local path".into(),
             ));
         }
-        let mut staged = Self {
-            dir: self.dir.clone(),
-            data: self.data.clone(),
-        };
-        let healed = staged.heal_helper();
-        if let Some(task_ref) = &staged.data.helper.task_ref {
-            if staged
-                .task(task_ref)
-                .is_some_and(|task| task.repo != workspace)
-            {
-                return Err(Error::Invalid(
-                    "the existing helper belongs to another workspace; its task was not retargeted"
-                        .into(),
-                ));
+        self.transact(|reg| {
+            if let Some(task_ref) = &reg.data.helper.task_ref {
+                if reg
+                    .task(task_ref)
+                    .is_some_and(|task| task.repo != workspace)
+                {
+                    return Err(Error::Invalid(
+                        "the existing helper belongs to another workspace; its task was not retargeted"
+                            .into(),
+                    ));
+                }
             }
-        }
-        if let (Some(task_ref), Some(manager_ref)) = (
-            staged.data.helper.task_ref.clone(),
-            staged.data.helper.manager_ref.clone(),
-        ) {
-            if healed {
-                staged.persist()?;
-                self.data = staged.data;
+            if let (Some(task_ref), Some(manager_ref)) = (
+                reg.data.helper.task_ref.clone(),
+                reg.data.helper.manager_ref.clone(),
+            ) {
+                return Ok((task_ref, manager_ref, false));
             }
-            return Ok((task_ref, manager_ref, false));
-        }
-        let task_ref = match staged.data.helper.task_ref.clone() {
-            Some(task_ref) => task_ref,
-            None => {
-                staged.insert_task_on_server("taskai-helper", workspace, "local", source.clone())?
-            }
-        };
-        let manager_ref =
-            staged.insert_session(&task_ref, None, "TaskAI Helper", harness, workspace, source)?;
-        staged.data.helper = HelperSettings {
-            preferred_harness: Some(harness.into()),
-            task_ref: Some(task_ref.clone()),
-            manager_ref: Some(manager_ref.clone()),
-        };
-        staged.persist()?;
-        self.data = staged.data;
-        Ok((task_ref, manager_ref, true))
+            let task_ref = match reg.data.helper.task_ref.clone() {
+                Some(task_ref) => task_ref,
+                None => {
+                    reg.insert_task_on_server("taskai-helper", workspace, "local", source.clone())?
+                }
+            };
+            let manager_ref =
+                reg.insert_session(&task_ref, None, "TaskAI Helper", harness, workspace, source)?;
+            reg.data.helper = HelperSettings {
+                preferred_harness: Some(harness.into()),
+                task_ref: Some(task_ref.clone()),
+                manager_ref: Some(manager_ref.clone()),
+            };
+            Ok((task_ref, manager_ref, true))
+        })
     }
 
-    fn heal_helper(&mut self) -> bool {
-        let previous = self.data.helper.clone();
+    fn heal_helper(&mut self) {
         if self
             .data
             .helper
@@ -469,10 +557,19 @@ impl Registry {
                 self.data.helper.preferred_harness = manager.map(|manager| manager.harness.clone());
             }
         }
-        previous != self.data.helper
     }
 
     pub fn create_server(
+        &mut self,
+        name: &str,
+        target: ConnectionTarget,
+        repository_root: Option<PathBuf>,
+        source: Source,
+    ) -> Result<String, Error> {
+        self.transact(|reg| reg.insert_server(name, target, repository_root, source))
+    }
+
+    fn insert_server(
         &mut self,
         name: &str,
         target: ConnectionTarget,
@@ -503,7 +600,6 @@ impl Registry {
             setup_runtimes: BTreeMap::new(),
         });
         self.note("create_server", &id, source);
-        self.persist()?;
         Ok(id)
     }
 
@@ -518,16 +614,18 @@ impl Registry {
     ) -> Result<(), Error> {
         let name = validated_name(name)?;
         validate_repository_root(repository_root.as_deref())?;
-        let server = self
-            .data
-            .servers
-            .iter_mut()
-            .find(|server| server.server_id == id)
-            .ok_or_else(|| Error::NotFound(format!("server {id}")))?;
-        server.name = name;
-        server.repository_root = repository_root;
-        self.note("update_server", id, source);
-        self.persist()
+        self.transact(|reg| {
+            let server = reg
+                .data
+                .servers
+                .iter_mut()
+                .find(|server| server.server_id == id)
+                .ok_or_else(|| Error::NotFound(format!("server {id}")))?;
+            server.name = name;
+            server.repository_root = repository_root;
+            reg.note("update_server", id, source);
+            Ok(())
+        })
     }
 
     pub fn set_server_harness(
@@ -542,15 +640,17 @@ impl Registry {
             executable: settings.executable.clone(),
             model: settings.model.clone(),
         })?;
-        let server = self
-            .data
-            .servers
-            .iter_mut()
-            .find(|server| server.server_id == id)
-            .ok_or_else(|| Error::NotFound(format!("server {id}")))?;
-        server.harnesses.insert(hkey.into(), settings);
-        self.note("set_server_harness", id, source);
-        self.persist()
+        self.transact(|reg| {
+            let server = reg
+                .data
+                .servers
+                .iter_mut()
+                .find(|server| server.server_id == id)
+                .ok_or_else(|| Error::NotFound(format!("server {id}")))?;
+            server.harnesses.insert(hkey.into(), settings);
+            reg.note("set_server_harness", id, source);
+            Ok(())
+        })
     }
 
     /// Archiving hides a profile from new task creation. It does not destroy,
@@ -559,18 +659,20 @@ impl Registry {
         if id == "local" {
             return Err(Error::Invalid("This computer cannot be archived".into()));
         }
-        let server = self
-            .data
-            .servers
-            .iter_mut()
-            .find(|server| server.server_id == id)
-            .ok_or_else(|| Error::NotFound(format!("server {id}")))?;
-        if server.archived {
-            return Ok(());
-        }
-        server.archived = true;
-        self.note("archive_server", id, source);
-        self.persist()
+        self.transact(|reg| {
+            let server = reg
+                .data
+                .servers
+                .iter_mut()
+                .find(|server| server.server_id == id)
+                .ok_or_else(|| Error::NotFound(format!("server {id}")))?;
+            if server.archived {
+                return Ok(());
+            }
+            server.archived = true;
+            reg.note("archive_server", id, source);
+            Ok(())
+        })
     }
 
     /// Settings utilities are owned by their server profile, never agent records.
@@ -584,24 +686,25 @@ impl Registry {
             validate_harness_key(key)?;
         }
         validate_internal_name(private_server, "setup tmux server")?;
-        let server = self
-            .data
-            .servers
-            .iter_mut()
-            .find(|server| server.server_id == id)
-            .ok_or_else(|| Error::NotFound(format!("server {id}")))?;
-        if let Some(runtime) = server.setup_runtimes.get(key) {
-            return Ok(runtime.clone());
-        }
-        let runtime = TmuxRuntimeLocator {
-            target: server.target.clone(),
-            private_server: private_server.into(),
-            session: format!("setup-{id}-{key}"),
-        };
-        server.setup_runtimes.insert(key.into(), runtime.clone());
-        self.note("bind_server_setup", id, Source::HumanUi);
-        self.persist()?;
-        Ok(runtime)
+        self.transact(|reg| {
+            let server = reg
+                .data
+                .servers
+                .iter_mut()
+                .find(|server| server.server_id == id)
+                .ok_or_else(|| Error::NotFound(format!("server {id}")))?;
+            if let Some(runtime) = server.setup_runtimes.get(key) {
+                return Ok(runtime.clone());
+            }
+            let runtime = TmuxRuntimeLocator {
+                target: server.target.clone(),
+                private_server: private_server.into(),
+                session: format!("setup-{id}-{key}"),
+            };
+            server.setup_runtimes.insert(key.into(), runtime.clone());
+            reg.note("bind_server_setup", id, Source::HumanUi);
+            Ok(runtime)
+        })
     }
 
     fn next_server_id(&mut self) -> String {
@@ -609,8 +712,7 @@ impl Registry {
         format!("server-{}", self.data.next_server)
     }
 
-    fn migrate_servers(&mut self) -> Result<bool, Error> {
-        let mut changed = false;
+    fn migrate_servers(&mut self) {
         let highest = self
             .data
             .servers
@@ -626,7 +728,6 @@ impl Registry {
             .unwrap_or(0);
         if self.data.next_server < highest {
             self.data.next_server = highest;
-            changed = true;
         }
         if self.server("local").is_none() {
             self.data.servers.insert(
@@ -641,7 +742,6 @@ impl Registry {
                     setup_runtimes: BTreeMap::new(),
                 },
             );
-            changed = true;
         }
         for index in 0..self.data.tasks.len() {
             if self.data.tasks[index].server_profile_id.is_some() {
@@ -673,9 +773,7 @@ impl Registry {
                 id
             };
             self.data.tasks[index].server_profile_id = Some(id);
-            changed = true;
         }
-        Ok(changed)
     }
 
     fn validate_servers(&self) -> Result<(), Error> {
@@ -766,22 +864,26 @@ impl Registry {
         source: Source,
     ) -> Result<String, Error> {
         connection.validate()?;
-        let server_id = if let Some(server) = self
-            .data
-            .servers
-            .iter()
-            .find(|server| server.target == connection && !server.archived)
-        {
-            server.server_id.clone()
-        } else {
-            let name = match &connection {
-                ConnectionTarget::Local => "This computer",
-                ConnectionTarget::Ssh { host } => host.as_str(),
-            }
-            .to_string();
-            self.create_server(&name, connection, None, source.clone())?
-        };
-        self.create_task_on_server(name, repo, &server_id, source)
+        self.transact(|reg| {
+            let active = reg
+                .data
+                .servers
+                .iter()
+                .find(|server| server.target == connection && !server.archived)
+                .map(|server| server.server_id.clone());
+            let server_id = match active {
+                Some(server_id) => server_id,
+                None => {
+                    let server_name = match &connection {
+                        ConnectionTarget::Local => "This computer",
+                        ConnectionTarget::Ssh { host } => host.as_str(),
+                    }
+                    .to_string();
+                    reg.insert_server(&server_name, connection, None, source.clone())?
+                }
+            };
+            reg.insert_task_on_server(name, repo, &server_id, source)
+        })
     }
 
     pub fn create_task_on_server(
@@ -791,9 +893,7 @@ impl Registry {
         server_id: &str,
         source: Source,
     ) -> Result<String, Error> {
-        let task_ref = self.insert_task_on_server(name, repo, server_id, source)?;
-        self.persist()?;
-        Ok(task_ref)
+        self.transact(|reg| reg.insert_task_on_server(name, repo, server_id, source))
     }
 
     fn insert_task_on_server(
@@ -837,9 +937,7 @@ impl Registry {
         workspace: &Path,
         source: Source,
     ) -> Result<String, Error> {
-        let session_ref = self.insert_session(task, parent, name, harness, workspace, source)?;
-        self.persist()?;
-        Ok(session_ref)
+        self.transact(|reg| reg.insert_session(task, parent, name, harness, workspace, source))
     }
 
     fn insert_session(
@@ -891,6 +989,7 @@ impl Registry {
         };
         self.data.next_session += 1;
         let session_ref = format!("s{}", self.data.next_session);
+        let address = derive_address(harness, name, &session_ref, &self.addresses_in(task));
         self.data.sessions.push(Session {
             session_ref: session_ref.clone(),
             task_ref: task.into(),
@@ -904,9 +1003,39 @@ impl Registry {
             provider: None,
             runtime: None,
             launch,
+            address,
+            messaging: None,
         });
         self.note("create_session", &session_ref, source);
         Ok(session_ref)
+    }
+
+    /// Gives each session saved without an address one, in record order, by the same rule as a
+    /// new session. An address already saved is kept exactly.
+    fn assign_addresses(&mut self) {
+        for index in 0..self.data.sessions.len() {
+            let session = &self.data.sessions[index];
+            if !session.address.is_empty() {
+                continue;
+            }
+            let address = derive_address(
+                &session.harness,
+                &session.name,
+                &session.session_ref,
+                &self.addresses_in(&session.task_ref),
+            );
+            self.data.sessions[index].address = address;
+        }
+    }
+
+    /// The addresses already held by sessions of `task`.
+    fn addresses_in(&self, task: &str) -> Vec<String> {
+        self.data
+            .sessions
+            .iter()
+            .filter(|s| s.task_ref == task && !s.address.is_empty())
+            .map(|s| s.address.clone())
+            .collect()
     }
 
     pub fn task(&self, r: &str) -> Option<&Task> {
@@ -934,6 +1063,30 @@ impl Registry {
             .sessions
             .iter()
             .filter(|s| s.parent.as_deref() == Some(session))
+            .collect()
+    }
+
+    /// The routable sessions of `task_ref`, as the address book lists them: `name` is the address.
+    pub fn live_sessions(&self, task_ref: &str) -> Vec<MailPeer> {
+        self.sessions_of(task_ref)
+            .into_iter()
+            .filter_map(|session| {
+                let entry = session.live_mailbox()?;
+                Some(MailPeer {
+                    session_ref: session.session_ref.clone(),
+                    task_ref: session.task_ref.clone(),
+                    name: session.address.clone(),
+                    harness: session.harness.clone(),
+                    workspace: session.workspace.clone(),
+                    pid: entry.pid,
+                    proc_start: entry.proc_start.clone(),
+                    status: entry.status,
+                    waiting_for: entry.waiting_for.clone(),
+                    mailbox: entry.mailbox.clone(),
+                    features: entry.features.clone(),
+                    mode: entry.mode,
+                })
+            })
             .collect()
     }
 
@@ -985,37 +1138,104 @@ impl Registry {
     }
 
     pub fn set_state(&mut self, r: &str, state: SessionState) -> Result<(), Error> {
-        let s = self
-            .data
-            .sessions
-            .iter_mut()
-            .find(|s| s.session_ref == r)
-            .ok_or_else(|| Error::NotFound(format!("session {r}")))?;
-        s.state = state;
-        self.persist()
+        self.transact(|reg| {
+            let s = reg
+                .data
+                .sessions
+                .iter_mut()
+                .find(|s| s.session_ref == r)
+                .ok_or_else(|| Error::NotFound(format!("session {r}")))?;
+            s.state = state;
+            Ok(())
+        })
     }
 
     pub fn bind_provider(&mut self, r: &str, mapping: ProviderMapping) -> Result<(), Error> {
-        let s = self
-            .data
-            .sessions
-            .iter_mut()
-            .find(|s| s.session_ref == r)
-            .ok_or_else(|| Error::NotFound(format!("session {r}")))?;
-        s.provider = Some(mapping);
-        self.persist()
+        self.transact(|reg| {
+            let s = reg
+                .data
+                .sessions
+                .iter_mut()
+                .find(|s| s.session_ref == r)
+                .ok_or_else(|| Error::NotFound(format!("session {r}")))?;
+            s.provider = Some(mapping);
+            Ok(())
+        })
+    }
+
+    /// Chooses one provider ID before spawning a local tmux-backed native session. The
+    /// candidate and any existing winner must belong to this session's current harness and
+    /// runtime. Competing valid candidates return the saved winner without changing it;
+    /// missing/foreign/malformed identities fail without writing. The adapter still validates
+    /// its native ID format. This choice and persistence share one fresh-disk transaction.
+    pub fn bind_provider_if_absent(
+        &mut self,
+        r: &str,
+        mapping: ProviderMapping,
+    ) -> Result<ProviderMapping, Error> {
+        self.transact(|reg| {
+            let session = reg
+                .data
+                .sessions
+                .iter_mut()
+                .find(|session| session.session_ref == r)
+                .ok_or_else(|| Error::NotFound(format!("session {r}")))?;
+            let runtime = session.runtime.as_ref().ok_or_else(|| {
+                Error::Invalid(format!("session {r} has no runtime for provider binding"))
+            })?;
+            let task = reg
+                .data
+                .tasks
+                .iter()
+                .find(|task| task.task_ref == session.task_ref)
+                .ok_or_else(|| Error::NotFound(format!("task {}", session.task_ref)))?;
+            if runtime.target != ConnectionTarget::Local
+                || task.connection != ConnectionTarget::Local
+                || runtime.session != r
+            {
+                return Err(Error::Invalid(
+                    "provider binding requires this session's exact local runtime".into(),
+                ));
+            }
+            let expected_runtime = format!("tmux:{}:{}", runtime.private_server, runtime.session);
+            let valid = |binding: &ProviderMapping| {
+                binding.provider == session.harness
+                    && binding.runtime_id == expected_runtime
+                    && !binding.provider_session_id.trim().is_empty()
+                    && !binding.connector_version.trim().is_empty()
+            };
+            if !valid(&mapping) {
+                return Err(Error::Invalid(
+                    "candidate provider binding is incomplete or belongs to another harness/runtime"
+                        .into(),
+                ));
+            }
+            if let Some(existing) = &session.provider {
+                if !valid(existing) {
+                    return Err(Error::Invalid(
+                        "saved provider binding is incomplete or belongs to another harness/runtime"
+                            .into(),
+                    ));
+                }
+                return Ok(existing.clone());
+            }
+            session.provider = Some(mapping.clone());
+            Ok(mapping)
+        })
     }
 
     /// Drops a provider binding proven unresumable — reconciled from native truth.
     pub fn clear_provider(&mut self, r: &str) -> Result<(), Error> {
-        let s = self
-            .data
-            .sessions
-            .iter_mut()
-            .find(|s| s.session_ref == r)
-            .ok_or_else(|| Error::NotFound(format!("session {r}")))?;
-        s.provider = None;
-        self.persist()
+        self.transact(|reg| {
+            let s = reg
+                .data
+                .sessions
+                .iter_mut()
+                .find(|s| s.session_ref == r)
+                .ok_or_else(|| Error::NotFound(format!("session {r}")))?;
+            s.provider = None;
+            Ok(())
+        })
     }
 
     /// Records the durable tmux process location for one agent session.
@@ -1024,29 +1244,31 @@ impl Registry {
     /// Task, Manager, or role name. Its target is copied from the owning Task.
     pub fn bind_runtime(&mut self, r: &str, private_server: &str) -> Result<(), Error> {
         validate_internal_name(private_server, "tmux private server")?;
-        let task_ref = self
-            .session(r)
-            .ok_or_else(|| Error::NotFound(format!("session {r}")))?
-            .task_ref
-            .clone();
-        let target = self
-            .task(&task_ref)
-            .ok_or_else(|| Error::NotFound(format!("task {task_ref}")))?
-            .connection
-            .clone();
-        target.validate()?;
-        let s = self
-            .data
-            .sessions
-            .iter_mut()
-            .find(|s| s.session_ref == r)
-            .expect("session was resolved above");
-        s.runtime = Some(TmuxRuntimeLocator {
-            target,
-            private_server: private_server.into(),
-            session: r.into(),
-        });
-        self.persist()
+        self.transact(|reg| {
+            let task_ref = reg
+                .session(r)
+                .ok_or_else(|| Error::NotFound(format!("session {r}")))?
+                .task_ref
+                .clone();
+            let target = reg
+                .task(&task_ref)
+                .ok_or_else(|| Error::NotFound(format!("task {task_ref}")))?
+                .connection
+                .clone();
+            target.validate()?;
+            let s = reg
+                .data
+                .sessions
+                .iter_mut()
+                .find(|s| s.session_ref == r)
+                .expect("session was resolved above");
+            s.runtime = Some(TmuxRuntimeLocator {
+                target,
+                private_server: private_server.into(),
+                session: r.into(),
+            });
+            Ok(())
+        })
     }
 
     /// Persist one task-owned utility shell before creating its runtime. Repeated
@@ -1057,36 +1279,39 @@ impl Registry {
         private_server: &str,
     ) -> Result<TmuxRuntimeLocator, Error> {
         validate_internal_name(private_server, "terminal tmux server")?;
-        let task = self
-            .data
-            .tasks
-            .iter_mut()
-            .find(|t| t.task_ref == task_ref)
-            .ok_or_else(|| Error::NotFound(format!("task {task_ref}")))?;
-        if let Some(runtime) = &task.terminal {
-            return Ok(runtime.clone());
-        }
-        let runtime = TmuxRuntimeLocator {
-            target: task.connection.clone(),
-            private_server: private_server.into(),
-            session: terminal_ref(task_ref),
-        };
-        task.terminal = Some(runtime.clone());
-        self.note("bind_terminal", task_ref, Source::HumanUi);
-        self.persist()?;
-        Ok(runtime)
+        self.transact(|reg| {
+            let task = reg
+                .data
+                .tasks
+                .iter_mut()
+                .find(|t| t.task_ref == task_ref)
+                .ok_or_else(|| Error::NotFound(format!("task {task_ref}")))?;
+            if let Some(runtime) = &task.terminal {
+                return Ok(runtime.clone());
+            }
+            let runtime = TmuxRuntimeLocator {
+                target: task.connection.clone(),
+                private_server: private_server.into(),
+                session: terminal_ref(task_ref),
+            };
+            task.terminal = Some(runtime.clone());
+            reg.note("bind_terminal", task_ref, Source::HumanUi);
+            Ok(runtime)
+        })
     }
 
     /// Removes only the tmux process locator, leaving provider identity untouched.
     pub fn clear_runtime(&mut self, r: &str) -> Result<(), Error> {
-        let s = self
-            .data
-            .sessions
-            .iter_mut()
-            .find(|s| s.session_ref == r)
-            .ok_or_else(|| Error::NotFound(format!("session {r}")))?;
-        s.runtime = None;
-        self.persist()
+        self.transact(|reg| {
+            let s = reg
+                .data
+                .sessions
+                .iter_mut()
+                .find(|s| s.session_ref == r)
+                .ok_or_else(|| Error::NotFound(format!("session {r}")))?;
+            s.runtime = None;
+            Ok(())
+        })
     }
 
     /// The exact session refs destroy would remove, in confirmation order:
@@ -1124,22 +1349,285 @@ impl Registry {
     /// Removes exactly the blast-radius entries (and the task entry for a task).
     /// Never touches repositories, worktrees, or provider-native history.
     pub fn destroy(&mut self, item: &Item, source: Source) -> Result<Vec<String>, Error> {
-        let removed = self.blast(item)?;
-        self.data
-            .sessions
-            .retain(|s| !removed.contains(&s.session_ref));
-        if let Item::Task(r) = item {
-            self.data.tasks.retain(|t| t.task_ref != *r);
-        }
-        self.heal_helper();
-        let label = match item {
-            Item::Task(r) => r.clone(),
-            Item::Session(r) => r.clone(),
-        };
-        self.note("destroy", &label, source);
-        self.persist()?;
-        Ok(removed)
+        self.transact(|reg| {
+            let removed = reg.blast(item)?;
+            reg.data
+                .sessions
+                .retain(|s| !removed.contains(&s.session_ref));
+            if let Item::Task(r) = item {
+                reg.data.tasks.retain(|t| t.task_ref != *r);
+            }
+            reg.heal_helper();
+            let label = match item {
+                Item::Task(r) => r.clone(),
+                Item::Session(r) => r.clone(),
+            };
+            reg.note("destroy", &label, source);
+            Ok(removed)
+        })
     }
+}
+
+/// One task's address book over TaskAI's registry directory: the `mail::Directory` a bridge's
+/// mailbox resolves names in and registers into. It keeps no copy; every call reads or changes
+/// the registry as it is on disk.
+pub struct AddressBook {
+    dir: PathBuf,
+    task_ref: String,
+}
+
+impl AddressBook {
+    pub fn new(registry_dir: impl Into<PathBuf>, task_ref: impl Into<String>) -> Self {
+        Self {
+            dir: registry_dir.into(),
+            task_ref: task_ref.into(),
+        }
+    }
+
+    /// A transaction on the registry as it is on disk. A missing registry fails the read under
+    /// the lock, so it is never taken for an empty one.
+    fn transact<T>(
+        &self,
+        change: impl FnOnce(&mut Registry) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let mut registry = Registry {
+            dir: self.dir.clone(),
+            data: Data::default(),
+        };
+        registry.transact(change)
+    }
+
+    /// Clears the mailbox entry of a session of this book's task, but only while it is exactly the
+    /// one recorded for `pid`, `proc_start` and `mailbox`; true when it was cleared. Any other
+    /// entry, such as a newer registration, stays and nothing is written. The session, its runtime
+    /// and provider mapping stay, and no file is touched. Unlike `unregister`, any process may
+    /// clear, so an observer can retract a native session's entry it registered.
+    pub fn clear_if_matches(
+        &self,
+        session_ref: &str,
+        pid: u32,
+        proc_start: &str,
+        mailbox: &Path,
+    ) -> Result<bool, Error> {
+        self.transact(|registry| {
+            let matching = registry.data.sessions.iter_mut().find(|s| {
+                s.session_ref == session_ref
+                    && s.task_ref == self.task_ref
+                    && s.messaging.as_ref().is_some_and(|entry| {
+                        entry.pid == pid
+                            && entry.proc_start == proc_start
+                            && entry.mailbox == mailbox
+                    })
+            });
+            let Some(session) = matching else {
+                return Ok(false);
+            };
+            session.messaging = None;
+            Ok(true)
+        })
+    }
+
+    /// The entry this process registered for a session of this book's task.
+    fn own_entry<'a>(
+        &self,
+        registry: &'a mut Registry,
+        session_ref: &str,
+    ) -> Result<&'a mut MessagingEntry, Error> {
+        registry
+            .data
+            .sessions
+            .iter_mut()
+            .find(|s| s.session_ref == session_ref && s.task_ref == self.task_ref)
+            .and_then(|s| s.messaging.as_mut())
+            .filter(|entry| entry.pid == std::process::id())
+            .ok_or_else(|| {
+                Error::NotFound(format!(
+                    "no mailbox of this process for session {session_ref}"
+                ))
+            })
+    }
+}
+
+impl Directory for AddressBook {
+    fn live_sessions(&self) -> Result<Vec<MailPeer>, Error> {
+        let (registry, _) = Registry::read(&self.dir)?;
+        Ok(registry.live_sessions(&self.task_ref))
+    }
+
+    /// Records the bridge's mailbox on its session. The session must be in this book's task under
+    /// the entry's address and harness; a live entry of another process is never replaced.
+    fn register(&self, entry: &MailPeer) -> Result<(), Error> {
+        self.transact(|registry| {
+            let session = registry
+                .data
+                .sessions
+                .iter_mut()
+                .find(|s| s.session_ref == entry.session_ref)
+                .ok_or_else(|| Error::NotFound(format!("session {}", entry.session_ref)))?;
+            if session.task_ref != self.task_ref || entry.task_ref != self.task_ref {
+                return Err(Error::Invalid(format!(
+                    "session {} is not in task {}",
+                    entry.session_ref, self.task_ref
+                )));
+            }
+            if session.address != entry.name || session.harness != entry.harness {
+                return Err(Error::Invalid(format!(
+                    "session {} is {} ({}), not {} ({})",
+                    session.session_ref,
+                    session.address,
+                    session.harness,
+                    entry.name,
+                    entry.harness
+                )));
+            }
+            if let Some(held) = session.live_mailbox() {
+                if held.pid != entry.pid {
+                    return Err(Error::Invalid(format!(
+                        "session {} already has a live mailbox in process {}",
+                        session.session_ref, held.pid
+                    )));
+                }
+            }
+            session.messaging = Some(MessagingEntry {
+                pid: entry.pid,
+                proc_start: entry.proc_start.clone(),
+                mailbox: entry.mailbox.clone(),
+                features: entry.features.clone(),
+                mode: entry.mode,
+                status: entry.status,
+                waiting_for: entry
+                    .waiting_for
+                    .clone()
+                    .filter(|_| entry.status == Activity::Waiting),
+            });
+            Ok(())
+        })
+    }
+
+    /// Publishes this process's session status; `waiting_for` is kept only while waiting.
+    fn set_status(
+        &self,
+        session_ref: &str,
+        status: Activity,
+        waiting_for: Option<&str>,
+    ) -> Result<(), Error> {
+        self.transact(|registry| {
+            let entry = self.own_entry(registry, session_ref)?;
+            entry.status = status;
+            entry.waiting_for = waiting_for
+                .filter(|_| status == Activity::Waiting)
+                .map(str::to_string);
+            Ok(())
+        })
+    }
+
+    /// Removes this process's mailbox entry; the session, its address and topology stay.
+    fn unregister(&self, session_ref: &str) -> Result<(), Error> {
+        self.transact(|registry| {
+            let session = registry
+                .data
+                .sessions
+                .iter_mut()
+                .find(|s| s.session_ref == session_ref && s.task_ref == self.task_ref);
+            if let Some(session) = session {
+                let ours = session
+                    .messaging
+                    .as_ref()
+                    .is_some_and(|entry| entry.pid == std::process::id());
+                if ours {
+                    session.messaging = None;
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Exclusive hold on a registry directory while one change reads, applies and saves
+/// `state.json`, so the changes of every process apply one after another to the state on disk.
+struct RegistryLock {
+    _file: fs::File,
+}
+
+impl RegistryLock {
+    fn take(dir: &Path) -> Result<Self, Error> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(dir.join("state.lock"))?;
+        loop {
+            match flock(&file, FlockOperation::LockExclusive) {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(Errno::INTR) => {}
+                Err(error) => return Err(std::io::Error::from(error).into()),
+            }
+        }
+    }
+}
+
+/// A messaging address for a session, unused among `taken`: `<harness>-<name>` as lowercase ASCII
+/// letters, digits and single dashes, without repeating a harness prefix the name already has, cut
+/// to 64 characters. A name with no ASCII letter or digit gives `<harness>-<ref>`. On a collision
+/// `-<ref>` is appended, then a counter, with the base cut to fit.
+fn derive_address(harness: &str, name: &str, session_ref: &str, taken: &[String]) -> String {
+    let harness = slug(harness);
+    let name = slug(name);
+    let session_ref = slug(session_ref);
+    let base = if name.is_empty() {
+        joined(&harness, &session_ref)
+    } else if name == harness || name.starts_with(&format!("{harness}-")) {
+        name
+    } else {
+        joined(&harness, &name)
+    };
+    let unused = |candidate: &String| !taken.contains(candidate);
+    let whole = cut(&base, MAX_ADDRESS_CHARS);
+    if unused(&whole) {
+        return whole;
+    }
+    (1..)
+        .map(|attempt: u32| {
+            let suffix = match attempt {
+                1 => format!("-{session_ref}"),
+                _ => format!("-{session_ref}-{attempt}"),
+            };
+            let room = MAX_ADDRESS_CHARS.saturating_sub(suffix.len());
+            format!("{}{suffix}", cut(&base, room))
+        })
+        .find(unused)
+        .expect("counters run until an address is unused")
+}
+
+/// Lowercase ASCII letters and digits of `text`, every other run of characters as one dash,
+/// with no dash at either end.
+fn slug(text: &str) -> String {
+    let mut slug = String::new();
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    if slug.ends_with('-') {
+        slug.pop();
+    }
+    slug
+}
+
+fn joined(prefix: &str, rest: &str) -> String {
+    match (prefix.is_empty(), rest.is_empty()) {
+        (true, _) => rest.into(),
+        (_, true) => prefix.into(),
+        _ => format!("{prefix}-{rest}"),
+    }
+}
+
+/// The first `room` characters of an ASCII slug, without a trailing dash.
+fn cut(slug: &str, room: usize) -> String {
+    slug[..slug.len().min(room)].trim_end_matches('-').into()
 }
 
 pub fn terminal_ref(task_ref: &str) -> String {
